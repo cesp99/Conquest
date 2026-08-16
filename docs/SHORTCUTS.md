@@ -25,12 +25,22 @@ editor.
 | `Ctrl` `B` | Show/hide the project panel |
 | `Ctrl` `O` | Open the project picker (switch, create, import, export) |
 | `Ctrl` `P` | Find a file by name (fuzzy) |
+| `Ctrl` `Shift` `G` | Clone a git repository into a new project |
 | `Ctrl` `,` | Open settings |
 | ``Ctrl` ` `` | Show/hide the terminal |
 | ``Ctrl` `Shift` ` `` | Open another terminal |
 
 In the file finder and project picker: `↑` `↓` move, `Enter` opens,
 `Esc` closes.
+
+In the project picker's forms — new project, and clone — `Enter` confirms,
+`Tab` and `Shift` `Tab` move between fields, and `Esc` goes back to the
+project list.
+
+`Ctrl` `Shift` `G` exists only in the `full` edition. Cloning runs the git
+inside the Linux userland, so the edition that has no userland leaves the
+command and its menu entry out entirely rather than showing them greyed —
+see [USERLAND.md](USERLAND.md).
 
 ## Editor
 
@@ -64,6 +74,7 @@ and htop need them. The workspace keeps only these:
 | `Ctrl` `Shift` `W` | Close this terminal |
 | `Ctrl` `Shift` `V` | Paste (`Ctrl` `V` would be a control code) |
 | `Ctrl` `Shift` `S` / `P` / `O` / `B` / `,` | Save, find file, projects, project panel, settings |
+| `Ctrl` `Shift` `G` | Clone a repository (`full` edition) |
 
 Sessions start in the project directory and keep running while the
 terminal is hidden. They close when you switch projects. In the `full`
@@ -73,7 +84,8 @@ edition the shell runs inside Debian once you install it — see
 ## Mouse
 
 - The editor shows a text cursor; tabs, tree rows and actions show a
-  hand cursor.
+  hand cursor. Dialog fields — the project name, the clone URL — show a
+  text cursor too, so a mouse tells you where it can type.
 - Click a file in the project panel to open it, a directory to expand
   or collapse it.
 - Click a tab to switch to it, its `✕` to close it, and its unsaved-changes
@@ -89,7 +101,10 @@ drag the handles to adjust a selection, and use the floating toolbar for
 copy/paste. The status bar carries a **Save** action while the current
 file has unsaved changes, `☰ files` toggles the project panel, `▤` toggles the project
 panel and `⌕` opens the file finder, and `❯_` opens the terminal. Project,
-file and settings commands live in the `☰` menu in the title bar.
+file and settings commands live in the `☰` menu in the title bar. The
+project picker's own footer carries **New**, **Clone…** and **Import
+folder**; a clone in progress shows what git is doing and a **Cancel**
+that stops it and removes the half-cloned directory.
 
 In the terminal, the row above the keyboard carries the keys a soft
 keyboard doesn't have: `esc`, `tab`, `ctrl`, `alt`, arrows, `home` and

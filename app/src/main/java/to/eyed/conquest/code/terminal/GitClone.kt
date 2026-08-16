@@ -1,0 +1,554 @@
+package to.eyed.conquest.code.terminal
+
+import android.content.Context
+import android.system.Os
+import android.system.OsConstants
+import android.util.Log
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import to.eyed.conquest.code.core.ProjectsRoot
+import to.eyed.conquest.code.core.SafeDelete
+import java.io.File
+import java.util.concurrent.TimeUnit
+
+/**
+ * Clone a git repository into a new project.
+ *
+ * git runs *inside the userland*, through the same seam the terminal uses
+ * ([UserlandBackend.execCommand]), for the reason the userland exists at all:
+ * the only git on this device is the one apt installed, and Android will
+ * execute it for nobody but proot. The `play` flavour therefore cannot clone,
+ * `execCommand` returns null there, and the UI leaves the action out rather
+ * than showing it greyed — see [isSupported].
+ *
+ * Three things about driving git from a program rather than a terminal, all of
+ * which have bitten this code:
+ *
+ * 1. `--progress` writes its phases separated by **carriage returns**, because
+ *    it is redrawing one line. `readLine()` blocks until the phase is over and
+ *    then hands you the whole thing at once, so the UI would sit at 0% and
+ *    jump to 100%. [GitProgressReader] splits on `\r` as well as `\n`.
+ * 2. Without `GIT_TERMINAL_PROMPT=0`, a private repository does not fail — it
+ *    *hangs*, waiting for a username on a terminal that is not there.
+ * 3. Cancelling is not `destroy()`. proot ignores SIGTERM, and
+ *    `destroyForcibly()` sends SIGKILL, which proot never sees: its tracees
+ *    (git, and whatever git forked) are orphaned and keep downloading into a
+ *    directory we are about to delete. proot *does* handle SIGQUIT — it kills
+ *    its tracees and exits — so [terminate] sends that first and keeps
+ *    SIGKILL as the last resort. Getting the pid is its own small mess:
+ *    `Process.pid()` is API 33 and minSdk is 31.
+ */
+object GitClone {
+
+    private const val TAG = "conquest-clone"
+
+    /** How long to give proot to take its tracees down after SIGQUIT. */
+    private const val QUIT_GRACE_MS = 3_000L
+
+    /** ~10 Hz. Progress arrives far faster than that and a phone need not care. */
+    private const val PROGRESS_INTERVAL_NS = 100_000_000L
+
+    /** Keep the tail of git's own words for the error message. */
+    private const val TRANSCRIPT_LINES = 12
+
+    // --- state ---------------------------------------------------------------
+
+    /**
+     * Owned here rather than in the composition: the project picker is a
+     * dialog, and dismissing it must not abandon a half-finished clone with a
+     * partial directory on disk. Same reasoning as [UserlandInstaller].
+     */
+    var state by mutableStateOf<CloneState>(CloneState.Idle)
+        private set
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var job: Job? = null
+
+    /**
+     * Bumped by every start and every cancel. A job that finishes after it was
+     * cancelled — the kill leaves git with a non-zero status, which looks like
+     * a failure — checks this before writing [state], so a cancelled clone
+     * cannot report an error over whatever the user is doing now.
+     */
+    @Volatile
+    private var generation = 0
+
+    /** The process to signal, and what to delete if it is cancelled. */
+    @Volatile
+    private var attempt: Attempt? = null
+
+    private class Attempt(val process: Process, val destination: File?)
+
+    /** False in builds with no userland: the UI must not offer cloning at all. */
+    val isSupported: Boolean get() = Userland.backend.isSupported
+
+    val isBusy: Boolean
+        get() = state is CloneState.Working || state is CloneState.InstallingGit
+
+    /** Back to a blank form. Ignored while something is running. */
+    fun reset() {
+        if (!isBusy) state = CloneState.Idle
+    }
+
+    // --- running -------------------------------------------------------------
+
+    /**
+     * Clone [url] into a new project called [name], reporting through [state].
+     *
+     * [onCloned] fires on the caller's thread only on success, with the new
+     * project's path, so the workspace can open it.
+     */
+    fun start(context: Context, url: String, name: String, onCloned: (String) -> Unit) =
+        launch(context, url, name, installFirst = false, onCloned = onCloned)
+
+    /**
+     * `apt-get install -y git` in the guest, then carry on with the clone the
+     * user asked for. Offered instead of failing with "command not found",
+     * which is a dead end the user has no way out of.
+     */
+    fun installGitAndClone(context: Context, url: String, name: String, onCloned: (String) -> Unit) =
+        launch(context, url, name, installFirst = true, onCloned = onCloned)
+
+    private fun launch(
+        context: Context,
+        url: String,
+        name: String,
+        installFirst: Boolean,
+        onCloned: (String) -> Unit,
+    ) {
+        if (job?.isActive == true) return
+        val app = context.applicationContext
+        val mine = ++generation
+        state = if (installFirst) {
+            CloneState.InstallingGit("Starting")
+        } else {
+            CloneState.Working(CloneProgress("Preparing", null))
+        }
+        job = scope.launch {
+            val result = runCatching {
+                if (installFirst) {
+                    installGit(app)?.let { return@runCatching it }
+                    if (generation != mine) return@launch
+                    state = CloneState.Working(CloneProgress("Preparing", null))
+                }
+                clone(app, url.trim(), name.trim())
+            }.getOrElse { error ->
+                Log.e(TAG, "clone failed", error)
+                CloneState.Failed("Could not clone", error.message)
+            }
+            attempt = null
+            // A cancel already moved on; do not report the failure its own
+            // kill produced over whatever the user is looking at now.
+            if (generation != mine) return@launch
+            state = result
+            if (result is CloneState.Finished) onCloned(result.path)
+        }
+    }
+
+    /**
+     * Stop a clone and leave nothing behind.
+     *
+     * The signalling runs in its own coroutine, a sibling of the clone's, so
+     * cancelling the clone cannot cancel the cleanup — and so the main thread
+     * never blocks on the grace period.
+     */
+    fun cancel() {
+        val running = job?.takeIf { it.isActive } ?: return
+        job = null
+        generation++
+        state = CloneState.Idle
+        scope.launch {
+            terminate()
+            running.cancel()
+        }
+    }
+
+    /** SIGQUIT, then SIGKILL, then delete whatever git had written. */
+    private fun terminate() {
+        val current = attempt ?: return
+        attempt = null
+        val process = current.process
+        if (process.isAlive) {
+            val pid = pidOf(process)
+            if (pid != null) {
+                runCatching { Os.kill(pid, OsConstants.SIGQUIT) }
+                    .onFailure { Log.w(TAG, "SIGQUIT to $pid failed", it) }
+                runCatching { process.waitFor(QUIT_GRACE_MS, TimeUnit.MILLISECONDS) }
+            } else {
+                Log.w(TAG, "no pid for the clone process; going straight to SIGKILL")
+            }
+            if (process.isAlive) {
+                // proot did not go, so its tracees are about to be orphaned.
+                // Nothing better is left than killing what we can reach.
+                process.destroyForcibly()
+                runCatching { process.waitFor(QUIT_GRACE_MS, TimeUnit.MILLISECONDS) }
+            }
+        }
+        // Only after the writer is gone, or we would race it and leave files.
+        current.destination?.let { SafeDelete.deleteTree(it) }
+    }
+
+    /**
+     * The child's pid, defensively.
+     *
+     * `Process.pid()` is API 33 and this app runs from 31 — and it is not even
+     * in the SDK stubs this module compiles against, so it has to be reached
+     * by name. Where it is missing, the platform's own `ProcessImpl` has
+     * always carried the pid in a field. Both paths can fail, and the caller
+     * degrades to `destroyForcibly()` when they do.
+     */
+    private fun pidOf(process: Process): Int? {
+        runCatching {
+            val method = process.javaClass.getMethod("pid")
+            method.isAccessible = true
+            return (method.invoke(process) as Long).toInt()
+        }.onFailure { Log.w(TAG, "Process.pid() unavailable, trying the field", it) }
+
+        var type: Class<*>? = process.javaClass
+        while (type != null) {
+            val field = runCatching { type.getDeclaredField("pid") }.getOrNull()
+            if (field != null) {
+                return runCatching {
+                    field.isAccessible = true
+                    field.getInt(process)
+                }.getOrNull()
+            }
+            type = type.superclass
+        }
+        return null
+    }
+
+    // --- the clone itself ----------------------------------------------------
+
+    private fun clone(context: Context, url: String, name: String): CloneState {
+        if (url.isEmpty()) return CloneState.Failed("Enter a repository URL", null)
+        ProjectsRoot.nameError(context, name)?.let { return CloneState.Failed(it, null) }
+
+        // Cloning into the projects directory with a *relative* destination:
+        // the guest sees it as /projects, and we never have to know what the
+        // backend called it inside the fake root.
+        val projects = ProjectsRoot.directory(context)
+        val destination = ProjectsRoot.projectDir(context, name)
+        if (destination.exists()) {
+            return CloneState.Failed("A project called “$name” already exists", null)
+        }
+
+        val command = Userland.backend.execCommand(
+            context,
+            projects.absolutePath,
+            listOf("git", "clone", "--progress", "--", url, name),
+            gitEnvironment(),
+        ) ?: return CloneState.Failed(noUserland(), null)
+
+        if (!hasGit(context, projects)) return CloneState.NeedsGit
+
+        val transcript = ArrayDeque<String>()
+        val exit = run(command, destination) { record ->
+            // Keep what git *said*, not the progress bar it drew: a hundred
+            // "Receiving objects" redraws would push the actual error out of
+            // the tail we show.
+            if (GitProgress.parse(record) == null) {
+                if (transcript.size >= TRANSCRIPT_LINES) transcript.removeFirst()
+                transcript.addLast(record)
+            }
+        }
+        if (exit == 0) return CloneState.Finished(destination.absolutePath, name)
+
+        // git already said it better than we can; keep its words and put a
+        // sentence the user can act on in front of them.
+        val output = transcript.joinToString("\n")
+        return CloneState.Failed(explain(output, url), output.ifBlank { null })
+            .also { SafeDelete.deleteTree(destination) }
+    }
+
+    /** Null when git is now installed; a failure state otherwise. */
+    private fun installGit(context: Context): CloneState? {
+        val projects = ProjectsRoot.directory(context)
+        val command = Userland.backend.execCommand(
+            context,
+            projects.absolutePath,
+            listOf(
+                "/bin/sh", "-c",
+                "apt-get update && apt-get install -y --no-install-recommends git",
+            ),
+            listOf("DEBIAN_FRONTEND=noninteractive"),
+        ) ?: return CloneState.Failed(noUserland(), null)
+
+        val transcript = ArrayDeque<String>()
+        var lastStep = 0L
+        val exit = run(command, destination = null) { record ->
+            if (transcript.size >= TRANSCRIPT_LINES) transcript.removeFirst()
+            transcript.addLast(record)
+            // apt is chatty; the same 10 Hz ceiling as the clone's progress.
+            val now = System.nanoTime()
+            // Never resurrect a state a cancel has already moved past.
+            if (now - lastStep >= PROGRESS_INTERVAL_NS && state is CloneState.InstallingGit) {
+                lastStep = now
+                state = CloneState.InstallingGit(record.take(120))
+            }
+        }
+        if (exit == 0) return null
+        val output = transcript.joinToString("\n")
+        return CloneState.Failed("Could not install git", output.ifBlank { null })
+    }
+
+    /**
+     * Why there is nowhere to run git. Reached in the `full` flavour before
+     * Debian is installed; the `play` flavour never gets here, because the UI
+     * leaves the action out when [isSupported] is false.
+     */
+    private fun noUserland(): String =
+        if (Userland.backend.isSupported) {
+            "${Userland.backend.displayName} is not installed yet — open the terminal to " +
+                "install it, then try again"
+        } else {
+            "This edition has no Linux userland to run git in"
+        }
+
+    private fun hasGit(context: Context, projects: File): Boolean {
+        val command = Userland.backend.execCommand(
+            context,
+            projects.absolutePath,
+            listOf("/bin/sh", "-c", "command -v git"),
+        ) ?: return false
+        return runCatching { run(command, destination = null) { } == 0 }.getOrDefault(false)
+    }
+
+    /**
+     * Start [command], stream its output through the progress reader, and
+     * return its exit status. Every completed record is handed to [onRecord],
+     * so callers can keep a transcript; the [state] updates are throttled to
+     * [PROGRESS_INTERVAL_NS] because git redraws far faster than a screen.
+     */
+    private fun run(
+        command: ShellCommand,
+        destination: File?,
+        onRecord: (String) -> Unit,
+    ): Int {
+        // ProcessBuilder cannot set argv[0] apart from the executable, and
+        // proot does not care what it is called, so the .so path stands in.
+        val builder = ProcessBuilder(listOf(command.executable) + command.argv.drop(1))
+            // git writes progress to stderr and almost nothing to stdout;
+            // merging keeps the ordering and gives one stream to read.
+            .redirectErrorStream(true)
+        builder.environment().apply {
+            clear()
+            for (entry in command.environment) {
+                val split = entry.indexOf('=')
+                if (split > 0) put(entry.substring(0, split), entry.substring(split + 1))
+            }
+        }
+
+        val process = builder.start()
+        attempt = Attempt(process, destination)
+        val reader = GitProgressReader()
+        var lastEmit = 0L
+        var lastPhase: String? = null
+
+        process.inputStream.reader(Charsets.UTF_8).use { source ->
+            val buffer = CharArray(4096)
+            while (true) {
+                val read = source.read(buffer)
+                if (read < 0) break
+                for (record in reader.feed(String(buffer, 0, read))) {
+                    onRecord(record)
+                    val progress = GitProgress.parse(record) ?: continue
+                    val now = System.nanoTime()
+                    // Always show a new phase at once — that is the part the
+                    // user reads — and rate-limit only the percentages.
+                    if (progress.phase != lastPhase || now - lastEmit >= PROGRESS_INTERVAL_NS) {
+                        lastPhase = progress.phase
+                        lastEmit = now
+                        if (state is CloneState.Working) state = CloneState.Working(progress)
+                    }
+                }
+            }
+        }
+        for (record in reader.flush()) onRecord(record)
+        return process.waitFor()
+    }
+
+    /**
+     * The environment that makes git fail instead of hang.
+     *
+     * `GIT_TERMINAL_PROMPT=0` is the one that matters: a private HTTPS
+     * repository otherwise blocks forever on "Username for …", with no
+     * terminal to type it into. The askpass variables close the same door for
+     * the GUI helper, and `BatchMode=yes` for ssh.
+     */
+    private fun gitEnvironment(): List<String> = listOf(
+        "GIT_TERMINAL_PROMPT=0",
+        "GIT_ASKPASS=",
+        "SSH_ASKPASS=",
+        "GIT_SSH_COMMAND=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
+        // Progress is a terminal affordance; git suppresses it when stdout is
+        // a pipe unless asked, which --progress does. Keep the columns sane so
+        // the records are the shape the parser expects.
+        "COLUMNS=80",
+    )
+
+    /** A sentence the user can act on, from whatever git printed. */
+    private fun explain(output: String, url: String): String {
+        val text = output.lowercase()
+        return when {
+            "could not read username" in text ||
+                "terminal prompts disabled" in text ||
+                "authentication failed" in text ||
+                "permission denied (publickey)" in text ||
+                "invalid username or password" in text ->
+                "That repository needs credentials, and there is nowhere to type them yet"
+
+            "repository not found" in text ||
+                "not found" in text && "remote" in text ||
+                "does not appear to be a git repository" in text ||
+                "could not find remote repository" in text ->
+                "No repository at $url"
+
+            "could not resolve host" in text ||
+                "network is unreachable" in text ||
+                "connection timed out" in text ||
+                "connection refused" in text ||
+                "temporary failure in name resolution" in text ->
+                "Could not reach the network"
+
+            "already exists and is not an empty directory" in text ->
+                "The destination already exists"
+
+            "command not found" in text || "no such file or directory" in text && "git" in text ->
+                "git is not installed in the userland"
+
+            else -> "git could not clone that repository"
+        }
+    }
+}
+
+/** Where a clone has got to. [fraction] is null while a phase has no percent. */
+data class CloneProgress(val phase: String, val fraction: Float?)
+
+/** What the picker draws. */
+sealed interface CloneState {
+    /** Nothing running: show the form. */
+    data object Idle : CloneState
+
+    data class Working(val progress: CloneProgress) : CloneState
+
+    /** The guest has no git; the user is offered the install rather than an error. */
+    data object NeedsGit : CloneState
+
+    data class InstallingGit(val step: String) : CloneState
+
+    /** [detail] is git's own message, kept verbatim. */
+    data class Failed(val summary: String, val detail: String?) : CloneState
+
+    data class Finished(val path: String, val name: String) : CloneState
+}
+
+/**
+ * Split git's output into records.
+ *
+ * `git clone --progress` is drawing on a terminal: it ends a progress update
+ * with `\r` and returns to the start of the line to overwrite it. Only the
+ * *last* update of a phase is followed by `\n`. Reading by line therefore
+ * shows nothing for the length of a download and then everything at once,
+ * which is exactly the 0→100% jump this class exists to prevent.
+ *
+ * Chunk boundaries fall wherever the pipe felt like it, so a record is
+ * routinely split across two reads; the tail is held until it is complete.
+ */
+class GitProgressReader {
+    private val pending = StringBuilder()
+
+    /** The records completed by [text]. Empty separators (`\r\n`) are dropped. */
+    fun feed(text: String): List<String> {
+        val records = mutableListOf<String>()
+        for (char in text) {
+            if (char == '\r' || char == '\n') {
+                val record = pending.toString().trim()
+                pending.setLength(0)
+                if (record.isNotEmpty()) records += record
+            } else {
+                pending.append(char)
+            }
+        }
+        return records
+    }
+
+    /** Whatever was left unterminated when the stream closed. */
+    fun flush(): List<String> {
+        val record = pending.toString().trim()
+        pending.setLength(0)
+        return if (record.isEmpty()) emptyList() else listOf(record)
+    }
+}
+
+/** Reading a phase and a percentage out of one of git's records. */
+object GitProgress {
+
+    /** `Receiving objects:  43% (531/1234), 1.20 MiB | 600.00 KiB/s` */
+    private val PERCENT = Regex("""^(?:remote:\s*)?([A-Za-z][A-Za-z ]*[a-z]):\s+(\d{1,3})%""")
+
+    /** `remote: Enumerating objects: 1234, done.` — a count, with no total. */
+    private val COUNT = Regex("""^(?:remote:\s*)?([A-Za-z][A-Za-z ]*[a-z]):\s+\d+(?:,|$)""")
+
+    private val CLONING = Regex("""^Cloning into '.*'\.\.\.$""")
+
+    /** Null when the record is not progress — an error, a hint, a warning. */
+    fun parse(record: String): CloneProgress? {
+        PERCENT.find(record)?.let { match ->
+            val percent = match.groupValues[2].toInt().coerceIn(0, 100)
+            return CloneProgress(match.groupValues[1], percent / 100f)
+        }
+        COUNT.find(record)?.let { return CloneProgress(it.groupValues[1], null) }
+        if (CLONING.matches(record)) return CloneProgress("Cloning", null)
+        return null
+    }
+}
+
+/** Turning a repository URL into a project name. */
+object GitCloneUrl {
+
+    /** Suffixes git itself strips when it picks a directory name. */
+    private const val GIT_SUFFIX = ".git"
+
+    /**
+     * The directory name git would use for [url], or null if it cannot be one.
+     *
+     * Follows git's own rule — the last non-empty path component, minus a
+     * `.git` suffix — across the URL shapes people actually paste:
+     * `https://host/owner/repo.git`, `git@host:owner/repo.git`,
+     * `ssh://git@host:22/owner/repo/`, and a bare local path. Null for
+     * anything with no component left to use, so the picker can say so rather
+     * than creating a project called `.git` or an empty string.
+     */
+    fun projectName(url: String): String? {
+        var text = url.trim()
+        if (text.isEmpty()) return null
+
+        // Strip a fragment or query first: they are not part of the path.
+        text = text.substringBefore('#').substringBefore('?')
+
+        // scp-style `git@host:owner/repo` has no scheme and a colon where a
+        // slash belongs; everything after the colon is the path.
+        text = when {
+            "://" in text -> text.substringAfter("://").substringAfter('/', "")
+            ':' in text && !text.startsWith("/") -> text.substringAfter(':')
+            else -> text
+        }
+
+        val last = text.split('/', '\\')
+            .lastOrNull { it.isNotBlank() && it != "." && it != ".." }
+            ?: return null
+
+        val trimmed = last.removeSuffix(GIT_SUFFIX).trim().trimEnd('.')
+        if (trimmed.isEmpty() || trimmed.startsWith(".")) return null
+        // A name that cannot be a directory is worse than no suggestion.
+        if (trimmed.any { it.code < 0x20 }) return null
+        return trimmed
+    }
+}

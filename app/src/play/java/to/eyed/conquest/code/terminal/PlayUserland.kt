@@ -21,6 +21,17 @@ private object NoUserland : UserlandBackend {
 
     override fun shellCommand(context: Context, projectDir: String): ShellCommand? = null
 
+    /**
+     * There is no guest to run anything in, so every caller — clone included —
+     * sees null and leaves its feature out of the UI entirely.
+     */
+    override fun execCommand(
+        context: Context,
+        hostWorkingDir: String?,
+        argv: List<String>,
+        extraEnvironment: List<String>,
+    ): ShellCommand? = null
+
     override fun install(
         context: Context,
         isActive: () -> Boolean,

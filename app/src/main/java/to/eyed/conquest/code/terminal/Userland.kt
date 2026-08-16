@@ -61,6 +61,29 @@ interface UserlandBackend {
     fun shellCommand(context: Context, projectDir: String): ShellCommand?
 
     /**
+     * A one-shot, non-interactive command *inside* the userland — `git clone`,
+     * `apt-get install`, a formatter — or null when there is no userland to run
+     * it in, exactly as with [shellCommand].
+     *
+     * This is not [shellCommand] with a different program: no login shell, no
+     * pty, and [argv] is the program itself, so a caller can pipe its output
+     * and read its exit status. [hostWorkingDir] is an *Android* path; the
+     * backend maps it to wherever it appears inside the guest, and falls back
+     * to the guest's home when it maps to nothing (or is null).
+     * [extraEnvironment] is appended to the session environment, later entries
+     * winning, which is how `GIT_TERMINAL_PROMPT=0` gets in.
+     *
+     * Callers must treat null as "this build cannot do it" and keep the
+     * feature out of the UI rather than showing it disabled.
+     */
+    fun execCommand(
+        context: Context,
+        hostWorkingDir: String?,
+        argv: List<String>,
+        extraEnvironment: List<String> = emptyList(),
+    ): ShellCommand?
+
+    /**
      * Download and unpack the rootfs. Blocking; call it off the main thread.
      *
      * [isActive] is polled during the long phases so a cancelled install stops

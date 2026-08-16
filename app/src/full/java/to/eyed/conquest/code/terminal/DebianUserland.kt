@@ -64,7 +64,32 @@ private object DebianUserland : UserlandBackend {
 
     // --- running -----------------------------------------------------------
 
-    override fun shellCommand(context: Context, projectDir: String): ShellCommand? {
+    override fun shellCommand(context: Context, projectDir: String): ShellCommand? =
+        inside(context, projectDir, listOf("/bin/bash", "--login"))
+
+    override fun execCommand(
+        context: Context,
+        hostWorkingDir: String?,
+        argv: List<String>,
+        extraEnvironment: List<String>,
+    ): ShellCommand? =
+        inside(context, hostWorkingDir, argv, extraEnvironment)
+
+    /**
+     * Run [program] under proot with [hostWorkingDir] as the cwd, or null when
+     * nothing is installed to run it in.
+     *
+     * One builder for both callers on purpose: an interactive shell and a
+     * `git clone` must see the same fake root, the same bind mounts and the
+     * same `/projects`, or the terminal and the rest of the app would disagree
+     * about where a project is.
+     */
+    private fun inside(
+        context: Context,
+        hostWorkingDir: String?,
+        program: List<String>,
+        extraEnvironment: List<String> = emptyList(),
+    ): ShellCommand? {
         if (state(context) !is UserlandState.Ready) return null
         val root = rootfs(context)
         // The network may be a different one than at install time, and stale
@@ -73,12 +98,6 @@ private object DebianUserland : UserlandBackend {
         // and only when the answer actually changed.
         refreshResolvConf(context, root)
         val projects = File(context.filesDir, "projects")
-
-        // The project has to be visible from inside the fake root, or the
-        // terminal would open somewhere the editor cannot see.
-        val guestCwd = File(projectDir).relativeToOrNull(projects)
-            ?.let { "/projects/$it" }
-            ?: "/root"
 
         val argv = listOf(
             "proot",
@@ -89,6 +108,8 @@ private object DebianUserland : UserlandBackend {
             "--link2symlink",
             // Take the whole guest down with the session rather than leaving
             // processes behind for Android's phantom-process killer to reap.
+            // This is also what makes cancelling a clone work: SIGQUIT to
+            // proot takes git with it.
             "--kill-on-exit",
             // Some Debian packages refuse to install on kernels they think are
             // ancient; report something modern.
@@ -98,9 +119,8 @@ private object DebianUserland : UserlandBackend {
             "-b", "/proc",
             "-b", "/sys",
             "-b", "${projects.absolutePath}:/projects",
-            "-w", guestCwd,
-            "/bin/bash", "--login",
-        )
+            "-w", guestPath(projects, hostWorkingDir),
+        ) + program
 
         return ShellCommand(
             executable = proot(context).absolutePath,
@@ -113,8 +133,25 @@ private object DebianUserland : UserlandBackend {
                 "COLORTERM=truecolor",
                 "LANG=C.UTF-8",
                 "PS1=\\w \\$ ",
-            ),
+            ) + extraEnvironment,
         )
+    }
+
+    /**
+     * Where an Android path shows up inside the guest.
+     *
+     * Only the projects directory is bound in, so anything else — and anything
+     * that would have to climb out with `..` — lands in the guest's home
+     * instead of naming a path that does not exist there.
+     */
+    private fun guestPath(projects: File, hostPath: String?): String {
+        if (hostPath == null) return "/root"
+        val relative = File(hostPath).relativeToOrNull(projects)?.path ?: return "/root"
+        return when {
+            relative.isEmpty() || relative == "." -> "/projects"
+            relative.startsWith("..") -> "/root"
+            else -> "/projects/$relative"
+        }
     }
 
     // --- installing --------------------------------------------------------
