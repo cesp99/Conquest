@@ -112,7 +112,12 @@ servers) are bundled; an optional package layer can add more later.
 
 Terminal emulation builds on Termux's cleanly decoupled
 `terminal-emulator` / `terminal-view` libraries (GPL-compatible),
-embedded in Compose via `AndroidView`.
+embedded in Compose via `AndroidView`. They are vendored as Gradle
+modules under `vendor/` at a pinned upstream commit — source, tests and
+all — for the same reasons the Zed crates are: see `vendor/VENDOR.md`.
+The emulator carries a small C shim (`libtermux.so`) that opens
+`/dev/ptmx` and forks the child process; everything above it, including
+the VT/xterm state machine, is plain Java.
 
 ## ACP (Agent Client Protocol)
 

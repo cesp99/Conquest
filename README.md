@@ -63,7 +63,7 @@ Samsung DeX.
 | Projects: create, switch, import & export | ✅ app-private storage, SAF folder import/export |
 | Fuzzy file finder | ✅ Ctrl+P, match highlighting |
 | Settings | ✅ JSONC file that keeps your comments, settings screen |
-| Terminal emulator | ⬜ planned |
+| Terminal emulator | 🚧 Termux emulator + view vendored and running a shell on-device; no UI yet |
 | LSP on-device | ⬜ planned |
 | ACP agent panel | ⬜ planned |
 
@@ -80,8 +80,12 @@ Conquest Code is licensed under **GPL-3.0-or-later** (see
 - **[Zed](https://github.com/zed-industries/zed)** (GPL-3.0 /
   Apache-2.0) — the engine crates this project reuses, and the design
   north star.
-- **[Termux](https://github.com/termux/termux-app)** (GPLv3) — terminal
-  emulation and the art of running a real userland on Android.
+- **[Termux](https://github.com/termux/termux-app)** (GPLv3, with an
+  Apache-2.0 heritage from
+  [Android Terminal Emulator](https://github.com/jackpal/Android-Terminal-Emulator))
+  — its `terminal-emulator` and `terminal-view` libraries are vendored
+  here under `vendor/`, and its work is the reference for running a real
+  userland on Android.
 - **[VSCodium](https://github.com/VSCodium/vscodium)** (MIT) — proof
   that a community can keep an IDE honest.
 

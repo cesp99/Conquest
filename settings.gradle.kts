@@ -24,4 +24,11 @@ dependencyResolutionManagement {
 
 rootProject.name = "Conquest Code by Eyed"
 include(":app")
+
+// Termux's terminal emulator and view, vendored verbatim under vendor/.
+// See vendor/VENDOR.md for the upstream commit and the list of local patches.
+include(":terminal-emulator")
+project(":terminal-emulator").projectDir = file("vendor/terminal-emulator")
+include(":terminal-view")
+project(":terminal-view").projectDir = file("vendor/terminal-view")
  

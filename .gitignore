@@ -15,6 +15,10 @@
 local.properties
 .kotlin/
 
+# Gradle output of the vendored Android modules (kept out of the vendor
+# directories themselves so they stay byte-identical to upstream)
+/vendor/*/build
+
 # Rust
 /core/target
 core/**/target

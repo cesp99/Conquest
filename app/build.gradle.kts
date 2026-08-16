@@ -62,7 +62,9 @@ android {
     }
 }
 
-val ndkVersion = "28.2.13676358"
+// Pinned in gradle.properties so the app and the vendored terminal modules
+// (which build libtermux.so with ndk-build) cannot drift apart.
+val ndkVersion = providers.gradleProperty("conquest.ndkVersion").get()
 val sdkDir: String = run {
     val localProps = Properties()
     val localPropsFile = rootProject.file("local.properties")
@@ -99,6 +101,7 @@ tasks.named("preBuild") {
 }
 
 dependencies {
+    implementation(project(":terminal-view"))
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)

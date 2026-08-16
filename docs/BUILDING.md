@@ -32,7 +32,18 @@ The `cargoNdkBuild` Gradle task cross-compiles `core/` to
 `app/src/main/jniLibs/` (generated, gitignored) before the APK is
 packaged. The NDK path is derived from `sdk.dir` in `local.properties`
 (falling back to `$ANDROID_HOME`); the NDK version pin lives in
-`app/build.gradle.kts`.
+`gradle.properties` (`conquest.ndkVersion`) and is shared with the
+vendored terminal modules.
+
+Two more Gradle modules live under `vendor/`: `terminal-emulator` and
+`terminal-view`, Termux's terminal libraries vendored at a pinned commit
+(`vendor/VENDOR.md`). The emulator builds a second small native library,
+`libtermux.so`, via `ndk-build` — no extra setup beyond the NDK above.
+Their unit tests run on the host:
+
+```sh
+./gradlew :terminal-emulator:testDebugUnitTest
+```
 
 The build emits one APK per ABI plus a universal one, since the Rust
 engine is by far the largest thing in the package and no device can use
