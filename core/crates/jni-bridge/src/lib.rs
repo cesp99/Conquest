@@ -27,7 +27,14 @@ fn engine() -> &'static Engine {
         #[cfg(target_os = "android")]
         android_logger::init_once(
             android_logger::Config::default()
-                .with_max_level(log::LevelFilter::Info)
+                // Debug in a debug build: the engine's own diagnostics (git
+                // runs, scans) are debug-level, and chasing a problem without
+                // them means rebuilding to see anything. Release stays at Info.
+                .with_max_level(if cfg!(debug_assertions) {
+                    log::LevelFilter::Debug
+                } else {
+                    log::LevelFilter::Info
+                })
                 .with_tag("conquest-core"),
         );
         install_panic_hook();
