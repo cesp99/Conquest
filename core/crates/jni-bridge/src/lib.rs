@@ -179,6 +179,51 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferLines(
     }
 }
 
+/// Byte offset of (row, byte column), clipped to the buffer. -1 for an
+/// unknown buffer or negative arguments.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_pointToOffset(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+    row: jlong,
+    column: jlong,
+) -> jlong {
+    if row < 0 || column < 0 {
+        return -1;
+    }
+    let row = row.min(u32::MAX as jlong) as u32;
+    let column = column.min(u32::MAX as jlong) as u32;
+    match engine().point_to_offset(buffer_id as u64, row, column) {
+        Ok(offset) => offset as jlong,
+        Err(err) => {
+            log::warn!("pointToOffset failed: {err}");
+            -1
+        }
+    }
+}
+
+/// (row, byte column) of a byte offset, clipped to the buffer, packed as
+/// `(row << 32) | column`. -1 for an unknown buffer or negative offset.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_offsetToPoint(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+    offset: jlong,
+) -> jlong {
+    if offset < 0 {
+        return -1;
+    }
+    match engine().offset_to_point(buffer_id as u64, offset as usize) {
+        Ok((row, column)) => ((row as jlong) << 32) | column as jlong,
+        Err(err) => {
+            log::warn!("offsetToPoint failed: {err}");
+            -1
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferText(
     env: JNIEnv,

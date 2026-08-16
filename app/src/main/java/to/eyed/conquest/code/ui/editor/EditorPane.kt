@@ -4,6 +4,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.rememberScrollableState
 import androidx.compose.foundation.gestures.scrollable
 import androidx.compose.foundation.layout.fillMaxSize
@@ -16,11 +17,23 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEvent
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.isShiftPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.key.utf16CodePoint
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextMeasurer
@@ -69,7 +82,7 @@ fun EditorPane(state: EditorState, modifier: Modifier = Modifier) {
     }
 
     var cursorVisible by remember { mutableStateOf(true) }
-    LaunchedEffect(state.cursorRow, state.cursorCol) {
+    LaunchedEffect(state.cursorRow, state.cursorCol, state.session.version) {
         cursorVisible = true
         while (true) {
             delay(CURSOR_BLINK_MILLIS)
@@ -79,6 +92,8 @@ fun EditorPane(state: EditorState, modifier: Modifier = Modifier) {
 
     val verticalScroll = rememberScrollableState { delta -> state.applyScrollDeltaY(delta) }
     val horizontalScroll = rememberScrollableState { delta -> state.applyScrollDeltaX(delta) }
+    val focusRequester = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
 
     Canvas(
         modifier = modifier
@@ -87,9 +102,15 @@ fun EditorPane(state: EditorState, modifier: Modifier = Modifier) {
             .background(colors.background)
             .scrollable(verticalScroll, Orientation.Vertical)
             .scrollable(horizontalScroll, Orientation.Horizontal)
+            .focusRequester(focusRequester)
+            .editorTextInput(state)
+            .onKeyEvent { event -> handleEditorKey(state, event) }
+            .focusable()
             .pointerInput(state) {
                 detectTapGestures { tap ->
                     state.moveCursorTo(tap) { line -> layoutCache.layoutFor(line) }
+                    focusRequester.requestFocus()
+                    keyboard?.show()
                 }
             }
     ) {
@@ -166,6 +187,63 @@ fun EditorPane(state: EditorState, modifier: Modifier = Modifier) {
                     top + (lineHeight - layout.size.height) / 2f,
                 ),
             )
+        }
+    }
+}
+
+/**
+ * Hardware-key (and IME-forwarded key event) editing: character input,
+ * backspace/enter, arrow navigation, undo/redo. Selection and Zed-style
+ * bindings are later phase-2 tasks.
+ */
+private fun handleEditorKey(state: EditorState, event: KeyEvent): Boolean {
+    if (event.type != KeyEventType.KeyDown) return false
+    if (event.isCtrlPressed) {
+        return when (event.key) {
+            Key.Z -> {
+                if (event.isShiftPressed) state.redo() else state.undo()
+                true
+            }
+            Key.Y -> {
+                state.redo()
+                true
+            }
+            else -> false
+        }
+    }
+    return when (event.key) {
+        Key.Backspace -> {
+            state.backspace()
+            true
+        }
+        Key.Enter, Key.NumPadEnter -> {
+            state.insertAtCursor("\n")
+            true
+        }
+        Key.DirectionLeft -> {
+            state.moveCursorHorizontally(-1)
+            true
+        }
+        Key.DirectionRight -> {
+            state.moveCursorHorizontally(1)
+            true
+        }
+        Key.DirectionUp -> {
+            state.moveCursorVertically(-1)
+            true
+        }
+        Key.DirectionDown -> {
+            state.moveCursorVertically(1)
+            true
+        }
+        else -> {
+            val codePoint = event.utf16CodePoint
+            if (codePoint >= 32 && codePoint != 127) {
+                state.insertAtCursor(String(Character.toChars(codePoint)))
+                true
+            } else {
+                false
+            }
         }
     }
 }

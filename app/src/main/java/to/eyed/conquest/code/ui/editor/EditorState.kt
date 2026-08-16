@@ -8,6 +8,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.text.TextLayoutResult
 import to.eyed.conquest.code.core.BufferSession
 import to.eyed.conquest.code.core.CoreBridge
+import to.eyed.conquest.code.core.Utf8Diff
 
 /**
  * View state of one editor pane: scroll offsets, cursor, and a cached
@@ -146,5 +147,157 @@ class EditorState(val session: BufferSession) {
         val layout = layoutForLine(line(row))
         cursorRow = row
         cursorCol = layout.getOffsetForPosition(Offset(xInText.coerceAtLeast(0f), 0f))
+        onCursorChangedExternally?.invoke()
+    }
+
+    // ---- Editing ---------------------------------------------------------
+
+    /**
+     * Invoked when the cursor or buffer changes through anything except
+     * [applyLineDiff] (taps, hardware keys, undo). The IME session listens
+     * so it can re-seed its per-line shadow of the buffer.
+     */
+    var onCursorChangedExternally: (() -> Unit)? = null
+
+    fun currentLine(): String = line(cursorRow)
+
+    fun lineStartOffset(row: Int): Long =
+        CoreBridge.pointToOffset(session.id, row.toLong(), 0)
+
+    /**
+     * Replace the whole content of [row] with [newLine] (diffed down to a
+     * minimal engine edit) and put the cursor at UTF-16 offset [selUtf16]
+     * of the new content. This is the IME write path: the input connection
+     * hands us its per-line shadow after every operation.
+     *
+     * Returns true if the edit changed the line structure (a newline was
+     * inserted), in which case the caller must re-seed its shadow.
+     */
+    fun applyLineDiff(row: Int, newLine: String, selUtf16: Int): Boolean {
+        val oldLine = line(row)
+        if (oldLine == newLine) {
+            cursorRow = row
+            cursorCol = selUtf16.coerceIn(0, newLine.length)
+            ensureCursorVisible()
+            return false
+        }
+        val edit = Utf8Diff.diff(oldLine.encodeToByteArray(), newLine.encodeToByteArray())
+        val lineStart = lineStartOffset(row)
+        if (edit != null) {
+            session.editBytes(lineStart + edit.start, lineStart + edit.end, edit.replacement)
+        }
+        val structural = '\n' in newLine
+        if (structural) {
+            val cursorOffset = lineStart +
+                newLine.substring(0, selUtf16.coerceIn(0, newLine.length))
+                    .encodeToByteArray().size
+            val packed = CoreBridge.offsetToPoint(session.id, cursorOffset)
+            val newRow = (packed ushr 32).toInt()
+            val byteCol = (packed and 0xFFFFFFFFL).toInt()
+            cursorRow = newRow
+            cursorCol = utf16Col(line(newRow), byteCol)
+        } else {
+            cursorRow = row
+            cursorCol = selUtf16.coerceIn(0, newLine.length)
+        }
+        refreshLineCount()
+        ensureCursorVisible()
+        return structural
+    }
+
+    /** Insert [text] at the cursor (hardware-key path). */
+    fun insertAtCursor(text: String) {
+        val line = currentLine()
+        val col = cursorCol.coerceAtMost(line.length)
+        applyLineDiff(cursorRow, line.take(col) + text + line.drop(col), col + text.length)
+        onCursorChangedExternally?.invoke()
+    }
+
+    /** Delete the code point before the cursor, joining lines at column 0. */
+    fun backspace() {
+        val line = currentLine()
+        val col = cursorCol.coerceAtMost(line.length)
+        if (col > 0) {
+            val previous = line.offsetByCodePoints(col, -1)
+            applyLineDiff(cursorRow, line.take(previous) + line.drop(col), previous)
+        } else {
+            joinWithPreviousLine()
+        }
+        onCursorChangedExternally?.invoke()
+    }
+
+    /** Remove the newline before the cursor's line. No-op on row 0. */
+    fun joinWithPreviousLine(): Boolean {
+        if (cursorRow == 0) return false
+        val previousLine = line(cursorRow - 1)
+        val lineStart = lineStartOffset(cursorRow)
+        session.editBytes(lineStart - 1, lineStart, "")
+        refreshLineCount()
+        cursorRow -= 1
+        cursorCol = previousLine.length
+        ensureCursorVisible()
+        return true
+    }
+
+    fun undo() {
+        if (session.undo()) afterHistoryChange()
+    }
+
+    fun redo() {
+        if (session.redo()) afterHistoryChange()
+    }
+
+    fun moveCursorHorizontally(delta: Int) {
+        val line = currentLine()
+        val col = cursorCol.coerceAtMost(line.length)
+        if (delta < 0) {
+            if (col > 0) {
+                cursorCol = line.offsetByCodePoints(col, -1)
+            } else if (cursorRow > 0) {
+                cursorRow -= 1
+                cursorCol = currentLine().length
+            }
+        } else {
+            if (col < line.length) {
+                cursorCol = line.offsetByCodePoints(col, 1)
+            } else if (cursorRow < lineCount - 1) {
+                cursorRow += 1
+                cursorCol = 0
+            }
+        }
+        ensureCursorVisible()
+        onCursorChangedExternally?.invoke()
+    }
+
+    fun moveCursorVertically(delta: Int) {
+        cursorRow = (cursorRow + delta).coerceIn(0, lineCount - 1)
+        cursorCol = cursorCol.coerceAtMost(currentLine().length)
+        ensureCursorVisible()
+        onCursorChangedExternally?.invoke()
+    }
+
+    /** Scroll just enough to keep the cursor's line inside the viewport. */
+    fun ensureCursorVisible() {
+        if (viewportHeight <= 0f) return
+        val top = cursorRow * lineHeightPx
+        val bottom = top + lineHeightPx
+        if (top < scrollY) {
+            scrollY = top
+        } else if (bottom > scrollY + viewportHeight) {
+            scrollY = bottom - viewportHeight
+        }
+    }
+
+    private fun afterHistoryChange() {
+        refreshLineCount()
+        cursorRow = cursorRow.coerceIn(0, lineCount - 1)
+        cursorCol = cursorCol.coerceAtMost(currentLine().length)
+        ensureCursorVisible()
+        onCursorChangedExternally?.invoke()
+    }
+
+    private fun utf16Col(line: String, byteCol: Int): Int {
+        val bytes = line.encodeToByteArray()
+        return bytes.decodeToString(0, byteCol.coerceIn(0, bytes.size)).length
     }
 }

@@ -62,8 +62,20 @@ object CoreBridge {
     external fun bufferLines(bufferId: Long, firstLine: Long, lastLine: Long): String?
 
     /**
-     * Whole buffer contents. Placeholder-era convenience for the interim
-     * text-field editor; real rendering must use [bufferLines].
+     * Byte offset of (row, byte column), clipped to the buffer. -1 for an
+     * unknown buffer or negative arguments.
+     */
+    external fun pointToOffset(bufferId: Long, row: Long, column: Long): Long
+
+    /**
+     * (row, byte column) of a byte offset, clipped to the buffer, packed as
+     * `(row shl 32) or column`. -1 for an unknown buffer or negative offset.
+     */
+    external fun offsetToPoint(bufferId: Long, offset: Long): Long
+
+    /**
+     * Whole buffer contents. Placeholder-era convenience; real rendering
+     * must use [bufferLines].
      */
     external fun bufferText(bufferId: Long): String?
 }
