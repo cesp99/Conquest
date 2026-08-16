@@ -10,6 +10,9 @@ import to.eyed.conquest.code.core.BufferSession
 import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.core.Utf8Diff
 
+/** One highlighted range on one row; columns are UTF-16 offsets. */
+data class HighlightSpan(val start: Int, val end: Int, val style: Int)
+
 /**
  * View state of one editor pane: scroll offsets, cursor, and a cached
  * window of visible lines fetched from the engine via the line-window JNI

@@ -8,7 +8,6 @@ import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.rememberScrollableState
 import androidx.compose.foundation.gestures.scrollable
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -47,6 +46,8 @@ import androidx.compose.ui.unit.sp
 import kotlin.math.ceil
 import kotlin.math.min
 import kotlinx.coroutines.delay
+import to.eyed.conquest.code.ui.theme.LocalZedTheme
+import to.eyed.conquest.code.ui.theme.ZedTheme
 
 private const val CURSOR_BLINK_MILLIS = 530L
 
@@ -63,15 +64,16 @@ private const val CURSOR_BLINK_MILLIS = 530L
  */
 @Composable
 fun EditorPane(state: EditorState, modifier: Modifier = Modifier) {
-    val colors = MaterialTheme.colorScheme
+    val theme = LocalZedTheme.current
     val textStyle = TextStyle(
         fontFamily = FontFamily.Monospace,
         fontSize = 14.sp,
-        color = colors.onBackground,
+        color = theme.color("editor.foreground"),
     )
     val density = LocalDensity.current
     val measurer = rememberTextMeasurer()
-    val layoutCache = remember(measurer, textStyle) { TextLayoutCache(measurer, textStyle) }
+    val layoutCache =
+        remember(measurer, textStyle, theme) { TextLayoutCache(measurer, textStyle, theme) }
 
     with(density) {
         state.updateMetrics(
@@ -100,7 +102,7 @@ fun EditorPane(state: EditorState, modifier: Modifier = Modifier) {
         modifier = modifier
             .fillMaxSize()
             .clipToBounds()
-            .background(colors.background)
+            .background(theme.color("editor.background"))
             .scrollable(verticalScroll, Orientation.Vertical)
             .scrollable(horizontalScroll, Orientation.Horizontal)
             .focusRequester(focusRequester)
@@ -131,7 +133,7 @@ fun EditorPane(state: EditorState, modifier: Modifier = Modifier) {
         if (cursorTop + lineHeight > 0 && cursorTop < size.height) {
             clipRect(left = gutterWidth) {
                 drawRect(
-                    color = colors.surfaceVariant.copy(alpha = 0.35f),
+                    color = theme.color("editor.active_line.background"),
                     topLeft = Offset(gutterWidth, cursorTop),
                     size = Size(size.width - gutterWidth, lineHeight),
                 )
@@ -160,7 +162,7 @@ fun EditorPane(state: EditorState, modifier: Modifier = Modifier) {
                 val cursorX = textLeft + layout.getHorizontalPosition(col, true)
                 if (cursorX >= gutterWidth - 1f) {
                     drawRect(
-                        color = colors.primary,
+                        color = theme.cursor,
                         topLeft = Offset(cursorX, cursorTop),
                         size = Size(2f, lineHeight),
                     )
@@ -170,21 +172,23 @@ fun EditorPane(state: EditorState, modifier: Modifier = Modifier) {
 
         // Gutter: background, divider, right-aligned line numbers.
         drawRect(
-            color = colors.surface,
+            color = theme.color("editor.gutter.background"),
             topLeft = Offset.Zero,
             size = Size(gutterWidth, size.height),
         )
         drawLine(
-            color = colors.surfaceVariant,
+            color = theme.color("border.variant"),
             start = Offset(gutterWidth, 0f),
             end = Offset(gutterWidth, size.height),
         )
+        val lineNumber = theme.color("editor.line_number")
+        val activeLineNumber = theme.color("editor.active_line_number")
         for (row in firstRow until lastRow) {
             val layout = layoutCache.layoutFor((row + 1).toString())
             val top = row * lineHeight - state.scrollY
             drawText(
                 textLayoutResult = layout,
-                color = if (row == state.cursorRow) colors.onSurface else colors.onSurfaceVariant,
+                color = if (row == state.cursorRow) activeLineNumber else lineNumber,
                 topLeft = Offset(
                     gutterWidth - state.gutterPaddingPx - layout.size.width,
                     top + (lineHeight - layout.size.height) / 2f,
@@ -260,6 +264,7 @@ private fun handleEditorKey(state: EditorState, event: KeyEvent): Boolean {
 private class TextLayoutCache(
     private val measurer: TextMeasurer,
     private val style: TextStyle,
+    private val theme: ZedTheme,
     private val capacity: Int = 512,
 ) {
     private data class Key(val line: String, val spans: List<HighlightSpan>)
@@ -282,7 +287,7 @@ private class TextLayoutCache(
                 val start = span.start.coerceIn(0, line.length)
                 val end = span.end.coerceIn(0, line.length)
                 if (start >= end) continue
-                SyntaxPalette.spanStyle(span.style)?.let { addStyle(it, start, end) }
+                theme.spanStyle(span.style)?.let { addStyle(it, start, end) }
             }
         }
     }

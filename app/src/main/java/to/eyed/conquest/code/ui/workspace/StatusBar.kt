@@ -15,6 +15,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import to.eyed.conquest.code.core.CoreBridge
+import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
 /**
  * Zed-style status bar. On compact layouts it also hosts the project panel
@@ -32,7 +33,7 @@ fun StatusBar(
         modifier = modifier
             .fillMaxWidth()
             .height(32.dp)
-            .background(MaterialTheme.colorScheme.surface)
+            .background(LocalZedTheme.current.color("status_bar.background"))
             .padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
