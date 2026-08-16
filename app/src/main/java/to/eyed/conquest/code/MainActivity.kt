@@ -12,10 +12,15 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.core.content.ContextCompat
 import to.eyed.conquest.code.core.AppSettings
 import to.eyed.conquest.code.core.CoreBridge
 import java.io.File
 import to.eyed.conquest.code.ui.theme.ConquestCodeByEyedTheme
+import to.eyed.conquest.code.terminal.TerminalService
 import to.eyed.conquest.code.ui.workspace.WorkspaceScreen
 
 class MainActivity : ComponentActivity() {
@@ -31,6 +36,12 @@ class MainActivity : ComponentActivity() {
         // app-private storage, not the kind of I/O the main thread must be
         // kept away from.
         val initialSettings = AppSettings.load()
+        // Before any session exists: Android only offers the notification
+        // prompt to an app targeting API 32 or lower once a channel exists and
+        // an activity starts, and the terminal's foreground service wants that
+        // notification visible. Cheap, and idempotent.
+        TerminalService.ensureChannel(this)
+        requestNotificationPermission()
         enableEdgeToEdge()
         setContent {
             var settings by remember { mutableStateOf(initialSettings) }
@@ -45,5 +56,17 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * Ask for notifications, so the terminal's foreground service can show why
+     * it is running. Denial is not fatal — the service still protects sessions,
+     * it just does so invisibly — so this never blocks anything.
+     */
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+        if (granted == PackageManager.PERMISSION_GRANTED) return
+        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
     }
 }

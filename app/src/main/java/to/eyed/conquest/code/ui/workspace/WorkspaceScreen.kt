@@ -56,7 +56,7 @@ import to.eyed.conquest.code.core.ProjectSummary
 import to.eyed.conquest.code.core.ProjectsRoot
 import to.eyed.conquest.code.core.SafTransfer
 import java.io.File
-import to.eyed.conquest.code.terminal.TerminalPanelState
+import to.eyed.conquest.code.terminal.TerminalSessions
 import to.eyed.conquest.code.terminal.Userland
 import to.eyed.conquest.code.terminal.UserlandState
 import to.eyed.conquest.code.ui.editor.EditorPane
@@ -113,15 +113,12 @@ fun WorkspaceScreen(
     // The terminal dock. Sessions survive the dock being hidden — a build
     // keeps running while you read code — but not a project switch, since a
     // shell sitting in a directory nobody has open is a trap.
-    val terminals = remember { TerminalPanelState() }
+    val terminals = remember(context) { TerminalSessions.of(context) }
     var terminalFocused by remember { mutableStateOf(false) }
     var dockHeight by remember { mutableStateOf(TerminalDockHeight) }
     // Removing the Linux userland throws away ~100 MB and everything installed
     // into it, so it confirms first — same rule as deleting a project.
     var removeUserlandOpen by remember { mutableStateOf(false) }
-    DisposableEffect(terminals) {
-        onDispose { terminals.closeAll() }
-    }
 
     // Project picker state. `projects` is re-listed whenever the dialog opens
     // or a transfer finishes, rather than watched — projects change only when
@@ -323,12 +320,12 @@ fun WorkspaceScreen(
                     terminalFocused = false
                     rootFocus.requestFocus()
                 } else {
-                    terminals.open(context, root)
+                    terminals.open(root)
                 }
             }
             WorkspaceCommand.NewTerminal -> {
                 val root = project?.rootPath ?: return false
-                terminals.newSession(context, root)
+                terminals.newSession(root)
             }
             WorkspaceCommand.CloseTerminal -> {
                 if (terminals.activeIndex < 0) return false

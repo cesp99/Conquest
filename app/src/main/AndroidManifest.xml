@@ -2,6 +2,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- Terminal sessions run as child processes, which Android 12+ kills once
+         the app is cached. A foreground service is the only mitigation an app
+         can apply to itself; see terminal/TerminalService.kt. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Only so the service can say why it is running; denial costs the
+         notification, not the protection. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -24,6 +32,14 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- stopWithTask=false: swiping the app out of Recents must not kill a
+             running build. The notification's "Stop all" action is how a
+             session is ended from outside the app. -->
+        <service
+            android:name=".terminal.TerminalService"
+            android:exported="false"
+            android:stopWithTask="false" />
     </application>
 
 </manifest>

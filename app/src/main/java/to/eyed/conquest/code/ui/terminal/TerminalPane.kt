@@ -24,11 +24,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -43,9 +43,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TextStyle
 import com.termux.view.TerminalView
@@ -53,6 +50,7 @@ import com.termux.view.TerminalViewClient
 import to.eyed.conquest.code.terminal.TerminalPanelState
 import to.eyed.conquest.code.terminal.TerminalSessionHost
 import to.eyed.conquest.code.terminal.Userland
+import to.eyed.conquest.code.terminal.UserlandInstaller
 import to.eyed.conquest.code.terminal.UserlandState
 import to.eyed.conquest.code.ui.theme.ZedTheme
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
@@ -153,7 +151,7 @@ fun TerminalDock(
     ) {
         TerminalHeader(
             state = state,
-            onNew = { cwd?.let { state.newSession(context, it) } },
+            onNew = { cwd?.let { state.newSession(it) } },
             onSelect = state::select,
             onClose = state::closeSession,
             onRestart = { host.restart() },
@@ -162,28 +160,23 @@ fun TerminalDock(
         HorizontalDivider()
 
         // The userland offer. Absent in builds without one, and once Debian is
-        // installed there is nothing to say.
-        val scope = rememberCoroutineScope()
-        var userland by remember { mutableStateOf(Userland.backend.state(context)) }
-        if (userland !is UserlandState.Ready && userland !is UserlandState.Unsupported) {
+        // installed there is nothing to say. The work itself belongs to
+        // UserlandInstaller rather than to this composable — hiding the dock
+        // must not cancel a 30 MB download.
+        LaunchedEffect(Unit) { UserlandInstaller.refresh(context) }
+        val userland = UserlandInstaller.state
+        if (userland != null &&
+            userland !is UserlandState.Ready &&
+            userland !is UserlandState.Unsupported
+        ) {
             UserlandBanner(
                 state = userland,
                 onInstall = {
-                    scope.launch {
-                        val result = withContext(Dispatchers.IO) {
-                            Userland.backend.install(context) { step, fraction ->
-                                userland = UserlandState.Installing(step, fraction)
-                            }
-                        }
-                        userland = result.fold(
-                            onSuccess = { UserlandState.Ready },
-                            onFailure = { UserlandState.Failed(it.message ?: "install failed") },
-                        )
-                        // Re-enter the shell so this session lands in Debian
-                        // rather than the fallback it started in.
-                        if (result.isSuccess) host.restart()
-                    }
+                    // Re-enter the shell on success so this session lands in
+                    // Debian rather than the fallback it started in.
+                    UserlandInstaller.install(context) { host.restart() }
                 },
+                onCancel = { UserlandInstaller.cancel() },
             )
             HorizontalDivider()
         }
@@ -321,7 +314,11 @@ private fun TerminalHeader(
  * a 30 MB download is not worth blocking on.
  */
 @Composable
-private fun UserlandBanner(state: UserlandState, onInstall: () -> Unit) {
+private fun UserlandBanner(
+    state: UserlandState,
+    onInstall: () -> Unit,
+    onCancel: () -> Unit,
+) {
     val theme = LocalZedTheme.current
     val backend = Userland.backend
     Column(
@@ -345,7 +342,17 @@ private fun UserlandBanner(state: UserlandState, onInstall: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.weight(1f),
             )
-            if (state !is UserlandState.Installing) {
+            if (state is UserlandState.Installing) {
+                Text(
+                    text = "Cancel",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .pointerHoverIcon(PointerIcon.Hand)
+                        .clickable(onClick = onCancel)
+                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                )
+            } else {
                 Text(
                     text = if (state is UserlandState.Failed) "Retry" else "Install",
                     style = MaterialTheme.typography.labelMedium,

@@ -62,9 +62,17 @@ interface UserlandBackend {
 
     /**
      * Download and unpack the rootfs. Blocking; call it off the main thread.
-     * Progress arrives as a human-readable step and an optional fraction.
+     *
+     * [isActive] is polled during the long phases so a cancelled install stops
+     * promptly instead of finishing in the background — coroutine cancellation
+     * alone would not interrupt a blocking socket read. Progress arrives as a
+     * human-readable step and an optional fraction.
      */
-    fun install(context: Context, onProgress: (String, Float?) -> Unit): Result<Unit>
+    fun install(
+        context: Context,
+        isActive: () -> Boolean,
+        onProgress: (String, Float?) -> Unit,
+    ): Result<Unit>
 
     /** Delete the rootfs, freeing its disk. */
     fun remove(context: Context)

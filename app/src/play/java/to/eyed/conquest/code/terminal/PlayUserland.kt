@@ -21,7 +21,11 @@ private object NoUserland : UserlandBackend {
 
     override fun shellCommand(context: Context, projectDir: String): ShellCommand? = null
 
-    override fun install(context: Context, onProgress: (String, Float?) -> Unit): Result<Unit> =
+    override fun install(
+        context: Context,
+        isActive: () -> Boolean,
+        onProgress: (String, Float?) -> Unit,
+    ): Result<Unit> =
         Result.failure(UnsupportedOperationException("This build has no userland support"))
 
     override fun remove(context: Context) = Unit

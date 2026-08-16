@@ -32,6 +32,8 @@ Conquest Code builds in two editions from one source tree. They differ in
 | Linux userland (Debian, `apt`) | ✅ | ❌ |
 | `INTERNET` permission | ✅ (to fetch the rootfs) | ❌ |
 | Terminal | Debian `bash`, or Android's `sh` before the rootfs is installed | Android's `sh` (mksh) + toybox |
+| Foreground service | `FOREGROUND_SERVICE` only (API 28 is exempt from service types) | also `foregroundServiceType="specialUse"` + `FOREGROUND_SERVICE_SPECIAL_USE` (API 34+ rule) |
+| `ACCESS_NETWORK_STATE` | ✅ (guest DNS follows the device) | ❌ |
 | Where it can ship | F-Droid, direct APK download | Google Play, and anywhere else |
 
 Android only executes programs that arrived through the package installer.

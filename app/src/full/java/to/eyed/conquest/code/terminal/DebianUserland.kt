@@ -3,6 +3,7 @@ package to.eyed.conquest.code.terminal
 import android.content.Context
 import android.net.ConnectivityManager
 import android.util.Log
+import to.eyed.conquest.code.core.SafeDelete
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
@@ -41,6 +42,9 @@ private val MANIFEST_TYPES = listOf(
     "application/vnd.docker.distribution.manifest.v2+json",
 ).joinToString(", ")
 
+/** Thrown when the user cancels; the failure path cleans up as usual. */
+internal class InstallCancelled : InstallCancelledMarker("Install cancelled")
+
 private object DebianUserland : UserlandBackend {
 
     override val isSupported = true
@@ -63,6 +67,11 @@ private object DebianUserland : UserlandBackend {
     override fun shellCommand(context: Context, projectDir: String): ShellCommand? {
         if (state(context) !is UserlandState.Ready) return null
         val root = rootfs(context)
+        // The network may be a different one than at install time, and stale
+        // resolvers are a maddening failure — apt hangs rather than saying
+        // why. Cheap enough to redo per session: one IPC and a short write,
+        // and only when the answer actually changed.
+        refreshResolvConf(context, root)
         val projects = File(context.filesDir, "projects")
 
         // The project has to be visible from inside the fake root, or the
@@ -110,11 +119,17 @@ private object DebianUserland : UserlandBackend {
 
     // --- installing --------------------------------------------------------
 
-    override fun install(context: Context, onProgress: (String, Float?) -> Unit): Result<Unit> =
+    override fun install(
+        context: Context,
+        isActive: () -> Boolean,
+        onProgress: (String, Float?) -> Unit,
+    ): Result<Unit> =
         runCatching {
             val root = rootfs(context)
-            // A half-finished rootfs is worse than none: start clean.
-            root.deleteRecursively()
+            // A half-finished rootfs is worse than none: start clean. Symlink
+            // safe, because a rootfs is full of links and one of them could
+            // point at the user's projects — see SafeDelete.
+            SafeDelete.deleteTree(root)
             root.mkdirs()
 
             onProgress("Contacting the Debian image registry", null)
@@ -122,11 +137,27 @@ private object DebianUserland : UserlandBackend {
             val layer = resolveLayer(token)
             Log.i(TAG, "layer ${layer.digest} (${layer.size} bytes)")
 
+            // Unpacked, the base image is roughly three times its download, and
+            // apt will want room on top. Failing here with a number beats
+            // failing halfway through an unpack with ENOSPC.
+            if (layer.size > 0) {
+                val needed = layer.size * 4
+                val free = context.filesDir.usableSpace
+                if (free < needed) {
+                    error(
+                        "not enough space: ${needed / 1_000_000} MB needed, " +
+                            "${free / 1_000_000} MB free"
+                    )
+                }
+            }
+
             val blob = File(context.cacheDir, "debian-rootfs.tar.gz")
-            downloadLayer(token, layer, blob) { fraction ->
+            downloadLayer(token, layer, blob, isActive) { fraction ->
                 onProgress("Downloading Debian", fraction)
             }
 
+            // Past this point the install is short and not interruptible; a
+            // half-unpacked rootfs is deleted by the failure path either way.
             onProgress("Unpacking", null)
             unpack(context, blob, root)
             blob.delete()
@@ -138,11 +169,12 @@ private object DebianUserland : UserlandBackend {
             Unit
         }.onFailure { error ->
             Log.e(TAG, "install failed", error)
-            rootfs(context).deleteRecursively()
+            SafeDelete.deleteTree(rootfs(context))
+            File(context.cacheDir, "debian-rootfs.tar.gz").delete()
         }
 
     override fun remove(context: Context) {
-        rootfs(context).deleteRecursively()
+        SafeDelete.deleteTree(rootfs(context))
     }
 
     private data class Layer(val digest: String, val size: Long)
@@ -203,6 +235,7 @@ private object DebianUserland : UserlandBackend {
         token: String,
         layer: Layer,
         into: File,
+        isActive: () -> Boolean,
         onProgress: (Float?) -> Unit,
     ) {
         val digest = MessageDigest.getInstance("SHA-256")
@@ -214,6 +247,10 @@ private object DebianUserland : UserlandBackend {
                 var total = 0L
                 var lastReported = 0L
                 while (true) {
+                    if (!isActive()) {
+                        into.delete()
+                        throw InstallCancelled()
+                    }
                     val read = source.read(buffer)
                     if (read < 0) break
                     digest.update(buffer, 0, read)
@@ -254,6 +291,15 @@ private object DebianUserland : UserlandBackend {
         }
         val exit = process.waitFor()
         if (exit != 0) error("unpacking failed (exit $exit): ${log.readText().take(400)}")
+    }
+
+    /** Rewrite the guest's resolvers if the device's have changed. */
+    private fun refreshResolvConf(context: Context, root: File) {
+        runCatching {
+            val file = File(root, "etc/resolv.conf")
+            val wanted = resolvConf(context)
+            if (!file.isFile || file.readText() != wanted) file.writeText(wanted)
+        }
     }
 
     /** The few things a container image leaves to whoever starts it. */

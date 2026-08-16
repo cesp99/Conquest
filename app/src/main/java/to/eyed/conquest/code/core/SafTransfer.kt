@@ -60,7 +60,7 @@ object SafTransfer {
         } catch (error: Exception) {
             // A half-copied project is worse than none: it would open, look
             // complete, and quietly be missing files.
-            destination.deleteRecursively()
+            SafeDelete.deleteTree(destination)
             Result.Failed(error.message ?: "Import failed")
         }
     }

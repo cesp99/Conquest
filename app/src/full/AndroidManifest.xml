@@ -10,5 +10,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- So the guest's /etc/resolv.conf can carry the device's own resolvers.
+         Without it ConnectivityManager returns nothing and the userland falls
+         back to public DNS, which breaks on networks with a captive or
+         split-horizon resolver. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
 </manifest>

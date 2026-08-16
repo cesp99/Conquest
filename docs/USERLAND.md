@@ -63,9 +63,12 @@ virtualisation: proot uses `ptrace` to rewrite what the guest sees.
   network sockets. `ping` may not work; `curl` and `git` are fine.
 - **Speed.** proot intercepts system calls, so heavy compilation is slower
   than the same work on a Linux machine. Ordinary shell work feels normal.
-- **Background survival.** Android may kill background processes; a long
-  build can be stopped when you leave the app. Keeping the app in the
-  foreground avoids it.
+- **Background survival is now handled, within limits.** While a session
+  is running, a notification appears and the app holds a foreground
+  service, which keeps Android from reaping your build when you switch
+  away. It has a **Stop all** action, and swiping the app out of Recents
+  no longer kills sessions. What it cannot override: the device-wide cap
+  on background child processes, and aggressive vendor battery managers.
 
 ## Removing it
 
