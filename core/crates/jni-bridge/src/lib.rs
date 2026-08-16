@@ -593,6 +593,20 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_openFile(
     }
 }
 
+/// The grammar the buffer is highlighted with ("rust", "markdown"), or null
+/// if it has no language.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferLanguage(
+    env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+) -> jstring {
+    match engine().buffer_language(buffer_id as u64) {
+        Some(name) => to_jstring(&env, name.to_owned()),
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Absolute path of the file behind a buffer; null for scratch buffers.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferPath(

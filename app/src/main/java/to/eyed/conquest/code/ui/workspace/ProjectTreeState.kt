@@ -5,6 +5,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import to.eyed.conquest.code.core.GitignoredFiles
 import to.eyed.conquest.code.core.ProjectEntry
 import to.eyed.conquest.code.core.ProjectSession
 
@@ -24,8 +25,8 @@ data class ProjectTreeRow(val entry: ProjectEntry, val depth: Int)
  */
 class ProjectTreeState(
     private val session: ProjectSession,
-    /** When false, gitignored entries are left out of the tree entirely. */
-    private val showIgnored: Boolean = true,
+    /** How gitignored entries are treated (listed, dimmed, or left out). */
+    private val gitignoredFiles: GitignoredFiles = GitignoredFiles.Dimmed,
 ) {
     /** Project-relative paths of the expanded directories. */
     private val expanded = mutableStateListOf<String>()
@@ -70,7 +71,7 @@ class ProjectTreeState(
         // followed) turning a UI refresh into an unbounded walk.
         if (depth > MAX_DEPTH) return
         for (entry in session.children(dir)) {
-            if (entry.isIgnored && !showIgnored) continue
+            if (entry.isIgnored && gitignoredFiles == GitignoredFiles.Hide) continue
             into += ProjectTreeRow(entry, depth)
             if (entry.isDir && expanded.contains(entry.path)) {
                 appendChildren(entry.path, depth + 1, into)

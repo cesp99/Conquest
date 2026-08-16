@@ -183,18 +183,25 @@ fn style_for_capture(capture: &str) -> Option<u16> {
 }
 
 pub struct HighlightState {
+    /// Grammar name, so the UI can say what it is parsing as.
+    name: &'static str,
     language: &'static LanguageEntry,
     parser: Parser,
     tree: Option<Tree>,
 }
 
 impl HighlightState {
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
     /// Returns None for unknown language names.
     pub fn new(language_name: &str, text: &Rope) -> Option<HighlightState> {
-        let entry = registry().get(language_name)?;
+        let (name, entry) = registry().get_key_value(language_name)?;
         let mut parser = Parser::new();
         parser.set_language(&entry.language).ok()?;
         let mut state = HighlightState {
+            name,
             language: entry,
             parser,
             tree: None,

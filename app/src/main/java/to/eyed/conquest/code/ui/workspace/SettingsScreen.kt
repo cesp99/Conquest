@@ -25,6 +25,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import to.eyed.conquest.code.core.AppSettings
+import to.eyed.conquest.code.core.GitignoredFiles
 import to.eyed.conquest.code.core.ThemeMode
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
@@ -105,9 +106,13 @@ fun SettingsScreen(
                     ChoiceRow(
                         label = "Gitignored files",
                         detail = "In the project tree",
-                        options = listOf(true to "Show", false to "Hide"),
-                        selected = settings.showIgnored,
-                        onSelect = { onSet(AppSettings.KEY_SHOW_IGNORED, it.toString()) },
+                        options = listOf(
+                            GitignoredFiles.Show to "Show",
+                            GitignoredFiles.Dimmed to "Grey out",
+                            GitignoredFiles.Hide to "Hide",
+                        ),
+                        selected = settings.gitignoredFiles,
+                        onSelect = { onSet(AppSettings.KEY_GITIGNORED, "\"${it.key}\"") },
                     )
                 }
 

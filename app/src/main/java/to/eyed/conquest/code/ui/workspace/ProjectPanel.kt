@@ -29,6 +29,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import to.eyed.conquest.code.core.GitignoredFiles
 import to.eyed.conquest.code.core.ProjectEntry
 import to.eyed.conquest.code.core.ProjectSession
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
@@ -54,7 +55,7 @@ fun ProjectPanel(
     onOpenFile: (ProjectEntry) -> Unit,
     modifier: Modifier = Modifier,
     openedPath: String? = null,
-    showIgnored: Boolean = true,
+    gitignoredFiles: GitignoredFiles = GitignoredFiles.Dimmed,
 ) {
     val theme = LocalZedTheme.current
     Column(
@@ -77,7 +78,9 @@ fun ProjectPanel(
             return@Column
         }
 
-        val tree = remember(project, showIgnored) { ProjectTreeState(project, showIgnored) }
+        val tree = remember(project, gitignoredFiles) {
+            ProjectTreeState(project, gitignoredFiles)
+        }
         val scope = rememberCoroutineScope()
 
         // Keyed on `tree`, not `project`: changing a setting that affects the
@@ -112,6 +115,7 @@ fun ProjectPanel(
                         depth = row.depth,
                         isExpanded = tree.isExpanded(row.entry.path),
                         isOpen = row.entry.path == openedPath,
+                        dimIgnored = gitignoredFiles == GitignoredFiles.Dimmed,
                         onClick = {
                             if (!row.entry.isDir) {
                                 onOpenFile(row.entry)
@@ -139,6 +143,7 @@ private fun ProjectRow(
     depth: Int,
     isExpanded: Boolean,
     isOpen: Boolean,
+    dimIgnored: Boolean,
     onClick: () -> Unit,
 ) {
     val theme = LocalZedTheme.current
@@ -147,9 +152,10 @@ private fun ProjectRow(
     } else {
         Color.Transparent
     }
-    // Zed dims gitignored entries rather than hiding them.
-    val color = if (entry.isIgnored) {
-        MaterialTheme.colorScheme.onSurfaceVariant
+    // Zed greys gitignored entries rather than hiding them; "show" opts out
+    // of even that, for people who don't want their tree to editorialise.
+    val color = if (entry.isIgnored && dimIgnored) {
+        theme.color("text.disabled", MaterialTheme.colorScheme.onSurfaceVariant)
     } else {
         MaterialTheme.colorScheme.onSurface
     }

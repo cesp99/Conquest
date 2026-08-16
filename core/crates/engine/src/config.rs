@@ -29,17 +29,25 @@ pub enum ThemeMode {
     Dark,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ProjectPanelSettings {
-    /// Show gitignored entries in the project tree (dimmed).
-    pub show_ignored: bool,
+/// How the project tree treats gitignored entries. Zed dims them rather than
+/// hiding them, which is the default here too — seeing that a file is ignored
+/// is usually more useful than not seeing the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GitignoredFiles {
+    /// Listed like any other file.
+    Show,
+    /// Listed, but greyed out.
+    #[default]
+    Dimmed,
+    /// Left out of the tree.
+    Hide,
 }
 
-impl Default for ProjectPanelSettings {
-    fn default() -> Self {
-        Self { show_ignored: true }
-    }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProjectPanelSettings {
+    pub gitignored_files: GitignoredFiles,
 }
 
 /// Everything the app can be configured with. Every field here is wired to
@@ -96,8 +104,8 @@ const DEFAULT_FILE: &str = r#"// Conquest Code settings.
   "tab_size": 4,
 
   "project_panel": {
-    // Show gitignored files in the tree, dimmed.
-    "show_ignored": true
+    // Gitignored files in the tree: "show", "dimmed" or "hide".
+    "gitignored_files": "dimmed"
   }
 }
 "#;
@@ -264,10 +272,35 @@ mod tests {
         with_settings_dir(|engine, _dir| {
             engine.settings_text();
             let updated = engine
-                .set_setting(&["project_panel", "show_ignored"], json!(false))
+                .set_setting(&["project_panel", "gitignored_files"], json!("hide"))
                 .unwrap();
-            assert!(!updated.project_panel.show_ignored);
-            assert!(!engine.settings().project_panel.show_ignored);
+            assert_eq!(
+                updated.project_panel.gitignored_files,
+                GitignoredFiles::Hide
+            );
+            assert_eq!(
+                engine.settings().project_panel.gitignored_files,
+                GitignoredFiles::Hide
+            );
+        });
+    }
+
+    #[test]
+    fn an_unrecognised_value_falls_back_rather_than_breaking_the_file() {
+        with_settings_dir(|engine, dir| {
+            // A key we no longer understand (the old boolean form) must not
+            // make the whole file unreadable.
+            std::fs::write(
+                dir.join("settings.json"),
+                "{ \"project_panel\": { \"show_ignored\": false }, \"tab_size\": 2 }",
+            )
+            .unwrap();
+            let settings = engine.settings();
+            assert_eq!(settings.tab_size, 2);
+            assert_eq!(
+                settings.project_panel.gitignored_files,
+                GitignoredFiles::Dimmed
+            );
         });
     }
 

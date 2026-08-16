@@ -31,7 +31,7 @@ mod platform;
 mod project;
 mod runtime;
 
-pub use config::{ProjectPanelSettings, Settings, ThemeMode};
+pub use config::{GitignoredFiles, ProjectPanelSettings, Settings, ThemeMode};
 pub use find::FileMatch;
 pub use highlight::{HighlightSpan, STYLE_NAMES, language_for_path};
 pub use project::{ProjectId, TreeEntry};
@@ -234,6 +234,16 @@ impl Engine {
             let end = rope.point_to_offset(Point::new(last - 1, rope.line_len(last - 1)));
             highlighter.highlights(rope, start..end)
         })
+    }
+
+    /// The grammar the buffer is highlighted with ("rust", "markdown"), or
+    /// None if it has no language.
+    pub fn buffer_language(&self, id: BufferId) -> Option<&'static str> {
+        self.with_buffer(id, |state| {
+            state.highlight.as_ref().map(|highlight| highlight.name())
+        })
+        .ok()
+        .flatten()
     }
 
     pub fn version(&self, id: BufferId) -> Result<u64, EngineError> {

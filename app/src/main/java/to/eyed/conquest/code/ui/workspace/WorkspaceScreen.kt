@@ -303,7 +303,49 @@ fun WorkspaceScreen(
         isWide = maxWidth >= WideLayoutMinWidth
         // The status bar spans the whole window, below the panel as well as
         // the editor — it reports on the workspace, not on the editor pane.
+        val active = files.active
+        val menuGroups = listOf(
+            listOf(
+                MenuAction("New project…", null) {
+                    refreshProjects(); transferError = null; pickerOpen = true
+                },
+                MenuAction("Open project…", "Ctrl O") {
+                    runCommand(WorkspaceCommand.OpenProjects)
+                },
+                MenuAction("Import folder…", null) { importLauncher.launch(null) },
+            ),
+            listOf(
+                MenuAction("Find file…", "Ctrl P", enabled = project != null) {
+                    runCommand(WorkspaceCommand.FindFile)
+                },
+                MenuAction("Save", "Ctrl S", enabled = active != null) {
+                    active?.let { save(it) }
+                },
+                MenuAction("Save all", null, enabled = files.tabs.any { it.isDirty }) {
+                    for (tab in files.tabs) if (tab.isDirty) save(tab)
+                },
+                MenuAction("Close tab", "Ctrl W", enabled = active != null) {
+                    runCommand(WorkspaceCommand.CloseTab)
+                },
+            ),
+            listOf(
+                MenuAction("Toggle project panel", "Ctrl B") {
+                    runCommand(WorkspaceCommand.ToggleProjectPanel)
+                },
+                MenuAction("Settings…", "Ctrl ,") {
+                    runCommand(WorkspaceCommand.OpenSettings)
+                },
+            ),
+        )
+
         Column(modifier = Modifier.fillMaxSize()) {
+            TitleBar(
+                projectName = project?.rootName,
+                filePath = active?.path,
+                isDirty = active?.isDirty == true,
+                menuGroups = menuGroups,
+            )
+            HorizontalDivider()
             Box(modifier = Modifier.weight(1f)) {
                 if (isWide) {
                     Row(modifier = Modifier.fillMaxSize()) {
@@ -317,7 +359,7 @@ fun WorkspaceScreen(
                                 project = project,
                                 onOpenFile = onOpenEntry,
                                 openedPath = files.active?.path,
-                                showIgnored = settings.showIgnored,
+                                gitignoredFiles = settings.gitignoredFiles,
                             )
                             }
                             VerticalDivider()
@@ -342,7 +384,7 @@ fun WorkspaceScreen(
                                         scope.launch { drawerState.close() }
                                     },
                                     openedPath = files.active?.path,
-                                    showIgnored = settings.showIgnored,
+                                    gitignoredFiles = settings.gitignoredFiles,
                                 )
                             }
                         }
@@ -358,20 +400,17 @@ fun WorkspaceScreen(
             }
             HorizontalDivider()
             StatusBar(
-                cursorRow = files.active?.editor?.cursorRow ?: 0,
-                cursorCol = files.active?.editor?.cursorCol ?: 0,
-                filePath = files.active?.path,
-                isDirty = files.active?.isDirty == true,
-                projectName = project?.rootName,
-                onSave = files.active?.let { file -> { save(file) } },
+                cursorRow = active?.editor?.cursorRow ?: 0,
+                cursorCol = active?.editor?.cursorCol ?: 0,
+                language = active?.language,
+                hasFile = active != null,
+                isPanelVisible = if (isWide) panelVisible else drawerState.isOpen,
                 onToggleProjectPanel = { runCommand(WorkspaceCommand.ToggleProjectPanel) },
-                onOpenProjects = { runCommand(WorkspaceCommand.OpenProjects) },
                 onFindFile = if (project != null) {
                     { runCommand(WorkspaceCommand.FindFile) }
                 } else {
                     null
                 },
-                onOpenSettings = { runCommand(WorkspaceCommand.OpenSettings) },
             )
         }
     }

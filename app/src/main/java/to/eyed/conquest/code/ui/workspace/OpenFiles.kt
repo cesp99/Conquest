@@ -33,6 +33,12 @@ class OpenFile(
     var isDeleted by mutableStateOf(false)
         private set
 
+    /**
+     * Grammar the engine is highlighting with, for the status bar. Read once:
+     * the language is chosen when the file is opened and doesn't change.
+     */
+    val language: String? = session.language
+
     /** Whether anything changed, so callers can skip needless work. */
     fun refreshStatus(): Boolean {
         val dirty = session.isDirty

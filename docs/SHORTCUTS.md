@@ -43,6 +43,9 @@ In the file finder and project picker: `↑` `↓` move, `Enter` opens,
 | `Backspace` | Delete backwards (joins lines at column 0) |
 | `Enter` | Insert a line break |
 
+All of these are also in the `☰` menu in the title bar, with their
+shortcuts listed beside them.
+
 ## Mouse
 
 - The editor shows a text cursor; tabs, tree rows and actions show a
@@ -58,6 +61,6 @@ In the file finder and project picker: `↑` `↓` move, `Enter` opens,
 Everything above is reachable by touch too: long-press to select a word,
 drag the handles to adjust a selection, and use the floating toolbar for
 copy/paste. The status bar carries a **Save** action while the current
-file has unsaved changes, `☰ files` toggles the project panel, `⌕ find`
-opens the file finder, the project name opens the project picker, and `⚙`
-opens settings.
+file has unsaved changes, `☰ files` toggles the project panel, `▤` toggles the project
+panel and `⌕` opens the file finder. Project, file and settings commands
+live in the `☰` menu in the title bar.

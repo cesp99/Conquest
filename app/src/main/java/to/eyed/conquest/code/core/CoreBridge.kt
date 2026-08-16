@@ -198,6 +198,12 @@ object CoreBridge {
      */
     external fun openFile(path: String): Long
 
+    /**
+     * The grammar the buffer is highlighted with ("rust", "markdown"), or
+     * null if it has no language.
+     */
+    external fun bufferLanguage(bufferId: Long): String?
+
     /** Absolute path of the file behind a buffer; null for scratch buffers. */
     external fun bufferPath(bufferId: Long): String?
 

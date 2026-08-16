@@ -33,6 +33,10 @@ class BufferSession private constructor(val id: Long) {
      */
     fun setLanguage(language: String): Boolean = CoreBridge.bufferSetLanguage(id, language)
 
+    /** Grammar name for the status bar; null when no language is assigned. */
+    val language: String?
+        get() = CoreBridge.bufferLanguage(id)
+
     /** Absolute path of the backing file; null for scratch buffers. */
     val path: String?
         get() = CoreBridge.bufferPath(id)

@@ -2,6 +2,21 @@ package to.eyed.conquest.code.core
 
 import org.json.JSONObject
 
+/** How the project tree treats gitignored entries. */
+enum class GitignoredFiles(val key: String) {
+    /** Listed like any other file. */
+    Show("show"),
+    /** Listed, but greyed out — what Zed does. */
+    Dimmed("dimmed"),
+    /** Left out of the tree. */
+    Hide("hide");
+
+    companion object {
+        fun fromKey(key: String): GitignoredFiles =
+            entries.firstOrNull { it.key == key } ?: Dimmed
+    }
+}
+
 /** How the editor picks light or dark. */
 enum class ThemeMode(val key: String) {
     System("system"),
@@ -27,15 +42,15 @@ data class AppSettings(
     val bufferFontSize: Float = 14f,
     /** Spaces inserted by the Tab key. */
     val tabSize: Int = 4,
-    /** Show gitignored entries in the project tree, dimmed. */
-    val showIgnored: Boolean = true,
+    /** How gitignored entries appear in the project tree. */
+    val gitignoredFiles: GitignoredFiles = GitignoredFiles.Dimmed,
 ) {
     companion object {
         /** Keys as the engine names them, for [CoreBridge.setSetting]. */
         const val KEY_THEME = "theme"
         const val KEY_FONT_SIZE = "buffer_font_size"
         const val KEY_TAB_SIZE = "tab_size"
-        const val KEY_SHOW_IGNORED = "project_panel.show_ignored"
+        const val KEY_GITIGNORED = "project_panel.gitignored_files"
 
         fun parse(json: String): AppSettings = runCatching {
             val root = JSONObject(json)
@@ -44,7 +59,9 @@ data class AppSettings(
                 theme = ThemeMode.fromKey(root.optString("theme", "system")),
                 bufferFontSize = root.optDouble("buffer_font_size", 14.0).toFloat(),
                 tabSize = root.optInt("tab_size", 4),
-                showIgnored = panel?.optBoolean("show_ignored", true) ?: true,
+                gitignoredFiles = GitignoredFiles.fromKey(
+                    panel?.optString("gitignored_files", "dimmed") ?: "dimmed"
+                ),
             )
         }.getOrDefault(AppSettings())
 
