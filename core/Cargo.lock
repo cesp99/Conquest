@@ -1687,6 +1687,7 @@ dependencies = [
  "fuzzy",
  "gpui",
  "grammars",
+ "libc",
  "log",
  "parking_lot",
  "path",

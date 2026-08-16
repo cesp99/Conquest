@@ -52,6 +52,10 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(20);
 /// How often the supervising thread checks on a running git.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// How long proot gets to take its tracees down after SIGQUIT, before we
+/// resort to SIGKILL. The same grace the Kotlin side gives it.
+const QUIT_GRACE: Duration = Duration::from_secs(3);
+
 /// How many times one refresh may immediately re-run because the worktree
 /// moved again while it was running. See [`run_until_settled`].
 const MAX_CHAINED_RUNS: u32 = 4;
@@ -440,8 +444,7 @@ fn capture(userland: &Userland, repo_root: &Path, project: &Path) -> Option<Vec<
         }
         if Instant::now() >= deadline {
             log::debug!("git status timed out after {RUN_TIMEOUT:?}; killing it");
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate(&mut child);
             break None;
         }
         thread::sleep(POLL_INTERVAL);
@@ -477,6 +480,36 @@ fn bind_dirs(userland: &Userland, repo_root: &Path) -> Vec<PathBuf> {
         dirs.push(repo_root.to_path_buf());
     }
     dirs
+}
+
+/// Stop a wedged proot without orphaning what it is tracing.
+///
+/// `Child::kill` is SIGKILL, and proot never sees it: it dies where it stands
+/// and its tracees — a git that has stopped answering, and whatever it forked —
+/// keep running, counting against Android's cap on background child processes
+/// with nothing left holding a handle to them. proot does act on SIGQUIT, and
+/// takes its tracees down with it, so ask that way first and give it a moment.
+/// This is the lesson `GitClone.terminate` already learned on the Kotlin side.
+///
+/// SIGKILL stays as the last resort, for a proot that ignores even this.
+fn terminate(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // Safety: `child` is alive here — nothing has reaped it, since the only
+        // waits on it are this function's own — so the pid cannot have been
+        // recycled onto some other process.
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGQUIT) };
+        let deadline = Instant::now() + QUIT_GRACE;
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => thread::sleep(POLL_INTERVAL),
+                Err(_) => break,
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// `-b <path>:<path>`: the host path mounted at the identical guest path.

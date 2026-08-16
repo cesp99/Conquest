@@ -12,6 +12,7 @@ futures.workspace = true
 fuzzy.workspace = true
 gpui.workspace = true
 grammars = { workspace = true, features = ["load-grammars"] }
+libc.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 path.workspace = true
