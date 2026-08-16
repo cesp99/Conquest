@@ -154,6 +154,15 @@ object CoreBridge {
     external fun projectEntryPath(projectId: Long, path: String): String?
 
     /**
+     * Fuzzy-matches [query] against the project's files, best first, as a JSON
+     * array of objects with `path`, `name`, `positions` (UTF-16 offsets into
+     * `path`, for highlighting) and `score`. An empty query lists files rather
+     * than matching nothing. Never null. **Blocking** — call it off the main
+     * thread.
+     */
+    external fun projectFindFiles(projectId: Long, query: String, limit: Long): String
+
+    /**
      * Reads a file into a new buffer, choosing the language from its name.
      * Opening the same file twice returns the *same* buffer — a file must
      * never fork into two edit histories. Returns the buffer id, or -1 if the

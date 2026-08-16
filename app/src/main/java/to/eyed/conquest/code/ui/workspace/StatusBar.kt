@@ -36,6 +36,7 @@ fun StatusBar(
     onSave: (() -> Unit)? = null,
     onToggleProjectPanel: (() -> Unit)? = null,
     onOpenProjects: (() -> Unit)? = null,
+    onFindFile: (() -> Unit)? = null,
 ) {
     val engineVersion = remember { CoreBridge.engineVersion() }
     Row(
@@ -82,6 +83,18 @@ fun StatusBar(
             )
         }
         Spacer(modifier = Modifier.weight(1f))
+        // The touch twin of Ctrl+P.
+        if (onFindFile != null) {
+            Text(
+                text = "⌕ find",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .pointerHoverIcon(PointerIcon.Hand)
+                    .clickable(onClick = onFindFile)
+                    .padding(end = 12.dp),
+            )
+        }
         // Ctrl+S covers hardware keyboards; touch needs something to press.
         if (isDirty && onSave != null) {
             Text(

@@ -18,6 +18,15 @@ data class ProjectEntry(
     val size: Long,
 )
 
+/** One fuzzy file-finder hit. */
+data class FileMatch(
+    /** Path relative to the project root, '/'-separated. */
+    val path: String,
+    val name: String,
+    /** UTF-16 offsets into [path] that matched, for highlighting. */
+    val positions: List<Int>,
+)
+
 /**
  * Handle for one open project (a Zed worktree inside the engine).
  *
@@ -57,6 +66,24 @@ class ProjectSession(absolutePath: String) {
                 isHidden = entry.getBoolean("is_hidden"),
                 isUnloaded = entry.getBoolean("is_unloaded"),
                 size = entry.getLong("size"),
+            )
+        }
+    }
+
+    /**
+     * Fuzzy-match [query] against the project's files, best first. An empty
+     * query lists files. **Blocking** — call from
+     * [kotlinx.coroutines.Dispatchers.Default].
+     */
+    fun findFiles(query: String, limit: Int = 50): List<FileMatch> {
+        val json = JSONArray(CoreBridge.projectFindFiles(id, query, limit.toLong()))
+        return List(json.length()) { index ->
+            val entry = json.getJSONObject(index)
+            val positions = entry.getJSONArray("positions")
+            FileMatch(
+                path = entry.getString("path"),
+                name = entry.getString("name"),
+                positions = List(positions.length()) { positions.getInt(it) },
             )
         }
     }

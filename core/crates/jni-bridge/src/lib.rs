@@ -449,6 +449,28 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectEntryPa
     }
 }
 
+/// Fuzzy-match `query` against the project's files, best first, as a JSON
+/// array of objects with `path`, `name`, `positions` (UTF-16 offsets into
+/// `path`) and `score`. An empty query lists files. Never null: unknown
+/// projects give `[]`. **Blocking**: call it off the main thread.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectFindFiles(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    query: JString,
+    limit: jlong,
+) -> jstring {
+    let query = get_string(&mut env, &query);
+    let limit = limit.clamp(0, 1000) as usize;
+    let matches = engine().find_files(project_id as u64, &query, limit);
+    let json = serde_json::to_string(&matches).unwrap_or_else(|err| {
+        log::warn!("projectFindFiles failed to serialize: {err}");
+        "[]".to_owned()
+    });
+    to_jstring(&env, json)
+}
+
 /// Read a file into a new buffer, with the language chosen from its name.
 /// Returns the buffer id, or -1 if the file could not be read (missing,
 /// unreadable, or not UTF-8). **Blocking**: call it off the main thread.

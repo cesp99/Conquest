@@ -347,7 +347,11 @@ impl crate::Engine {
         Some(root.join(path))
     }
 
-    fn with_project<T>(&self, id: ProjectId, f: impl FnOnce(&ProjectState) -> T) -> Option<T> {
+    pub(crate) fn with_project<T>(
+        &self,
+        id: ProjectId,
+        f: impl FnOnce(&ProjectState) -> T,
+    ) -> Option<T> {
         let state = self.projects.lock().unwrap().get(&id).cloned()?;
         let state = state.lock().unwrap();
         Some(f(&state))

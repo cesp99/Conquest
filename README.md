@@ -61,6 +61,7 @@ Samsung DeX.
 | Project tree (Zed worktree in-engine) | ✅ lazy, gitignore-aware; open files from the panel |
 | Tabs, save & external change detection | ✅ dirty dots, atomic save, live reload |
 | Projects: create, switch, import & export | ✅ app-private storage, SAF folder import/export |
+| Fuzzy file finder | ✅ Ctrl+P, match highlighting |
 | Terminal emulator | ⬜ planned |
 | LSP on-device | ⬜ planned |
 | ACP agent panel | ⬜ planned |

@@ -24,11 +24,13 @@ use rope::Point;
 use sum_tree::Bias;
 
 mod file;
+mod find;
 mod highlight;
 mod platform;
 mod project;
 mod runtime;
 
+pub use find::FileMatch;
 pub use highlight::{HighlightSpan, STYLE_NAMES, language_for_path};
 pub use project::{ProjectId, TreeEntry};
 

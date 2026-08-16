@@ -1684,6 +1684,7 @@ dependencies = [
  "clock",
  "fs",
  "futures",
+ "fuzzy",
  "gpui",
  "grammars",
  "log",

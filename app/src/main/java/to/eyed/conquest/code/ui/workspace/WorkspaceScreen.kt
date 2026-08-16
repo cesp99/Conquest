@@ -84,6 +84,7 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
     // or a transfer finishes, rather than watched — projects change only when
     // the user changes them.
     var pickerOpen by remember { mutableStateOf(false) }
+    var finderOpen by remember { mutableStateOf(false) }
     var projects by remember { mutableStateOf(emptyList<ProjectSummary>()) }
     var transferMessage by remember { mutableStateOf<String?>(null) }
     var transferError by remember { mutableStateOf<String?>(null) }
@@ -256,6 +257,10 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
                 transferError = null
                 pickerOpen = true
             }
+            WorkspaceCommand.FindFile -> {
+                if (project == null) return false
+                finderOpen = true
+            }
         }
         return true
     }
@@ -340,8 +345,25 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
                 onSave = files.active?.let { file -> { save(file) } },
                 onToggleProjectPanel = { runCommand(WorkspaceCommand.ToggleProjectPanel) },
                 onOpenProjects = { runCommand(WorkspaceCommand.OpenProjects) },
+                onFindFile = if (project != null) {
+                    { runCommand(WorkspaceCommand.FindFile) }
+                } else {
+                    null
+                },
             )
         }
+    }
+
+    val openedProject = project
+    if (finderOpen && openedProject != null) {
+        FileFinder(
+            project = openedProject,
+            onOpen = { match ->
+                finderOpen = false
+                openFile(openedProject, match.path)
+            },
+            onDismiss = { finderOpen = false },
+        )
     }
 
     if (pickerOpen) {

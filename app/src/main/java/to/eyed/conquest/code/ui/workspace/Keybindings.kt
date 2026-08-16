@@ -38,6 +38,9 @@ enum class WorkspaceCommand {
 
     /** Open the project picker (switch, create, import, export). */
     OpenProjects,
+
+    /** Open the fuzzy file finder. */
+    FindFile,
 }
 
 /**
@@ -53,6 +56,7 @@ fun workspaceCommandFor(event: KeyEvent): WorkspaceCommand? {
         Key.W -> WorkspaceCommand.CloseTab
         Key.B -> WorkspaceCommand.ToggleProjectPanel
         Key.O -> WorkspaceCommand.OpenProjects
+        Key.P -> WorkspaceCommand.FindFile
         Key.Tab -> if (event.isShiftPressed) {
             WorkspaceCommand.PreviousTab
         } else {
