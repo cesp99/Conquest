@@ -450,6 +450,78 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectEntryPa
 }
 
 // ---------------------------------------------------------------------------
+// Git status (P3-8). The engine has no git of its own: it runs the one inside
+// the Debian userland, through proot. Kotlin knows where that is — the engine
+// must not guess — so `setUserland` is what turns the feature on. The `play`
+// flavour never calls it, and every query below then answers "nothing to
+// show", which is exactly what a clean repository looks like.
+// ---------------------------------------------------------------------------
+
+/// Tell the engine where proot and the Debian rootfs are. Call it once the
+/// userland reports itself installed; never in the `play` flavour.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_setUserland(
+    mut env: JNIEnv,
+    _class: JClass,
+    proot: JString,
+    rootfs: JString,
+    tmp_dir: JString,
+    projects_dir: JString,
+) {
+    let proot = get_string(&mut env, &proot);
+    let rootfs = get_string(&mut env, &rootfs);
+    let tmp_dir = get_string(&mut env, &tmp_dir);
+    let projects_dir = get_string(&mut env, &projects_dir);
+    engine().set_userland(
+        Path::new(&proot),
+        Path::new(&rootfs),
+        Path::new(&tmp_dir),
+        Path::new(&projects_dir),
+    );
+}
+
+/// Forget the userland — after the user deletes the rootfs. Git status then
+/// degrades to empty, as in a build that never had one.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_clearUserland(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    engine().clear_userland();
+}
+
+/// Generation counter for a project's git status; 0 until there is something
+/// to show. Poll it exactly like `projectVersion`. Polling is also what
+/// schedules refreshes — it never waits for git.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitStatusVersion(
+    _env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jlong {
+    engine().git_status_version(project_id as u64) as jlong
+}
+
+/// The whole status map as a JSON object of project-relative path to status
+/// (`modified`, `added`, `deleted`, `renamed`, `conflicted`, `untracked`,
+/// `ignored`). Ancestor directories are included, so the panel needs one
+/// lookup per row. Reads a cache: never blocks, never null, `{}` when there is
+/// nothing to show.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitStatus(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    let statuses = engine().git_status(project_id as u64);
+    let json = serde_json::to_string(&statuses).unwrap_or_else(|err| {
+        log::warn!("gitStatus failed to serialize: {err}");
+        "{}".to_owned()
+    });
+    to_jstring(&env, json)
+}
+
+// ---------------------------------------------------------------------------
 // Settings. The file is JSONC and hand-editable; writes are surgical so
 // comments survive. All of these touch the filesystem — call them off the
 // main thread.

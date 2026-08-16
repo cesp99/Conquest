@@ -154,6 +154,49 @@ object CoreBridge {
     external fun projectEntryPath(projectId: Long, path: String): String?
 
     // -----------------------------------------------------------------------
+    // Git status. The engine has no git of its own: it runs the one inside the
+    // Debian userland, through proot. We know where that lives and the engine
+    // must not guess, so [setUserland] is what turns the feature on — and the
+    // `play` flavour simply never calls it, leaving every query below
+    // answering "nothing to show".
+    // -----------------------------------------------------------------------
+
+    /**
+     * Tells the engine where proot and the Debian rootfs are. Call once the
+     * userland reports [to.eyed.conquest.code.terminal.UserlandState.Ready];
+     * never in the `play` flavour, which has no userland to point at.
+     *
+     * The engine binds [projectsDir] into the guest at its *own* path, so host
+     * and guest agree on every path and nothing needs translating.
+     */
+    external fun setUserland(
+        proot: String,
+        rootfs: String,
+        tmpDir: String,
+        projectsDir: String,
+    )
+
+    /** Forgets the userland — after the rootfs is deleted. Status goes empty. */
+    external fun clearUserland()
+
+    /**
+     * Generation counter for a project's git status; 0 while there is nothing
+     * to show. Poll it exactly like [projectVersion]. Polling is also what
+     * schedules a refresh, so this must be called for status to stay current —
+     * it never waits on git.
+     */
+    external fun gitStatusVersion(projectId: Long): Long
+
+    /**
+     * The status map as a JSON object of project-relative path to status
+     * (`modified`, `added`, `deleted`, `renamed`, `conflicted`, `untracked`,
+     * `ignored`). Ancestor directories of a changed file are included with a
+     * rolled-up status, so the panel needs one lookup per row. Reads a cache:
+     * never blocks, never null, `{}` when there is nothing to show.
+     */
+    external fun gitStatus(projectId: Long): String
+
+    // -----------------------------------------------------------------------
     // Settings. The file is JSONC and hand-editable; writes are surgical, so
     // comments survive. All of these touch the filesystem — call them off the
     // main thread.

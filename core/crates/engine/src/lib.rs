@@ -14,6 +14,11 @@
 //! runtime. That runtime lives on a thread of its own (`runtime.rs`) behind a
 //! headless `Platform` (`platform.rs`) that cannot draw; see `project.rs` for
 //! how its state reaches the UI without blocking anything.
+//!
+//! Git status is not computed here: it comes from the `git` binary inside the
+//! Debian userland, reached through proot (`git.rs`), cached behind a
+//! generation counter of the same shape, and silently empty in builds that
+//! have no userland.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -26,6 +31,7 @@ use sum_tree::Bias;
 mod config;
 mod file;
 mod find;
+mod git;
 mod highlight;
 mod highlight_worker;
 mod platform;
@@ -34,6 +40,7 @@ mod runtime;
 
 pub use config::{GitignoredFiles, ProjectPanelSettings, Settings, ThemeMode};
 pub use find::FileMatch;
+pub use git::GitStatus;
 pub use highlight::{HighlightSpan, STYLE_NAMES, language_for_path};
 pub use project::{ProjectId, TreeEntry};
 
@@ -76,6 +83,10 @@ pub struct Engine {
     /// Started when a buffer first gets a language. Reparsing happens here,
     /// never on the caller's thread — see highlight_worker.rs.
     highlight_worker: OnceLock<highlight_worker::HighlightWorker>,
+    /// Cached `git status` per project, plus where the userland that can run
+    /// git lives. Empty and quiet until the platform layer configures one —
+    /// see git.rs.
+    git: git::GitStatuses,
 }
 
 pub(crate) struct BufferState {

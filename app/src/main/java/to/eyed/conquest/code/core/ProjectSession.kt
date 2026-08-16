@@ -1,6 +1,7 @@
 package to.eyed.conquest.code.core
 
 import org.json.JSONArray
+import org.json.JSONObject
 
 /** One entry in a project's worktree, as the engine reports it. */
 data class ProjectEntry(
@@ -17,6 +18,37 @@ data class ProjectEntry(
     /** Size in bytes; 0 for directories. */
     val size: Long,
 )
+
+/**
+ * What git says about one path, reduced to what a project-panel row can show.
+ *
+ * A directory carries a rolled-up summary rather than an exact status — it can
+ * hold a deletion and an addition at once — so on a directory [Modified] means
+ * "something below changed" and [Added] means "everything below is new".
+ */
+enum class GitFileStatus {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Conflicted,
+    Untracked,
+    Ignored;
+
+    internal companion object {
+        /** The engine's snake_case names; anything unknown is ignored. */
+        fun parse(name: String): GitFileStatus? = when (name) {
+            "modified" -> Modified
+            "added" -> Added
+            "deleted" -> Deleted
+            "renamed" -> Renamed
+            "conflicted" -> Conflicted
+            "untracked" -> Untracked
+            "ignored" -> Ignored
+            else -> null
+        }
+    }
+}
 
 /** One fuzzy file-finder hit. */
 data class FileMatch(
@@ -92,6 +124,36 @@ class ProjectSession(absolutePath: String) {
                 positions = List(positions.length()) { positions.getInt(it) },
             )
         }
+    }
+
+    /**
+     * Staleness token for [gitStatus], of the same shape as [version]: it
+     * changes when the statuses change, and reading it is also what tells the
+     * engine to go and refresh them. Nothing here waits on git — the engine
+     * runs it on a thread of its own, debounced behind worktree changes — so
+     * this is safe to poll from the UI loop.
+     *
+     * Stays 0 forever in builds with no Linux userland: there is no git to
+     * ask, and that must look like a clean repository, not like a failure.
+     */
+    val gitStatusVersion: Long
+        get() = CoreBridge.gitStatusVersion(id)
+
+    /**
+     * Git status by project-relative path, ready to colour rows with.
+     *
+     * Ancestor directories of a changed file are present too, with a rolled-up
+     * status, so a row lookup is a single map hit whether it is a file or a
+     * directory. Empty when the project is not in a repository, or when there
+     * is no userland to run git in.
+     */
+    fun gitStatus(): Map<String, GitFileStatus> {
+        val json = JSONObject(CoreBridge.gitStatus(id))
+        val statuses = HashMap<String, GitFileStatus>(json.length())
+        for (path in json.keys()) {
+            GitFileStatus.parse(json.getString(path))?.let { statuses[path] = it }
+        }
+        return statuses
     }
 
     /** Ask the engine to scan a directory it deferred. Asynchronous. */
