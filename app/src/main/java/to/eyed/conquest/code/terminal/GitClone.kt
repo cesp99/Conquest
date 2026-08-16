@@ -57,6 +57,9 @@ object GitClone {
     /** Keep the tail of git's own words for the error message. */
     private const val TRANSCRIPT_LINES = 12
 
+    /** Where ca-certificates puts the bundle git's TLS reads. Guest path. */
+    private const val CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
+
     // --- state ---------------------------------------------------------------
 
     /**
@@ -281,7 +284,12 @@ object GitClone {
             projects.absolutePath,
             listOf(
                 "/bin/sh", "-c",
-                "apt-get update && apt-get install -y --no-install-recommends git",
+                // ca-certificates is only a *recommendation* of git, so
+                // --no-install-recommends alone produces a git that cannot
+                // reach any https:// remote: no /etc/ssl/certs, and every
+                // clone dies with "Problem with the SSL CA cert". Name it.
+                "apt-get update && apt-get install -y --no-install-recommends " +
+                    "git ca-certificates",
             ),
             listOf("DEBIAN_FRONTEND=noninteractive"),
         ) ?: return CloneState.Failed(noUserland(), null)
@@ -317,11 +325,17 @@ object GitClone {
             "This edition has no Linux userland to run git in"
         }
 
+    /**
+     * Whether the guest can clone over https — which takes more than the git
+     * binary. A rootfs that has git but no CA bundle fails every clone with
+     * "Problem with the SSL CA cert", and offering the install is the only way
+     * out; so the two are one question, not two.
+     */
     private fun hasGit(context: Context, projects: File): Boolean {
         val command = Userland.backend.execCommand(
             context,
             projects.absolutePath,
-            listOf("/bin/sh", "-c", "command -v git"),
+            listOf("/bin/sh", "-c", "command -v git >/dev/null && [ -s $CA_BUNDLE ]"),
         ) ?: return false
         return runCatching { run(command, destination = null) { } == 0 }.getOrDefault(false)
     }

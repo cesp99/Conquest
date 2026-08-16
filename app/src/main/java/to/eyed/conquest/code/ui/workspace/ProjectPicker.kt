@@ -366,20 +366,23 @@ private fun CloneForm(
             }
 
             is CloneState.InstallingGit -> {
-                CloneProgressView(phase = "Installing git — ${state.step}", fraction = null)
+                CloneProgressView(phase = "Installing — ${state.step}", fraction = null)
                 CloneActions {
                     DialogAction("Cancel", onClick = onCancel, isDestructive = true)
                 }
             }
 
             CloneState.NeedsGit -> {
+                // Covers both halves of "can this userland clone": the git
+                // binary and the CA bundle its https support needs. Naming
+                // only git would be a lie on a rootfs that has git alone.
                 Message(
-                    "git isn’t installed in the userland yet. Installing it takes a " +
-                        "minute and about 50 MB."
+                    "The userland still needs git and its HTTPS certificates. " +
+                        "Installing them takes a minute and about 50 MB."
                 )
                 CloneActions {
                     DialogAction("Back", onClick = onRetry)
-                    DialogAction("Install git and clone", onClick = onInstallGit)
+                    DialogAction("Install and clone", onClick = onInstallGit)
                 }
             }
 
