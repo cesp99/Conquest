@@ -5,13 +5,24 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 clock.workspace = true
+fs.workspace = true
+futures.workspace = true
+gpui.workspace = true
 grammars = { workspace = true, features = ["load-grammars"] }
 log.workspace = true
+parking_lot.workspace = true
+path.workspace = true
 rope.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+settings.workspace = true
 streaming-iterator.workspace = true
 sum_tree.workspace = true
 text.workspace = true
 tree-sitter.workspace = true
+worktree.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

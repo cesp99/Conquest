@@ -21,9 +21,7 @@ util.workspace = true
 ztracing.workspace = true
 tracing.workspace = true
 
-# CONQUEST PATCH: `gpui` here resolves to our test-macro shim
-# (core/vendor/gpui_test_shim), not Zed's gpui. Dropped the criterion
-# benchmark (benches/ removed).
+# CONQUEST PATCH: dropped the criterion benchmark (benches/ removed).
 [dev-dependencies]
 ctor.workspace = true
 gpui = { workspace = true, features = ["test-support"] }

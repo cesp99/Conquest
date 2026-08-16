@@ -110,6 +110,64 @@ fn registry() -> &'static HashMap<&'static str, LanguageEntry> {
     })
 }
 
+/// Language configs whose grammar name differs from their directory name in
+/// `grammars/src/`, so an extension lookup would otherwise miss them.
+/// JavaScript is the only one that matters to us — Zed parses it with the
+/// `tsx` grammar.
+const EXTRA_CONFIGS: &[&str] = &["javascript"];
+
+/// Extension (lowercased, no dot) → grammar name, built from the vendored
+/// `config.toml` files so the mapping stays Zed's rather than ours. First
+/// writer wins, which keeps the order of `native_grammars()` authoritative
+/// where two languages claim the same suffix.
+fn extension_map() -> &'static HashMap<String, &'static str> {
+    static MAP: OnceLock<HashMap<String, &'static str>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut map = HashMap::new();
+        let names = registry()
+            .keys()
+            .copied()
+            .chain(EXTRA_CONFIGS.iter().copied());
+        for name in names {
+            if grammars::get_file(&format!("{name}/config.toml")).is_none() {
+                continue;
+            }
+            let config = grammars::load_config(name);
+            // A config's `grammar` may point at another language's grammar
+            // (JavaScript → tsx); only keep it if that grammar is loaded.
+            let Some(grammar) = config
+                .grammar
+                .as_ref()
+                .and_then(|grammar| registry().get_key_value(grammar.as_ref()))
+                .map(|(name, _)| *name)
+            else {
+                continue;
+            };
+            for suffix in &config.matcher.path_suffixes {
+                map.entry(suffix.to_lowercase()).or_insert(grammar);
+            }
+        }
+        map
+    })
+}
+
+/// The grammar to highlight `path` with, from its file name. Matches the
+/// longest suffix first, so `tsconfig.json` beats `json`.
+pub fn language_for_path(path: &str) -> Option<&'static str> {
+    let name = path.rsplit(['/', '\\']).next()?.to_lowercase();
+    let map = extension_map();
+    // Zed's `path_suffixes` hold both plain extensions ("rs") and whole file
+    // names ("tsconfig.json"), so try progressively shorter suffixes.
+    let mut candidate = name.as_str();
+    loop {
+        if let Some(language) = map.get(candidate) {
+            return Some(language);
+        }
+        let dot = candidate.find('.')?;
+        candidate = &candidate[dot + 1..];
+    }
+}
+
 /// Longest-dotted-prefix lookup of a capture name in [`STYLE_NAMES`].
 fn style_for_capture(capture: &str) -> Option<u16> {
     if capture.starts_with('_') {

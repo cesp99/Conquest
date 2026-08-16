@@ -58,17 +58,27 @@ Zed's crates fall into tiers (verified against the Zed source):
   local patches); `engine` buffers are `text::Buffer` instances —
   single-replica CRDTs whose collaboration machinery simply lies
   dormant.
-- **Runtime-coupled**: `language`, `lsp`, `worktree`, `project`, etc.
+- **Runtime-coupled**: `fs`, `worktree`, `language`, `lsp` and friends
   depend on GPUI — but on its *reactive runtime* (entities, tasks,
-  executors), not its renderer. GPUI itself is Apache-2.0, pure Rust
-  at its core, and supports pluggable platforms including headless
-  operation. Reusing this tier means bringing up a minimal headless
-  GPUI platform for Android — a large but bounded task.
+  executors), not its renderer. GPUI itself is Apache-2.0 and pure Rust
+  at its core, with a pluggable `Platform` trait. This tier is now
+  vendored too, and the engine supplies its own headless platform: a
+  thread pool, a timer thread and a foreground queue, with every
+  window, display and menu method left `unimplemented!()`. GPUI runs on
+  a thread of the engine's own and **never draws a pixel** — if a
+  vendored crate ever reached for a window it would panic rather than
+  silently misbehave.
 - **UI crates** (`editor`, `workspace`, GPUI rendering): not reused.
   Their responsibilities are reimplemented natively in Compose.
 
 Zed's own `remote_server` crate — a headless Zed engine driven over an
 RPC protocol — is the in-tree proof that the engine runs without a UI.
+
+Because the worktree scans asynchronously on that runtime, its state
+reaches the UI by being *mirrored* into an ordinary snapshot the JNI
+layer reads directly. Kotlin polls a version counter to know when to
+re-read; no JNI call ever waits on the Rust runtime, and the Android
+main thread is never blocked by it.
 
 ## On-device execution (terminals, LSP servers, agents)
 

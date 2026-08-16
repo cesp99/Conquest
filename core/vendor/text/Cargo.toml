@@ -29,8 +29,6 @@ smallvec.workspace = true
 sum_tree.workspace = true
 util.workspace = true
 
-# CONQUEST PATCH: `gpui` here resolves to our test-macro shim
-# (core/vendor/gpui_test_shim), not Zed's gpui.
 [dev-dependencies]
 collections = { workspace = true, features = ["test-support"] }
 ctor.workspace = true

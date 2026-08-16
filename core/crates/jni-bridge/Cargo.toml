@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 engine.workspace = true
 jni.workspace = true
 log.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger.workspace = true

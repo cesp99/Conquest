@@ -6,8 +6,8 @@ package to.eyed.conquest.code.core
  * API ([CoreBridge.bufferLines]) — the UI layer never holds the whole
  * buffer.
  */
-class BufferSession(initialText: String) {
-    val id: Long = CoreBridge.createBuffer(initialText)
+class BufferSession private constructor(val id: Long) {
+    constructor(initialText: String) : this(CoreBridge.createBuffer(initialText))
 
     var version: Long = CoreBridge.bufferVersion(id)
         private set
@@ -45,5 +45,18 @@ class BufferSession(initialText: String) {
         if (newVersion < 0) return false
         version = newVersion
         return true
+    }
+
+    companion object {
+        /**
+         * Read a file from disk into a new engine buffer, with the language
+         * chosen from its name. Returns null if it could not be read.
+         *
+         * **Blocking** (file I/O in the engine) — call it off the main thread.
+         */
+        fun openFile(absolutePath: String): BufferSession? {
+            val id = CoreBridge.openFile(absolutePath)
+            return if (id < 0) null else BufferSession(id)
+        }
     }
 }

@@ -55,6 +55,8 @@ narrow, coarse-grained JNI boundary. See
 | Rope/CRDT text engine (from Zed) | ✅ vendored & wired through JNI |
 | Tree-sitter syntax highlighting | ✅ in-engine, 21 languages |
 | Custom high-performance editor surface | ✅ v1: virtualized canvas, IME editing, selection & clipboard, Zed themes |
+| Project tree (Zed worktree in-engine) | ✅ lazy, gitignore-aware; open files from the panel |
+| Tabs, save & external change detection | 🚧 next |
 | Terminal emulator | ⬜ planned |
 | LSP on-device | ⬜ planned |
 | ACP agent panel | ⬜ planned |

@@ -13,6 +13,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
@@ -26,6 +27,7 @@ fun StatusBar(
     cursorRow: Int,
     cursorCol: Int,
     modifier: Modifier = Modifier,
+    filePath: String? = null,
     onOpenProjectPanel: (() -> Unit)? = null,
 ) {
     val engineVersion = remember { CoreBridge.engineVersion() }
@@ -45,6 +47,16 @@ fun StatusBar(
                 modifier = Modifier
                     .clickable(onClick = onOpenProjectPanel)
                     .padding(end = 12.dp),
+            )
+        }
+        if (filePath != null) {
+            Text(
+                text = filePath,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
             )
         }
         Spacer(modifier = Modifier.weight(1f))

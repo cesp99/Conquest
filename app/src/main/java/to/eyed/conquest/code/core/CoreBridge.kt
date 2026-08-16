@@ -93,4 +93,60 @@ object CoreBridge {
      * must use [bufferLines].
      */
     external fun bufferText(bufferId: Long): String?
+
+    // -----------------------------------------------------------------------
+    // Projects. Opening and expanding are asynchronous: they hand work to the
+    // engine's gpui runtime and return at once. Watch [projectVersion] to know
+    // when there is something new to read; every other call reads a mirrored
+    // snapshot and never waits on the runtime.
+    // -----------------------------------------------------------------------
+
+    /** Starts scanning [path] as a project. Returns its id (always > 0). */
+    external fun openProject(path: String): Long
+
+    external fun closeProject(projectId: Long): Boolean
+
+    /**
+     * Monotonic version of the mirrored worktree snapshot; 0 while there is
+     * nothing to show. Poll it to know when to re-read entries.
+     */
+    external fun projectVersion(projectId: Long): Long
+
+    /** Whether the initial scan has finished. Entries are readable before it. */
+    external fun projectScanComplete(projectId: Long): Boolean
+
+    /** Why the project failed to open, or null if it did not fail. */
+    external fun projectError(projectId: Long): String?
+
+    /** Display name of the project root; null for an unknown project. */
+    external fun projectRootName(projectId: Long): String?
+
+    /**
+     * Direct children of a project-relative directory ("" for the root), as a
+     * JSON array of objects with `path`, `name`, `is_dir`, `is_ignored`,
+     * `is_hidden`, `is_unloaded` and `size`. One call per expanded directory —
+     * never one per entry. Unknown projects and unscanned directories give
+     * `[]`, never null.
+     */
+    external fun projectEntries(projectId: Long, dir: String): String
+
+    /**
+     * Scans a directory the worktree deferred (gitignored, hidden, or past
+     * Zed's `file_scan_depth`). Asynchronous: results show up as a version
+     * bump. False if the project or path is unknown.
+     */
+    external fun expandDirectory(projectId: Long, dir: String): Boolean
+
+    /**
+     * Absolute path of a project-relative entry; null if the project is
+     * unknown or the path tries to escape the root.
+     */
+    external fun projectEntryPath(projectId: Long, path: String): String?
+
+    /**
+     * Reads a file into a new buffer, choosing the language from its name.
+     * Returns the buffer id, or -1 if the file could not be read. **Blocking**
+     * — call it off the main thread.
+     */
+    external fun openFile(path: String): Long
 }

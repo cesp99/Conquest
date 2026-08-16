@@ -9,17 +9,27 @@
 //! lie dormant. Edits are grouped into undo transactions by `text`'s history
 //! (time-based grouping), and every content mutation bumps a per-buffer
 //! version counter so the UI can cheaply detect staleness.
+//!
+//! Projects are backed by Zed's `Worktree`, which needs GPUI's reactive
+//! runtime. That runtime lives on a thread of its own (`runtime.rs`) behind a
+//! headless `Platform` (`platform.rs`) that cannot draw; see `project.rs` for
+//! how its state reaches the UI without blocking anything.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rope::Point;
 use sum_tree::Bias;
 
 mod highlight;
+mod platform;
+mod project;
+mod runtime;
 
-pub use highlight::{HighlightSpan, STYLE_NAMES};
+pub use highlight::{HighlightSpan, STYLE_NAMES, language_for_path};
+pub use project::{ProjectId, TreeEntry};
 
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -30,6 +40,11 @@ static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Default)]
 pub struct Engine {
     buffers: Mutex<HashMap<BufferId, BufferState>>,
+    projects: Mutex<HashMap<ProjectId, Arc<Mutex<project::ProjectState>>>>,
+    next_project_id: AtomicU64,
+    /// Started on the first `open_project`, so buffer-only use (and most
+    /// tests) never pays for a gpui App.
+    runtime: OnceLock<runtime::Runtime>,
 }
 
 struct BufferState {
@@ -60,6 +75,30 @@ impl BufferState {
 impl Engine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The gpui runtime, started on first use.
+    fn runtime(&self) -> &runtime::Runtime {
+        self.runtime
+            .get_or_init(|| runtime::Runtime::new(project::init_globals))
+    }
+
+    fn next_project_id(&self) -> ProjectId {
+        self.next_project_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Read a file from disk into a new buffer, picking the language from its
+    /// name. **Blocking** — call it off the Android main thread.
+    pub fn open_file(&self, path: &Path) -> Result<BufferId, EngineError> {
+        let text = std::fs::read_to_string(path).map_err(|err| EngineError::Io {
+            path: path.display().to_string(),
+            message: err.to_string(),
+        })?;
+        let id = self.create_buffer(&text);
+        if let Some(language) = language_for_path(&path.to_string_lossy()) {
+            let _ = self.set_language(id, language);
+        }
+        Ok(id)
     }
 
     pub fn create_buffer(&self, initial_text: &str) -> BufferId {
@@ -260,6 +299,7 @@ impl Engine {
 pub enum EngineError {
     UnknownBuffer(BufferId),
     InvalidRange { start: usize, end: usize },
+    Io { path: String, message: String },
 }
 
 impl std::fmt::Display for EngineError {
@@ -269,6 +309,7 @@ impl std::fmt::Display for EngineError {
             EngineError::InvalidRange { start, end } => {
                 write!(f, "invalid range {start}..{end}")
             }
+            EngineError::Io { path, message } => write!(f, "{path}: {message}"),
         }
     }
 }
@@ -429,6 +470,38 @@ mod tests {
         // "let e = \"€\"; let n = " is 21 UTF-16 units; the 7 sits at col 21.
         assert_eq!(number.start_col_utf16, 21);
         assert_eq!(number.end_col_utf16, 22);
+    }
+
+    #[test]
+    fn languages_come_from_file_names() {
+        assert_eq!(language_for_path("src/main.rs"), Some("rust"));
+        assert_eq!(language_for_path("Cargo.toml"), None); // no toml grammar
+        assert_eq!(language_for_path("README.md"), Some("markdown"));
+        assert_eq!(language_for_path("script.PY"), Some("python"));
+        // JavaScript is parsed with the tsx grammar, as in Zed.
+        assert_eq!(language_for_path("app.jsx"), Some("tsx"));
+        // Whole-file-name suffixes beat bare extensions.
+        assert_eq!(language_for_path("/p/tsconfig.json"), Some("jsonc"));
+        assert_eq!(language_for_path("/p/data.json"), Some("json"));
+        assert_eq!(language_for_path("Makefile"), None);
+    }
+
+    #[test]
+    fn open_file_reads_and_detects_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let engine = Engine::new();
+        let id = engine.open_file(&file).unwrap();
+        assert_eq!(engine.text(id).unwrap(), "fn main() {}\n");
+        // The language stuck, so highlighting is live without a second call.
+        assert!(!engine.highlights(id, 0, 1).unwrap().is_empty());
+
+        assert!(matches!(
+            engine.open_file(&dir.path().join("absent.rs")),
+            Err(EngineError::Io { .. })
+        ));
     }
 
     #[test]

@@ -15,6 +15,7 @@
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jintArray, jlong, jstring};
+use std::path::Path;
 use std::sync::OnceLock;
 
 use engine::Engine;
@@ -279,6 +280,158 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_offsetToPoint(
         Ok((row, column)) => ((row as jlong) << 32) | column as jlong,
         Err(err) => {
             log::warn!("offsetToPoint failed: {err}");
+            -1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Projects (P3-2). Opening and expanding are asynchronous — they queue work on
+// the engine's gpui runtime and return at once. The UI learns that something
+// changed by watching `projectVersion`; every other call reads the mirrored
+// snapshot and never blocks on the runtime.
+// ---------------------------------------------------------------------------
+
+/// Start scanning a directory as a project. Returns its id (always > 0).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_openProject(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+) -> jlong {
+    let path = get_string(&mut env, &path);
+    engine().open_project(Path::new(&path)) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_closeProject(
+    _env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jboolean {
+    if engine().close_project(project_id as u64) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Monotonic version of the mirrored worktree snapshot; 0 while there is
+/// nothing to show. Poll this to know when to re-read entries.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectVersion(
+    _env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jlong {
+    engine().project_version(project_id as u64) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectScanComplete(
+    _env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jboolean {
+    if engine().project_scan_complete(project_id as u64) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Why the project failed to open, or null if it did not fail.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectError(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    match engine().project_error(project_id as u64) {
+        Some(error) => to_jstring(&env, error),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Display name of the project root; null for an unknown project.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectRootName(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    match engine().project_root_name(project_id as u64) {
+        Some(name) => to_jstring(&env, name),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Direct children of a project-relative directory ("" for the root), as a
+/// JSON array — one coarse call per expanded directory rather than one per
+/// entry. Never null: unknown projects and unscanned directories give `[]`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectEntries(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    dir: JString,
+) -> jstring {
+    let dir = get_string(&mut env, &dir);
+    let entries = engine().project_entries(project_id as u64, &dir);
+    let json = serde_json::to_string(&entries).unwrap_or_else(|err| {
+        log::warn!("projectEntries failed to serialize: {err}");
+        "[]".to_owned()
+    });
+    to_jstring(&env, json)
+}
+
+/// Scan a directory the worktree deferred (ignored, hidden, or past
+/// `file_scan_depth`). Asynchronous; the results arrive as a version bump.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_expandDirectory(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    dir: JString,
+) -> jboolean {
+    let dir = get_string(&mut env, &dir);
+    if engine().expand_directory(project_id as u64, &dir) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Absolute path of a project-relative entry; null if the project is unknown
+/// or the path tries to escape the root.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectEntryPath(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    path: JString,
+) -> jstring {
+    let path = get_string(&mut env, &path);
+    match engine().project_entry_abs_path(project_id as u64, &path) {
+        Some(path) => to_jstring(&env, path.to_string_lossy().into_owned()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Read a file into a new buffer, with the language chosen from its name.
+/// Returns the buffer id, or -1 if the file could not be read (missing,
+/// unreadable, or not UTF-8). **Blocking**: call it off the main thread.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_openFile(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+) -> jlong {
+    let path = get_string(&mut env, &path);
+    match engine().open_file(Path::new(&path)) {
+        Ok(id) => id as jlong,
+        Err(err) => {
+            log::warn!("openFile failed: {err}");
             -1
         }
     }
