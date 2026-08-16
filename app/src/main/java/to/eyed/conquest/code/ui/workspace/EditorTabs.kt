@@ -21,6 +21,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
@@ -91,6 +93,7 @@ private fun EditorTab(
         modifier = Modifier
             .height(TabBarHeight)
             .background(background)
+            .pointerHoverIcon(PointerIcon.Hand)
             .clickable(onClick = onSelect)
             .padding(start = 14.dp, end = 8.dp),
     ) {
@@ -112,6 +115,7 @@ private fun EditorTab(
                 modifier = Modifier
                     .size(DotTouchTarget)
                     .clip(CircleShape)
+                    .pointerHoverIcon(PointerIcon.Hand)
                     .clickable(onClick = onSave),
             ) {
                 Box(
@@ -130,6 +134,7 @@ private fun EditorTab(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier
                 .clip(CircleShape)
+                .pointerHoverIcon(PointerIcon.Hand)
                 .clickable(onClick = onClose)
                 .padding(horizontal = 6.dp, vertical = 4.dp),
         )
@@ -188,6 +193,7 @@ private fun ConflictAction(label: String, onClick: () -> Unit) {
         style = MaterialTheme.typography.labelLarge,
         color = MaterialTheme.colorScheme.primary,
         modifier = Modifier
+            .pointerHoverIcon(PointerIcon.Hand)
             .clickable(onClick = onClick)
             .padding(horizontal = 4.dp, vertical = 2.dp),
     )

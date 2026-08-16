@@ -68,6 +68,13 @@ class OpenFilesState {
         if (index in _tabs.indices) activeIndex = index
     }
 
+    /** Move [delta] tabs along, wrapping — what Ctrl+Tab is expected to do. */
+    fun selectRelative(delta: Int) {
+        if (_tabs.isEmpty()) return
+        val size = _tabs.size
+        activeIndex = ((activeIndex + delta) % size + size) % size
+    }
+
     /** Add a tab (or select the existing one) and make it active. */
     fun open(file: OpenFile) {
         val existing = indexOfPath(file.path)

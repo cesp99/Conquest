@@ -24,8 +24,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.focusable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
@@ -133,50 +137,109 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
         project?.let { openFile(it, entry.path) }
     }
 
-    BoxWithConstraints(modifier = modifier.fillMaxSize()) {
-        if (maxWidth >= WideLayoutMinWidth) {
-            Row(modifier = Modifier.fillMaxSize()) {
-                Box(
-                    modifier = Modifier
-                        .width(ProjectPanelWidth)
-                        .fillMaxHeight()
-                ) {
-                    ProjectPanel(project, onOpenEntry, openedPath = files.active?.path)
-                }
-                VerticalDivider()
-                EditorArea(
-                    files = files,
-                    dismissed = dismissedConflicts,
-                    onSave = ::save,
-                    onReload = ::reload,
-                    modifier = Modifier.weight(1f),
-                )
+    // Wide layouts can hide the panel (Ctrl+B); compact ones use the drawer.
+    var panelVisible by remember { mutableStateOf(true) }
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    var isWide by remember { mutableStateOf(false) }
+
+    fun runCommand(command: WorkspaceCommand): Boolean {
+        val active = files.active
+        when (command) {
+            WorkspaceCommand.Save -> active?.let { save(it) } ?: return false
+            WorkspaceCommand.CloseTab -> {
+                if (files.activeIndex < 0) return false
+                files.close(files.activeIndex)
             }
-        } else {
-            val drawerState = rememberDrawerState(DrawerValue.Closed)
-            ModalNavigationDrawer(
-                drawerState = drawerState,
-                drawerContent = {
-                    ModalDrawerSheet(drawerState) {
-                        ProjectPanel(
-                            project = project,
-                            onOpenFile = { entry ->
-                                onOpenEntry(entry)
-                                scope.launch { drawerState.close() }
-                            },
-                            openedPath = files.active?.path,
+            WorkspaceCommand.NextTab -> files.selectRelative(1)
+            WorkspaceCommand.PreviousTab -> files.selectRelative(-1)
+            WorkspaceCommand.ToggleProjectPanel -> if (isWide) {
+                panelVisible = !panelVisible
+            } else {
+                scope.launch { if (drawerState.isOpen) drawerState.close() else drawerState.open() }
+            }
+        }
+        return true
+    }
+
+    // Workspace shortcuts are matched in a *preview* pass at the root, so they
+    // work wherever focus sits — including while the editor holds it. Editor
+    // chords are never matched here, so they still reach EditorPane.
+    val rootFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { rootFocus.requestFocus() }
+
+    BoxWithConstraints(
+        modifier = modifier
+            .fillMaxSize()
+            .focusRequester(rootFocus)
+            .focusable()
+            .onPreviewKeyEvent { event ->
+                tabIndexFor(event, files.tabs.size)?.let { index ->
+                    files.select(index)
+                    return@onPreviewKeyEvent true
+                }
+                workspaceCommandFor(event)?.let { return@onPreviewKeyEvent runCommand(it) }
+                false
+            }
+    ) {
+        isWide = maxWidth >= WideLayoutMinWidth
+        // The status bar spans the whole window, below the panel as well as
+        // the editor — it reports on the workspace, not on the editor pane.
+        Column(modifier = Modifier.fillMaxSize()) {
+            Box(modifier = Modifier.weight(1f)) {
+                if (isWide) {
+                    Row(modifier = Modifier.fillMaxSize()) {
+                        if (panelVisible) {
+                            Box(
+                                modifier = Modifier
+                                    .width(ProjectPanelWidth)
+                                    .fillMaxHeight()
+                            ) {
+                                ProjectPanel(project, onOpenEntry, openedPath = files.active?.path)
+                            }
+                            VerticalDivider()
+                        }
+                        EditorArea(
+                            files = files,
+                            dismissed = dismissedConflicts,
+                            onSave = ::save,
+                            onReload = ::reload,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                } else {
+                    ModalNavigationDrawer(
+                        drawerState = drawerState,
+                        drawerContent = {
+                            ModalDrawerSheet(drawerState) {
+                                ProjectPanel(
+                                    project = project,
+                                    onOpenFile = { entry ->
+                                        onOpenEntry(entry)
+                                        scope.launch { drawerState.close() }
+                                    },
+                                    openedPath = files.active?.path,
+                                )
+                            }
+                        }
+                    ) {
+                        EditorArea(
+                            files = files,
+                            dismissed = dismissedConflicts,
+                            onSave = ::save,
+                            onReload = ::reload,
                         )
                     }
                 }
-            ) {
-                EditorArea(
-                    files = files,
-                    dismissed = dismissedConflicts,
-                    onSave = ::save,
-                    onReload = ::reload,
-                    onOpenProjectPanel = { scope.launch { drawerState.open() } },
-                )
             }
+            HorizontalDivider()
+            StatusBar(
+                cursorRow = files.active?.editor?.cursorRow ?: 0,
+                cursorCol = files.active?.editor?.cursorCol ?: 0,
+                filePath = files.active?.path,
+                isDirty = files.active?.isDirty == true,
+                onSave = files.active?.let { file -> { save(file) } },
+                onToggleProjectPanel = { runCommand(WorkspaceCommand.ToggleProjectPanel) },
+            )
         }
     }
 }
@@ -188,7 +251,6 @@ private fun EditorArea(
     onSave: (OpenFile) -> Unit,
     onReload: (OpenFile) -> Unit,
     modifier: Modifier = Modifier,
-    onOpenProjectPanel: (() -> Unit)? = null,
 ) {
     val active = files.active
     Column(modifier = modifier.fillMaxSize()) {
@@ -233,14 +295,5 @@ private fun EditorArea(
                 onSave = { onSave(active) },
             )
         }
-        HorizontalDivider()
-        StatusBar(
-            cursorRow = active?.editor?.cursorRow ?: 0,
-            cursorCol = active?.editor?.cursorCol ?: 0,
-            filePath = active?.path,
-            isDirty = active?.isDirty == true,
-            onSave = active?.let { file -> { onSave(file) } },
-            onOpenProjectPanel = onOpenProjectPanel,
-        )
     }
 }

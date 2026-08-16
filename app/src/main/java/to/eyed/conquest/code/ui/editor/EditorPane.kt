@@ -33,6 +33,8 @@ import androidx.compose.ui.input.key.isCtrlPressed
 import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.key.utf16CodePoint
 import androidx.compose.ui.input.pointer.pointerInput
@@ -127,6 +129,9 @@ fun EditorPane(
             .fillMaxSize()
             .clipToBounds()
             .background(theme.color("editor.background"))
+            // DeX and paired keyboards mean a mouse is ordinary here, not
+            // exotic; text should say so under the pointer.
+            .pointerHoverIcon(PointerIcon.Text)
             .onGloballyPositioned { paneCoordinates = it }
             .scrollable(verticalScroll, Orientation.Vertical)
             .scrollable(horizontalScroll, Orientation.Horizontal)

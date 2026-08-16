@@ -13,6 +13,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import to.eyed.conquest.code.core.CoreBridge
@@ -31,7 +33,7 @@ fun StatusBar(
     filePath: String? = null,
     isDirty: Boolean = false,
     onSave: (() -> Unit)? = null,
-    onOpenProjectPanel: (() -> Unit)? = null,
+    onToggleProjectPanel: (() -> Unit)? = null,
 ) {
     val engineVersion = remember { CoreBridge.engineVersion() }
     Row(
@@ -42,13 +44,14 @@ fun StatusBar(
             .padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (onOpenProjectPanel != null) {
+        if (onToggleProjectPanel != null) {
             Text(
                 text = "☰ files",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier
-                    .clickable(onClick = onOpenProjectPanel)
+                    .pointerHoverIcon(PointerIcon.Hand)
+                    .clickable(onClick = onToggleProjectPanel)
                     .padding(end = 12.dp),
             )
         }
@@ -70,6 +73,7 @@ fun StatusBar(
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.primary,
                 modifier = Modifier
+                    .pointerHoverIcon(PointerIcon.Hand)
                     .clickable(onClick = onSave)
                     .padding(end = 12.dp),
             )

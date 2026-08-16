@@ -43,8 +43,11 @@ project state, git, and ACP agent sessions. A Kotlin/Jetpack Compose app
 (`app/`) owns everything visual and platform-specific: rendering, input,
 window/fold awareness, storage access. The two meet at one deliberately
 narrow, coarse-grained JNI boundary. See
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the long version and
-[docs/BUILDING.md](docs/BUILDING.md) to build it yourself.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the long version,
+[docs/BUILDING.md](docs/BUILDING.md) to build it yourself, and
+[docs/SHORTCUTS.md](docs/SHORTCUTS.md) for the keyboard and mouse
+bindings — the app is meant to be driven from a keyboard, including in
+Samsung DeX.
 
 ## Status
 
