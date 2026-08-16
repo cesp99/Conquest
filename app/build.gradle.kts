@@ -53,6 +53,18 @@ android {
             isUniversalApk = true
         }
     }
+    // Extract native libraries to nativeLibraryDir on install instead of
+    // mapping them straight out of the APK. Measured, not assumed: with the
+    // modern default, nativeLibraryDir is an *empty* directory, so nothing
+    // there can be executed. Everything on-device that is a process rather
+    // than a library — the shell, git, language servers, agent runtimes —
+    // depends on this flag.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
