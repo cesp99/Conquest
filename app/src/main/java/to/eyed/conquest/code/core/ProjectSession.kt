@@ -36,6 +36,12 @@ data class FileMatch(
  * [to.eyed.conquest.code.ui.workspace.ProjectPanel].
  */
 class ProjectSession(absolutePath: String) {
+    /**
+     * Where the project lives on disk. The engine works in project-relative
+     * paths, but a terminal has to start somewhere real.
+     */
+    val rootPath: String = absolutePath
+
     val id: Long = CoreBridge.openProject(absolutePath)
 
     val version: Long

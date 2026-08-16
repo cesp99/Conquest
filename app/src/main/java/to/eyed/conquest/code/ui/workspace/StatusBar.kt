@@ -37,6 +37,8 @@ fun StatusBar(
     isPanelVisible: Boolean = true,
     onToggleProjectPanel: (() -> Unit)? = null,
     onFindFile: (() -> Unit)? = null,
+    isTerminalOpen: Boolean = false,
+    onToggleTerminal: (() -> Unit)? = null,
 ) {
     val theme = LocalZedTheme.current
     Row(
@@ -57,6 +59,15 @@ fun StatusBar(
         }
         if (onFindFile != null) {
             StatusAction(glyph = "⌕", onClick = onFindFile)
+        }
+        if (onToggleTerminal != null) {
+            // The touch twin of Ctrl+`, and the only way to reach a terminal
+            // on a device with no keyboard attached.
+            StatusAction(
+                glyph = "❯_",
+                emphasised = isTerminalOpen,
+                onClick = onToggleTerminal,
+            )
         }
 
         Spacer(modifier = Modifier.weight(1f))

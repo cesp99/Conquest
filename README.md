@@ -63,7 +63,7 @@ Samsung DeX.
 | Projects: create, switch, import & export | ✅ app-private storage, SAF folder import/export |
 | Fuzzy file finder | ✅ Ctrl+P, match highlighting |
 | Settings | ✅ JSONC file that keeps your comments, settings screen |
-| Terminal emulator | 🚧 Termux emulator + view vendored and running a shell on-device; no UI yet |
+| Integrated terminal | ✅ shells in the project directory, tabs, theme colours, keyboard/mouse/touch |
 | LSP on-device | ⬜ planned |
 | ACP agent panel | ⬜ planned |
 

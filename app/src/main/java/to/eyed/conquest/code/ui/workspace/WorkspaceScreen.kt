@@ -6,6 +6,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.DrawerValue
@@ -20,6 +22,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -27,11 +30,15 @@ import androidx.compose.runtime.setValue
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.pointerHoverIcon
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
@@ -47,11 +54,17 @@ import to.eyed.conquest.code.core.ProjectSummary
 import to.eyed.conquest.code.core.ProjectsRoot
 import to.eyed.conquest.code.core.SafTransfer
 import java.io.File
+import to.eyed.conquest.code.terminal.TerminalPanelState
 import to.eyed.conquest.code.ui.editor.EditorPane
 import to.eyed.conquest.code.ui.editor.EditorState
+import to.eyed.conquest.code.ui.terminal.TerminalDock
 
 private val WideLayoutMinWidth = 840.dp
 private val ProjectPanelWidth = 260.dp
+
+/** Terminal dock: initial height, and how small or large a drag may make it. */
+private val TerminalDockHeight = 260.dp
+private val TerminalDockMinHeight = 96.dp
 
 /** The file opened on a fresh install, relative to the sample project root. */
 private const val STARTUP_FILE = "src/main.rs"
@@ -86,6 +99,22 @@ fun WorkspaceScreen(
     val scope = rememberCoroutineScope()
     // Conflicts the user chose to live with, so the bar doesn't nag.
     val dismissedConflicts = remember { mutableStateOf(setOf<String>()) }
+
+    // Workspace shortcuts are matched in a *preview* pass at the root, so they
+    // work wherever focus sits — including while the editor holds it. Editor
+    // chords are never matched here, so they still reach EditorPane; terminal
+    // chords are arbitrated by focus (see Keybindings.kt).
+    val rootFocus = remember { FocusRequester() }
+
+    // The terminal dock. Sessions survive the dock being hidden — a build
+    // keeps running while you read code — but not a project switch, since a
+    // shell sitting in a directory nobody has open is a trap.
+    val terminals = remember { TerminalPanelState() }
+    var terminalFocused by remember { mutableStateOf(false) }
+    var dockHeight by remember { mutableStateOf(TerminalDockHeight) }
+    DisposableEffect(terminals) {
+        onDispose { terminals.closeAll() }
+    }
 
     // Project picker state. `projects` is re-listed whenever the dialog opens
     // or a transfer finishes, rather than watched — projects change only when
@@ -126,6 +155,7 @@ fun WorkspaceScreen(
     fun openProject(path: String, startupFile: String? = null) {
         scope.launch {
             while (files.tabs.isNotEmpty()) files.close(files.tabs.lastIndex)
+            terminals.closeAll()
             dismissedConflicts.value = emptySet()
             project?.close()
             val opened = ProjectSession(path)
@@ -246,6 +276,7 @@ fun WorkspaceScreen(
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     var isWide by remember { mutableStateOf(false) }
 
+
     fun runCommand(command: WorkspaceCommand): Boolean {
         val active = files.active
         when (command) {
@@ -276,14 +307,36 @@ fun WorkspaceScreen(
                     settingsOpen = true
                 }
             }
+            WorkspaceCommand.ToggleTerminal -> {
+                val root = project?.rootPath ?: return false
+                if (terminals.isOpen) {
+                    terminals.hide()
+                    // Give the keyboard back to the workspace, or the next
+                    // keystroke would go nowhere.
+                    terminalFocused = false
+                    rootFocus.requestFocus()
+                } else {
+                    terminals.open(context, root)
+                }
+            }
+            WorkspaceCommand.NewTerminal -> {
+                val root = project?.rootPath ?: return false
+                terminals.newSession(context, root)
+            }
+            WorkspaceCommand.CloseTerminal -> {
+                if (terminals.activeIndex < 0) return false
+                terminals.closeSession(terminals.activeIndex)
+                if (!terminals.isOpen) {
+                    terminalFocused = false
+                    rootFocus.requestFocus()
+                }
+            }
+            WorkspaceCommand.NextTerminal -> terminals.selectRelative(1)
+            WorkspaceCommand.PreviousTerminal -> terminals.selectRelative(-1)
         }
         return true
     }
 
-    // Workspace shortcuts are matched in a *preview* pass at the root, so they
-    // work wherever focus sits — including while the editor holds it. Editor
-    // chords are never matched here, so they still reach EditorPane.
-    val rootFocus = remember { FocusRequester() }
     LaunchedEffect(Unit) { rootFocus.requestFocus() }
 
     BoxWithConstraints(
@@ -292,11 +345,12 @@ fun WorkspaceScreen(
             .focusRequester(rootFocus)
             .focusable()
             .onPreviewKeyEvent { event ->
-                tabIndexFor(event, files.tabs.size)?.let { index ->
+                val focus = if (terminalFocused) Focus.Terminal else Focus.Workspace
+                tabIndexFor(event, files.tabs.size, focus)?.let { index ->
                     files.select(index)
                     return@onPreviewKeyEvent true
                 }
-                workspaceCommandFor(event)?.let { return@onPreviewKeyEvent runCommand(it) }
+                workspaceCommandFor(event, focus)?.let { return@onPreviewKeyEvent runCommand(it) }
                 false
             }
     ) {
@@ -332,6 +386,12 @@ fun WorkspaceScreen(
                 MenuAction("Toggle project panel", "Ctrl B") {
                     runCommand(WorkspaceCommand.ToggleProjectPanel)
                 },
+                MenuAction("Toggle terminal", "Ctrl `", enabled = project != null) {
+                    runCommand(WorkspaceCommand.ToggleTerminal)
+                },
+                MenuAction("New terminal", "Ctrl Shift `", enabled = project != null) {
+                    runCommand(WorkspaceCommand.NewTerminal)
+                },
                 MenuAction("Settings…", "Ctrl ,") {
                     runCommand(WorkspaceCommand.OpenSettings)
                 },
@@ -346,8 +406,19 @@ fun WorkspaceScreen(
                 menuGroups = menuGroups,
             )
             HorizontalDivider()
+            // Compact screens have no room to split: the dock takes the whole
+            // work area, as the settings screen and the drawer already do.
+            val dockIsFullScreen = !isWide && terminals.isOpen
             Box(modifier = Modifier.weight(1f)) {
-                if (isWide) {
+                if (dockIsFullScreen) {
+                    TerminalDock(
+                        state = terminals,
+                        cwd = project?.rootPath,
+                        fontSizeSp = settings.bufferFontSize,
+                        onCommand = { runCommand(it) },
+                        onFocusChanged = { focused -> terminalFocused = focused },
+                    )
+                } else if (isWide) {
                     Row(modifier = Modifier.fillMaxSize()) {
                         if (panelVisible) {
                             Box(
@@ -398,6 +469,32 @@ fun WorkspaceScreen(
                     }
                 }
             }
+            if (terminals.isOpen && !dockIsFullScreen) {
+                // Drag handle. Wide screens are where a paired mouse lives, so
+                // it gets a resize cursor as well as a touch target.
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(6.dp)
+                        .pointerHoverIcon(PointerIcon.Crosshair)
+                        .pointerInput(Unit) {
+                            detectVerticalDragGestures { _, delta ->
+                                dockHeight = (dockHeight - delta.toDp())
+                                    .coerceAtLeast(TerminalDockMinHeight)
+                            }
+                        }
+                ) {
+                    HorizontalDivider()
+                }
+                TerminalDock(
+                    state = terminals,
+                    cwd = project?.rootPath,
+                    fontSizeSp = settings.bufferFontSize,
+                    onCommand = { runCommand(it) },
+                    onFocusChanged = { focused -> terminalFocused = focused },
+                    modifier = Modifier.height(dockHeight),
+                )
+            }
             HorizontalDivider()
             StatusBar(
                 cursorRow = active?.editor?.cursorRow ?: 0,
@@ -408,6 +505,12 @@ fun WorkspaceScreen(
                 onToggleProjectPanel = { runCommand(WorkspaceCommand.ToggleProjectPanel) },
                 onFindFile = if (project != null) {
                     { runCommand(WorkspaceCommand.FindFile) }
+                } else {
+                    null
+                },
+                isTerminalOpen = terminals.isOpen,
+                onToggleTerminal = if (project != null) {
+                    { runCommand(WorkspaceCommand.ToggleTerminal) }
                 } else {
                     null
                 },
