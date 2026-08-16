@@ -34,6 +34,23 @@ packaged. The NDK path is derived from `sdk.dir` in `local.properties`
 (falling back to `$ANDROID_HOME`); the NDK version pin lives in
 `app/build.gradle.kts`.
 
+The build emits one APK per ABI plus a universal one, since the Rust
+engine is by far the largest thing in the package and no device can use
+more than one architecture's copy:
+
+```
+app/build/outputs/apk/debug/app-arm64-v8a-debug.apk    ← real devices
+app/build/outputs/apk/debug/app-x86_64-debug.apk       ← emulators
+app/build/outputs/apk/debug/app-universal-debug.apk    ← both
+```
+
+Release builds additionally run R8 (code shrinking + obfuscation) and
+resource shrinking. **The JNI boundary must survive that**: a native
+symbol name encodes the Java class and method it binds to, so
+`CoreBridge` is kept verbatim by `app/src/main/keepRules/rules.keep`.
+Adding a class that Android instantiates reflectively — an Activity,
+a Service, a Parcelable — may need a keep rule of its own.
+
 ## Rust-only iteration
 
 ```sh
@@ -57,3 +74,12 @@ ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358 \
 ```
 
 Supported ABIs: `arm64-v8a` (all real devices) and `x86_64` (emulator).
+
+To try a release build locally, sign it with the debug key — an unsigned
+APK cannot be installed:
+
+```sh
+apksigner sign --ks ~/.android/debug.keystore --ks-pass pass:android \
+  --ks-key-alias androiddebugkey --key-pass pass:android \
+  app/build/outputs/apk/release/app-arm64-v8a-release-unsigned.apk
+```

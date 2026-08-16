@@ -5,6 +5,11 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// The Rust engine (core/) is compiled to libconquestcore.so by cargo-ndk and
+// packaged from src/main/jniLibs, which is generated and gitignored.
+val rustAbis = listOf("arm64-v8a", "x86_64")
+val rustJniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
+
 android {
     namespace = "to.eyed.conquest.code"
     compileSdk {
@@ -23,9 +28,29 @@ android {
 
     buildTypes {
         release {
-            optimization {
-                enable = false
-            }
+            // R8: shrink and obfuscate the DEX, and drop unreferenced
+            // resources. Worth far more here than it looks — an unminified
+            // build carries ~29 MB of Compose/AndroidX classes we barely
+            // touch. Keep rules live in src/main/keepRules; the JNI surface
+            // must survive renaming (see rules.keep).
+            isMinifyEnabled = true
+            isShrinkResources = true
+        }
+    }
+
+    // One APK per ABI instead of one fat APK carrying every ABI. The Rust
+    // engine dominates this app's size — tens of MB per architecture — so a
+    // universal APK makes every user download an engine they cannot run.
+    // Play prefers an app bundle, which splits this way on its own; the
+    // per-ABI APKs are what F-Droid and direct installs want.
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include(*rustAbis.toTypedArray())
+            // Still emit the every-ABI APK: it is what `adb install` on an
+            // unknown device and a plain "download the APK" link need.
+            isUniversalApk = true
         }
     }
     compileOptions {
@@ -36,11 +61,6 @@ android {
         compose = true
     }
 }
-
-// The Rust engine (core/) is compiled to libconquestcore.so by cargo-ndk and
-// packaged from src/main/jniLibs, which is generated and gitignored.
-val rustAbis = listOf("arm64-v8a", "x86_64")
-val rustJniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
 
 val ndkVersion = "28.2.13676358"
 val sdkDir: String = run {
