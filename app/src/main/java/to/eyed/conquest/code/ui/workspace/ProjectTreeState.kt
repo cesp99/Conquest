@@ -66,6 +66,19 @@ class ProjectTreeState(
     var rows by mutableStateOf<List<ProjectTreeRow>>(emptyList())
         private set
 
+    /**
+     * Bumped whenever the tree's *shape* could change — i.e. by a toggle.
+     *
+     * A re-colour pass reads the rows on the main thread, does its work on
+     * another, and publishes; if the user expanded a directory in that window,
+     * publishing the old rows would leave the panel showing an expanded
+     * chevron with no children under it, and neither version counter would
+     * ever fire again to correct it. [publish] uses this to drop a result that
+     * was computed against a shape nobody is looking at any more.
+     */
+    var shape by mutableLongStateOf(0L)
+        private set
+
     fun isExpanded(path: String): Boolean = expanded.contains(path)
 
     /**
@@ -75,6 +88,7 @@ class ProjectTreeState(
      */
     fun toggle(entry: ProjectEntry) {
         if (!entry.isDir) return
+        shape += 1
         if (expanded.remove(entry.path)) return
         expanded.add(entry.path)
         if (entry.isUnloaded || entry.isIgnored) {
@@ -116,7 +130,14 @@ class ProjectTreeState(
         )
     }
 
-    fun publish(version: Long, snapshot: ProjectTreeSnapshot) {
+    /**
+     * Install a snapshot. [shapeWhenComputed] is the [shape] the caller saw
+     * before it started; a mismatch means the tree was expanded or collapsed
+     * meanwhile and this result describes a tree that no longer exists, so it
+     * is dropped rather than painted.
+     */
+    fun publish(version: Long, snapshot: ProjectTreeSnapshot, shapeWhenComputed: Long = shape) {
+        if (shapeWhenComputed != shape) return
         this.version = version
         this.statusVersion = snapshot.statusVersion
         this.rows = snapshot.rows

@@ -65,6 +65,8 @@ Samsung DeX.
 | Settings | ✅ JSONC file that keeps your comments, settings screen |
 | Integrated terminal | ✅ shells in the project directory, tabs, theme colours, keyboard/mouse/touch |
 | Debian userland (`apt`) | ✅ in the `full` edition — installs on demand, ~30 MB |
+| Clone a repository into a project | ✅ `Ctrl+Shift+G`, progress and cancel (`full` edition) |
+| Git status colours in the project panel | ✅ engine-side, from the theme's own colours |
 | LSP on-device | ⬜ planned |
 | ACP agent panel | ⬜ planned |
 

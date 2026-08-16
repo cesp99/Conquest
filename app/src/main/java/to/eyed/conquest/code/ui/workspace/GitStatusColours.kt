@@ -25,6 +25,8 @@ enum class GitFileStatus {
     /** Not tracked by git at all. */
     Untracked,
     Deleted,
+    /** Tracked and moved. The theme ships a colour for it; git emits R/RM. */
+    Renamed,
     Conflicted,
     Ignored,
 }
@@ -56,7 +58,10 @@ class GitStatusSnapshot private constructor(
         val Empty = GitStatusSnapshot(0L, emptyMap())
 
         fun of(version: Long, byPath: Map<String, GitFileStatus>): GitStatusSnapshot =
-            GitStatusSnapshot(version, byPath)
+            // Copy: the class is @Immutable, which Compose treats as a promise
+            // it may skip recomposition on, and callers build these from
+            // mutable maps.
+            GitStatusSnapshot(version, HashMap(byPath))
     }
 }
 
@@ -88,25 +93,6 @@ interface GitStatusSource {
     }
 }
 
-/**
- * A fixed table, for previews and tests. Mutating [statuses] bumps [version],
- * which is what makes it useful for exercising "status arrives after the tree".
- */
-class FakeGitStatusSource(statuses: Map<String, GitFileStatus> = emptyMap()) : GitStatusSource {
-    override var version: Long = 1L
-        private set
-
-    private var snapshot: GitStatusSnapshot = GitStatusSnapshot.of(1L, statuses)
-
-    var statuses: Map<String, GitFileStatus> = statuses
-        set(value) {
-            field = value
-            version += 1
-            snapshot = GitStatusSnapshot.of(version, value)
-        }
-
-    override fun snapshot(): GitStatusSnapshot = snapshot
-}
 
 /**
  * The theme's version-control colours, resolved once per theme.
@@ -122,6 +108,7 @@ class FakeGitStatusSource(statuses: Map<String, GitFileStatus> = emptyMap()) : G
  * | added      | `version_control.added`    | `created` |
  * | untracked  | `version_control.added`    | `created` |
  * | deleted    | `version_control.deleted`  | `deleted` |
+ * | renamed    | `version_control.renamed`  | `renamed` |
  * | conflicted | `version_control.conflict` | `conflict`|
  * | ignored    | `ignored`                  | `text.disabled` |
  *
@@ -142,6 +129,7 @@ class GitStatusColours(
     val added: Color,
     val untracked: Color,
     val deleted: Color,
+    val renamed: Color,
     val conflicted: Color,
     val ignored: Color,
 ) {
@@ -165,6 +153,7 @@ class GitStatusColours(
             GitFileStatus.Added -> added
             GitFileStatus.Untracked -> untracked
             GitFileStatus.Deleted -> deleted
+            GitFileStatus.Renamed -> renamed
             GitFileStatus.Conflicted -> conflicted
             GitFileStatus.None, GitFileStatus.Ignored -> default
         }
@@ -186,6 +175,7 @@ class GitStatusColours(
             return GitStatusColours(
                 default = default,
                 modified = key("version_control.modified", "modified"),
+                renamed = key("version_control.renamed", "renamed"),
                 added = key("version_control.added", "created"),
                 untracked = key("version_control.untracked", "version_control.added", "created"),
                 deleted = key("version_control.deleted", "deleted"),

@@ -548,7 +548,12 @@ pub(crate) fn parse_records(output: &[u8]) -> Vec<(String, GitStatus)> {
         // a status query is not the place to fail over it.
         let path = String::from_utf8_lossy(&record[3..]).into_owned();
 
-        if matches!(status, GitStatus::Renamed) {
+        // Whether a second (source) record follows is a property of the raw
+        // X byte, not of the classified status: git emits `RD` and `CD` for a
+        // rename whose destination was then deleted, and those classify as
+        // Deleted. Deciding from the status desynchronises the whole parse and
+        // invents a path — covered by the RD/CD tests below.
+        if x == b'R' || x == b'C' {
             // Skip the source path. It is *not* reported as deleted: the file
             // moved, and painting its old location would be showing the user
             // something that no longer exists.
@@ -1006,5 +1011,35 @@ mod tests {
 
         engine.clear_userland();
         assert!(engine.git_status(id).is_empty());
+    }
+
+    /// `RD` is "renamed in the index, deleted in the worktree". Its second
+    /// record is the *source* path; a parser that decides whether to consume
+    /// it from the classified status (Deleted) reads that source as the next
+    /// status line and invents a path from it.
+    #[test]
+    fn rename_then_delete_does_not_desync_the_parse() {
+        let porcelain = b"RD new.rs\0old.rs\0 M other.rs\0";
+        let parsed = parse_records(porcelain);
+        assert_eq!(
+            parsed,
+            vec![
+                ("new.rs".to_string(), GitStatus::Deleted),
+                ("other.rs".to_string(), GitStatus::Modified),
+            ],
+            "the rename source must be consumed, not parsed as a record"
+        );
+    }
+
+    #[test]
+    fn copy_then_delete_does_not_desync_the_parse() {
+        let parsed = parse_records(b"CD copy.rs\0source.rs\0?? new.txt\0");
+        assert_eq!(
+            parsed,
+            vec![
+                ("copy.rs".to_string(), GitStatus::Deleted),
+                ("new.txt".to_string(), GitStatus::Untracked),
+            ]
+        );
     }
 }

@@ -160,19 +160,25 @@ object GitClone {
      */
     fun cancel() {
         val running = job?.takeIf { it.isActive } ?: return
+        // Capture the doomed attempt *now*, on the main thread, rather than
+        // letting terminate() read the field later: by then the user may have
+        // started a second clone, and this cancellation would kill that one
+        // and delete its destination.
+        val doomed = attempt
+        attempt = null
         job = null
         generation++
         state = CloneState.Idle
         scope.launch {
-            terminate()
+            terminate(doomed)
             running.cancel()
         }
     }
 
     /** SIGQUIT, then SIGKILL, then delete whatever git had written. */
-    private fun terminate() {
-        val current = attempt ?: return
-        attempt = null
+    private fun terminate(doomed: Attempt? = null) {
+        val current = doomed ?: attempt ?: return
+        if (doomed == null) attempt = null
         val process = current.process
         if (process.isAlive) {
             val pid = pidOf(process)
@@ -420,7 +426,9 @@ object GitClone {
             "already exists and is not an empty directory" in text ->
                 "The destination already exists"
 
-            "command not found" in text || "no such file or directory" in text && "git" in text ->
+            // Deliberately narrow: git's own "could not create work tree dir
+            // …: No such file or directory" must not be read as a missing git.
+            "command not found" in text || "exec: git" in text || "git: not found" in text ->
                 "git is not installed in the userland"
 
             else -> "git could not clone that repository"

@@ -58,6 +58,17 @@ enum class WorkspaceCommand {
     /** Open the settings screen. */
     OpenSettings,
 
+    /**
+     * Clone a git repository into a new project.
+     *
+     * In the table like everything else, and refused at the point of use where
+     * there is no Linux userland to run git in — the same way FindFile is
+     * refused with no project open. Shift is required: a bare `Ctrl+G` is "go
+     * to line" in every editor that has one, and this table must not spend it
+     * on a dialog.
+     */
+    CloneRepository,
+
     /** Show or hide the terminal dock. */
     ToggleTerminal,
 
@@ -101,6 +112,7 @@ private fun workspace(event: AndroidKeyEvent, shift: Boolean): WorkspaceCommand?
         AndroidKeyEvent.KEYCODE_O -> WorkspaceCommand.OpenProjects
         AndroidKeyEvent.KEYCODE_P -> WorkspaceCommand.FindFile
         AndroidKeyEvent.KEYCODE_COMMA -> WorkspaceCommand.OpenSettings
+        AndroidKeyEvent.KEYCODE_G -> if (shift) WorkspaceCommand.CloneRepository else null
         AndroidKeyEvent.KEYCODE_GRAVE ->
             if (shift) WorkspaceCommand.NewTerminal else WorkspaceCommand.ToggleTerminal
         AndroidKeyEvent.KEYCODE_TAB ->
@@ -132,35 +144,10 @@ private fun terminalReserved(event: AndroidKeyEvent, shift: Boolean): WorkspaceC
             AndroidKeyEvent.KEYCODE_O -> WorkspaceCommand.OpenProjects
             AndroidKeyEvent.KEYCODE_P -> WorkspaceCommand.FindFile
             AndroidKeyEvent.KEYCODE_COMMA -> WorkspaceCommand.OpenSettings
+            AndroidKeyEvent.KEYCODE_G -> WorkspaceCommand.CloneRepository
             else -> null
         }
     }
-
-/**
- * `Ctrl+Shift+G` — clone a git repository into a new project.
- *
- * Matched here, with the rest of the table, but deliberately *not* a
- * [WorkspaceCommand]: cloning only exists in a build that has a Linux userland
- * to run git in, so the workspace asks about this chord separately and does
- * nothing with it where `GitClone.isSupported` is false. Fold it into the enum
- * when every edition can clone.
- *
- * Shift is required. A bare `Ctrl+G` is "go to line" in every editor that has
- * one, and this table must not spend it on a dialog. Being a
- * `Ctrl+Shift+<letter>` chord, it is also safe while a shell has the keyboard,
- * which is why [Focus] does not change the answer.
- */
-fun isCloneRepositoryChord(event: KeyEvent): Boolean =
-    event.type == KeyEventType.KeyDown &&
-        event.isCtrlPressed &&
-        isCloneRepositoryChord(event.nativeKeyEvent)
-
-/** As above, for callers holding an Android key event (the terminal view). */
-fun isCloneRepositoryChord(event: AndroidKeyEvent): Boolean =
-    event.action == AndroidKeyEvent.ACTION_DOWN &&
-        event.isCtrlPressed &&
-        event.isShiftPressed &&
-        event.keyCode == AndroidKeyEvent.KEYCODE_G
 
 /**
  * Zero-based tab index for Ctrl+1…Ctrl+9, or null. Ctrl+9 means "the last

@@ -56,6 +56,8 @@ import to.eyed.conquest.code.core.ProjectSummary
 import to.eyed.conquest.code.core.ProjectsRoot
 import to.eyed.conquest.code.core.SafTransfer
 import java.io.File
+import android.content.Context
+import to.eyed.conquest.code.terminal.GitClone
 import to.eyed.conquest.code.terminal.TerminalSessions
 import to.eyed.conquest.code.terminal.Userland
 import to.eyed.conquest.code.terminal.UserlandState
@@ -124,6 +126,8 @@ fun WorkspaceScreen(
     // or a transfer finishes, rather than watched — projects change only when
     // the user changes them.
     var pickerOpen by remember { mutableStateOf(false) }
+    /** The picker opens straight into the clone form for Ctrl+Shift+G. */
+    var pickerStartsInClone by remember { mutableStateOf(false) }
     var finderOpen by remember { mutableStateOf(false) }
     var settingsOpen by remember { mutableStateOf(false) }
     var settingsValid by remember { mutableStateOf(true) }
@@ -173,6 +177,10 @@ fun WorkspaceScreen(
     }
 
     LaunchedEffect(Unit) {
+        // The engine runs Debian's git through proot for status, and cannot
+        // guess where either lives. Harmless and idempotent when there is no
+        // userland: the call is simply never made, and status stays empty.
+        withContext(Dispatchers.IO) { syncUserlandWithEngine(context) }
         val root = withContext(Dispatchers.IO) { ProjectsRoot.defaultProject(context) }
         val opened = ProjectSession(root)
         project = opened
@@ -299,6 +307,14 @@ fun WorkspaceScreen(
             WorkspaceCommand.OpenProjects -> {
                 refreshProjects()
                 transferError = null
+                pickerStartsInClone = false
+                pickerOpen = true
+            }
+            WorkspaceCommand.CloneRepository -> {
+                if (!GitClone.isSupported) return false
+                refreshProjects()
+                transferError = null
+                pickerStartsInClone = true
                 pickerOpen = true
             }
             WorkspaceCommand.FindFile -> {
@@ -573,7 +589,12 @@ fun WorkspaceScreen(
                     scope.launch {
                         // Sessions are running inside it; they have to go first.
                         terminals.closeAll()
-                        withContext(Dispatchers.IO) { Userland.backend.remove(context) }
+                        withContext(Dispatchers.IO) {
+                            Userland.backend.remove(context)
+                            // Or the engine keeps pointing git at a rootfs
+                            // that is no longer there.
+                            CoreBridge.clearUserland()
+                        }
                     }
                 }) { Text("Remove") }
             },
@@ -585,6 +606,13 @@ fun WorkspaceScreen(
 
     if (pickerOpen) {
         ProjectPicker(
+            startInClone = pickerStartsInClone,
+            onCloned = { path ->
+                pickerOpen = false
+                pickerStartsInClone = false
+                refreshProjects()
+                openProject(path)
+            },
             projects = projects,
             currentPath = project?.let { session -> projects.firstOrNull { it.name == session.rootName }?.path },
             busyMessage = transferMessage,
@@ -695,3 +723,24 @@ private fun userlandActions(
     } else {
         emptyList()
     }
+
+/**
+ * Point the engine at the Linux userland, so it can run git for project-panel
+ * status. Blocking; call it off the main thread.
+ *
+ * Nothing to do in a build without a userland, or before Debian is installed —
+ * git status then reads as "clean", which is the right way for a feature that
+ * cannot run to look.
+ */
+internal fun syncUserlandWithEngine(context: Context) {
+    if (Userland.backend.state(context) !is UserlandState.Ready) {
+        CoreBridge.clearUserland()
+        return
+    }
+    CoreBridge.setUserland(
+        File(context.applicationInfo.nativeLibraryDir, "libproot_exec.so").absolutePath,
+        File(context.filesDir, "debian").absolutePath,
+        context.cacheDir.absolutePath,
+        File(context.filesDir, "projects").absolutePath,
+    )
+}

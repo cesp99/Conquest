@@ -31,6 +31,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import to.eyed.conquest.code.core.GitignoredFiles
 import to.eyed.conquest.code.core.ProjectEntry
+import to.eyed.conquest.code.core.GitFileStatus as EngineStatus
 import to.eyed.conquest.code.core.ProjectSession
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
@@ -42,15 +43,42 @@ private const val SCANNING_POLL_MS = 120L
 private const val IDLE_POLL_MS = 1_000L
 
 /**
- * Where the panel gets per-path git status.
+ * Where the panel gets per-path git status: the engine, which runs Debian's
+ * git through proot behind a version counter of the same shape as the worktree
+ * snapshot's. Both are cheap reads of a cache; neither ever waits on git.
  *
- * One place to change when the engine can answer: return the JNI-backed
- * source here (see `agent-docs/TASKS.md` P3-8 — the query is keyed off the
- * worktree snapshot version) and every call site picks it up. Until then it is
- * [GitStatusSource.Absent] and the tree looks exactly as it always has.
+ * In a build with no Linux userland the counter stays 0 and the table is
+ * empty, so the tree looks exactly as it always has.
  */
-fun gitStatusSourceFor(@Suppress("UNUSED_PARAMETER") project: ProjectSession): GitStatusSource =
-    GitStatusSource.Absent
+fun gitStatusSourceFor(project: ProjectSession): GitStatusSource = EngineGitStatusSource(project)
+
+private class EngineGitStatusSource(private val project: ProjectSession) : GitStatusSource {
+
+    override val version: Long get() = project.gitStatusVersion
+
+    override fun snapshot(): GitStatusSnapshot {
+        // Read the version first: a bump between here and the table means the
+        // next poll picks the change up, rather than this one recording a new
+        // version against older rows.
+        val version = project.gitStatusVersion
+        val engine = project.gitStatus()
+        if (engine.isEmpty()) return GitStatusSnapshot.of(version, emptyMap())
+        val byPath = HashMap<String, GitFileStatus>(engine.size)
+        for ((path, status) in engine) byPath[path] = status.forPanel()
+        return GitStatusSnapshot.of(version, byPath)
+    }
+}
+
+/** The engine's vocabulary, in the panel's. */
+private fun EngineStatus.forPanel(): GitFileStatus = when (this) {
+    EngineStatus.Modified -> GitFileStatus.Modified
+    EngineStatus.Added -> GitFileStatus.Added
+    EngineStatus.Deleted -> GitFileStatus.Deleted
+    EngineStatus.Renamed -> GitFileStatus.Renamed
+    EngineStatus.Conflicted -> GitFileStatus.Conflicted
+    EngineStatus.Untracked -> GitFileStatus.Untracked
+    EngineStatus.Ignored -> GitFileStatus.Ignored
+}
 
 /**
  * The project tree, rendered from the engine's worktree.
@@ -118,8 +146,13 @@ fun ProjectPanel(
         LaunchedEffect(tree) {
             while (true) {
                 val version = project.version
+                val shape = tree.shape
                 if (version != tree.version) {
-                    tree.publish(version, withContext(Dispatchers.Default) { tree.rebuild() })
+                    tree.publish(
+                        version,
+                        withContext(Dispatchers.Default) { tree.rebuild() },
+                        shape,
+                    )
                 } else if (statusSource.version != tree.statusVersion) {
                     // Statuses normally land after the tree has been drawn.
                     // Re-colouring keeps the same rows and the same keys, so
@@ -128,6 +161,7 @@ fun ProjectPanel(
                     tree.publish(
                         version,
                         withContext(Dispatchers.Default) { tree.restatus(current) },
+                        shape,
                     )
                 }
                 delay(if (project.scanComplete) IDLE_POLL_MS else SCANNING_POLL_MS)
