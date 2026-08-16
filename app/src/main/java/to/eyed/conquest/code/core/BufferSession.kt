@@ -33,6 +33,14 @@ class BufferSession private constructor(val id: Long) {
      */
     fun setLanguage(language: String): Boolean = CoreBridge.bufferSetLanguage(id, language)
 
+    /**
+     * Bumped when the engine's background reparse lands. Syntax highlighting
+     * is allowed to trail the text by a frame or two — reparsing on the
+     * keystroke path is what made large files stutter.
+     */
+    val highlightVersion: Long
+        get() = CoreBridge.bufferHighlightVersion(id)
+
     /** Grammar name for the status bar; null when no language is assigned. */
     val language: String?
         get() = CoreBridge.bufferLanguage(id)

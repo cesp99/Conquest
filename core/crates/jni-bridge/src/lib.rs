@@ -593,6 +593,17 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_openFile(
     }
 }
 
+/// Bumped when a background reparse lands. The content version doesn't move
+/// then, so the UI watches this to know its highlight spans are stale.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferHighlightVersion(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+) -> jlong {
+    engine().buffer_highlight_version(buffer_id as u64) as jlong
+}
+
 /// The grammar the buffer is highlighted with ("rust", "markdown"), or null
 /// if it has no language.
 #[unsafe(no_mangle)]

@@ -3,6 +3,7 @@ package to.eyed.conquest.code.ui.editor
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.text.TextLayoutResult
@@ -71,6 +72,23 @@ class EditorState(val session: BufferSession) {
         }
     }
 
+    /**
+     * The engine's highlight version, as snapshot state so a reparse landing
+     * repaints the view. Polled rather than pushed: the engine's bridge is
+     * one-directional, and a poll of one integer is cheaper than a callback
+     * into the JVM from a Rust thread.
+     */
+    var highlightVersion by mutableLongStateOf(0L)
+        private set
+
+    /** True if the engine has newer spans than the ones last drawn. */
+    fun refreshHighlightVersion(): Boolean {
+        val version = session.highlightVersion
+        if (version == highlightVersion) return false
+        highlightVersion = version
+        return true
+    }
+
     /** Not snapshot state: refreshed from the engine in [refreshLineCount]. */
     var lineCount: Int = session.lineCount
         private set
@@ -101,6 +119,7 @@ class EditorState(val session: BufferSession) {
     private var cachedFirst = -1
     private var cachedLast = -1
     private var cachedVersion = -1L
+    private var cachedHighlightVersion = -1L
     private var requestedFirst = 0
     private var requestedLast = 0
 
@@ -129,7 +148,10 @@ class EditorState(val session: BufferSession) {
      */
     fun linesWindow(first: Int, last: Int): List<String> {
         val version = session.version
-        val miss = version != cachedVersion || first < cachedFirst || last > cachedLast
+        val miss = version != cachedVersion ||
+            highlightVersion != cachedHighlightVersion ||
+            first < cachedFirst ||
+            last > cachedLast
         if (miss) {
             val paddedFirst = (first - WINDOW_PADDING).coerceAtLeast(0)
             val paddedLast = (last + WINDOW_PADDING).coerceAtMost(lineCount)
@@ -154,6 +176,7 @@ class EditorState(val session: BufferSession) {
             cachedFirst = paddedFirst
             cachedLast = paddedFirst + cachedLines.size
             cachedVersion = version
+            cachedHighlightVersion = highlightVersion
         }
         requestedFirst = first.coerceIn(cachedFirst, cachedLast)
         requestedLast = last.coerceIn(requestedFirst, cachedLast)

@@ -208,10 +208,14 @@ impl crate::Engine {
         state.buffer.edit([(0..len, text.as_str())]);
         state.buffer.finalize_last_transaction();
         state.version += 1;
-        state.reset_highlighter();
+        let needs_highlight = state.reset_highlighter();
         let version = state.version;
         if let Some(file) = &mut state.file {
             file.mark_synced(version);
+        }
+        drop(buffers);
+        if needs_highlight {
+            self.request_highlight(id);
         }
         Ok(version)
     }

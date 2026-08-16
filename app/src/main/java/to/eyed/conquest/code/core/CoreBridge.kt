@@ -199,6 +199,12 @@ object CoreBridge {
     external fun openFile(path: String): Long
 
     /**
+     * Bumped when a background reparse lands. The content version doesn't
+     * move then, so watch this to know highlight spans are stale.
+     */
+    external fun bufferHighlightVersion(bufferId: Long): Long
+
+    /**
      * The grammar the buffer is highlighted with ("rust", "markdown"), or
      * null if it has no language.
      */

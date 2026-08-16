@@ -64,6 +64,7 @@ import to.eyed.conquest.code.ui.theme.LocalAppSettings
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import to.eyed.conquest.code.ui.theme.ZedTheme
 
+private const val HIGHLIGHT_POLL_MILLIS = 100L
 private const val CURSOR_BLINK_MILLIS = 530L
 
 /**
@@ -106,6 +107,15 @@ fun EditorPane(
     }
     val handleRadiusPx = with(density) { 6.dp.toPx() }
     val handleTouchRadiusPx = with(density) { 24.dp.toPx() }
+
+    // Syntax lags the text slightly by design (the reparse is off the
+    // keystroke path), so watch for it landing and repaint when it does.
+    LaunchedEffect(state) {
+        while (true) {
+            state.refreshHighlightVersion()
+            delay(HIGHLIGHT_POLL_MILLIS)
+        }
+    }
 
     var cursorVisible by remember { mutableStateOf(true) }
     LaunchedEffect(state.cursorRow, state.cursorCol, state.session.version) {

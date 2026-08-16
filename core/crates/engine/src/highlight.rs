@@ -188,11 +188,57 @@ pub struct HighlightState {
     language: &'static LanguageEntry,
     parser: Parser,
     tree: Option<Tree>,
+    /// Edits have been applied to `tree`'s positions but not reparsed, so the
+    /// spans it yields are approximate until the worker catches up.
+    dirty: bool,
+    /// Bumped when a reparse lands, so the UI knows to re-read spans even
+    /// though the buffer's content version hasn't moved.
+    version: u64,
+    /// The next parse must start from scratch. Set by history operations,
+    /// where the text changed without a matching `tree.edit()` — handing
+    /// tree-sitter that tree as the "old" one would make it reuse subtrees
+    /// that no longer correspond to the text.
+    needs_full_parse: bool,
 }
 
 impl HighlightState {
     pub fn name(&self) -> &'static str {
         self.name
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// The inputs a background reparse needs, taken while the buffer lock is
+    /// held so the parse itself can run without it.
+    pub fn parse_inputs(&self) -> (&'static str, Option<Tree>) {
+        if self.needs_full_parse {
+            (self.name, None)
+        } else {
+            (self.name, self.tree.clone())
+        }
+    }
+
+    /// Adopt a tree parsed off-thread.
+    pub fn install(&mut self, tree: Tree) {
+        self.tree = Some(tree);
+        self.dirty = false;
+        self.needs_full_parse = false;
+        self.version += 1;
+    }
+
+    /// Mark the tree stale without reparsing — for history operations, where
+    /// the edit shape isn't readily available. The old tree is kept so the
+    /// view keeps its highlighting until the reparse lands, rather than
+    /// flashing to unhighlighted text.
+    pub fn invalidate(&mut self) {
+        self.dirty = true;
+        self.needs_full_parse = true;
     }
 
     /// Returns None for unknown language names.
@@ -205,6 +251,9 @@ impl HighlightState {
             language: entry,
             parser,
             tree: None,
+            dirty: false,
+            version: 0,
+            needs_full_parse: false,
         };
         state.reparse(text);
         Some(state)
@@ -215,6 +264,11 @@ impl HighlightState {
     /// post-edit buffer; the points are the matching (row, column-byte)
     /// coordinates. The tree is edited and incrementally reparsed.
     #[allow(clippy::too_many_arguments)]
+    /// Shift the tree's positions to match a completed edit and mark it
+    /// stale. **Does not reparse** — that costs milliseconds on a large file
+    /// and must not sit on the keystroke path; the engine's highlight worker
+    /// picks it up. Until it does, the shifted tree still yields spans in
+    /// very nearly the right places.
     pub fn edited(
         &mut self,
         text: &Rope,
@@ -235,26 +289,35 @@ impl HighlightState {
                 new_end_position: ts_point(new_end_point),
             });
         }
-        self.reparse(text);
+        let _ = text;
+        self.dirty = true;
     }
 
     /// Drop incremental state and parse from scratch (used after undo/redo,
     /// where the edit shape isn't readily available).
-    pub fn invalidate(&mut self, text: &Rope) {
-        self.tree = None;
-        self.reparse(text);
-    }
-
-    fn reparse(&mut self, text: &Rope) {
+    /// Parse `text`, reusing `old_tree` when given. Free function so the
+    /// highlight worker can call it with its own parser, off the lock.
+    pub fn parse(
+        parser: &mut Parser,
+        language: &str,
+        text: &Rope,
+        old_tree: Option<&Tree>,
+    ) -> Option<Tree> {
+        let entry = registry().get(language)?;
+        parser.set_language(&entry.language).ok()?;
         let mut chunks = text.chunks();
-        let tree = self.parser.parse_with_options(
+        parser.parse_with_options(
             &mut |offset, _| {
                 chunks.seek(offset);
                 chunks.next().unwrap_or("").as_bytes()
             },
-            self.tree.as_ref(),
+            old_tree,
             None,
-        );
+        )
+    }
+
+    fn reparse(&mut self, text: &Rope) {
+        let tree = Self::parse(&mut self.parser, self.name, text, self.tree.as_ref());
         if let Some(tree) = tree {
             self.tree = Some(tree);
         }

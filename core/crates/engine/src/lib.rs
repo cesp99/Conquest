@@ -27,6 +27,7 @@ mod config;
 mod file;
 mod find;
 mod highlight;
+mod highlight_worker;
 mod platform;
 mod project;
 mod runtime;
@@ -72,16 +73,19 @@ pub struct Engine {
     /// Started on the first `open_project`, so buffer-only use (and most
     /// tests) never pays for a gpui App.
     runtime: OnceLock<runtime::Runtime>,
+    /// Started when a buffer first gets a language. Reparsing happens here,
+    /// never on the caller's thread — see highlight_worker.rs.
+    highlight_worker: OnceLock<highlight_worker::HighlightWorker>,
 }
 
-struct BufferState {
-    buffer: text::Buffer,
+pub(crate) struct BufferState {
+    pub(crate) buffer: text::Buffer,
     /// Monotonic content version: bumped by edit/undo/redo. Not a CRDT
     /// vector clock — just a cheap staleness check for the UI layer.
-    version: u64,
+    pub(crate) version: u64,
     /// Present once a language has been assigned (interim tree-sitter
     /// highlighting; see highlight.rs).
-    highlight: Option<highlight::HighlightState>,
+    pub(crate) highlight: Option<highlight::HighlightState>,
     /// Present for buffers backed by a file on disk (see file.rs).
     file: Option<file::FileState>,
 }
@@ -91,12 +95,15 @@ impl BufferState {
         self.buffer.max_point().row + 1
     }
 
-    /// Full reparse after history operations, where the edit shape isn't
-    /// readily available for an incremental tree edit.
-    fn reset_highlighter(&mut self) {
+    /// Mark the tree stale after a history operation, where the edit shape
+    /// isn't readily available for an incremental tree edit. The reparse
+    /// itself is the worker's job.
+    fn reset_highlighter(&mut self) -> bool {
         if let Some(highlighter) = &mut self.highlight {
-            let rope = self.buffer.as_rope().clone();
-            highlighter.invalidate(&rope);
+            highlighter.invalidate();
+            true
+        } else {
+            false
         }
     }
 }
@@ -110,6 +117,13 @@ impl Engine {
     fn runtime(&self) -> &runtime::Runtime {
         self.runtime
             .get_or_init(|| runtime::Runtime::new(project::init_globals))
+    }
+
+    /// Ask the highlight worker to bring a buffer's tree up to date.
+    fn request_highlight(&self, id: BufferId) {
+        self.highlight_worker
+            .get_or_init(|| highlight_worker::HighlightWorker::new(self.buffers.clone()))
+            .request(id);
     }
 
     fn next_project_id(&self) -> ProjectId {
@@ -170,7 +184,7 @@ impl Engine {
         let old_end_point = snapshot.offset_to_point(end);
         state.buffer.edit([(start..end, text)]);
         state.version += 1;
-        if let Some(highlighter) = &mut state.highlight {
+        let needs_highlight = if let Some(highlighter) = &mut state.highlight {
             let new_end = start + text.len();
             let rope = state.buffer.as_rope().clone();
             let new_end_point = rope.offset_to_point(new_end);
@@ -183,8 +197,17 @@ impl Engine {
                 old_end_point,
                 new_end_point,
             );
+            true
+        } else {
+            false
+        };
+        let version = state.version;
+        // Release the lock before touching the worker.
+        drop(buffers);
+        if needs_highlight {
+            self.request_highlight(id);
         }
-        Ok(state.version)
+        Ok(version)
     }
 
     /// Undo the most recent transaction. Returns the new version, or `None`
@@ -192,10 +215,17 @@ impl Engine {
     pub fn undo(&self, id: BufferId) -> Result<Option<u64>, EngineError> {
         let mut buffers = self.buffers.lock().unwrap();
         let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
-        Ok(state.buffer.undo().map(|_| {
+        let result = state.buffer.undo().map(|_| {
             state.version += 1;
-            state.reset_highlighter();
-            state.version
+            let needs_highlight = state.reset_highlighter();
+            (state.version, needs_highlight)
+        });
+        drop(buffers);
+        Ok(result.map(|(version, needs_highlight)| {
+            if needs_highlight {
+                self.request_highlight(id);
+            }
+            version
         }))
     }
 
@@ -204,10 +234,17 @@ impl Engine {
     pub fn redo(&self, id: BufferId) -> Result<Option<u64>, EngineError> {
         let mut buffers = self.buffers.lock().unwrap();
         let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
-        Ok(state.buffer.redo().map(|_| {
+        let result = state.buffer.redo().map(|_| {
             state.version += 1;
-            state.reset_highlighter();
-            state.version
+            let needs_highlight = state.reset_highlighter();
+            (state.version, needs_highlight)
+        });
+        drop(buffers);
+        Ok(result.map(|(version, needs_highlight)| {
+            if needs_highlight {
+                self.request_highlight(id);
+            }
+            version
         }))
     }
 
@@ -238,6 +275,19 @@ impl Engine {
 
     /// The grammar the buffer is highlighted with ("rust", "markdown"), or
     /// None if it has no language.
+    /// Bumped when a reparse lands. The content version doesn't move then,
+    /// so the UI watches this to know its spans are stale.
+    pub fn buffer_highlight_version(&self, id: BufferId) -> u64 {
+        self.with_buffer(id, |state| {
+            state
+                .highlight
+                .as_ref()
+                .map(|highlight| highlight.version())
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+    }
+
     pub fn buffer_language(&self, id: BufferId) -> Option<&'static str> {
         self.with_buffer(id, |state| {
             state.highlight.as_ref().map(|highlight| highlight.name())
@@ -476,24 +526,40 @@ mod tests {
                 .all(|s| s.row == 1)
         );
 
-        // Incremental reparse after an edit: "42" -> "\"hi\"" becomes a string.
+        // Reparsing is asynchronous — it costs milliseconds on a large file
+        // and must not sit on the keystroke path — so spans catch up shortly
+        // after an edit rather than during it. Callers watch
+        // `buffer_highlight_version` for that; tests do the same.
+        let has_style = |engine: &Engine, style: &str| {
+            engine
+                .highlights(id, 1, 2)
+                .unwrap()
+                .iter()
+                .any(|s| STYLE_NAMES[s.style as usize] == style)
+        };
+
+        // "42" -> "\"hi\"" becomes a string.
         let offset = engine.point_to_offset(id, 1, 12).unwrap();
         engine.edit(id, offset, offset + 2, "\"hi\"").unwrap();
-        let spans = engine.highlights(id, 1, 2).unwrap();
-        assert!(
-            spans
-                .iter()
-                .any(|s| STYLE_NAMES[s.style as usize] == "string")
-        );
+        wait_for_highlights(&engine, id, |engine| has_style(engine, "string"));
 
-        // Undo falls back to a full reparse and the number returns.
+        // Undo invalidates the tree; the number comes back.
         engine.undo(id).unwrap();
-        let spans = engine.highlights(id, 1, 2).unwrap();
-        assert!(
-            spans
-                .iter()
-                .any(|s| STYLE_NAMES[s.style as usize] == "number")
-        );
+        wait_for_highlights(&engine, id, |engine| has_style(engine, "number"));
+    }
+
+    /// Spin until the highlight worker has caught up and `ready` holds.
+    #[track_caller]
+    fn wait_for_highlights(engine: &Engine, id: BufferId, ready: impl Fn(&Engine) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if ready(engine) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = id;
+        panic!("the highlight worker never produced the expected spans");
     }
 
     #[test]
