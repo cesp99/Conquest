@@ -56,17 +56,16 @@ private const val STARTUP_FILE = "src/main.rs"
 @Composable
 fun WorkspaceScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
-    val project = remember { ProjectSession(ProjectsRoot.defaultProject(context)) }
-    DisposableEffect(project) {
-        onDispose { project.close() }
-    }
-
+    // Resolving the project root can write to disk (it seeds the sample on a
+    // fresh install), so it happens off the main thread and the UI starts with
+    // no project — which is also the state P3-4's project picker will use.
+    var project by remember { mutableStateOf<ProjectSession?>(null) }
     var editorState by remember { mutableStateOf<EditorState?>(null) }
     var openedPath by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
     /** Swap the editor to a project file, closing the buffer it replaces. */
-    fun openFile(path: String) {
+    fun openFile(project: ProjectSession, path: String) {
         scope.launch {
             val absolutePath = project.absolutePathOf(path) ?: return@launch
             val session = withContext(Dispatchers.IO) { BufferSession.openFile(absolutePath) }
@@ -77,9 +76,20 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
         }
     }
 
-    LaunchedEffect(project) { openFile(STARTUP_FILE) }
+    LaunchedEffect(Unit) {
+        val root = withContext(Dispatchers.IO) { ProjectsRoot.defaultProject(context) }
+        val opened = ProjectSession(root)
+        project = opened
+        openFile(opened, STARTUP_FILE)
+    }
+    DisposableEffect(project) {
+        val opened = project
+        onDispose { opened?.close() }
+    }
 
-    val onOpenEntry: (ProjectEntry) -> Unit = { entry -> openFile(entry.path) }
+    val onOpenEntry: (ProjectEntry) -> Unit = { entry ->
+        project?.let { openFile(it, entry.path) }
+    }
 
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
         if (maxWidth >= WideLayoutMinWidth) {
