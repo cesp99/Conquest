@@ -30,9 +30,27 @@ fn engine() -> &'static Engine {
                 .with_max_level(log::LevelFilter::Info)
                 .with_tag("conquest-core"),
         );
+        install_panic_hook();
         log::info!("engine initialized, version {}", engine::ENGINE_VERSION);
         Engine::new()
     })
+}
+
+/// Route panics to the log. Android discards a process's stderr, so without
+/// this a panic on an engine thread — the runtime thread, a worktree scan —
+/// is completely silent: the work simply never finishes.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|location| location.to_string())
+            .unwrap_or_else(|| "unknown location".to_owned());
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        log::error!("panic on thread {name} at {location}: {}", info);
+        previous(info);
+    }));
 }
 
 fn get_string(env: &mut JNIEnv, s: &JString) -> String {
@@ -43,6 +61,19 @@ fn to_jstring(env: &JNIEnv, text: String) -> jstring {
     env.new_string(text)
         .expect("failed to allocate Java string")
         .into_raw()
+}
+
+/// Hand the engine the app's private files directory, then bring it up.
+/// Must be the first call into the bridge — see `engine::initialize`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_initialize(
+    mut env: JNIEnv,
+    _class: JClass,
+    files_dir: JString,
+) {
+    let files_dir = get_string(&mut env, &files_dir);
+    engine::initialize(Path::new(&files_dir));
+    engine();
 }
 
 #[unsafe(no_mangle)]

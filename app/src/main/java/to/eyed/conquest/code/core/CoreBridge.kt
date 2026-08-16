@@ -20,6 +20,16 @@ object CoreBridge {
         System.loadLibrary("conquestcore")
     }
 
+    /**
+     * Hands the engine the app's private files directory and brings it up.
+     * Call this before anything else touches the bridge.
+     *
+     * Android runs apps without `$HOME`, which the vendored Zed crates assume
+     * exists — a worktree scan panics without one. The engine points `HOME`
+     * (and the trash) at this directory.
+     */
+    external fun initialize(filesDir: String)
+
     external fun engineVersion(): String
 
     /** Returns the id of the newly created buffer. */

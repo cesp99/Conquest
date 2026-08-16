@@ -33,6 +33,25 @@ pub use project::{ProjectId, TreeEntry};
 
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Tell the engine where the app's private storage is. Call this once, from
+/// the platform layer, before anything else touches the engine.
+///
+/// Android runs apps without `$HOME`, but the vendored Zed crates assume a
+/// home directory exists — `util::paths::home_dir()` panics outright without
+/// one, taking a worktree scan down with it, and `dirs`' config/data lookups
+/// derive from it too. An app does have a home; the OS simply doesn't export
+/// it, so we do. The same directory anchors the trash, which must sit on the
+/// same filesystem as the projects it swallows.
+pub fn initialize(files_dir: &Path) {
+    if std::env::var_os("HOME").is_none() {
+        // SAFETY: `set_var` is unsound only against concurrent environment
+        // access. This runs from the platform layer at startup, before the
+        // engine has spawned a thread of its own.
+        unsafe { std::env::set_var("HOME", files_dir) };
+    }
+    trash::set_root(files_dir.join(".trash"));
+}
+
 pub type BufferId = u64;
 
 static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);

@@ -21,6 +21,9 @@ settings.workspace = true
 streaming-iterator.workspace = true
 sum_tree.workspace = true
 text.workspace = true
+# The Conquest trash implementation; `[patch]` in the workspace manifest points
+# `fs`'s `trash` dependency at this same crate.
+trash = { path = "../trash-android" }
 tree-sitter.workspace = true
 worktree.workspace = true
 

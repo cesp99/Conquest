@@ -128,10 +128,12 @@ impl crate::Engine {
 
             cx.spawn(async move |cx| {
                 let fail = |message: String| {
+                    log::warn!("project {id} failed to open: {message}");
                     let mut state = state.lock().unwrap();
                     state.error = Some(message);
                     state.version += 1;
                 };
+                log::info!("project {id}: opening {}", path.display());
 
                 // `Worktree::local` happily accepts a path that isn't there
                 // (Zed opens worktrees for paths yet to be created), which
@@ -164,6 +166,7 @@ impl crate::Engine {
                         }
                     };
 
+                log::info!("project {id}: worktree created");
                 let scan_complete = cx.update(|cx| {
                     mirror(&worktree, &state, cx);
                     let mirrored = state.clone();
@@ -185,7 +188,13 @@ impl crate::Engine {
                 }
                 cx.update(|cx| {
                     if let Some(worktree) = cx.global::<WorktreeRegistry>().worktrees.get(&id) {
-                        let snapshot = worktree.read(cx).snapshot();
+                        let worktree = worktree.read(cx);
+                        log::info!(
+                            "project {id}: scan complete, {} files, {} dirs",
+                            worktree.file_count(),
+                            worktree.dir_count()
+                        );
+                        let snapshot = worktree.snapshot();
                         let mut state = state.lock().unwrap();
                         state.snapshot = Some(snapshot);
                         state.scan_complete = true;
