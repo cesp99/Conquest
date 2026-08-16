@@ -54,7 +54,7 @@ narrow, coarse-grained JNI boundary. See
 | Adaptive workspace shell (tablet/phone) | ✅ first version |
 | Rope/CRDT text engine (from Zed) | ✅ vendored & wired through JNI |
 | Tree-sitter syntax highlighting | ✅ in-engine, 21 languages |
-| Custom high-performance editor surface | ✅ v1: virtualized canvas, IME editing, Zed themes |
+| Custom high-performance editor surface | ✅ v1: virtualized canvas, IME editing, selection & clipboard, Zed themes |
 | Terminal emulator | ⬜ planned |
 | LSP on-device | ⬜ planned |
 | ACP agent panel | ⬜ planned |
