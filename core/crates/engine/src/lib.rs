@@ -17,6 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rope::Point;
 use sum_tree::Bias;
 
+mod highlight;
+
+pub use highlight::{HighlightSpan, STYLE_NAMES};
+
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub type BufferId = u64;
@@ -33,11 +37,23 @@ struct BufferState {
     /// Monotonic content version: bumped by edit/undo/redo. Not a CRDT
     /// vector clock — just a cheap staleness check for the UI layer.
     version: u64,
+    /// Present once a language has been assigned (interim tree-sitter
+    /// highlighting; see highlight.rs).
+    highlight: Option<highlight::HighlightState>,
 }
 
 impl BufferState {
     fn line_count(&self) -> u32 {
         self.buffer.max_point().row + 1
+    }
+
+    /// Full reparse after history operations, where the edit shape isn't
+    /// readily available for an incremental tree edit.
+    fn reset_highlighter(&mut self) {
+        if let Some(highlighter) = &mut self.highlight {
+            let rope = self.buffer.as_rope().clone();
+            highlighter.invalidate(&rope);
+        }
     }
 }
 
@@ -50,11 +66,25 @@ impl Engine {
         let id = NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed);
         let remote_id = text::BufferId::new(id).expect("buffer ids start at 1");
         let buffer = text::Buffer::new(clock::ReplicaId::LOCAL, remote_id, initial_text);
-        self.buffers
-            .lock()
-            .unwrap()
-            .insert(id, BufferState { buffer, version: 0 });
+        self.buffers.lock().unwrap().insert(
+            id,
+            BufferState {
+                buffer,
+                version: 0,
+                highlight: None,
+            },
+        );
         id
+    }
+
+    /// Assign a tree-sitter language (by grammar name, e.g. "rust") to the
+    /// buffer and parse it. Returns false for unknown language names.
+    pub fn set_language(&self, id: BufferId, language: &str) -> Result<bool, EngineError> {
+        let mut buffers = self.buffers.lock().unwrap();
+        let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
+        let rope = state.buffer.as_rope().clone();
+        state.highlight = highlight::HighlightState::new(language, &rope);
+        Ok(state.highlight.is_some())
     }
 
     pub fn close_buffer(&self, id: BufferId) -> bool {
@@ -81,8 +111,24 @@ impl Engine {
         {
             return Err(EngineError::InvalidRange { start, end });
         }
+        let start_point = snapshot.offset_to_point(start);
+        let old_end_point = snapshot.offset_to_point(end);
         state.buffer.edit([(start..end, text)]);
         state.version += 1;
+        if let Some(highlighter) = &mut state.highlight {
+            let new_end = start + text.len();
+            let rope = state.buffer.as_rope().clone();
+            let new_end_point = rope.offset_to_point(new_end);
+            highlighter.edited(
+                &rope,
+                start,
+                end,
+                new_end,
+                start_point,
+                old_end_point,
+                new_end_point,
+            );
+        }
         Ok(state.version)
     }
 
@@ -93,6 +139,7 @@ impl Engine {
         let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
         Ok(state.buffer.undo().map(|_| {
             state.version += 1;
+            state.reset_highlighter();
             state.version
         }))
     }
@@ -104,8 +151,34 @@ impl Engine {
         let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
         Ok(state.buffer.redo().map(|_| {
             state.version += 1;
+            state.reset_highlighter();
             state.version
         }))
+    }
+
+    /// Highlight spans for rows `first_row..last_row` (end-exclusive,
+    /// clipped). Empty when the buffer has no language assigned.
+    pub fn highlights(
+        &self,
+        id: BufferId,
+        first_row: u32,
+        last_row: u32,
+    ) -> Result<Vec<HighlightSpan>, EngineError> {
+        self.with_buffer(id, |state| {
+            let Some(highlighter) = &state.highlight else {
+                return Vec::new();
+            };
+            let rope = state.buffer.as_rope();
+            let line_count = state.line_count();
+            let first = first_row.min(line_count);
+            let last = last_row.min(line_count);
+            if first >= last {
+                return Vec::new();
+            }
+            let start = rope.point_to_offset(Point::new(first, 0));
+            let end = rope.point_to_offset(Point::new(last - 1, rope.line_len(last - 1)));
+            highlighter.highlights(rope, start..end)
+        })
     }
 
     pub fn version(&self, id: BufferId) -> Result<u64, EngineError> {
@@ -287,6 +360,75 @@ mod tests {
         // Clipped past the end of a line / buffer.
         assert_eq!(engine.point_to_offset(id, 0, 99).unwrap(), 2);
         assert_eq!(engine.offset_to_point(id, 99).unwrap(), (1, 2));
+    }
+
+    #[test]
+    fn highlights_rust() {
+        let engine = Engine::new();
+        let id = engine.create_buffer("fn main() {\n    let x = 42; // answer\n}\n");
+        // No language yet: no spans.
+        assert!(engine.highlights(id, 0, 3).unwrap().is_empty());
+        assert!(!engine.set_language(id, "not-a-language").unwrap());
+        assert!(engine.set_language(id, "rust").unwrap());
+
+        let spans = engine.highlights(id, 0, 3).unwrap();
+        let style_at = |row: u32, col: u32| {
+            spans
+                .iter()
+                .filter(|s| s.row == row && s.start_col_utf16 <= col && col < s.end_col_utf16)
+                .map(|s| STYLE_NAMES[s.style as usize])
+                .last()
+        };
+        // "fn" and "let" are keywords, "42" a number, the comment a comment.
+        assert_eq!(style_at(0, 0), Some("keyword"));
+        assert_eq!(style_at(1, 4), Some("keyword"));
+        assert_eq!(style_at(1, 12), Some("number"));
+        assert_eq!(style_at(1, 17), Some("comment"));
+
+        // Window clipping: row 1 only.
+        assert!(
+            engine
+                .highlights(id, 1, 2)
+                .unwrap()
+                .iter()
+                .all(|s| s.row == 1)
+        );
+
+        // Incremental reparse after an edit: "42" -> "\"hi\"" becomes a string.
+        let offset = engine.point_to_offset(id, 1, 12).unwrap();
+        engine.edit(id, offset, offset + 2, "\"hi\"").unwrap();
+        let spans = engine.highlights(id, 1, 2).unwrap();
+        assert!(
+            spans
+                .iter()
+                .any(|s| STYLE_NAMES[s.style as usize] == "string")
+        );
+
+        // Undo falls back to a full reparse and the number returns.
+        engine.undo(id).unwrap();
+        let spans = engine.highlights(id, 1, 2).unwrap();
+        assert!(
+            spans
+                .iter()
+                .any(|s| STYLE_NAMES[s.style as usize] == "number")
+        );
+    }
+
+    #[test]
+    fn highlight_columns_are_utf16() {
+        let engine = Engine::new();
+        // '€' is 3 UTF-8 bytes but 1 UTF-16 unit; the string after it must
+        // report UTF-16 columns.
+        let id = engine.create_buffer("let e = \"€\"; let n = 7;");
+        assert!(engine.set_language(id, "rust").unwrap());
+        let spans = engine.highlights(id, 0, 1).unwrap();
+        let number = spans
+            .iter()
+            .find(|s| STYLE_NAMES[s.style as usize] == "number")
+            .expect("number span");
+        // "let e = \"€\"; let n = " is 21 UTF-16 units; the 7 sits at col 21.
+        assert_eq!(number.start_col_utf16, 21);
+        assert_eq!(number.end_col_utf16, 22);
     }
 
     #[test]

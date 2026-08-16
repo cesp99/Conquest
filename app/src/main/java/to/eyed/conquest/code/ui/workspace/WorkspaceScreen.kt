@@ -30,11 +30,14 @@ private val WELCOME_TEXT = """
     // Welcome to Conquest Code.
     //
     // This buffer lives inside the Rust engine (core/crates/engine):
-    // Zed's rope/CRDT text stack, reached over JNI. The editor below
-    // draws only the visible line window — it never holds the file.
+    // Zed's rope/CRDT text stack, reached over JNI. The editor draws
+    // only the visible line window, and the colors come from Zed's
+    // tree-sitter highlight queries running inside the engine.
     //
     // The lines that follow are generated so you can put the
     // virtualized renderer through its paces. Fling away.
+
+    const GREETING: &str = "Hello from the Rust core!";
 
 """.trimIndent()
 
@@ -42,7 +45,7 @@ private val WELCOME_TEXT = """
 private fun sampleText(): String = buildString {
     append(WELCOME_TEXT)
     for (i in 1..5_000) {
-        append("fun generated_$i() = $i * ${i % 7}  // scroll test, line ${i + 9}\n")
+        append("fn generated_$i() -> i32 { $i * ${i % 7} }  // scroll test, line ${i + 12}\n")
     }
 }
 
@@ -55,7 +58,7 @@ private fun sampleText(): String = buildString {
 @Composable
 fun WorkspaceScreen(modifier: Modifier = Modifier) {
     val editorState = remember {
-        EditorState(BufferSession(sampleText()))
+        EditorState(BufferSession(sampleText()).also { it.setLanguage("rust") })
     }
 
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {

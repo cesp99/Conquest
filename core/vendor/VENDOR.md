@@ -28,6 +28,8 @@ From `zed/crates/` unless noted:
 | `path` | Apache-2.0 | unpatched |
 | `gpui_shared_string` | Apache-2.0 | unpatched |
 | `gpui_util` | Apache-2.0 | unpatched |
+| `grammars` | GPL-3.0-or-later | unpatched; feature `load-grammars` compiles the embedded tree-sitter C grammars (works for Android via cargo-ndk) |
+| `language_core` | GPL-3.0-or-later | unpatched |
 | `zlog` | GPL-3.0-or-later | unpatched |
 | `ztracing` | GPL-3.0-or-later / Apache-2.0 | unpatched |
 | `ztracing_macro` | GPL-3.0-or-later / Apache-2.0 | unpatched |
@@ -45,6 +47,13 @@ All `X.workspace = true` references resolve against
 `core/Cargo.toml`, whose `[workspace.dependencies]` external pins
 mirror Zed's workspace `Cargo.toml` at the commit above. Keep them in
 sync when syncing vendor/.
+
+Exception to "no git dependencies": several tree-sitter grammar crates
+(`cpp`, `gitcommit`, `go-mod`, `gowork`, `md`, `typescript`, `yaml`)
+are rev-pinned git dependencies because that is how Zed itself pins
+them (forks/unreleased fixes). They are small repositories, cached by
+cargo after first fetch — nothing like the full-Zed-clone problem the
+vendoring decision avoids.
 
 ## Local patches
 

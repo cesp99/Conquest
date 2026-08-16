@@ -55,10 +55,21 @@ class EditorState(val session: BufferSession) {
     /** Widest line width seen so far, for the horizontal scroll extent. */
     private var contentWidthPx = 0f
 
+    // The fetched window is padded by [WINDOW_PADDING] rows beyond what the
+    // viewport asked for, so scrolling only crosses the JNI boundary (and
+    // re-runs the highlight query) every few dozen rows instead of every
+    // row.
     private var cachedLines: List<String> = emptyList()
+    private var cachedSpans: List<List<HighlightSpan>> = emptyList()
     private var cachedFirst = -1
     private var cachedLast = -1
     private var cachedVersion = -1L
+    private var requestedFirst = 0
+    private var requestedLast = 0
+
+    private companion object {
+        const val WINDOW_PADDING = 32
+    }
 
     val gutterWidthPx: Float
         get() = lineCount.toString().length.coerceAtLeast(2) * charWidthPx + 2 * gutterPaddingPx
@@ -81,19 +92,64 @@ class EditorState(val session: BufferSession) {
      */
     fun linesWindow(first: Int, last: Int): List<String> {
         val version = session.version
-        if (first != cachedFirst || last != cachedLast || version != cachedVersion) {
-            cachedLines = if (last > first) {
-                CoreBridge.bufferLines(session.id, first.toLong(), last.toLong())
+        val miss = version != cachedVersion || first < cachedFirst || last > cachedLast
+        if (miss) {
+            val paddedFirst = (first - WINDOW_PADDING).coerceAtLeast(0)
+            val paddedLast = (last + WINDOW_PADDING).coerceAtMost(lineCount)
+            if (paddedLast > paddedFirst) {
+                cachedLines = CoreBridge
+                    .bufferLines(session.id, paddedFirst.toLong(), paddedLast.toLong())
                     .orEmpty()
                     .split('\n')
+                cachedSpans = groupSpans(
+                    CoreBridge.bufferHighlights(
+                        session.id,
+                        paddedFirst.toLong(),
+                        paddedLast.toLong(),
+                    ),
+                    paddedFirst,
+                    cachedLines.size,
+                )
             } else {
-                emptyList()
+                cachedLines = emptyList()
+                cachedSpans = emptyList()
             }
-            cachedFirst = first
-            cachedLast = last
+            cachedFirst = paddedFirst
+            cachedLast = paddedFirst + cachedLines.size
             cachedVersion = version
         }
-        return cachedLines
+        requestedFirst = first.coerceIn(cachedFirst, cachedLast)
+        requestedLast = last.coerceIn(requestedFirst, cachedLast)
+        return cachedLines.subList(requestedFirst - cachedFirst, requestedLast - cachedFirst)
+    }
+
+    /**
+     * Highlight spans for the window last returned by [linesWindow],
+     * parallel to its returned lines.
+     */
+    fun spansWindow(): List<List<HighlightSpan>> =
+        cachedSpans.subList(requestedFirst - cachedFirst, requestedLast - cachedFirst)
+
+    fun spansFor(row: Int): List<HighlightSpan> =
+        if (row in cachedFirst until cachedLast && cachedVersion == session.version) {
+            cachedSpans.getOrElse(row - cachedFirst) { emptyList() }
+        } else {
+            emptyList()
+        }
+
+    /** Flat [row, start, end, style] groups → per-row span lists. */
+    private fun groupSpans(flat: IntArray?, firstRow: Int, rowCount: Int): List<List<HighlightSpan>> {
+        if (flat == null || flat.isEmpty()) return List(rowCount) { emptyList() }
+        val grouped = List(rowCount) { mutableListOf<HighlightSpan>() }
+        var i = 0
+        while (i + 3 < flat.size) {
+            val row = flat[i] - firstRow
+            if (row in 0 until rowCount) {
+                grouped[row].add(HighlightSpan(flat[i + 1], flat[i + 2], flat[i + 3]))
+            }
+            i += 4
+        }
+        return grouped
     }
 
     fun line(row: Int): String =

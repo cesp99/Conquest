@@ -62,6 +62,21 @@ object CoreBridge {
     external fun bufferLines(bufferId: Long, firstLine: Long, lastLine: Long): String?
 
     /**
+     * Assigns a tree-sitter language (grammar name, e.g. "rust") to the
+     * buffer and parses it. Returns false for unknown buffers/languages.
+     */
+    external fun bufferSetLanguage(bufferId: Long, language: String): Boolean
+
+    /**
+     * Highlight spans for rows [firstLine, lastLine), flattened as groups
+     * of four ints: row, UTF-16 start column, UTF-16 end column, style id
+     * (index into the engine's style-name list, mirrored by
+     * [to.eyed.conquest.code.ui.editor.SyntaxPalette]). Empty when the
+     * buffer has no language; null for unknown buffers.
+     */
+    external fun bufferHighlights(bufferId: Long, firstLine: Long, lastLine: Long): IntArray?
+
+    /**
      * Byte offset of (row, byte column), clipped to the buffer. -1 for an
      * unknown buffer or negative arguments.
      */

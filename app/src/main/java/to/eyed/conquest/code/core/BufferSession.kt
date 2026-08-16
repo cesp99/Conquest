@@ -27,6 +27,12 @@ class BufferSession(initialText: String) {
         return true
     }
 
+    /**
+     * Assign a tree-sitter language (grammar name, e.g. "rust"). Returns
+     * false for unknown language names.
+     */
+    fun setLanguage(language: String): Boolean = CoreBridge.bufferSetLanguage(id, language)
+
     /** Undo the last edit transaction. Returns false if nothing to undo. */
     fun undo(): Boolean = applyHistory(CoreBridge.undoBuffer(id))
 

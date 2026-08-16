@@ -38,6 +38,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.rememberTextMeasurer
@@ -138,9 +139,11 @@ fun EditorPane(state: EditorState, modifier: Modifier = Modifier) {
         }
 
         // Buffer text, clipped so it never slides under the gutter.
+        val spansWindow = state.spansWindow()
         clipRect(left = gutterWidth) {
             lines.forEachIndexed { index, line ->
-                val layout = layoutCache.layoutFor(line)
+                val layout =
+                    layoutCache.layoutFor(line, spansWindow.getOrElse(index) { emptyList() })
                 state.noteContentWidth(layout.size.width.toFloat())
                 val top = (firstRow + index) * lineHeight - state.scrollY
                 drawText(
@@ -152,7 +155,7 @@ fun EditorPane(state: EditorState, modifier: Modifier = Modifier) {
             // Cursor.
             if (cursorVisible && state.cursorRow in firstRow until lastRow) {
                 val line = lines[state.cursorRow - firstRow]
-                val layout = layoutCache.layoutFor(line)
+                val layout = layoutCache.layoutFor(line, state.spansFor(state.cursorRow))
                 val col = state.cursorCol.coerceAtMost(line.length)
                 val cursorX = textLeft + layout.getHorizontalPosition(col, true)
                 if (cursorX >= gutterWidth - 1f) {
@@ -249,22 +252,38 @@ private fun handleEditorKey(state: EditorState, event: KeyEvent): Boolean {
 }
 
 /**
- * LRU cache of text layouts keyed by line content. Identical lines (blank
- * lines, closing braces, repeated code) share one measured layout, so
- * steady-state scrolling measures only lines it has never seen.
+ * LRU cache of text layouts keyed by line content + highlight spans.
+ * Identical styled lines (blank lines, closing braces, repeated code)
+ * share one measured layout, so steady-state scrolling measures only
+ * lines it has never seen.
  */
 private class TextLayoutCache(
     private val measurer: TextMeasurer,
     private val style: TextStyle,
     private val capacity: Int = 512,
 ) {
-    private val cache = object : LinkedHashMap<String, TextLayoutResult>(64, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, TextLayoutResult>) =
+    private data class Key(val line: String, val spans: List<HighlightSpan>)
+
+    private val cache = object : LinkedHashMap<Key, TextLayoutResult>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Key, TextLayoutResult>) =
             size > capacity
     }
 
-    fun layoutFor(line: String): TextLayoutResult =
-        cache.getOrPut(line) {
-            measurer.measure(AnnotatedString(line), style, softWrap = false)
+    fun layoutFor(line: String, spans: List<HighlightSpan> = emptyList()): TextLayoutResult =
+        cache.getOrPut(Key(line, spans)) {
+            measurer.measure(annotate(line, spans), style, softWrap = false)
         }
+
+    private fun annotate(line: String, spans: List<HighlightSpan>): AnnotatedString {
+        if (spans.isEmpty()) return AnnotatedString(line)
+        return buildAnnotatedString {
+            append(line)
+            for (span in spans) {
+                val start = span.start.coerceIn(0, line.length)
+                val end = span.end.coerceIn(0, line.length)
+                if (start >= end) continue
+                SyntaxPalette.spanStyle(span.style)?.let { addStyle(it, start, end) }
+            }
+        }
+    }
 }
