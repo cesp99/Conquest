@@ -13,3 +13,13 @@
 .externalNativeBuild
 .cxx
 local.properties
+.kotlin/
+
+# Rust
+/core/target
+core/**/target
+
+# Local agent documentation — never push (see agent-docs/README note)
+/agent-docs/
+/CLAUDE.md
+/AGENTS.md
