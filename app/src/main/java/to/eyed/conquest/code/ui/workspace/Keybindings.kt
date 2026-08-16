@@ -41,6 +41,9 @@ enum class WorkspaceCommand {
 
     /** Open the fuzzy file finder. */
     FindFile,
+
+    /** Open the settings screen. */
+    OpenSettings,
 }
 
 /**
@@ -57,6 +60,7 @@ fun workspaceCommandFor(event: KeyEvent): WorkspaceCommand? {
         Key.B -> WorkspaceCommand.ToggleProjectPanel
         Key.O -> WorkspaceCommand.OpenProjects
         Key.P -> WorkspaceCommand.FindFile
+        Key.Comma -> WorkspaceCommand.OpenSettings
         Key.Tab -> if (event.isShiftPressed) {
             WorkspaceCommand.PreviousTab
         } else {

@@ -38,7 +38,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import to.eyed.conquest.code.core.AppSettings
 import to.eyed.conquest.code.core.BufferSession
+import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.core.ProjectEntry
 import to.eyed.conquest.code.core.ProjectSession
 import to.eyed.conquest.code.core.ProjectSummary
@@ -69,7 +71,12 @@ private const val STATUS_POLL_MS = 250L
  * slimmer layout with the panel in a drawer.
  */
 @Composable
-fun WorkspaceScreen(modifier: Modifier = Modifier) {
+fun WorkspaceScreen(
+    settings: AppSettings,
+    settingsPath: String?,
+    onSettingsChanged: (AppSettings) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val context = LocalContext.current
     // Resolving the project root can write to disk (it seeds the sample on a
     // fresh install), so it happens off the main thread and the UI starts with
@@ -85,6 +92,8 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
     // the user changes them.
     var pickerOpen by remember { mutableStateOf(false) }
     var finderOpen by remember { mutableStateOf(false) }
+    var settingsOpen by remember { mutableStateOf(false) }
+    var settingsValid by remember { mutableStateOf(true) }
     var projects by remember { mutableStateOf(emptyList<ProjectSummary>()) }
     var transferMessage by remember { mutableStateOf<String?>(null) }
     var transferError by remember { mutableStateOf<String?>(null) }
@@ -261,6 +270,12 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
                 if (project == null) return false
                 finderOpen = true
             }
+            WorkspaceCommand.OpenSettings -> {
+                scope.launch {
+                    settingsValid = withContext(Dispatchers.IO) { CoreBridge.settingsAreValid() }
+                    settingsOpen = true
+                }
+            }
         }
         return true
     }
@@ -298,7 +313,12 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
                                     .width(ProjectPanelWidth)
                                     .fillMaxHeight()
                             ) {
-                                ProjectPanel(project, onOpenEntry, openedPath = files.active?.path)
+                                ProjectPanel(
+                                project = project,
+                                onOpenFile = onOpenEntry,
+                                openedPath = files.active?.path,
+                                showIgnored = settings.showIgnored,
+                            )
                             }
                             VerticalDivider()
                         }
@@ -322,6 +342,7 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
                                         scope.launch { drawerState.close() }
                                     },
                                     openedPath = files.active?.path,
+                                    showIgnored = settings.showIgnored,
                                 )
                             }
                         }
@@ -350,8 +371,29 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
                 } else {
                     null
                 },
+                onOpenSettings = { runCommand(WorkspaceCommand.OpenSettings) },
             )
         }
+    }
+
+    if (settingsOpen) {
+        SettingsScreen(
+            settings = settings,
+            settingsPath = settingsPath,
+            isFileValid = settingsValid,
+            onSet = { keyPath, valueJson ->
+                scope.launch {
+                    val updated = withContext(Dispatchers.IO) {
+                        AppSettings.set(keyPath, valueJson)
+                    }
+                    if (updated != null) {
+                        onSettingsChanged(updated)
+                        settingsValid = true
+                    }
+                }
+            },
+            onDismiss = { settingsOpen = false },
+        )
     }
 
     val openedProject = project

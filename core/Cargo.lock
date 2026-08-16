@@ -1694,6 +1694,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "settings_json",
  "streaming-iterator",
  "sum_tree",
  "tempfile",

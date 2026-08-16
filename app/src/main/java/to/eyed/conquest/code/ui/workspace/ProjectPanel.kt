@@ -54,6 +54,7 @@ fun ProjectPanel(
     onOpenFile: (ProjectEntry) -> Unit,
     modifier: Modifier = Modifier,
     openedPath: String? = null,
+    showIgnored: Boolean = true,
 ) {
     val theme = LocalZedTheme.current
     Column(
@@ -76,13 +77,17 @@ fun ProjectPanel(
             return@Column
         }
 
-        val tree = remember(project) { ProjectTreeState(project) }
+        val tree = remember(project, showIgnored) { ProjectTreeState(project, showIgnored) }
         val scope = rememberCoroutineScope()
 
-        // One coroutine per project: re-flatten whenever the engine reports a
-        // newer snapshot. The rebuild reads through JNI and parses JSON, so it
-        // stays off the main thread.
-        LaunchedEffect(project) {
+        // Keyed on `tree`, not `project`: changing a setting that affects the
+        // tree (showing gitignored files) builds a fresh, empty
+        // ProjectTreeState, and an effect still holding the old one would
+        // leave the panel permanently blank.
+        //
+        // Re-flatten whenever the engine reports a newer snapshot. The rebuild
+        // reads through JNI and parses JSON, so it stays off the main thread.
+        LaunchedEffect(tree) {
             while (true) {
                 val version = project.version
                 if (version != tree.version) {

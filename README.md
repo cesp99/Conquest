@@ -62,6 +62,7 @@ Samsung DeX.
 | Tabs, save & external change detection | ✅ dirty dots, atomic save, live reload |
 | Projects: create, switch, import & export | ✅ app-private storage, SAF folder import/export |
 | Fuzzy file finder | ✅ Ctrl+P, match highlighting |
+| Settings | ✅ JSONC file that keeps your comments, settings screen |
 | Terminal emulator | ⬜ planned |
 | LSP on-device | ⬜ planned |
 | ACP agent panel | ⬜ planned |

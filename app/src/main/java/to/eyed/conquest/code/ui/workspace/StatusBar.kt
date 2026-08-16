@@ -37,6 +37,7 @@ fun StatusBar(
     onToggleProjectPanel: (() -> Unit)? = null,
     onOpenProjects: (() -> Unit)? = null,
     onFindFile: (() -> Unit)? = null,
+    onOpenSettings: (() -> Unit)? = null,
 ) {
     val engineVersion = remember { CoreBridge.engineVersion() }
     Row(
@@ -113,6 +114,18 @@ fun StatusBar(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(end = 12.dp),
         )
+        if (onOpenSettings != null) {
+            // The touch twin of Ctrl+,
+            Text(
+                text = "⚙",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .pointerHoverIcon(PointerIcon.Hand)
+                    .clickable(onClick = onOpenSettings)
+                    .padding(end = 12.dp),
+            )
+        }
         Text(
             text = "engine v$engineVersion",
             style = MaterialTheme.typography.labelMedium,

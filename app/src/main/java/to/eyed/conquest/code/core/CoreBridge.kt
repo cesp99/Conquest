@@ -153,6 +153,34 @@ object CoreBridge {
      */
     external fun projectEntryPath(projectId: Long, path: String): String?
 
+    // -----------------------------------------------------------------------
+    // Settings. The file is JSONC and hand-editable; writes are surgical, so
+    // comments survive. All of these touch the filesystem — call them off the
+    // main thread.
+    // -----------------------------------------------------------------------
+
+    /** Resolved settings as JSON. Falls back to defaults if the file is broken. */
+    external fun settings(): String
+
+    /** The settings file's raw JSONC, created with documented defaults on first use. */
+    external fun settingsText(): String
+
+    /** Whether the file parses. False means [settings] is showing defaults. */
+    external fun settingsAreValid(): Boolean
+
+    /**
+     * Sets one setting. [keyPath] is dot-separated
+     * (`project_panel.show_ignored`), [valueJson] is JSON (`true`, `18`,
+     * `"dark"`). Returns the resolved settings as JSON, or null on failure.
+     */
+    external fun setSetting(keyPath: String, valueJson: String): String?
+
+    /**
+     * Replaces the whole settings file. Returns the resolved settings as JSON,
+     * or null if the text doesn't parse — the file is then left untouched.
+     */
+    external fun setSettingsText(text: String): String?
+
     /**
      * Fuzzy-matches [query] against the project's files, best first, as a JSON
      * array of objects with `path`, `name`, `positions` (UTF-16 offsets into

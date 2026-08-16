@@ -25,6 +25,7 @@ editor.
 | `Ctrl` `B` | Show/hide the project panel |
 | `Ctrl` `O` | Open the project picker (switch, create, import, export) |
 | `Ctrl` `P` | Find a file by name (fuzzy) |
+| `Ctrl` `,` | Open settings |
 
 In the file finder and project picker: `↑` `↓` move, `Enter` opens,
 `Esc` closes.
@@ -58,4 +59,5 @@ Everything above is reachable by touch too: long-press to select a word,
 drag the handles to adjust a selection, and use the floating toolbar for
 copy/paste. The status bar carries a **Save** action while the current
 file has unsaved changes, `☰ files` toggles the project panel, `⌕ find`
-opens the file finder, and the project name opens the project picker.
+opens the file finder, the project name opens the project picker, and `⚙`
+opens settings.

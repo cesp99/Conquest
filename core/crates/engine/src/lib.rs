@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use rope::Point;
 use sum_tree::Bias;
 
+mod config;
 mod file;
 mod find;
 mod highlight;
@@ -30,6 +31,7 @@ mod platform;
 mod project;
 mod runtime;
 
+pub use config::{ProjectPanelSettings, Settings, ThemeMode};
 pub use find::FileMatch;
 pub use highlight::{HighlightSpan, STYLE_NAMES, language_for_path};
 pub use project::{ProjectId, TreeEntry};
@@ -53,6 +55,7 @@ pub fn initialize(files_dir: &Path) {
         unsafe { std::env::set_var("HOME", files_dir) };
     }
     trash::set_root(files_dir.join(".trash"));
+    config::set_directory(files_dir.to_path_buf());
 }
 
 pub type BufferId = u64;
@@ -317,6 +320,10 @@ pub enum EngineError {
     },
     /// The operation needs a file behind the buffer, and there isn't one.
     NoFile(BufferId),
+    /// The engine was never told where settings live (see `initialize`).
+    NoSettingsFile,
+    /// Settings text that doesn't parse; carries the parser's complaint.
+    InvalidSettings(String),
     Io {
         path: String,
         message: String,
@@ -331,6 +338,8 @@ impl std::fmt::Display for EngineError {
                 write!(f, "invalid range {start}..{end}")
             }
             EngineError::NoFile(id) => write!(f, "buffer {id} is not backed by a file"),
+            EngineError::NoSettingsFile => write!(f, "no settings directory configured"),
+            EngineError::InvalidSettings(message) => write!(f, "invalid settings: {message}"),
             EngineError::Io { path, message } => write!(f, "{path}: {message}"),
         }
     }

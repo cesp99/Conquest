@@ -8,6 +8,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
+import to.eyed.conquest.code.core.AppSettings
+import to.eyed.conquest.code.core.ThemeMode
 
 // An IDE has its own visual identity: we deliberately skip Material dynamic
 // color so the editor looks like Zed everywhere. All colors come from Zed's
@@ -15,9 +17,15 @@ import androidx.compose.ui.platform.LocalContext
 // mapped from the theme's style table for the stock components we use.
 @Composable
 fun ConquestCodeByEyedTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
+    settings: AppSettings = AppSettings(),
     content: @Composable () -> Unit
 ) {
+    // "system" follows the device; the other two pin it.
+    val darkTheme = when (settings.theme) {
+        ThemeMode.System -> isSystemInDarkTheme()
+        ThemeMode.Light -> false
+        ThemeMode.Dark -> true
+    }
     val context = LocalContext.current
     val theme = remember(darkTheme) { ZedTheme.load(context, darkTheme) }
     val colorScheme = remember(theme) {
@@ -36,7 +44,10 @@ fun ConquestCodeByEyedTheme(
             error = theme.color("error"),
         )
     }
-    CompositionLocalProvider(LocalZedTheme provides theme) {
+    CompositionLocalProvider(
+        LocalZedTheme provides theme,
+        LocalAppSettings provides settings,
+    ) {
         MaterialTheme(
             colorScheme = colorScheme,
             typography = Typography,

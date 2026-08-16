@@ -22,7 +22,11 @@ data class ProjectTreeRow(val entry: ProjectEntry, val depth: Int)
  * [rebuild] does the JNI reads and JSON parsing, so callers should run it off
  * the main thread and then publish the result with [publish].
  */
-class ProjectTreeState(private val session: ProjectSession) {
+class ProjectTreeState(
+    private val session: ProjectSession,
+    /** When false, gitignored entries are left out of the tree entirely. */
+    private val showIgnored: Boolean = true,
+) {
     /** Project-relative paths of the expanded directories. */
     private val expanded = mutableStateListOf<String>()
 
@@ -66,6 +70,7 @@ class ProjectTreeState(private val session: ProjectSession) {
         // followed) turning a UI refresh into an unbounded walk.
         if (depth > MAX_DEPTH) return
         for (entry in session.children(dir)) {
+            if (entry.isIgnored && !showIgnored) continue
             into += ProjectTreeRow(entry, depth)
             if (entry.isDir && expanded.contains(entry.path)) {
                 appendChildren(entry.path, depth + 1, into)

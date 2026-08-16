@@ -449,6 +449,109 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectEntryPa
     }
 }
 
+// ---------------------------------------------------------------------------
+// Settings. The file is JSONC and hand-editable; writes are surgical so
+// comments survive. All of these touch the filesystem — call them off the
+// main thread.
+// ---------------------------------------------------------------------------
+
+/// Resolved settings as JSON. Falls back to defaults if the file is broken;
+/// pair it with `settingsAreValid` to tell the user rather than silently
+/// showing settings that aren't in effect.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_settings(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let settings = engine().settings();
+    let json = serde_json::to_string(&settings).unwrap_or_else(|err| {
+        log::warn!("settings failed to serialize: {err}");
+        "{}".to_owned()
+    });
+    to_jstring(&env, json)
+}
+
+/// The settings file's raw JSONC text, created with documented defaults on
+/// first use.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_settingsText(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    to_jstring(&env, engine().settings_text())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_settingsAreValid(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    if engine().settings_are_valid() {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Set one setting. `key_path` is dot-separated (`project_panel.show_ignored`)
+/// and `value_json` is the new value as JSON (`true`, `18`, `"dark"`).
+/// Returns the resolved settings as JSON, or null if the write failed.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_setSetting(
+    mut env: JNIEnv,
+    _class: JClass,
+    key_path: JString,
+    value_json: JString,
+) -> jstring {
+    let key_path = get_string(&mut env, &key_path);
+    let value_json = get_string(&mut env, &value_json);
+    let value: serde_json::Value = match serde_json::from_str(&value_json) {
+        Ok(value) => value,
+        Err(err) => {
+            log::warn!("setSetting: {value_json:?} is not JSON: {err}");
+            return std::ptr::null_mut();
+        }
+    };
+    let keys: Vec<&str> = key_path.split('.').collect();
+    match engine().set_setting(&keys, value) {
+        Ok(settings) => match serde_json::to_string(&settings) {
+            Ok(json) => to_jstring(&env, json),
+            Err(err) => {
+                log::warn!("setSetting failed to serialize: {err}");
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            log::warn!("setSetting failed: {err}");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Replace the whole settings file. Returns the resolved settings as JSON, or
+/// null if the text doesn't parse — in which case the file is left untouched.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_setSettingsText(
+    mut env: JNIEnv,
+    _class: JClass,
+    text: JString,
+) -> jstring {
+    let text = get_string(&mut env, &text);
+    match engine().set_settings_text(&text) {
+        Ok(settings) => match serde_json::to_string(&settings) {
+            Ok(json) => to_jstring(&env, json),
+            Err(err) => {
+                log::warn!("setSettingsText failed to serialize: {err}");
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            log::warn!("setSettingsText failed: {err}");
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Fuzzy-match `query` against the project's files, best first, as a JSON
 /// array of objects with `path`, `name`, `positions` (UTF-16 offsets into
 /// `path`) and `score`. An empty query lists files. Never null: unknown

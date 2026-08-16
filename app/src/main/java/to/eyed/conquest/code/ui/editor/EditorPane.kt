@@ -60,6 +60,7 @@ import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
 import kotlinx.coroutines.delay
+import to.eyed.conquest.code.ui.theme.LocalAppSettings
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import to.eyed.conquest.code.ui.theme.ZedTheme
 
@@ -80,19 +81,24 @@ fun EditorPane(
     onSave: (() -> Unit)? = null,
 ) {
     val theme = LocalZedTheme.current
+    val settings = LocalAppSettings.current
+    val fontSize = settings.bufferFontSize.sp
     val textStyle = TextStyle(
         fontFamily = FontFamily.Monospace,
-        fontSize = 14.sp,
+        fontSize = fontSize,
         color = theme.color("editor.foreground"),
     )
     val density = LocalDensity.current
     val measurer = rememberTextMeasurer()
     val layoutCache =
         remember(measurer, textStyle, theme) { TextLayoutCache(measurer, textStyle, theme) }
+    // Line height follows the font so changing the size doesn't cramp or
+    // scatter the lines.
+    val lineHeight = settings.bufferFontSize * 1.45f
 
     with(density) {
         state.updateMetrics(
-            lineHeight = 20.sp.toPx(),
+            lineHeight = lineHeight.sp.toPx(),
             charWidth = layoutCache.layoutFor("M").size.width.toFloat(),
             gutterPadding = 10.dp.toPx(),
             textPadding = 8.dp.toPx(),
@@ -137,7 +143,7 @@ fun EditorPane(
             .scrollable(horizontalScroll, Orientation.Horizontal)
             .focusRequester(focusRequester)
             .editorTextInput(state)
-            .onKeyEvent { event -> handleEditorKey(state, actions, event, onSave) }
+            .onKeyEvent { event -> handleEditorKey(state, actions, event, onSave, settings.tabSize) }
             .focusable()
             .pointerInput(state) {
                 detectDragGesturesAfterLongPress(
@@ -415,6 +421,7 @@ private fun handleEditorKey(
     actions: EditorActions,
     event: KeyEvent,
     onSave: (() -> Unit)?,
+    tabSize: Int,
 ): Boolean {
     if (event.type != KeyEventType.KeyDown) return false
     if (event.isCtrlPressed) {
@@ -449,6 +456,12 @@ private fun handleEditorKey(
         }
         Key.Enter, Key.NumPadEnter -> {
             state.insertAtCursor("\n")
+            true
+        }
+        // Spaces, not a tab character: mixed indentation is a bug factory,
+        // and the width is the user's to choose.
+        Key.Tab -> {
+            state.insertAtCursor(" ".repeat(tabSize))
             true
         }
         Key.DirectionLeft -> {
