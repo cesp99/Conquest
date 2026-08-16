@@ -64,11 +64,18 @@ virtualisation: proot uses `ptrace` to rewrite what the guest sees.
 - **Speed.** proot intercepts system calls, so heavy compilation is slower
   than the same work on a Linux machine. Ordinary shell work feels normal.
 - **Background survival is now handled, within limits.** While a session
-  is running, a notification appears and the app holds a foreground
-  service, which keeps Android from reaping your build when you switch
-  away. It has a **Stop all** action, and swiping the app out of Recents
+  is running the app holds a foreground service, which keeps Android from
+  reaping your build when you switch away. Swiping the app out of Recents
   no longer kills sessions. What it cannot override: the device-wide cap
   on background child processes, and aggressive vendor battery managers.
+
+  That service normally shows a notification, with a **Stop all** action
+  that ends every session. In this edition you may have to turn it on
+  yourself, in Android's app settings for Conquest Code: the edition
+  targets an old API level so that the userland can run at all, and
+  Android will not show the notification permission prompt to an app that
+  does. Until you allow notifications, the service protects your sessions
+  without showing anything.
 
 ## Removing it
 

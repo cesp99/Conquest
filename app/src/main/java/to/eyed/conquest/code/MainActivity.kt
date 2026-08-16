@@ -26,7 +26,7 @@ import to.eyed.conquest.code.ui.workspace.WorkspaceScreen
 
 class MainActivity : ComponentActivity() {
 
-    /** Asked at most once per activity; see [askForNotificationsOnce]. */
+    /** Asked at most once per activity; see [requestNotificationPermission]. */
     private var askedForNotifications = false
 
     private val notificationPermission =

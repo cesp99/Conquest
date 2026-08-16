@@ -359,6 +359,20 @@ fun WorkspaceScreen(
 
     LaunchedEffect(Unit) { rootFocus.requestFocus() }
 
+    // The dock can close without anyone here asking it to: the foreground
+    // service's "Stop all" ends every session from the notification shade, and
+    // the composable that held focus — a TerminalView — simply disappears.
+    // Compose does not hand that focus anywhere, so the whole keymap goes dead:
+    // measured on the Fold, neither Ctrl+` nor Ctrl+P did anything afterwards,
+    // and only clicking the status bar's terminal button brought the app back.
+    // Whenever the dock is not open, focus belongs to the workspace.
+    LaunchedEffect(terminals.isOpen) {
+        if (!terminals.isOpen) {
+            terminalFocused = false
+            rootFocus.requestFocus()
+        }
+    }
+
     BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()

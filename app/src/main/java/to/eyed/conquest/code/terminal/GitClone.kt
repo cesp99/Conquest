@@ -111,9 +111,10 @@ object GitClone {
         launch(context, url, name, installFirst = false, onCloned = onCloned)
 
     /**
-     * `apt-get install -y git` in the guest, then carry on with the clone the
-     * user asked for. Offered instead of failing with "command not found",
-     * which is a dead end the user has no way out of.
+     * `apt-get install -y git ca-certificates` in the guest, then carry on with
+     * the clone the user asked for. Offered instead of failing with "command
+     * not found" or an SSL trust error, both of which are dead ends the user
+     * has no way out of.
      */
     fun installGitAndClone(context: Context, url: String, name: String, onCloned: (String) -> Unit) =
         launch(context, url, name, installFirst = true, onCloned = onCloned)
@@ -140,7 +141,21 @@ object GitClone {
                     if (generation != mine) return@launch
                     state = CloneState.Working(CloneProgress("Preparing", null))
                 }
-                clone(app, url.trim(), name.trim())
+                val outcome = clone(app, url.trim(), name.trim())
+                // apt said it succeeded and the guest still cannot clone.
+                // Offering the same install again would be a loop with no way
+                // out and nothing on screen to explain it, so say what
+                // happened instead.
+                if (installFirst && outcome == CloneState.NeedsGit) {
+                    CloneState.Failed(
+                        "The install finished but the userland still cannot clone",
+                        "apt-get reported success, yet git or $CA_BUNDLE is " +
+                            "still missing inside the userland. Installing them " +
+                            "from the terminal will show why.",
+                    )
+                } else {
+                    outcome
+                }
             }.getOrElse { error ->
                 Log.e(TAG, "clone failed", error)
                 CloneState.Failed("Could not clone", error.message)
@@ -255,7 +270,7 @@ object GitClone {
             gitEnvironment(),
         ) ?: return CloneState.Failed(noUserland(), null)
 
-        if (!hasGit(context, projects)) return CloneState.NeedsGit
+        if (!canClone(context, projects, url)) return CloneState.NeedsGit
 
         val transcript = ArrayDeque<String>()
         val exit = run(command, destination) { record ->
@@ -326,16 +341,27 @@ object GitClone {
         }
 
     /**
-     * Whether the guest can clone over https — which takes more than the git
-     * binary. A rootfs that has git but no CA bundle fails every clone with
-     * "Problem with the SSL CA cert", and offering the install is the only way
-     * out; so the two are one question, not two.
+     * Whether the guest can clone *this* URL.
+     *
+     * More than the git binary, for an `https://` remote: a rootfs with git but
+     * no CA bundle fails every one of those with "Problem with the SSL CA cert",
+     * and offering the install is the only way out, so for them the two are one
+     * question.
+     *
+     * Only for those, though. ssh remotes go through `GIT_SSH_COMMAND` and a
+     * local path touches no network at all; demanding a trust store they never
+     * read would refuse a clone that works, and send the user to an `apt-get
+     * update` that cannot even run offline.
      */
-    private fun hasGit(context: Context, projects: File): Boolean {
+    private fun canClone(context: Context, projects: File, url: String): Boolean {
+        val test = StringBuilder("command -v git >/dev/null")
+        if (url.trim().startsWith("https://", ignoreCase = true)) {
+            test.append(" && [ -s $CA_BUNDLE ]")
+        }
         val command = Userland.backend.execCommand(
             context,
             projects.absolutePath,
-            listOf("/bin/sh", "-c", "command -v git >/dev/null && [ -s $CA_BUNDLE ]"),
+            listOf("/bin/sh", "-c", test.toString()),
         ) ?: return false
         return runCatching { run(command, destination = null) { } == 0 }.getOrDefault(false)
     }
@@ -460,7 +486,10 @@ sealed interface CloneState {
 
     data class Working(val progress: CloneProgress) : CloneState
 
-    /** The guest has no git; the user is offered the install rather than an error. */
+    /**
+     * The guest cannot clone this URL yet — no git, or no CA bundle for an
+     * `https://` one. The user is offered the install rather than an error.
+     */
     data object NeedsGit : CloneState
 
     data class InstallingGit(val step: String) : CloneState

@@ -305,7 +305,7 @@ fn status_for(
 /// Keeping this query from writing `index.lock` is `--no-optional-locks`,
 /// which is *git's* option and not `git status`'s: passed after the
 /// subcommand, real git exits 129 with "unknown option", every run produces
-/// nothing, and the panel is silently colourless. It lives in [`capture`],
+/// nothing, and the panel is silently colourless. It lives in [`git_argv`],
 /// before the subcommand, next to the other git-level flags.
 ///
 /// `--ignored` is *not* passed. It would list every file under `target/` and
@@ -1065,6 +1065,13 @@ mod tests {
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            // Run the suite from a git hook or `git rebase --exec` and these
+            // are set, pointing every `git` below at the *outer* repository:
+            // the argv would be accepted, the paths would be someone else's,
+            // and the failure would read as an argv bug.
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
             .env("GIT_COMMITTER_NAME", "test")

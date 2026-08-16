@@ -12,9 +12,13 @@
     property explaining why to whoever reviews it.
 
   POST_NOTIFICATIONS lives in the main manifest instead: both flavours ask
-  for it, because both want the service's notification visible. Without it
-  the service still runs and still protects the session; only its
-  notification is hidden.
+  for it, because both want the service's notification visible. Only this
+  one is actually shown the dialog, though — Android does not offer it to
+  an app targeting API 32 or lower, so in the `full` flavour the user has
+  to allow notifications from system settings (measured on the Fold; see
+  MainActivity.requestNotificationPermission). Without the permission the
+  service still runs and still protects the session; only its notification
+  is hidden.
 
   The `full` flavour targets API 28 and is exempt from the service-type
   requirement, which is why it does not appear in the main manifest.
