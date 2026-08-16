@@ -21,11 +21,69 @@ embeds it. One Gradle command builds both.
   cargo install cargo-ndk
   ```
 
+## Editions (build flavours)
+
+Conquest Code builds in two editions from one source tree. They differ in
+**one setting**, `targetSdk`, and everything else follows from it:
+
+| | `full` | `play` |
+|---|---|---|
+| `targetSdk` | 28 | 37 |
+| Linux userland (Debian, `apt`) | ✅ | ❌ |
+| `INTERNET` permission | ✅ (to fetch the rootfs) | ❌ |
+| Terminal | Debian `bash`, or Android's `sh` before the rootfs is installed | Android's `sh` (mksh) + toybox |
+| Where it can ship | F-Droid, direct APK download | Google Play, and anywhere else |
+
+Android only executes programs that arrived through the package installer.
+At a modern `targetSdk` that means a downloaded program can never run — so
+`apt`, and any package manager like it, is impossible. `targetSdk 28` keeps
+the app in an older SELinux domain where that restriction does not apply,
+which is what makes the Debian userland possible, and is also why Google
+Play cannot accept such a build: Play requires a target SDK within about a
+year of the current release.
+
+The split is in `app/build.gradle.kts` (`productFlavors`), and the code that
+differs lives in exactly two files, one per flavour source set:
+
+```
+app/src/full/java/…/terminal/DebianUserland.kt   downloads and runs Debian
+app/src/play/java/…/terminal/PlayUserland.kt     says "no userland here"
+app/src/main/java/…/terminal/Userland.kt         the interface both satisfy
+app/src/full/AndroidManifest.xml                 adds INTERNET
+app/src/full/jniLibs/<abi>/libproot_exec.so      proot, built by tools/build-proot.sh
+```
+
+Everything above that interface — the terminal, the session layer, the
+editor, the engine — is identical in both editions.
+
 ## Build
 
 ```sh
-./gradlew assembleDebug
+./gradlew assembleFullDebug     # the edition with the Debian userland
+./gradlew assemblePlayDebug     # the Play-compatible edition
+./gradlew assembleDebug         # both
 ```
+
+Release builds follow the same pattern (`assembleFullRelease`,
+`assemblePlayRelease`), and `installFullDebug` / `installPlayDebug` push to
+a connected device. Instrumented tests need the flavour too:
+`connectedFullDebugAndroidTest`.
+
+### proot, for the `full` edition
+
+The Debian userland needs `proot`, which is not in this repository as
+source: `tools/build-proot.sh` fetches it (and talloc) with checksums,
+cross-compiles both for `arm64-v8a` and `x86_64`, and writes the result to
+`app/src/full/jniLibs/<abi>/libproot_exec.so`. The binaries are committed,
+so an ordinary build needs no extra steps; run the script only to update or
+rebuild them:
+
+```sh
+tools/build-proot.sh            # or --clean to start from scratch
+```
+
+Both proot and talloc are GPL-2.0-or-later. See docs/THIRD_PARTY.md for
+provenance and the source offer that obligation implies.
 
 The `cargoNdkBuild` Gradle task cross-compiles `core/` to
 `libconquestcore.so` for each supported ABI and drops it into
@@ -50,9 +108,9 @@ engine is by far the largest thing in the package and no device can use
 more than one architecture's copy:
 
 ```
-app/build/outputs/apk/debug/app-arm64-v8a-debug.apk    ← real devices
-app/build/outputs/apk/debug/app-x86_64-debug.apk       ← emulators
-app/build/outputs/apk/debug/app-universal-debug.apk    ← both
+app/build/outputs/apk/full/debug/app-full-arm64-v8a-debug.apk    ← real devices
+app/build/outputs/apk/full/debug/app-full-x86_64-debug.apk       ← emulators
+app/build/outputs/apk/full/debug/app-full-universal-debug.apk    ← both
 ```
 
 Release builds additionally run R8 (code shrinking + obfuscation) and

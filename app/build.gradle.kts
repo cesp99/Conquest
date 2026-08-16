@@ -19,11 +19,32 @@ android {
     defaultConfig {
         applicationId = "to.eyed.conquest.code"
         minSdk = 31
-        targetSdk = 37
         versionCode = 1
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    // Two editions of the same app, differing in one thing that changes
+    // everything downstream: whether Android will let a downloaded program
+    // run. See docs/BUILDING.md and agent-docs/DECISIONS.md.
+    flavorDimensions += "distribution"
+    productFlavors {
+        create("full") {
+            dimension = "distribution"
+            // The old SELinux domain still permits executing files from app
+            // storage, which is what a Debian userland under proot needs.
+            // Measured on Android 17; see research/android-exec-policy.md.
+            targetSdk = 28
+            versionNameSuffix = "-full"
+            buildConfigField("boolean", "USERLAND", "true")
+        }
+        create("play") {
+            dimension = "distribution"
+            targetSdk = 37
+            versionNameSuffix = "-play"
+            buildConfigField("boolean", "USERLAND", "false")
+        }
     }
 
     buildTypes {
@@ -71,6 +92,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 

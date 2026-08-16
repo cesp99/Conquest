@@ -1,0 +1,76 @@
+package to.eyed.conquest.code.terminal
+
+import android.content.Context
+
+/**
+ * The Linux userland a terminal session can run inside.
+ *
+ * Android will not execute a program that arrived after installation, which is
+ * why a package manager is impossible on a modern target SDK. The `full`
+ * flavour targets SDK 28, where that restriction does not apply, and runs a
+ * real Debian under proot: `apt install` works, and we maintain none of it.
+ * The `play` flavour has no userland at all and falls back to Android's own
+ * shell. See docs/BUILDING.md for what differs between the two, and
+ * agent-docs/DECISIONS.md for why.
+ *
+ * Everything above this interface is flavour-agnostic: the terminal asks for a
+ * command to run and gets one, whether that is `proot … /bin/bash` or plain
+ * `/system/bin/sh`.
+ */
+sealed interface UserlandState {
+    /** This build has no userland support. The `play` flavour, always. */
+    data object Unsupported : UserlandState
+
+    /** Supported, but the rootfs has not been downloaded yet. */
+    data object NotInstalled : UserlandState
+
+    /** [fraction] is null while the step's size is unknown. */
+    data class Installing(val step: String, val fraction: Float?) : UserlandState
+
+    data object Ready : UserlandState
+
+    data class Failed(val message: String) : UserlandState
+}
+
+/** What the terminal needs to start a session. */
+data class ShellCommand(
+    /** Absolute path of the executable to run. */
+    val executable: String,
+    /** Full argv, including argv[0]. */
+    val argv: List<String>,
+    /** Complete environment as `NAME=value`; the pty shim clears everything else. */
+    val environment: List<String>,
+)
+
+interface UserlandBackend {
+    /** False in builds that cannot run a userland, so the UI can stay quiet. */
+    val isSupported: Boolean
+
+    /** What to call it in the UI — "Debian", say. */
+    val displayName: String
+
+    /** Rough download size, for the install prompt. Null when unsupported. */
+    val downloadDescription: String?
+
+    fun state(context: Context): UserlandState
+
+    /**
+     * A session running inside the userland, with [projectDir] visible, or
+     * null when there is nothing installed and the host shell should be used.
+     */
+    fun shellCommand(context: Context, projectDir: String): ShellCommand?
+
+    /**
+     * Download and unpack the rootfs. Blocking; call it off the main thread.
+     * Progress arrives as a human-readable step and an optional fraction.
+     */
+    fun install(context: Context, onProgress: (String, Float?) -> Unit): Result<Unit>
+
+    /** Delete the rootfs, freeing its disk. */
+    fun remove(context: Context)
+}
+
+/** The backend this build was compiled with; see the flavour source sets. */
+object Userland {
+    val backend: UserlandBackend by lazy { createUserlandBackend() }
+}

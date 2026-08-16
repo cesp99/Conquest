@@ -24,10 +24,10 @@ agents as first-class citizens through the
 - **Built for big and small screens.** Foldables and tablets get a full
   workspace (project panel, splits, docks); phones get a slimmer,
   focused layout. Same app, adaptive UI.
-- **Terminal included.** An embedded terminal emulator (building on the
-  excellent work of [Termux](https://termux.dev)) with on-device shells
-  and toolchains, shipped Play-compatibly inside the APK's native
-  library directory.
+- **A real Linux userland.** The terminal runs a genuine Debian through
+  `proot` — `apt install` whatever you need, from Debian's own
+  repositories, on your phone. The terminal emulation builds on the
+  excellent work of [Termux](https://termux.dev).
 - **AI-native via ACP.** Any ACP-speaking agent (Claude Code, Gemini
   CLI, custom agents) can run against your project, with the same
   panel-based agent UX Zed pioneered.
@@ -64,8 +64,23 @@ Samsung DeX.
 | Fuzzy file finder | ✅ Ctrl+P, match highlighting |
 | Settings | ✅ JSONC file that keeps your comments, settings screen |
 | Integrated terminal | ✅ shells in the project directory, tabs, theme colours, keyboard/mouse/touch |
+| Debian userland (`apt`) | ✅ in the `full` edition — installs on demand, ~30 MB |
 | LSP on-device | ⬜ planned |
 | ACP agent panel | ⬜ planned |
+
+## Editions
+
+Two builds come out of this repository, and the difference is worth
+knowing before you download one:
+
+- **`full`** — includes the Debian userland, so `apt` works. Android only
+  permits that at an older target SDK, which Google Play does not accept,
+  so this edition comes from F-Droid or a direct APK.
+- **`play`** — Play-compatible. Everything else is identical; the terminal
+  runs Android's own shell and there is no `apt`.
+
+See [docs/BUILDING.md](docs/BUILDING.md) for the details and
+[docs/USERLAND.md](docs/USERLAND.md) for what the userland can do.
 
 ## Contributing
 
@@ -86,8 +101,15 @@ Conquest Code is licensed under **GPL-3.0-or-later** (see
   — its `terminal-emulator` and `terminal-view` libraries are vendored
   here under `vendor/`, and its work is the reference for running a real
   userland on Android.
+- **[proot](https://github.com/termux/proot)** (GPL-2.0) — the userspace
+  chroot that lets a Linux distribution run without root.
+- **[Debian](https://www.debian.org)** — the userland itself, and the
+  package archive behind it.
 - **[VSCodium](https://github.com/VSCodium/vscodium)** (MIT) — proof
   that a community can keep an IDE honest.
 
+Full provenance, licences and the source offer for the binaries we ship
+are in [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).
+
 This project is not affiliated with or endorsed by Zed Industries,
-Termux, or VSCodium.
+Termux, Debian, or VSCodium.

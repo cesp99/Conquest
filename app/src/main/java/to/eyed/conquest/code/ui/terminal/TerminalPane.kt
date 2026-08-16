@@ -19,6 +19,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -27,6 +28,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -41,12 +43,17 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TextStyle
 import com.termux.view.TerminalView
 import com.termux.view.TerminalViewClient
 import to.eyed.conquest.code.terminal.TerminalPanelState
 import to.eyed.conquest.code.terminal.TerminalSessionHost
+import to.eyed.conquest.code.terminal.Userland
+import to.eyed.conquest.code.terminal.UserlandState
 import to.eyed.conquest.code.ui.theme.ZedTheme
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import to.eyed.conquest.code.ui.workspace.Focus
@@ -153,6 +160,33 @@ fun TerminalDock(
             onHide = { onCommand(WorkspaceCommand.ToggleTerminal) },
         )
         HorizontalDivider()
+
+        // The userland offer. Absent in builds without one, and once Debian is
+        // installed there is nothing to say.
+        val scope = rememberCoroutineScope()
+        var userland by remember { mutableStateOf(Userland.backend.state(context)) }
+        if (userland !is UserlandState.Ready && userland !is UserlandState.Unsupported) {
+            UserlandBanner(
+                state = userland,
+                onInstall = {
+                    scope.launch {
+                        val result = withContext(Dispatchers.IO) {
+                            Userland.backend.install(context) { step, fraction ->
+                                userland = UserlandState.Installing(step, fraction)
+                            }
+                        }
+                        userland = result.fold(
+                            onSuccess = { UserlandState.Ready },
+                            onFailure = { UserlandState.Failed(it.message ?: "install failed") },
+                        )
+                        // Re-enter the shell so this session lands in Debian
+                        // rather than the fallback it started in.
+                        if (result.isSuccess) host.restart()
+                    }
+                },
+            )
+            HorizontalDivider()
+        }
 
         // The renderer draws from x=0, so the padding has to come from here or
         // the first column sits against the window edge.
@@ -277,6 +311,64 @@ private fun TerminalHeader(
         }
         HeaderAction(label = "+", onClick = onNew)
         HeaderAction(label = "⌄", onClick = onHide)
+    }
+}
+
+/**
+ * Offers the Linux userland, and reports on it while it installs.
+ *
+ * Deliberately not a modal: the terminal below is a working shell already, and
+ * a 30 MB download is not worth blocking on.
+ */
+@Composable
+private fun UserlandBanner(state: UserlandState, onInstall: () -> Unit) {
+    val theme = LocalZedTheme.current
+    val backend = Userland.backend
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(theme.color("status_bar.background"))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            val message = when (state) {
+                is UserlandState.NotInstalled ->
+                    "Install ${backend.displayName} for apt and a full Linux toolchain " +
+                        "(${backend.downloadDescription})"
+                is UserlandState.Installing -> state.step + "…"
+                is UserlandState.Failed -> "Install failed: ${state.message}"
+                else -> ""
+            }
+            Text(
+                text = message,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            if (state !is UserlandState.Installing) {
+                Text(
+                    text = if (state is UserlandState.Failed) "Retry" else "Install",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier
+                        .pointerHoverIcon(PointerIcon.Hand)
+                        .clickable(onClick = onInstall)
+                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                )
+            }
+        }
+        if (state is UserlandState.Installing) {
+            val fraction = state.fraction
+            if (fraction == null) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(top = 4.dp))
+            } else {
+                LinearProgressIndicator(
+                    progress = { fraction },
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                )
+            }
+        }
     }
 }
 

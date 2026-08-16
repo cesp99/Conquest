@@ -23,8 +23,10 @@ import java.io.File
  * 2. Nothing the user or a package downloads can ever be executed. Bundled
  *    interpreters running data files are the whole story for extensibility.
  *
- * Until P4-3 bundles a shell, the device's own is used: `/system/bin/sh` is
- * mksh, and toybox puts ~210 commands on `PATH` for free.
+ * This describes the *host* side. When a Linux userland is installed the
+ * terminal runs inside that instead (see [Userland]), and this is the
+ * fallback: `/system/bin/sh` is mksh, and toybox puts ~210 commands on `PATH`
+ * for free, so the terminal is useful with nothing installed at all.
  */
 object ShellEnvironment {
 
@@ -33,7 +35,11 @@ object ShellEnvironment {
     /** Bundled executables are packaged under this pattern. */
     private val EXEC_LIB = Regex("""^lib(.+)_exec\.so$""")
 
-    /** The shell we prefer, once P4-3 bundles it. */
+    /**
+     * Preferred host shell if some build ever ships one. Nothing bundles a
+     * shell today — the userland brings its own — but the lookup costs
+     * nothing and keeps the mechanism honest.
+     */
     private const val BUNDLED_SHELL = "bash"
 
     /** Always present on Android, and a real interactive shell (mksh). */
@@ -80,13 +86,33 @@ object ShellEnvironment {
     }
 
     /**
-     * The shell to run: the bundled one if this build has it, else the
-     * device's. Returned as its `$PREFIX/bin` path so that what the user sees
-     * in `$SHELL` is a path that still exists tomorrow.
+     * The shell to run on the *host* side: the bundled one if this build has
+     * it, else the device's. Returned as its `$PREFIX/bin` path so that what
+     * the user sees in `$SHELL` is a path that still exists tomorrow.
      */
     fun shellPath(context: Context): String {
         val bundled = File(binDir(context), BUNDLED_SHELL)
         return if (bundled.exists()) bundled.absolutePath else SYSTEM_SHELL
+    }
+
+    /**
+     * What a terminal session should actually run in [cwd].
+     *
+     * A Linux userland takes precedence when one is installed — that is the
+     * whole point of it — and the host shell is the fallback, so the terminal
+     * works on a fresh install, in the `play` flavour, and while Debian is
+     * still downloading.
+     */
+    fun commandFor(context: Context, cwd: String): ShellCommand {
+        Userland.backend.shellCommand(context, cwd)?.let { return it }
+
+        installBinDir(context)
+        val shell = shellPath(context)
+        return ShellCommand(
+            executable = shell,
+            argv = listOf(File(shell).name),
+            environment = buildEnvironment(context, cwd).toList(),
+        )
     }
 
     /**

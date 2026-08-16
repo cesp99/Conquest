@@ -102,13 +102,27 @@ flavor-specific capability.
 
 ## On-device execution (terminals, LSP servers, agents)
 
-Android 10+ forbids executing files from an app's writable data
-directory (W^X). Termux dodges this by targeting SDK 28; Conquest Code
-instead targets modern SDKs and uses the Play-compatible approach:
-executables ship inside the APK as `lib<name>.so` files in the native
-library directory, which remains executable at any target SDK
-(`extractNativeLibs=true`). Core tools (shell, busybox, common language
-servers) are bundled; an optional package layer can add more later.
+Android only executes programs that arrived through the package installer.
+On a modern target SDK that rules out any package manager: a downloaded
+binary cannot run, whatever permissions it is given. This shapes the whole
+tooling story, and the project answers it with two editions (see
+[BUILDING.md](BUILDING.md)).
+
+The **`full`** edition targets SDK 28, where the restriction does not
+apply, and runs a real **Debian** through
+[proot](https://github.com/termux/proot): the rootfs is downloaded on first
+use into app-private storage, proot fakes the filesystem layout its
+binaries expect, and `apt install` works against Debian's own servers. The
+project directory is bound into the namespace, so the shell and the editor
+see the same files. Nothing about the packages is maintained by this
+project — that is the point of borrowing a distribution. See
+[USERLAND.md](USERLAND.md).
+
+The **`play`** edition keeps a modern target SDK and has no userland. Its
+terminal runs Android's own shell (mksh, with toybox's ~210 commands), and
+anything else it needs must be compiled into the APK as a
+`lib<name>_exec.so` in the native library directory, which stays executable
+at any target SDK.
 
 Terminal emulation builds on Termux's cleanly decoupled
 `terminal-emulator` / `terminal-view` libraries (GPL-compatible),

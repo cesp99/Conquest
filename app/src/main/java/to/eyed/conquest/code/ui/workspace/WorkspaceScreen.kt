@@ -10,12 +10,14 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
@@ -55,6 +57,8 @@ import to.eyed.conquest.code.core.ProjectsRoot
 import to.eyed.conquest.code.core.SafTransfer
 import java.io.File
 import to.eyed.conquest.code.terminal.TerminalPanelState
+import to.eyed.conquest.code.terminal.Userland
+import to.eyed.conquest.code.terminal.UserlandState
 import to.eyed.conquest.code.ui.editor.EditorPane
 import to.eyed.conquest.code.ui.editor.EditorState
 import to.eyed.conquest.code.ui.terminal.TerminalDock
@@ -112,6 +116,9 @@ fun WorkspaceScreen(
     val terminals = remember { TerminalPanelState() }
     var terminalFocused by remember { mutableStateOf(false) }
     var dockHeight by remember { mutableStateOf(TerminalDockHeight) }
+    // Removing the Linux userland throws away ~100 MB and everything installed
+    // into it, so it confirms first — same rule as deleting a project.
+    var removeUserlandOpen by remember { mutableStateOf(false) }
     DisposableEffect(terminals) {
         onDispose { terminals.closeAll() }
     }
@@ -392,10 +399,11 @@ fun WorkspaceScreen(
                 MenuAction("New terminal", "Ctrl Shift `", enabled = project != null) {
                     runCommand(WorkspaceCommand.NewTerminal)
                 },
+
                 MenuAction("Settings…", "Ctrl ,") {
                     runCommand(WorkspaceCommand.OpenSettings)
                 },
-            ),
+            ) + userlandActions(context) { removeUserlandOpen = true },
         )
 
         Column(modifier = Modifier.fillMaxSize()) {
@@ -550,6 +558,34 @@ fun WorkspaceScreen(
         )
     }
 
+    if (removeUserlandOpen) {
+        val name = Userland.backend.displayName
+        AlertDialog(
+            onDismissRequest = { removeUserlandOpen = false },
+            title = { Text("Remove the $name userland?") },
+            text = {
+                Text(
+                    "Everything installed with apt is deleted and the terminal " +
+                        "goes back to Android's own shell. Your projects are not " +
+                        "part of the userland and are left alone."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    removeUserlandOpen = false
+                    scope.launch {
+                        // Sessions are running inside it; they have to go first.
+                        terminals.closeAll()
+                        withContext(Dispatchers.IO) { Userland.backend.remove(context) }
+                    }
+                }) { Text("Remove") }
+            },
+            dismissButton = {
+                TextButton(onClick = { removeUserlandOpen = false }) { Text("Cancel") }
+            },
+        )
+    }
+
     if (pickerOpen) {
         ProjectPicker(
             projects = projects,
@@ -646,3 +682,19 @@ private fun EditorArea(
         }
     }
 }
+
+/**
+ * The userland entry, or nothing at all in a build that has no userland —
+ * an editor should not advertise a feature it cannot perform.
+ */
+private fun userlandActions(
+    context: android.content.Context,
+    onRemove: () -> Unit,
+): List<MenuAction> =
+    if (Userland.backend.state(context) is UserlandState.Ready) {
+        listOf(
+            MenuAction("Remove ${Userland.backend.displayName} userland…", null) { onRemove() }
+        )
+    } else {
+        emptyList()
+    }

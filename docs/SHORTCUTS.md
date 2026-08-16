@@ -66,7 +66,9 @@ and htop need them. The workspace keeps only these:
 | `Ctrl` `Shift` `S` / `P` / `O` / `B` / `,` | Save, find file, projects, project panel, settings |
 
 Sessions start in the project directory and keep running while the
-terminal is hidden. They close when you switch projects.
+terminal is hidden. They close when you switch projects. In the `full`
+edition the shell runs inside Debian once you install it — see
+[USERLAND.md](USERLAND.md).
 
 ## Mouse
 

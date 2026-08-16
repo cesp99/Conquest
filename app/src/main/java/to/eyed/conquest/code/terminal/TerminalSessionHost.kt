@@ -10,7 +10,6 @@ import androidx.compose.runtime.setValue
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalView
-import java.io.File
 
 /**
  * One shell session, and the bridge between the vendored terminal and Compose.
@@ -45,14 +44,19 @@ class TerminalSessionHost(
     /** The view currently showing this session, if it is the visible one. */
     private var view: TerminalView? = null
 
-    private fun startSession(): TerminalSession = TerminalSession(
-        ShellEnvironment.shellPath(context),
-        cwd,
-        arrayOf(File(ShellEnvironment.shellPath(context)).name),
-        ShellEnvironment.buildEnvironment(context, cwd),
-        TRANSCRIPT_ROWS,
-        this,
-    )
+    private fun startSession(): TerminalSession {
+        // Either a shell inside the Linux userland or the host's own — see
+        // ShellEnvironment.commandFor.
+        val command = ShellEnvironment.commandFor(context, cwd)
+        return TerminalSession(
+            command.executable,
+            cwd,
+            command.argv.toTypedArray(),
+            command.environment.toTypedArray(),
+            TRANSCRIPT_ROWS,
+            this,
+        )
+    }
 
     fun attach(view: TerminalView) {
         this.view = view
