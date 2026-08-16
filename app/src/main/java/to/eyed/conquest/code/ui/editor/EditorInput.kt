@@ -77,9 +77,18 @@ internal class EditorTextInputNode(
                             EditorInfo.TYPE_TEXT_FLAG_AUTO_CORRECT
                         outAttributes.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN or
                             EditorInfo.IME_FLAG_NO_ENTER_ACTION
-                        val col = state.cursorCol.coerceAtMost(state.currentLine().length)
-                        outAttributes.initialSelStart = col
-                        outAttributes.initialSelEnd = col
+                        val lineLength = state.currentLine().length
+                        val range = state.selectionRange()
+                        if (range != null && !range.isMultiLine) {
+                            outAttributes.initialSelStart =
+                                range.startCol.coerceAtMost(lineLength)
+                            outAttributes.initialSelEnd =
+                                range.endCol.coerceAtMost(lineLength)
+                        } else {
+                            val col = state.cursorCol.coerceAtMost(lineLength)
+                            outAttributes.initialSelStart = col
+                            outAttributes.initialSelEnd = col
+                        }
                         // The platform may keep issuing calls on the old
                         // connection after a restart; close it so a stale
                         // shadow can never clobber the buffer.
@@ -124,7 +133,7 @@ private class EditorInputConnection(
     private val state: EditorState,
 ) : BaseInputConnection(view, true) {
 
-    private val row = state.cursorRow
+    private var row = state.cursorRow
     private val shadow = SpannableStringBuilder(state.currentLine())
     private var batchDepth = 0
 
@@ -136,11 +145,37 @@ private class EditorInputConnection(
     private var closed = false
 
     init {
-        Selection.setSelection(shadow, state.cursorCol.coerceAtMost(shadow.length))
+        // Seed a single-line selection into the shadow so IME input
+        // replaces it natively; multi-line selections are collapsed lazily
+        // in prepareForEdit().
+        val range = state.selectionRange()
+        if (range != null && !range.isMultiLine && range.startRow == row) {
+            Selection.setSelection(
+                shadow,
+                range.startCol.coerceAtMost(shadow.length),
+                range.endCol.coerceAtMost(shadow.length),
+            )
+        } else {
+            Selection.setSelection(shadow, state.cursorCol.coerceAtMost(shadow.length))
+        }
     }
 
     fun close() {
         closed = true
+    }
+
+    /**
+     * A multi-line selection can't live in the one-line shadow: on the
+     * first mutating IME op, delete it in the engine and re-seed the shadow
+     * from the collapsed cursor line, so the op applies there — no
+     * keystroke is lost.
+     */
+    private fun prepareForEdit() {
+        if (state.selectionRange()?.isMultiLine != true) return
+        state.deleteSelection()
+        row = state.cursorRow
+        shadow.replace(0, shadow.length, state.currentLine())
+        Selection.setSelection(shadow, state.cursorCol.coerceAtMost(shadow.length))
     }
 
     override fun getEditable(): Editable = shadow
@@ -158,11 +193,13 @@ private class EditorInputConnection(
 
     override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
         if (closed) return false
+        prepareForEdit()
         return super.commitText(text, newCursorPosition).also { maybeSync() }
     }
 
     override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
         if (closed) return false
+        prepareForEdit()
         return super.setComposingText(text, newCursorPosition).also { maybeSync() }
     }
 
@@ -183,6 +220,7 @@ private class EditorInputConnection(
 
     override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
         if (closed) return false
+        prepareForEdit()
         val selStart = Selection.getSelectionStart(shadow)
         if (beforeLength > 0 && selStart == 0 && Selection.getSelectionEnd(shadow) == 0) {
             // Backspace at column 0: join with the previous line. The

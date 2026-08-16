@@ -37,6 +37,40 @@ class EditorState(val session: BufferSession) {
     var cursorCol by mutableIntStateOf(0)
         private set
 
+    // Selection anchor; -1 row = no anchor. The selection is always
+    // anchor..cursor (either order). Selection state lives here — the
+    // EditorState is the per-pane view layer, same as Zed's Editor (Zed's
+    // text::Buffer doesn't own selections either).
+    var selectionAnchorRow by mutableIntStateOf(-1)
+        private set
+    var selectionAnchorCol by mutableIntStateOf(0)
+        private set
+
+    val hasSelection: Boolean
+        get() = selectionAnchorRow >= 0 &&
+            (selectionAnchorRow != cursorRow || selectionAnchorCol != cursorCol)
+
+    /** Normalized selection: start is always before end. */
+    data class SelectionRange(
+        val startRow: Int,
+        val startCol: Int,
+        val endRow: Int,
+        val endCol: Int,
+    ) {
+        val isMultiLine: Boolean get() = startRow != endRow
+    }
+
+    fun selectionRange(): SelectionRange? {
+        if (!hasSelection) return null
+        val anchorFirst = selectionAnchorRow < cursorRow ||
+            (selectionAnchorRow == cursorRow && selectionAnchorCol <= cursorCol)
+        return if (anchorFirst) {
+            SelectionRange(selectionAnchorRow, selectionAnchorCol, cursorRow, cursorCol)
+        } else {
+            SelectionRange(cursorRow, cursorCol, selectionAnchorRow, selectionAnchorCol)
+        }
+    }
+
     /** Not snapshot state: refreshed from the engine in [refreshLineCount]. */
     var lineCount: Int = session.lineCount
         private set
@@ -195,18 +229,154 @@ class EditorState(val session: BufferSession) {
         return consumed
     }
 
+    /** (row, UTF-16 col) at a pane-local pixel position. */
+    fun positionAt(point: Offset, layoutForLine: (String) -> TextLayoutResult): Pair<Int, Int> {
+        val row = ((point.y + scrollY) / lineHeightPx).toInt().coerceIn(0, lineCount - 1)
+        val xInText = point.x - gutterWidthPx - textPaddingPx + scrollX
+        val layout = layoutForLine(line(row))
+        return row to layout.getOffsetForPosition(Offset(xInText.coerceAtLeast(0f), 0f))
+    }
+
     /**
-     * Move the cursor to the position tapped at [tap] (pane-local pixels).
-     * [layoutForLine] measures a line's text so the horizontal hit can land
-     * between the right glyphs.
+     * Move the cursor to the position tapped at [tap] (pane-local pixels),
+     * clearing any selection. [layoutForLine] measures a line's text so
+     * the horizontal hit can land between the right glyphs.
      */
     fun moveCursorTo(tap: Offset, layoutForLine: (String) -> TextLayoutResult) {
-        val row = ((tap.y + scrollY) / lineHeightPx).toInt().coerceIn(0, lineCount - 1)
-        val xInText = tap.x - gutterWidthPx - textPaddingPx + scrollX
-        val layout = layoutForLine(line(row))
+        val (row, col) = positionAt(tap, layoutForLine)
+        clearSelection()
         cursorRow = row
-        cursorCol = layout.getOffsetForPosition(Offset(xInText.coerceAtLeast(0f), 0f))
+        cursorCol = col
         onCursorChangedExternally?.invoke()
+    }
+
+    // ---- Selection -------------------------------------------------------
+
+    fun clearSelection() {
+        selectionAnchorRow = -1
+        selectionAnchorCol = 0
+    }
+
+    /**
+     * Move one selection endpoint during a drag: the cursor end follows the
+     * pointer while the anchor stays. If [movingStart] the drag started on
+     * the start handle, so anchor and cursor are swapped as needed.
+     */
+    fun dragSelectionEndTo(
+        point: Offset,
+        movingStart: Boolean,
+        layoutForLine: (String) -> TextLayoutResult,
+    ) {
+        val range = selectionRange() ?: return
+        val (row, col) = positionAt(point, layoutForLine)
+        if (movingStart) {
+            selectionAnchorRow = range.endRow
+            selectionAnchorCol = range.endCol
+        } else {
+            selectionAnchorRow = range.startRow
+            selectionAnchorCol = range.startCol
+        }
+        cursorRow = row
+        cursorCol = col
+        onCursorChangedExternally?.invoke()
+    }
+
+    /** Extend (or start) a selection from the current cursor to [point]. */
+    fun extendSelectionTo(point: Offset, layoutForLine: (String) -> TextLayoutResult) {
+        if (selectionAnchorRow < 0) {
+            selectionAnchorRow = cursorRow
+            selectionAnchorCol = cursorCol
+        }
+        val (row, col) = positionAt(point, layoutForLine)
+        cursorRow = row
+        cursorCol = col
+        onCursorChangedExternally?.invoke()
+    }
+
+    /** Select the word (or symbol run) at a pane-local pixel position. */
+    fun selectWordAt(point: Offset, layoutForLine: (String) -> TextLayoutResult) {
+        val (row, col) = positionAt(point, layoutForLine)
+        val line = line(row)
+        if (line.isEmpty()) {
+            cursorRow = row
+            cursorCol = 0
+            clearSelection()
+            onCursorChangedExternally?.invoke()
+            return
+        }
+        val at = col.coerceIn(0, line.length - 1)
+        // Expand over a run of the same character class (word chars,
+        // whitespace, or other symbols).
+        fun charClass(c: Char): Int = when {
+            c.isLetterOrDigit() || c == '_' -> 0
+            c.isWhitespace() -> 1
+            else -> 2
+        }
+        val target = charClass(line[at])
+        var start = at
+        while (start > 0 && charClass(line[start - 1]) == target) start--
+        var end = at + 1
+        while (end < line.length && charClass(line[end]) == target) end++
+        selectionAnchorRow = row
+        selectionAnchorCol = start
+        cursorRow = row
+        cursorCol = end
+        onCursorChangedExternally?.invoke()
+    }
+
+    fun selectAll() {
+        selectionAnchorRow = 0
+        selectionAnchorCol = 0
+        cursorRow = lineCount - 1
+        cursorCol = currentLine().length
+        onCursorChangedExternally?.invoke()
+    }
+
+    /** The selected text, or "" without a selection. */
+    fun selectionText(): String {
+        val range = selectionRange() ?: return ""
+        val lines = CoreBridge
+            .bufferLines(session.id, range.startRow.toLong(), range.endRow.toLong() + 1)
+            .orEmpty()
+            .split('\n')
+        if (lines.isEmpty()) return ""
+        if (!range.isMultiLine) {
+            val line = lines[0]
+            return line.substring(
+                range.startCol.coerceAtMost(line.length),
+                range.endCol.coerceAtMost(line.length),
+            )
+        }
+        return buildString {
+            append(lines.first().substring(range.startCol.coerceAtMost(lines.first().length)))
+            for (i in 1 until lines.size - 1) {
+                append('\n')
+                append(lines[i])
+            }
+            append('\n')
+            append(lines.last().substring(0, range.endCol.coerceAtMost(lines.last().length)))
+        }
+    }
+
+    /** Delete the selected range; cursor lands at its start. */
+    fun deleteSelection(): Boolean {
+        val range = selectionRange() ?: return false
+        val start = byteOffsetOf(range.startRow, range.startCol)
+        val end = byteOffsetOf(range.endRow, range.endCol)
+        clearSelection()
+        if (end > start) session.editBytes(start, end, "")
+        refreshLineCount()
+        cursorRow = range.startRow
+        cursorCol = range.startCol
+        ensureCursorVisible()
+        return true
+    }
+
+    /** Global byte offset of (row, UTF-16 col). */
+    fun byteOffsetOf(row: Int, colUtf16: Int): Long {
+        val line = line(row)
+        val prefix = line.substring(0, colUtf16.coerceIn(0, line.length))
+        return lineStartOffset(row) + prefix.encodeToByteArray().size
     }
 
     // ---- Editing ---------------------------------------------------------
@@ -240,6 +410,9 @@ class EditorState(val session: BufferSession) {
             ensureCursorVisible()
             return false
         }
+        // Any IME text change collapses the selection (a seeded in-line
+        // selection has just been replaced by the edit).
+        clearSelection()
         val edit = Utf8Diff.diff(oldLine.encodeToByteArray(), newLine.encodeToByteArray())
         val lineStart = lineStartOffset(row)
         if (edit != null) {
@@ -264,16 +437,23 @@ class EditorState(val session: BufferSession) {
         return structural
     }
 
-    /** Insert [text] at the cursor (hardware-key path). */
+    /** Insert [text] at the cursor (hardware-key path), replacing any
+     * selection. */
     fun insertAtCursor(text: String) {
+        deleteSelection()
         val line = currentLine()
         val col = cursorCol.coerceAtMost(line.length)
         applyLineDiff(cursorRow, line.take(col) + text + line.drop(col), col + text.length)
         onCursorChangedExternally?.invoke()
     }
 
-    /** Delete the code point before the cursor, joining lines at column 0. */
+    /** Delete the selection, or the code point before the cursor (joining
+     * lines at column 0). */
     fun backspace() {
+        if (deleteSelection()) {
+            onCursorChangedExternally?.invoke()
+            return
+        }
         val line = currentLine()
         val col = cursorCol.coerceAtMost(line.length)
         if (col > 0) {
@@ -306,7 +486,22 @@ class EditorState(val session: BufferSession) {
         if (session.redo()) afterHistoryChange()
     }
 
-    fun moveCursorHorizontally(delta: Int) {
+    fun moveCursorHorizontally(delta: Int, extendSelection: Boolean = false) {
+        if (beginCursorMove(extendSelection)) {
+            // Plain arrow with a selection collapses to the matching edge.
+            val range = selectionRange()!!
+            clearSelection()
+            if (delta < 0) {
+                cursorRow = range.startRow
+                cursorCol = range.startCol
+            } else {
+                cursorRow = range.endRow
+                cursorCol = range.endCol
+            }
+            ensureCursorVisible()
+            onCursorChangedExternally?.invoke()
+            return
+        }
         val line = currentLine()
         val col = cursorCol.coerceAtMost(line.length)
         if (delta < 0) {
@@ -328,11 +523,30 @@ class EditorState(val session: BufferSession) {
         onCursorChangedExternally?.invoke()
     }
 
-    fun moveCursorVertically(delta: Int) {
+    fun moveCursorVertically(delta: Int, extendSelection: Boolean = false) {
+        if (beginCursorMove(extendSelection)) clearSelection()
         cursorRow = (cursorRow + delta).coerceIn(0, lineCount - 1)
         cursorCol = cursorCol.coerceAtMost(currentLine().length)
         ensureCursorVisible()
         onCursorChangedExternally?.invoke()
+    }
+
+    /**
+     * Prepare cursor movement w.r.t. selection: sets the anchor when
+     * extending, clears it when not. Returns true if the caller should
+     * instead collapse an existing selection (plain horizontal move).
+     */
+    private fun beginCursorMove(extendSelection: Boolean): Boolean {
+        if (extendSelection) {
+            if (selectionAnchorRow < 0) {
+                selectionAnchorRow = cursorRow
+                selectionAnchorCol = cursorCol
+            }
+            return false
+        }
+        if (hasSelection) return true
+        clearSelection()
+        return false
     }
 
     /** Scroll just enough to keep the cursor's line inside the viewport. */
