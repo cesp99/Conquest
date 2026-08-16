@@ -14,31 +14,37 @@ import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import to.eyed.conquest.code.core.BufferSession
 import to.eyed.conquest.code.ui.editor.EditorPane
+import to.eyed.conquest.code.ui.editor.EditorState
 
 private val WideLayoutMinWidth = 840.dp
 private val ProjectPanelWidth = 260.dp
 
-private const val SAMPLE_TEXT = """// Welcome to Conquest Code.
-//
-// Everything you see is rendered by Jetpack Compose, but this buffer
-// lives inside the Rust engine (core/crates/engine): a vendored copy of
-// Zed's rope/CRDT text stack, reached over JNI. Every keystroke becomes
-// an incremental byte-range edit against the rope.
+private val WELCOME_TEXT = """
+    // Welcome to Conquest Code.
+    //
+    // This buffer lives inside the Rust engine (core/crates/engine):
+    // Zed's rope/CRDT text stack, reached over JNI. The editor below
+    // draws only the visible line window — it never holds the file.
+    //
+    // The lines that follow are generated so you can put the
+    // virtualized renderer through its paces. Fling away.
 
-fun main() {
-    println("Hello from the Rust core!")
+""".trimIndent()
+
+/** Welcome text plus generated lines — a scroll workout for the renderer. */
+private fun sampleText(): String = buildString {
+    append(WELCOME_TEXT)
+    for (i in 1..5_000) {
+        append("fun generated_$i() = $i * ${i % 7}  // scroll test, line ${i + 9}\n")
+    }
 }
-"""
 
 /**
  * Root of the IDE UI, in the spirit of Zed's workspace: a project panel,
@@ -48,35 +54,21 @@ fun main() {
  */
 @Composable
 fun WorkspaceScreen(modifier: Modifier = Modifier) {
-    val session = remember { BufferSession(SAMPLE_TEXT.trimStart()) }
-    var bufferText by remember { mutableStateOf(session.text) }
-    var lineCount by remember { mutableStateOf(session.lineCount) }
-
-    // Interim edit strategy: the text field hands us the whole new string;
-    // BufferSession diffs it and sends a minimal byte-range edit through
-    // JNI. The real editor (phase 2) will produce range edits directly.
-    val onTextChange: (String) -> Unit = { newText ->
-        if (session.update(newText)) {
-            bufferText = session.text
-            lineCount = session.lineCount
-        }
+    val editorState = remember {
+        EditorState(BufferSession(sampleText()))
     }
 
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
         if (maxWidth >= WideLayoutMinWidth) {
-            WideWorkspace(bufferText, lineCount, onTextChange)
+            WideWorkspace(editorState)
         } else {
-            CompactWorkspace(bufferText, lineCount, onTextChange)
+            CompactWorkspace(editorState)
         }
     }
 }
 
 @Composable
-private fun WideWorkspace(
-    bufferText: String,
-    lineCount: Int,
-    onTextChange: (String) -> Unit,
-) {
+private fun WideWorkspace(editorState: EditorState) {
     Row(modifier = Modifier.fillMaxSize()) {
         Box(
             modifier = Modifier
@@ -86,16 +78,12 @@ private fun WideWorkspace(
             ProjectPanel()
         }
         VerticalDivider()
-        EditorArea(bufferText, lineCount, onTextChange, modifier = Modifier.weight(1f))
+        EditorArea(editorState, modifier = Modifier.weight(1f))
     }
 }
 
 @Composable
-private fun CompactWorkspace(
-    bufferText: String,
-    lineCount: Int,
-    onTextChange: (String) -> Unit,
-) {
+private fun CompactWorkspace(editorState: EditorState) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     ModalNavigationDrawer(
@@ -107,9 +95,7 @@ private fun CompactWorkspace(
         }
     ) {
         EditorArea(
-            bufferText,
-            lineCount,
-            onTextChange,
+            editorState,
             onOpenProjectPanel = { scope.launch { drawerState.open() } },
         )
     }
@@ -117,20 +103,20 @@ private fun CompactWorkspace(
 
 @Composable
 private fun EditorArea(
-    bufferText: String,
-    lineCount: Int,
-    onTextChange: (String) -> Unit,
+    editorState: EditorState,
     modifier: Modifier = Modifier,
     onOpenProjectPanel: (() -> Unit)? = null,
 ) {
     Column(modifier = modifier.fillMaxSize()) {
         EditorPane(
-            text = bufferText,
-            lineCount = lineCount,
-            onTextChange = onTextChange,
+            state = editorState,
             modifier = Modifier.weight(1f)
         )
         HorizontalDivider()
-        StatusBar(onOpenProjectPanel = onOpenProjectPanel)
+        StatusBar(
+            cursorRow = editorState.cursorRow,
+            cursorCol = editorState.cursorCol,
+            onOpenProjectPanel = onOpenProjectPanel,
+        )
     }
 }

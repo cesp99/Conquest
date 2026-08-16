@@ -22,6 +22,8 @@ import to.eyed.conquest.code.core.CoreBridge
  */
 @Composable
 fun StatusBar(
+    cursorRow: Int,
+    cursorCol: Int,
     modifier: Modifier = Modifier,
     onOpenProjectPanel: (() -> Unit)? = null,
 ) {
@@ -45,6 +47,12 @@ fun StatusBar(
             )
         }
         Spacer(modifier = Modifier.weight(1f))
+        Text(
+            text = "Ln ${cursorRow + 1}, Col ${cursorCol + 1}",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(end = 12.dp),
+        )
         Text(
             text = "engine v$engineVersion",
             style = MaterialTheme.typography.labelMedium,
