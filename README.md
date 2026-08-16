@@ -52,7 +52,7 @@ narrow, coarse-grained JNI boundary. See
 |---|---|
 | Rust core ↔ Kotlin JNI pipeline | ✅ working end-to-end |
 | Adaptive workspace shell (tablet/phone) | ✅ first version |
-| Rope/CRDT text engine (from Zed) | 🚧 next up |
+| Rope/CRDT text engine (from Zed) | ✅ vendored & wired through JNI |
 | Tree-sitter syntax highlighting | ⬜ planned |
 | Custom high-performance editor surface | ⬜ planned |
 | Terminal emulator | ⬜ planned |

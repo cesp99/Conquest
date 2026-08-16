@@ -53,7 +53,11 @@ Zed's crates fall into tiers (verified against the Zed source):
 - **UI-free, reusable as-is**: `sum_tree` (Apache-2.0), `rope`, `text`
   (the CRDT buffer), `clock`, `language_core`, `grammars` (tree-sitter
   queries + configs for 20+ languages), plus utility crates. This is
-  the text engine.
+  the text engine. These are vendored into `core/vendor/` at a pinned
+  upstream commit (see `core/vendor/VENDOR.md` for the crate list and
+  local patches); `engine` buffers are `text::Buffer` instances —
+  single-replica CRDTs whose collaboration machinery simply lies
+  dormant.
 - **Runtime-coupled**: `language`, `lsp`, `worktree`, `project`, etc.
   depend on GPUI — but on its *reactive runtime* (entities, tasks,
   executors), not its renderer. GPUI itself is Apache-2.0, pure Rust
