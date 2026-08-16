@@ -3,31 +3,133 @@ package to.eyed.conquest.code.core
 import android.content.Context
 import java.io.File
 
+/** A project directory as the picker lists it. */
+data class ProjectSummary(
+    val name: String,
+    val path: String,
+    /** Direct children, for a cheap sense of size. Not a recursive count. */
+    val entryCount: Int,
+    val lastModified: Long,
+)
+
 /**
- * Where projects live on device, for now.
+ * Where projects live on device.
  *
- * App-private storage (`filesDir/projects`) is the fast path: no permissions,
- * no SAF round-trips, and the engine can watch it. Importing from elsewhere on
- * the device, and cloning into it, are the storage work of P3-4 — until then
- * this is the only project root, seeded once so a fresh install has something
- * real to open.
+ * App-private storage (`filesDir/projects`) is the only project root, and
+ * that is a deliberate constraint rather than a stopgap: the engine's
+ * worktree is Zed's, which walks and watches a real filesystem path with
+ * `std::fs` and inotify. A Storage Access Framework tree is a stream of
+ * content URIs with no path behind it, so a project living out on shared
+ * storage could not be scanned, watched or opened by the engine at all.
+ * Content from elsewhere is therefore *copied in* (see [SafTransfer]) rather
+ * than opened in place.
  */
 object ProjectsRoot {
     private const val SAMPLE_NAME = "welcome"
+    private const val PREFS = "projects"
+    private const val KEY_LAST_OPENED = "last_opened"
+
+    /** Longest project name we accept, well under any filesystem limit. */
+    private const val MAX_NAME_LENGTH = 96
 
     fun directory(context: Context): File =
         File(context.filesDir, "projects").apply { mkdirs() }
 
+    fun projectDir(context: Context, name: String): File = File(directory(context), name)
+
+    /** Every project, most recently touched first. */
+    fun list(context: Context): List<ProjectSummary> =
+        directory(context)
+            .listFiles()
+            .orEmpty()
+            .filter { it.isDirectory }
+            .map { dir ->
+                ProjectSummary(
+                    name = dir.name,
+                    path = dir.absolutePath,
+                    entryCount = dir.list()?.size ?: 0,
+                    lastModified = dir.lastModified(),
+                )
+            }
+            .sortedByDescending { it.lastModified }
+
     /**
-     * The project to open at startup: the sample, created on first launch.
-     * Returns its absolute path.
+     * Why [name] can't be a project name, or null if it can. Rejecting rather
+     * than silently sanitizing: a project called something other than what
+     * the user typed is worse than being told no.
+     */
+    fun nameError(context: Context, name: String): String? {
+        val trimmed = name.trim()
+        return when {
+            trimmed.isEmpty() -> "Name cannot be empty"
+            trimmed.length > MAX_NAME_LENGTH -> "Name is too long"
+            trimmed == "." || trimmed == ".." -> "Reserved name"
+            trimmed.startsWith(".") -> "Name cannot start with a dot"
+            // A separator would escape the projects directory entirely.
+            trimmed.contains('/') || trimmed.contains('\\') -> "Name cannot contain slashes"
+            trimmed.any { it.code < 0x20 } -> "Name contains control characters"
+            projectDir(context, trimmed).exists() -> "A project called that already exists"
+            else -> null
+        }
+    }
+
+    /** Create an empty project. Returns null if the name is unusable. */
+    fun create(context: Context, name: String): File? {
+        val trimmed = name.trim()
+        if (nameError(context, trimmed) != null) return null
+        val dir = projectDir(context, trimmed)
+        return if (dir.mkdirs()) dir else null
+    }
+
+    /**
+     * A free name based on [desired] — `project`, `project 2`, `project 3`…
+     * Imports use this so bringing the same folder in twice doesn't fail.
+     */
+    fun uniqueName(context: Context, desired: String): String {
+        val base = desired.trim()
+            .replace('/', '-')
+            .replace('\\', '-')
+            .trimStart('.')
+            .take(MAX_NAME_LENGTH)
+            .ifEmpty { "project" }
+        if (!projectDir(context, base).exists()) return base
+        var suffix = 2
+        while (projectDir(context, "$base $suffix").exists()) suffix++
+        return "$base $suffix"
+    }
+
+    /** Delete a project and everything in it. There is no undo. */
+    fun delete(context: Context, name: String): Boolean {
+        val dir = projectDir(context, name)
+        // Guard against a name that somehow escapes the root.
+        if (dir.parentFile != directory(context)) return false
+        if (lastOpened(context) == name) setLastOpened(context, null)
+        return dir.deleteRecursively()
+    }
+
+    fun lastOpened(context: Context): String? =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_LAST_OPENED, null)
+            ?.takeIf { projectDir(context, it).isDirectory }
+
+    fun setLastOpened(context: Context, name: String?) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .apply { if (name == null) remove(KEY_LAST_OPENED) else putString(KEY_LAST_OPENED, name) }
+            .apply()
+    }
+
+    /**
+     * The project to open at startup: the one last open, else any existing
+     * one, else the sample — seeded only when there are no projects at all,
+     * so deleting it keeps it deleted.
      */
     fun defaultProject(context: Context): String {
-        val project = File(directory(context), SAMPLE_NAME)
-        if (!project.exists()) {
-            writeSampleProject(project)
-        }
-        return project.absolutePath
+        lastOpened(context)?.let { return projectDir(context, it).absolutePath }
+        list(context).firstOrNull()?.let { return it.path }
+        val sample = projectDir(context, SAMPLE_NAME)
+        writeSampleProject(sample)
+        return sample.absolutePath
     }
 
     private fun writeSampleProject(project: File) {
@@ -51,6 +153,9 @@ object ProjectsRoot {
             left is a real Zed worktree scanned inside the engine: gitignore
             aware, incremental, and lazy — directories are read only when you
             open them.
+
+            Use the project name in the status bar to switch projects, create
+            one, or import a folder from your device.
             """.trimIndent() + "\n"
         )
         File(project, "src/main.rs").writeText(sampleSource())

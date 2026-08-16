@@ -32,8 +32,10 @@ fun StatusBar(
     modifier: Modifier = Modifier,
     filePath: String? = null,
     isDirty: Boolean = false,
+    projectName: String? = null,
     onSave: (() -> Unit)? = null,
     onToggleProjectPanel: (() -> Unit)? = null,
+    onOpenProjects: (() -> Unit)? = null,
 ) {
     val engineVersion = remember { CoreBridge.engineVersion() }
     Row(
@@ -52,6 +54,20 @@ fun StatusBar(
                 modifier = Modifier
                     .pointerHoverIcon(PointerIcon.Hand)
                     .clickable(onClick = onToggleProjectPanel)
+                    .padding(end = 12.dp),
+            )
+        }
+        if (projectName != null && onOpenProjects != null) {
+            // The touch twin of Ctrl+O.
+            Text(
+                text = projectName,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .pointerHoverIcon(PointerIcon.Hand)
+                    .clickable(onClick = onOpenProjects)
                     .padding(end = 12.dp),
             )
         }

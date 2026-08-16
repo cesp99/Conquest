@@ -1,0 +1,330 @@
+package to.eyed.conquest.code.ui.workspace
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.pointerHoverIcon
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.runtime.LaunchedEffect
+import to.eyed.conquest.code.core.ProjectSummary
+import to.eyed.conquest.code.ui.theme.LocalZedTheme
+
+/** What the picker is currently asking for. */
+private enum class PickerMode { List, NewProject, ConfirmDelete }
+
+/**
+ * Switch, create, import, export and delete projects.
+ *
+ * Projects are directories in app-private storage; importing copies a folder
+ * in from the device rather than opening it in place, because the engine's
+ * worktree needs a real path (see `ProjectsRoot`).
+ */
+@Composable
+fun ProjectPicker(
+    projects: List<ProjectSummary>,
+    currentPath: String?,
+    busyMessage: String?,
+    errorMessage: String?,
+    onOpen: (ProjectSummary) -> Unit,
+    onCreate: (String) -> Unit,
+    onImport: () -> Unit,
+    onExport: (ProjectSummary) -> Unit,
+    onDelete: (ProjectSummary) -> Unit,
+    onDismiss: () -> Unit,
+    nameError: (String) -> String?,
+) {
+    val theme = LocalZedTheme.current
+    var mode by remember { mutableStateOf(PickerMode.List) }
+    var pendingDelete by remember { mutableStateOf<ProjectSummary?>(null) }
+    var newName by remember { mutableStateOf(TextFieldValue("")) }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = theme.color("elevated_surface.background", MaterialTheme.colorScheme.surface),
+            modifier = Modifier.widthIn(min = 320.dp, max = 520.dp),
+        ) {
+            Column(modifier = Modifier.padding(vertical = 16.dp)) {
+                Text(
+                    text = "PROJECTS",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 20.dp),
+                )
+
+                when {
+                    busyMessage != null -> Message(busyMessage)
+
+                    mode == PickerMode.NewProject -> NewProjectForm(
+                        value = newName,
+                        onValueChange = { newName = it },
+                        error = newName.text.takeIf { it.isNotEmpty() }?.let(nameError),
+                        onCancel = { mode = PickerMode.List; newName = TextFieldValue("") },
+                        onConfirm = {
+                            onCreate(newName.text)
+                            newName = TextFieldValue("")
+                            mode = PickerMode.List
+                        },
+                    )
+
+                    mode == PickerMode.ConfirmDelete && pendingDelete != null -> {
+                        val target = pendingDelete!!
+                        ConfirmDelete(
+                            project = target,
+                            onCancel = { mode = PickerMode.List; pendingDelete = null },
+                            onConfirm = {
+                                onDelete(target)
+                                mode = PickerMode.List
+                                pendingDelete = null
+                            },
+                        )
+                    }
+
+                    else -> {
+                        if (errorMessage != null) Message(errorMessage, isError = true)
+                        if (projects.isEmpty()) {
+                            Message("No projects yet")
+                        } else {
+                            LazyColumn(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 360.dp)
+                                    .padding(top = 8.dp)
+                            ) {
+                                items(projects, key = { it.path }) { project ->
+                                    ProjectRow(
+                                        project = project,
+                                        isCurrent = project.path == currentPath,
+                                        onOpen = { onOpen(project) },
+                                        onExport = { onExport(project) },
+                                        onDelete = {
+                                            pendingDelete = project
+                                            mode = PickerMode.ConfirmDelete
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(20.dp),
+                            modifier = Modifier.padding(horizontal = 20.dp),
+                        ) {
+                            DialogAction("New", onClick = { mode = PickerMode.NewProject })
+                            DialogAction("Import folder…", onClick = onImport)
+                            Box(modifier = Modifier.weight(1f))
+                            DialogAction("Close", onClick = onDismiss)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProjectRow(
+    project: ProjectSummary,
+    isCurrent: Boolean,
+    onOpen: () -> Unit,
+    onExport: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    val theme = LocalZedTheme.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(
+                if (isCurrent) {
+                    theme.color("element.selected")
+                } else {
+                    androidx.compose.ui.graphics.Color.Transparent
+                }
+            )
+            .pointerHoverIcon(PointerIcon.Hand)
+            .clickable(onClick = onOpen)
+            .padding(horizontal = 20.dp, vertical = 10.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = project.name,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = "${project.entryCount} " +
+                    if (project.entryCount == 1) "entry" else "entries",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        DialogAction("Export", onClick = onExport)
+        Box(modifier = Modifier.padding(start = 16.dp)) {
+            DialogAction("Delete", onClick = onDelete, isDestructive = true)
+        }
+    }
+}
+
+@Composable
+private fun NewProjectForm(
+    value: TextFieldValue,
+    onValueChange: (TextFieldValue) -> Unit,
+    error: String?,
+    onCancel: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    val theme = LocalZedTheme.current
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { focus.requestFocus() }
+
+    Column(modifier = Modifier.padding(top = 16.dp)) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp)
+                .background(
+                    theme.color("editor.background"),
+                    RoundedCornerShape(6.dp),
+                )
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+        ) {
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                singleLine = true,
+                textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
+                cursorBrush = androidx.compose.ui.graphics.SolidColor(
+                    theme.color("editor.foreground")
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .focusRequester(focus),
+            )
+            if (value.text.isEmpty()) {
+                Text(
+                    text = "Project name",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        if (error != null) {
+            Message(error, isError = true)
+        }
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(20.dp),
+            modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 16.dp),
+        ) {
+            Box(modifier = Modifier.weight(1f))
+            DialogAction("Cancel", onClick = onCancel)
+            DialogAction(
+                "Create",
+                onClick = onConfirm,
+                enabled = value.text.isNotBlank() && error == null,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ConfirmDelete(
+    project: ProjectSummary,
+    onCancel: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    Column(modifier = Modifier.padding(top = 16.dp)) {
+        Text(
+            text = "Delete “${project.name}” and everything in it? This cannot be undone.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.padding(horizontal = 20.dp),
+        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(20.dp),
+            modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 20.dp),
+        ) {
+            Box(modifier = Modifier.weight(1f))
+            DialogAction("Cancel", onClick = onCancel)
+            DialogAction("Delete", onClick = onConfirm, isDestructive = true)
+        }
+    }
+}
+
+@Composable
+private fun Message(text: String, isError: Boolean = false) {
+    val theme = LocalZedTheme.current
+    Text(
+        text = text,
+        style = MaterialTheme.typography.bodySmall,
+        color = if (isError) {
+            theme.color("error", MaterialTheme.colorScheme.error)
+        } else {
+            MaterialTheme.colorScheme.onSurfaceVariant
+        },
+        modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+    )
+}
+
+@Composable
+private fun DialogAction(
+    label: String,
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+    isDestructive: Boolean = false,
+) {
+    val theme = LocalZedTheme.current
+    Text(
+        text = label,
+        style = MaterialTheme.typography.labelLarge,
+        color = when {
+            !enabled -> MaterialTheme.colorScheme.onSurfaceVariant
+            isDestructive -> theme.color("error", MaterialTheme.colorScheme.error)
+            else -> MaterialTheme.colorScheme.primary
+        },
+        modifier = Modifier
+            .then(
+                if (enabled) {
+                    Modifier
+                        .pointerHoverIcon(PointerIcon.Hand)
+                        .clickable(onClick = onClick)
+                } else {
+                    Modifier
+                }
+            )
+            .padding(vertical = 4.dp),
+    )
+}

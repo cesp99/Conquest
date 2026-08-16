@@ -23,6 +23,7 @@ editor.
 | `Ctrl` `1`…`8` | Jump to tab by position |
 | `Ctrl` `9` | Jump to the last tab |
 | `Ctrl` `B` | Show/hide the project panel |
+| `Ctrl` `O` | Open the project picker (switch, create, import, export) |
 
 ## Editor
 
@@ -52,4 +53,5 @@ editor.
 Everything above is reachable by touch too: long-press to select a word,
 drag the handles to adjust a selection, and use the floating toolbar for
 copy/paste. The status bar carries a **Save** action while the current
-file has unsaved changes, and `☰ files` toggles the project panel.
+file has unsaved changes, `☰ files` toggles the project panel, and the
+project name opens the project picker.

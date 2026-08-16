@@ -35,6 +35,9 @@ enum class WorkspaceCommand {
 
     /** Show or hide the project panel. */
     ToggleProjectPanel,
+
+    /** Open the project picker (switch, create, import, export). */
+    OpenProjects,
 }
 
 /**
@@ -49,6 +52,7 @@ fun workspaceCommandFor(event: KeyEvent): WorkspaceCommand? {
         Key.S -> WorkspaceCommand.Save
         Key.W -> WorkspaceCommand.CloseTab
         Key.B -> WorkspaceCommand.ToggleProjectPanel
+        Key.O -> WorkspaceCommand.OpenProjects
         Key.Tab -> if (event.isShiftPressed) {
             WorkspaceCommand.PreviousTab
         } else {

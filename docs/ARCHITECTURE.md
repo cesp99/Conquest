@@ -80,6 +80,26 @@ layer reads directly. Kotlin polls a version counter to know when to
 re-read; no JNI call ever waits on the Rust runtime, and the Android
 main thread is never blocked by it.
 
+## Where projects live
+
+Projects are directories in the app's private storage, and content
+brought in from elsewhere on the device is **copied in** rather than
+opened where it sits.
+
+That is the engine's constraint rather than a preference. The worktree is
+Zed's: it walks a real filesystem path and watches it with inotify. A
+Storage Access Framework tree is a stream of content URIs with no path
+behind it, so a project left on shared storage could not be scanned,
+watched or opened by the engine at all. Import and export therefore copy,
+which costs real time on a large tree and is the honest trade for the
+engine working.
+
+`MANAGE_EXTERNAL_STORAGE` would give real paths anywhere and so genuine
+open-in-place, but Google Play restricts that permission to a short list
+of app categories an IDE is not in, and shared storage is FUSE-backed and
+slower to scan. It stays off the table for now, and would only ever be a
+flavor-specific capability.
+
 ## On-device execution (terminals, LSP servers, agents)
 
 Android 10+ forbids executing files from an app's writable data

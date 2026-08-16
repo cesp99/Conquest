@@ -24,6 +24,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.focusable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -39,7 +41,10 @@ import kotlinx.coroutines.withContext
 import to.eyed.conquest.code.core.BufferSession
 import to.eyed.conquest.code.core.ProjectEntry
 import to.eyed.conquest.code.core.ProjectSession
+import to.eyed.conquest.code.core.ProjectSummary
 import to.eyed.conquest.code.core.ProjectsRoot
+import to.eyed.conquest.code.core.SafTransfer
+import java.io.File
 import to.eyed.conquest.code.ui.editor.EditorPane
 import to.eyed.conquest.code.ui.editor.EditorState
 
@@ -75,6 +80,20 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
     // Conflicts the user chose to live with, so the bar doesn't nag.
     val dismissedConflicts = remember { mutableStateOf(setOf<String>()) }
 
+    // Project picker state. `projects` is re-listed whenever the dialog opens
+    // or a transfer finishes, rather than watched — projects change only when
+    // the user changes them.
+    var pickerOpen by remember { mutableStateOf(false) }
+    var projects by remember { mutableStateOf(emptyList<ProjectSummary>()) }
+    var transferMessage by remember { mutableStateOf<String?>(null) }
+    var transferError by remember { mutableStateOf<String?>(null) }
+
+    fun refreshProjects() {
+        scope.launch {
+            projects = withContext(Dispatchers.IO) { ProjectsRoot.list(context) }
+        }
+    }
+
     fun openFile(project: ProjectSession, path: String) {
         val existing = files.indexOfPath(path)
         if (existing >= 0) {
@@ -89,15 +108,90 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
         }
     }
 
+    /**
+     * Switch the workspace to another project: close every tab and the old
+     * worktree first, so the engine isn't left scanning a project nobody is
+     * looking at.
+     */
+    fun openProject(path: String, startupFile: String? = null) {
+        scope.launch {
+            while (files.tabs.isNotEmpty()) files.close(files.tabs.lastIndex)
+            dismissedConflicts.value = emptySet()
+            project?.close()
+            val opened = ProjectSession(path)
+            project = opened
+            withContext(Dispatchers.IO) {
+                ProjectsRoot.setLastOpened(context, File(path).name)
+            }
+            if (startupFile != null) openFile(opened, startupFile)
+            refreshProjects()
+        }
+    }
+
     LaunchedEffect(Unit) {
         val root = withContext(Dispatchers.IO) { ProjectsRoot.defaultProject(context) }
         val opened = ProjectSession(root)
         project = opened
-        openFile(opened, STARTUP_FILE)
+        withContext(Dispatchers.IO) { ProjectsRoot.setLastOpened(context, File(root).name) }
+        refreshProjects()
+        // Only meaningful for the seeded sample; a project the user brought in
+        // simply opens with no tabs.
+        if (File(root, STARTUP_FILE).isFile) openFile(opened, STARTUP_FILE)
     }
-    DisposableEffect(project) {
-        val opened = project
-        onDispose { opened?.close() }
+    DisposableEffect(Unit) {
+        onDispose { project?.close() }
+    }
+
+    // SAF pickers. Import copies a folder in; export copies a project out.
+    // Neither can open in place — see ProjectsRoot for why.
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            transferError = null
+            transferMessage = "Importing…"
+            val result = withContext(Dispatchers.IO) {
+                SafTransfer.importAsProject(context, uri) { progress ->
+                    transferMessage = "Importing ${progress.files} files… ${progress.currentName}"
+                }
+            }
+            transferMessage = null
+            when (result) {
+                is SafTransfer.Result.Imported -> {
+                    refreshProjects()
+                    openProject(result.project.absolutePath)
+                    pickerOpen = false
+                }
+                is SafTransfer.Result.Failed -> transferError = result.message
+                else -> Unit
+            }
+        }
+    }
+
+    var exportTarget by remember { mutableStateOf<ProjectSummary?>(null) }
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        val target = exportTarget
+        exportTarget = null
+        if (uri == null || target == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            transferError = null
+            transferMessage = "Exporting…"
+            val result = withContext(Dispatchers.IO) {
+                SafTransfer.exportProject(context, File(target.path), uri) { progress ->
+                    transferMessage = "Exporting ${progress.files} files… ${progress.currentName}"
+                }
+            }
+            transferMessage = null
+            when (result) {
+                is SafTransfer.Result.Exported ->
+                    transferError = "Exported ${result.files} files to the chosen folder"
+                is SafTransfer.Result.Failed -> transferError = result.message
+                else -> Unit
+            }
+        }
     }
 
     // One loop for every tab's status. A buffer whose file changed underneath
@@ -156,6 +250,11 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
                 panelVisible = !panelVisible
             } else {
                 scope.launch { if (drawerState.isOpen) drawerState.close() else drawerState.open() }
+            }
+            WorkspaceCommand.OpenProjects -> {
+                refreshProjects()
+                transferError = null
+                pickerOpen = true
             }
         }
         return true
@@ -237,10 +336,54 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
                 cursorCol = files.active?.editor?.cursorCol ?: 0,
                 filePath = files.active?.path,
                 isDirty = files.active?.isDirty == true,
+                projectName = project?.rootName,
                 onSave = files.active?.let { file -> { save(file) } },
                 onToggleProjectPanel = { runCommand(WorkspaceCommand.ToggleProjectPanel) },
+                onOpenProjects = { runCommand(WorkspaceCommand.OpenProjects) },
             )
         }
+    }
+
+    if (pickerOpen) {
+        ProjectPicker(
+            projects = projects,
+            currentPath = project?.let { session -> projects.firstOrNull { it.name == session.rootName }?.path },
+            busyMessage = transferMessage,
+            errorMessage = transferError,
+            onOpen = { summary ->
+                pickerOpen = false
+                openProject(summary.path)
+            },
+            onCreate = { name ->
+                scope.launch {
+                    val created = withContext(Dispatchers.IO) { ProjectsRoot.create(context, name) }
+                    if (created == null) {
+                        transferError = "Could not create that project"
+                    } else {
+                        pickerOpen = false
+                        openProject(created.absolutePath)
+                    }
+                }
+            },
+            onImport = { importLauncher.launch(null) },
+            onExport = { summary ->
+                exportTarget = summary
+                exportLauncher.launch(null)
+            },
+            onDelete = { summary ->
+                scope.launch {
+                    val wasCurrent = project?.rootName == summary.name
+                    withContext(Dispatchers.IO) { ProjectsRoot.delete(context, summary.name) }
+                    refreshProjects()
+                    if (wasCurrent) {
+                        val next = withContext(Dispatchers.IO) { ProjectsRoot.defaultProject(context) }
+                        openProject(next)
+                    }
+                }
+            },
+            onDismiss = { pickerOpen = false },
+            nameError = { name -> ProjectsRoot.nameError(context, name) },
+        )
     }
 }
 
