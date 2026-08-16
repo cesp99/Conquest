@@ -29,6 +29,7 @@
 //! path here logs at debug and yields an empty map.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -299,22 +300,42 @@ fn status_for(
 /// `--porcelain=v1 -z` is the only machine format that is both stable and
 /// unambiguous: `-z` means NUL-separated records with **raw** path bytes, so
 /// `core.quotePath` never applies and there is no C-style unquoting to get
-/// wrong (see the tests). `--no-optional-locks` keeps a read-only query from
-/// writing `index.lock` — it would otherwise refresh the index, and the panel
-/// polls this.
+/// wrong (see the tests).
+///
+/// Keeping this query from writing `index.lock` is `--no-optional-locks`,
+/// which is *git's* option and not `git status`'s: passed after the
+/// subcommand, real git exits 129 with "unknown option", every run produces
+/// nothing, and the panel is silently colourless. It lives in [`capture`],
+/// before the subcommand, next to the other git-level flags.
 ///
 /// `--ignored` is *not* passed. It would list every file under `target/` and
 /// `node_modules/`, which is the opposite of cheap, and the worktree already
 /// knows what is ignored (`TreeEntry::is_ignored`) from the same `.gitignore`
 /// files.
-fn status_args() -> [&'static str; 5] {
-    [
-        "status",
-        "--porcelain=v1",
-        "-z",
-        "--no-optional-locks",
-        "--untracked-files=normal",
-    ]
+fn status_args() -> [&'static str; 4] {
+    ["status", "--porcelain=v1", "-z", "--untracked-files=normal"]
+}
+
+/// Everything from `git` onwards, in order: the git-level options first, then
+/// the subcommand and its own.
+///
+/// Assembled in one place so the host tests can run the real git binary over
+/// the very argv the device uses. That is the only thing that catches a
+/// git-level option written after the subcommand: git exits 129 with "unknown
+/// option" while every parser test in this file still passes.
+fn git_argv(project: &Path) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = vec![OsString::from("git")];
+    argv.push(OsString::from("-C"));
+    argv.push(project.as_os_str().to_owned());
+    // Belt and braces with proot's fake_id0, and harmless if the "dubious
+    // ownership" check would have passed anyway. Supported since git 2.35.3;
+    // Debian stable is well past that.
+    argv.extend(["-c", "safe.directory=*"].map(OsString::from));
+    // Read-only query: don't refresh the index, don't write index.lock. The
+    // panel polls this, so a lock here would fight the user's own git.
+    argv.push(OsString::from("--no-optional-locks"));
+    argv.extend(status_args().map(OsString::from));
+    argv
 }
 
 /// Run git inside the guest and return its stdout.
@@ -347,17 +368,10 @@ fn capture(userland: &Userland, repo_root: &Path, project: &Path) -> Option<Vec<
     }
 
     command
-        // `/` always exists inside the guest; `-C` below is what actually puts
-        // git in the project.
+        // `/` always exists inside the guest; the `-C` in [`git_argv`] is what
+        // actually puts git in the project.
         .args(["-w", "/"])
-        .arg("git")
-        .arg("-C")
-        .arg(project)
-        // Belt and braces with fake_id0 above, and harmless if the check would
-        // have passed anyway. Supported since git 2.35.3; Debian stable is
-        // well past that.
-        .args(["-c", "safe.directory=*"])
-        .args(status_args());
+        .args(git_argv(project));
 
     command
         .env("PROOT_TMP_DIR", &userland.tmp_dir)
@@ -1041,5 +1055,77 @@ mod tests {
                 ("new.txt".to_string(), GitStatus::Untracked),
             ]
         );
+    }
+
+    /// Run the host's git hermetically: no user, system or global config, and
+    /// an identity of our own, so the result cannot depend on the machine.
+    fn host_git(dir: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .output()
+            .expect("failed to run git")
+    }
+
+    /// Every other test in this file feeds `parse_records` bytes we wrote
+    /// ourselves, so all of them pass no matter what argv git is handed. That
+    /// is exactly how `--no-optional-locks` came to sit *after* the
+    /// subcommand: it is a git-level option, real git answered "unknown
+    /// option" and exit 129 for months of runs, and the panel stayed
+    /// colourless with nothing failing anywhere.
+    ///
+    /// So: run the real binary over the real argv, and read the real output.
+    #[test]
+    fn real_git_accepts_the_argv_and_the_output_parses() {
+        // No git on this machine (a CI image can be that bare) — say so rather
+        // than fail, and rather than pretend the check ran.
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: no git on PATH");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        assert!(
+            host_git(repo, &["init", "--quiet", "-b", "main"])
+                .status
+                .success()
+        );
+        std::fs::write(repo.join("README"), "Hello World!\n").unwrap();
+        assert!(host_git(repo, &["add", "README"]).status.success());
+        assert!(
+            host_git(repo, &["commit", "--quiet", "-m", "first"])
+                .status
+                .success()
+        );
+
+        // The device's reproduction, exactly: one tracked file changed, one
+        // new file that git has never seen.
+        std::fs::write(repo.join("README"), "Hello World!\nx\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "").unwrap();
+
+        let argv = git_argv(repo);
+        let args: Vec<&str> = argv
+            .iter()
+            .skip(1) // the program name; `host_git` supplies it
+            .map(|arg| arg.to_str().expect("argv is UTF-8 in this test"))
+            .collect();
+        let out = host_git(repo, &args);
+        assert!(
+            out.status.success(),
+            "git rejected the argv we send on device: {:?}\n{}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let statuses = parse_porcelain(&out.stdout, "");
+        assert_eq!(statuses.get("README"), Some(&GitStatus::Modified));
+        assert_eq!(statuses.get("new.txt"), Some(&GitStatus::Untracked));
     }
 }
