@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -33,6 +35,47 @@ android {
     buildFeatures {
         compose = true
     }
+}
+
+// The Rust engine (core/) is compiled to libconquestcore.so by cargo-ndk and
+// packaged from src/main/jniLibs, which is generated and gitignored.
+val rustAbis = listOf("arm64-v8a", "x86_64")
+val rustJniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
+
+val ndkVersion = "28.2.13676358"
+val sdkDir: String = run {
+    val localProps = Properties()
+    val localPropsFile = rootProject.file("local.properties")
+    if (localPropsFile.exists()) {
+        localPropsFile.inputStream().use { stream -> localProps.load(stream) }
+    }
+    localProps.getProperty("sdk.dir")
+        ?: System.getenv("ANDROID_HOME")
+        ?: "${System.getProperty("user.home")}/Android/Sdk"
+}
+
+val cargoNdkBuild = tasks.register<Exec>("cargoNdkBuild") {
+    group = "build"
+    description = "Builds the Rust core (libconquestcore.so) for Android ABIs"
+    workingDir = rootProject.file("core")
+    inputs.dir(rootProject.file("core/crates"))
+    inputs.file(rootProject.file("core/Cargo.toml"))
+    outputs.dir(rustJniLibsDir)
+    environment("ANDROID_NDK_HOME", "$sdkDir/ndk/$ndkVersion")
+    environment(
+        "PATH",
+        "${System.getProperty("user.home")}/.cargo/bin:${System.getenv("PATH")}"
+    )
+    commandLine(
+        "cargo", "ndk",
+        *rustAbis.flatMap { listOf("-t", it) }.toTypedArray(),
+        "-o", rustJniLibsDir.asFile.absolutePath,
+        "build", "--release", "-p", "jni-bridge"
+    )
+}
+
+tasks.named("preBuild") {
+    dependsOn(cargoNdkBuild)
 }
 
 dependencies {

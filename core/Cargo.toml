@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine", "crates/jni-bridge"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/cesp99/ConquestCodebyEyed"
+
+[workspace.dependencies]
+engine = { path = "crates/engine" }
+jni = "0.21"
+log = "0.4"
+android_logger = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+strip = "symbols"
+
+[profile.dev]
+# Keep dev builds fast but usable on device.
+opt-level = 1

@@ -11,6 +11,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
+import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.ui.theme.ConquestCodeByEyedTheme
 
 class MainActivity : ComponentActivity() {
@@ -20,10 +21,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             ConquestCodeByEyedTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    Greeting(
-                        name = "Android",
-                        modifier = Modifier.padding(innerPadding)
-                    )
+                    EngineStatus(modifier = Modifier.padding(innerPadding))
                 }
             }
         }
@@ -31,17 +29,17 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun Greeting(name: String, modifier: Modifier = Modifier) {
+fun EngineStatus(modifier: Modifier = Modifier) {
     Text(
-        text = "Hello $name!",
+        text = "Conquest Code — engine v${CoreBridge.engineVersion()}",
         modifier = modifier
     )
 }
 
 @Preview(showBackground = true)
 @Composable
-fun GreetingPreview() {
+fun EngineStatusPreview() {
     ConquestCodeByEyedTheme {
-        Greeting("Android")
+        EngineStatus()
     }
 }
