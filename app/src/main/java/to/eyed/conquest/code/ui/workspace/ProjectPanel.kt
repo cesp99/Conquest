@@ -42,12 +42,25 @@ private const val SCANNING_POLL_MS = 120L
 private const val IDLE_POLL_MS = 1_000L
 
 /**
+ * Where the panel gets per-path git status.
+ *
+ * One place to change when the engine can answer: return the JNI-backed
+ * source here (see `agent-docs/TASKS.md` P3-8 — the query is keyed off the
+ * worktree snapshot version) and every call site picks it up. Until then it is
+ * [GitStatusSource.Absent] and the tree looks exactly as it always has.
+ */
+fun gitStatusSourceFor(@Suppress("UNUSED_PARAMETER") project: ProjectSession): GitStatusSource =
+    GitStatusSource.Absent
+
+/**
  * The project tree, rendered from the engine's worktree.
  *
  * Directories are read one level at a time and only while expanded, so the
  * panel never walks the whole project. The engine scans asynchronously, so
  * this polls its snapshot version — fast while the initial scan is running,
- * lazily afterwards, where it doubles as external-change detection.
+ * lazily afterwards, where it doubles as external-change detection. Git status
+ * rides the same poll: it is a second cheap version counter, and the rows are
+ * re-coloured in place when it moves.
  */
 @Composable
 fun ProjectPanel(
@@ -56,6 +69,7 @@ fun ProjectPanel(
     modifier: Modifier = Modifier,
     openedPath: String? = null,
     gitignoredFiles: GitignoredFiles = GitignoredFiles.Dimmed,
+    gitStatus: GitStatusSource? = null,
 ) {
     val theme = LocalZedTheme.current
     Column(
@@ -78,9 +92,20 @@ fun ProjectPanel(
             return@Column
         }
 
-        val tree = remember(project, gitignoredFiles) {
-            ProjectTreeState(project, gitignoredFiles)
+        val statusSource = remember(project, gitStatus) {
+            gitStatus ?: gitStatusSourceFor(project)
         }
+        val tree = remember(project, gitignoredFiles, statusSource) {
+            ProjectTreeState(project, gitignoredFiles, statusSource)
+        }
+        // Resolved once per theme, never per row: `ZedTheme.color` is a map
+        // read, and this panel draws one row per visible line per frame.
+        val onSurface = MaterialTheme.colorScheme.onSurface
+        val onSurfaceVariant = MaterialTheme.colorScheme.onSurfaceVariant
+        val colours = remember(theme, onSurface, onSurfaceVariant) {
+            GitStatusColours.from(theme, onSurface, onSurfaceVariant)
+        }
+        val dimIgnored = gitignoredFiles == GitignoredFiles.Dimmed
         val scope = rememberCoroutineScope()
 
         // Keyed on `tree`, not `project`: changing a setting that affects the
@@ -95,6 +120,15 @@ fun ProjectPanel(
                 val version = project.version
                 if (version != tree.version) {
                     tree.publish(version, withContext(Dispatchers.Default) { tree.rebuild() })
+                } else if (statusSource.version != tree.statusVersion) {
+                    // Statuses normally land after the tree has been drawn.
+                    // Re-colouring keeps the same rows and the same keys, so
+                    // the list doesn't blink, scroll, or re-measure.
+                    val current = tree.rows
+                    tree.publish(
+                        version,
+                        withContext(Dispatchers.Default) { tree.restatus(current) },
+                    )
                 }
                 delay(if (project.scanComplete) IDLE_POLL_MS else SCANNING_POLL_MS)
             }
@@ -113,9 +147,11 @@ fun ProjectPanel(
                     ProjectRow(
                         entry = row.entry,
                         depth = row.depth,
+                        status = row.status,
+                        colours = colours,
                         isExpanded = tree.isExpanded(row.entry.path),
                         isOpen = row.entry.path == openedPath,
-                        dimIgnored = gitignoredFiles == GitignoredFiles.Dimmed,
+                        dimIgnored = dimIgnored,
                         onClick = {
                             if (!row.entry.isDir) {
                                 onOpenFile(row.entry)
@@ -126,8 +162,8 @@ fun ProjectPanel(
                             // collapsing and expanding an already-scanned
                             // directory needs no engine round-trip.
                             scope.launch {
-                                val rows = withContext(Dispatchers.Default) { tree.rebuild() }
-                                tree.publish(tree.version, rows)
+                                val rebuilt = withContext(Dispatchers.Default) { tree.rebuild() }
+                                tree.publish(tree.version, rebuilt)
                             }
                         },
                     )
@@ -141,6 +177,8 @@ fun ProjectPanel(
 private fun ProjectRow(
     entry: ProjectEntry,
     depth: Int,
+    status: GitFileStatus,
+    colours: GitStatusColours,
     isExpanded: Boolean,
     isOpen: Boolean,
     dimIgnored: Boolean,
@@ -152,13 +190,14 @@ private fun ProjectRow(
     } else {
         Color.Transparent
     }
-    // Zed greys gitignored entries rather than hiding them; "show" opts out
-    // of even that, for people who don't want their tree to editorialise.
-    val color = if (entry.isIgnored && dimIgnored) {
-        theme.color("text.disabled", MaterialTheme.colorScheme.onSurfaceVariant)
-    } else {
-        MaterialTheme.colorScheme.onSurface
-    }
+    // Zed tints the *name* by git status and greys gitignored entries rather
+    // than hiding them; "show" opts out of even that, for people who don't
+    // want their tree to editorialise. Ignored still wins over status, as in
+    // Zed: an ignored file that also has changes reads as ignored.
+    //
+    // Colours were resolved once for the whole panel, so this is a `when` over
+    // an enum — no theme lookup and no allocation per row, per frame.
+    val color = colours.colorFor(status, entry.isIgnored, dimIgnored)
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
