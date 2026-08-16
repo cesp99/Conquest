@@ -3,6 +3,7 @@ package to.eyed.conquest.code
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -24,6 +25,16 @@ import to.eyed.conquest.code.terminal.TerminalService
 import to.eyed.conquest.code.ui.workspace.WorkspaceScreen
 
 class MainActivity : ComponentActivity() {
+
+    /** Asked at most once per activity; see [askForNotificationsOnce]. */
+    private var askedForNotifications = false
+
+    private val notificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+            // Denial is not fatal: the service still protects sessions, it
+            // just does so invisibly. Nothing to undo, nothing to nag about.
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Before anything else reaches the engine: it needs to know where the
@@ -41,7 +52,6 @@ class MainActivity : ComponentActivity() {
         // an activity starts, and the terminal's foreground service wants that
         // notification visible. Cheap, and idempotent.
         TerminalService.ensureChannel(this)
-        requestNotificationPermission()
         enableEdgeToEdge()
         setContent {
             var settings by remember { mutableStateOf(initialSettings) }
@@ -58,15 +68,35 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        requestNotificationPermission()
+    }
+
     /**
      * Ask for notifications, so the terminal's foreground service can show why
      * it is running. Denial is not fatal — the service still protects sessions,
      * it just does so invisibly — so this never blocks anything.
+     *
+     * **The `full` flavour cannot actually ask.** Measured on the Fold
+     * (Android 17): the system starts `GrantPermissionsActivity`, which
+     * displays and then finishes itself ~50 ms later with no UI and no
+     * `USER_SET` flag — the permission controller does not show this dialog to
+     * an app targeting API 32 or lower, which is exactly what the userland
+     * costs us (targetSdk 28, see DECISIONS.md). There the user has to enable
+     * notifications from system settings, and the service runs invisibly until
+     * they do. The `play` flavour targets a modern API and gets a real prompt.
+     *
+     * Asked from `onResume` rather than `onCreate` so the request happens with
+     * a window on screen; that is correct either way, and cost nothing to fix
+     * while measuring the above.
      */
     private fun requestNotificationPermission() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (askedForNotifications) return
         val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
         if (granted == PackageManager.PERMISSION_GRANTED) return
-        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+        askedForNotifications = true
+        notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 }
