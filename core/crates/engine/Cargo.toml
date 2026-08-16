@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+clock.workspace = true
 log.workspace = true
+rope.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sum_tree.workspace = true
+text.workspace = true

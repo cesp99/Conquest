@@ -1,6 +1,5 @@
 package to.eyed.conquest.code.ui.workspace
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -23,7 +22,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
-import to.eyed.conquest.code.core.CoreBridge
+import to.eyed.conquest.code.core.BufferSession
 import to.eyed.conquest.code.ui.editor.EditorPane
 
 private val WideLayoutMinWidth = 840.dp
@@ -32,8 +31,9 @@ private val ProjectPanelWidth = 260.dp
 private const val SAMPLE_TEXT = """// Welcome to Conquest Code.
 //
 // Everything you see is rendered by Jetpack Compose, but this buffer
-// lives inside the Rust engine (core/crates/engine), reached over JNI.
-// Edit it: every change round-trips through native code.
+// lives inside the Rust engine (core/crates/engine): a vendored copy of
+// Zed's rope/CRDT text stack, reached over JNI. Every keystroke becomes
+// an incremental byte-range edit against the rope.
 
 fun main() {
     println("Hello from the Rust core!")
@@ -48,29 +48,35 @@ fun main() {
  */
 @Composable
 fun WorkspaceScreen(modifier: Modifier = Modifier) {
-    val bufferId = remember { CoreBridge.createBuffer(SAMPLE_TEXT.trimStart()) }
-    var bufferText by remember { mutableStateOf(CoreBridge.bufferText(bufferId).orEmpty()) }
+    val session = remember { BufferSession(SAMPLE_TEXT.trimStart()) }
+    var bufferText by remember { mutableStateOf(session.text) }
+    var lineCount by remember { mutableStateOf(session.lineCount) }
 
-    // Placeholder edit strategy: replace the whole buffer. Fine while the
-    // engine buffer is a String; replaced by incremental edits with the rope.
+    // Interim edit strategy: the text field hands us the whole new string;
+    // BufferSession diffs it and sends a minimal byte-range edit through
+    // JNI. The real editor (phase 2) will produce range edits directly.
     val onTextChange: (String) -> Unit = { newText ->
-        val currentLen = bufferText.encodeToByteArray().size.toLong()
-        if (CoreBridge.editBuffer(bufferId, 0, currentLen, newText)) {
-            bufferText = newText
+        if (session.update(newText)) {
+            bufferText = session.text
+            lineCount = session.lineCount
         }
     }
 
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
         if (maxWidth >= WideLayoutMinWidth) {
-            WideWorkspace(bufferText, onTextChange)
+            WideWorkspace(bufferText, lineCount, onTextChange)
         } else {
-            CompactWorkspace(bufferText, onTextChange)
+            CompactWorkspace(bufferText, lineCount, onTextChange)
         }
     }
 }
 
 @Composable
-private fun WideWorkspace(bufferText: String, onTextChange: (String) -> Unit) {
+private fun WideWorkspace(
+    bufferText: String,
+    lineCount: Int,
+    onTextChange: (String) -> Unit,
+) {
     Row(modifier = Modifier.fillMaxSize()) {
         Box(
             modifier = Modifier
@@ -80,12 +86,16 @@ private fun WideWorkspace(bufferText: String, onTextChange: (String) -> Unit) {
             ProjectPanel()
         }
         VerticalDivider()
-        EditorArea(bufferText, onTextChange, modifier = Modifier.weight(1f))
+        EditorArea(bufferText, lineCount, onTextChange, modifier = Modifier.weight(1f))
     }
 }
 
 @Composable
-private fun CompactWorkspace(bufferText: String, onTextChange: (String) -> Unit) {
+private fun CompactWorkspace(
+    bufferText: String,
+    lineCount: Int,
+    onTextChange: (String) -> Unit,
+) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     ModalNavigationDrawer(
@@ -98,6 +108,7 @@ private fun CompactWorkspace(bufferText: String, onTextChange: (String) -> Unit)
     ) {
         EditorArea(
             bufferText,
+            lineCount,
             onTextChange,
             onOpenProjectPanel = { scope.launch { drawerState.open() } },
         )
@@ -107,6 +118,7 @@ private fun CompactWorkspace(bufferText: String, onTextChange: (String) -> Unit)
 @Composable
 private fun EditorArea(
     bufferText: String,
+    lineCount: Int,
     onTextChange: (String) -> Unit,
     modifier: Modifier = Modifier,
     onOpenProjectPanel: (() -> Unit)? = null,
@@ -114,6 +126,7 @@ private fun EditorArea(
     Column(modifier = modifier.fillMaxSize()) {
         EditorPane(
             text = bufferText,
+            lineCount = lineCount,
             onTextChange = onTextChange,
             modifier = Modifier.weight(1f)
         )

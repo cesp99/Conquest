@@ -23,12 +23,15 @@ import androidx.compose.ui.unit.sp
  * Placeholder editor pane: a monospace text field with a line-number
  * gutter. This is NOT the final editor — the real one is a custom
  * canvas-rendered surface driven by the Rust engine (rope + tree-sitter
- * highlighting), planned in agent-docs/ROADMAP.md phase 3. This exists to
+ * highlighting), planned in agent-docs/ROADMAP.md phase 2. This exists to
  * exercise the JNI buffer round-trip and give the shell something to show.
+ * [lineCount] comes from the engine (`bufferLineCount`), not from counting
+ * newlines in [text].
  */
 @Composable
 fun EditorPane(
     text: String,
+    lineCount: Int,
     onTextChange: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -38,7 +41,6 @@ fun EditorPane(
         lineHeight = 20.sp,
         color = MaterialTheme.colorScheme.onBackground,
     )
-    val lineCount = text.count { it == '\n' } + 1
     val scrollState = rememberScrollState()
 
     Row(
