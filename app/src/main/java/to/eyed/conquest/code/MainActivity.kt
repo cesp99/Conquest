@@ -29,7 +29,7 @@ class MainActivity : ComponentActivity() {
         // Before anything else reaches the engine: it needs to know where the
         // app's private storage is (Android gives a process no $HOME, and the
         // Zed crates require one).
-        CoreBridge.initialize(filesDir.absolutePath)
+        CoreBridge.initialize(filesDir.absolutePath, BuildConfig.DEBUG)
         // Read once, synchronously: the theme is chosen from it, and loading
         // it asynchronously would mean painting the wrong theme first and
         // flashing to the right one. It is a single ~700-byte read of

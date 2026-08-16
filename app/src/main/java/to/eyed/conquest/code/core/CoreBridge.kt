@@ -27,8 +27,13 @@ object CoreBridge {
      * Android runs apps without `$HOME`, which the vendored Zed crates assume
      * exists — a worktree scan panics without one. The engine points `HOME`
      * (and the trash) at this directory.
+     *
+     * [verboseLogging] raises the engine's log level from Info to Debug, which
+     * is where its git and scan diagnostics live. Pass `BuildConfig.DEBUG`: the
+     * Rust library cannot tell a debug APK from a release one on its own,
+     * because Gradle builds it `--release` for every Android build type.
      */
-    external fun initialize(filesDir: String)
+    external fun initialize(filesDir: String, verboseLogging: Boolean)
 
     external fun engineVersion(): String
 

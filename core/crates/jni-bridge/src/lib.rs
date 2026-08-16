@@ -17,10 +17,15 @@ use jni::objects::{JClass, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jintArray, jlong, jstring};
 use std::path::Path;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use engine::Engine;
 
 static ENGINE: OnceLock<Engine> = OnceLock::new();
+
+/// Whether to log the engine's own diagnostics. Set by `initialize` before the
+/// engine — and therefore the logger — comes up.
+static VERBOSE_LOG: AtomicBool = AtomicBool::new(false);
 
 fn engine() -> &'static Engine {
     ENGINE.get_or_init(|| {
@@ -30,7 +35,12 @@ fn engine() -> &'static Engine {
                 // Debug in a debug build: the engine's own diagnostics (git
                 // runs, scans) are debug-level, and chasing a problem without
                 // them means rebuilding to see anything. Release stays at Info.
-                .with_max_level(if cfg!(debug_assertions) {
+                //
+                // `cfg!(debug_assertions)` cannot answer this: one cargo
+                // invocation, always `--release`, serves every Android build
+                // type, so it is false even in a debug APK. Kotlin passes
+                // `BuildConfig.DEBUG` in instead.
+                .with_max_level(if VERBOSE_LOG.load(Ordering::Relaxed) {
                     log::LevelFilter::Debug
                 } else {
                     log::LevelFilter::Info
@@ -77,8 +87,10 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_initialize(
     mut env: JNIEnv,
     _class: JClass,
     files_dir: JString,
+    verbose_logging: jboolean,
 ) {
     let files_dir = get_string(&mut env, &files_dir);
+    VERBOSE_LOG.store(verbose_logging != JNI_FALSE, Ordering::Relaxed);
     engine::initialize(Path::new(&files_dir));
     engine();
 }
