@@ -155,8 +155,39 @@ object CoreBridge {
 
     /**
      * Reads a file into a new buffer, choosing the language from its name.
-     * Returns the buffer id, or -1 if the file could not be read. **Blocking**
-     * — call it off the main thread.
+     * Opening the same file twice returns the *same* buffer — a file must
+     * never fork into two edit histories. Returns the buffer id, or -1 if the
+     * file could not be read. **Blocking** — call it off the main thread.
      */
     external fun openFile(path: String): Long
+
+    /** Absolute path of the file behind a buffer; null for scratch buffers. */
+    external fun bufferPath(bufferId: Long): String?
+
+    /** Whether the buffer has edits not yet written to disk. */
+    external fun bufferIsDirty(bufferId: Long): Boolean
+
+    /**
+     * Whether the file changed on disk since the buffer last synced with it.
+     * Set by the worktree's file watcher; cleared by save or reload. The
+     * engine only ever *flags* this — resolving it is the UI's call.
+     */
+    external fun bufferHasDiskChange(bufferId: Long): Boolean
+
+    /** Whether the file behind the buffer has been deleted from disk. */
+    external fun bufferFileDeleted(bufferId: Long): Boolean
+
+    /**
+     * Writes the buffer to its file. Returns the version now on disk, or -1
+     * if the buffer has no file or the write failed. **Blocking** — call it
+     * off the main thread.
+     */
+    external fun saveBuffer(bufferId: Long): Long
+
+    /**
+     * Re-reads the file into the buffer, discarding local edits. Applied as a
+     * single undoable edit, so a mistaken reload is recoverable. Returns the
+     * new version, or -1. **Blocking** — call it off the main thread.
+     */
+    external fun reloadBuffer(bufferId: Long): Long
 }

@@ -19,8 +19,9 @@ import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
 /**
- * Zed-style status bar. On compact layouts it also hosts the project panel
- * toggle (Zed keeps panel toggles here too).
+ * Zed-style status bar: the open file's path, a save action while it has
+ * unsaved edits, and the cursor position. On compact layouts it also hosts the
+ * project panel toggle (Zed keeps panel toggles here too).
  */
 @Composable
 fun StatusBar(
@@ -28,6 +29,8 @@ fun StatusBar(
     cursorCol: Int,
     modifier: Modifier = Modifier,
     filePath: String? = null,
+    isDirty: Boolean = false,
+    onSave: (() -> Unit)? = null,
     onOpenProjectPanel: (() -> Unit)? = null,
 ) {
     val engineVersion = remember { CoreBridge.engineVersion() }
@@ -51,7 +54,7 @@ fun StatusBar(
         }
         if (filePath != null) {
             Text(
-                text = filePath,
+                text = if (isDirty) "$filePath •" else filePath,
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
@@ -60,6 +63,17 @@ fun StatusBar(
             )
         }
         Spacer(modifier = Modifier.weight(1f))
+        // Ctrl+S covers hardware keyboards; touch needs something to press.
+        if (isDirty && onSave != null) {
+            Text(
+                text = "Save",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier
+                    .clickable(onClick = onSave)
+                    .padding(end = 12.dp),
+            )
+        }
         Text(
             text = "Ln ${cursorRow + 1}, Col ${cursorCol + 1}",
             style = MaterialTheme.typography.labelMedium,

@@ -72,7 +72,11 @@ private const val CURSOR_BLINK_MILLIS = 530L
  * (editorTextInput) and hardware keys.
  */
 @Composable
-fun EditorPane(state: EditorState, modifier: Modifier = Modifier) {
+fun EditorPane(
+    state: EditorState,
+    modifier: Modifier = Modifier,
+    onSave: (() -> Unit)? = null,
+) {
     val theme = LocalZedTheme.current
     val textStyle = TextStyle(
         fontFamily = FontFamily.Monospace,
@@ -128,7 +132,7 @@ fun EditorPane(state: EditorState, modifier: Modifier = Modifier) {
             .scrollable(horizontalScroll, Orientation.Horizontal)
             .focusRequester(focusRequester)
             .editorTextInput(state)
-            .onKeyEvent { event -> handleEditorKey(state, actions, event) }
+            .onKeyEvent { event -> handleEditorKey(state, actions, event, onSave) }
             .focusable()
             .pointerInput(state) {
                 detectDragGesturesAfterLongPress(
@@ -405,6 +409,7 @@ private fun handleEditorKey(
     state: EditorState,
     actions: EditorActions,
     event: KeyEvent,
+    onSave: (() -> Unit)?,
 ): Boolean {
     if (event.type != KeyEventType.KeyDown) return false
     if (event.isCtrlPressed) {
@@ -424,6 +429,10 @@ private fun handleEditorKey(
             Key.C -> actions.copy()
             Key.X -> actions.cut()
             Key.V -> actions.paste()
+            Key.S -> {
+                onSave?.invoke()
+                onSave != null
+            }
             else -> false
         }
     }

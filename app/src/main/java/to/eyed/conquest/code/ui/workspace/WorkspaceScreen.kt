@@ -29,12 +29,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import to.eyed.conquest.code.core.BufferSession
 import to.eyed.conquest.code.core.ProjectEntry
 import to.eyed.conquest.code.core.ProjectSession
 import to.eyed.conquest.code.core.ProjectsRoot
-import to.eyed.conquest.code.core.BufferSession
 import to.eyed.conquest.code.ui.editor.EditorPane
 import to.eyed.conquest.code.ui.editor.EditorState
 
@@ -45,13 +46,18 @@ private val ProjectPanelWidth = 260.dp
 private const val STARTUP_FILE = "src/main.rs"
 
 /**
- * Root of the IDE UI, in the spirit of Zed's workspace: a project panel,
- * an editor area and a status bar. Wide screens (tablets, unfolded
+ * How often to re-read each open buffer's dirty / on-disk state from the
+ * engine. Those are plain JNI getters rather than observable state, so the UI
+ * pulls them; a few calls per second per tab is far cheaper than making every
+ * keystroke push through the bridge.
+ */
+private const val STATUS_POLL_MS = 250L
+
+/**
+ * Root of the IDE UI, in the spirit of Zed's workspace: a project panel, a tab
+ * strip, an editor area and a status bar. Wide screens (tablets, unfolded
  * foldables) get a fixed sidebar; compact screens (phones, folded) get a
  * slimmer layout with the panel in a drawer.
- *
- * The project is a real engine worktree and the editor buffer is a real file
- * read from disk, so both panes talk to the same Rust core.
  */
 @Composable
 fun WorkspaceScreen(modifier: Modifier = Modifier) {
@@ -60,19 +66,22 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
     // fresh install), so it happens off the main thread and the UI starts with
     // no project — which is also the state P3-4's project picker will use.
     var project by remember { mutableStateOf<ProjectSession?>(null) }
-    var editorState by remember { mutableStateOf<EditorState?>(null) }
-    var openedPath by remember { mutableStateOf<String?>(null) }
+    val files = remember { OpenFilesState() }
     val scope = rememberCoroutineScope()
+    // Conflicts the user chose to live with, so the bar doesn't nag.
+    val dismissedConflicts = remember { mutableStateOf(setOf<String>()) }
 
-    /** Swap the editor to a project file, closing the buffer it replaces. */
     fun openFile(project: ProjectSession, path: String) {
+        val existing = files.indexOfPath(path)
+        if (existing >= 0) {
+            files.select(existing)
+            return
+        }
         scope.launch {
             val absolutePath = project.absolutePathOf(path) ?: return@launch
             val session = withContext(Dispatchers.IO) { BufferSession.openFile(absolutePath) }
                 ?: return@launch
-            editorState?.session?.close()
-            editorState = EditorState(session)
-            openedPath = path
+            files.open(OpenFile(path, EditorState(session)))
         }
     }
 
@@ -87,6 +96,39 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
         onDispose { opened?.close() }
     }
 
+    // One loop for every tab's status. A buffer whose file changed underneath
+    // it while *clean* is reloaded without asking: there are no local edits to
+    // lose, and silently showing stale text would be the worse behaviour.
+    LaunchedEffect(files) {
+        while (true) {
+            files.refreshStatuses()
+            for (tab in files.tabs) {
+                if (tab.hasDiskChange && !tab.isDirty) {
+                    withContext(Dispatchers.IO) { tab.session.reload() }
+                    tab.refreshStatus()
+                    dismissedConflicts.value -= tab.path
+                }
+            }
+            delay(STATUS_POLL_MS)
+        }
+    }
+
+    fun save(file: OpenFile) {
+        scope.launch {
+            withContext(Dispatchers.IO) { file.session.save() }
+            file.refreshStatus()
+            dismissedConflicts.value -= file.path
+        }
+    }
+
+    fun reload(file: OpenFile) {
+        scope.launch {
+            withContext(Dispatchers.IO) { file.session.reload() }
+            file.refreshStatus()
+            dismissedConflicts.value -= file.path
+        }
+    }
+
     val onOpenEntry: (ProjectEntry) -> Unit = { entry ->
         project?.let { openFile(it, entry.path) }
     }
@@ -99,10 +141,16 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
                         .width(ProjectPanelWidth)
                         .fillMaxHeight()
                 ) {
-                    ProjectPanel(project, onOpenEntry, openedPath = openedPath)
+                    ProjectPanel(project, onOpenEntry, openedPath = files.active?.path)
                 }
                 VerticalDivider()
-                EditorArea(editorState, openedPath, modifier = Modifier.weight(1f))
+                EditorArea(
+                    files = files,
+                    dismissed = dismissedConflicts,
+                    onSave = ::save,
+                    onReload = ::reload,
+                    modifier = Modifier.weight(1f),
+                )
             }
         } else {
             val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -116,14 +164,16 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
                                 onOpenEntry(entry)
                                 scope.launch { drawerState.close() }
                             },
-                            openedPath = openedPath,
+                            openedPath = files.active?.path,
                         )
                     }
                 }
             ) {
                 EditorArea(
-                    editorState,
-                    openedPath,
+                    files = files,
+                    dismissed = dismissedConflicts,
+                    onSave = ::save,
+                    onReload = ::reload,
                     onOpenProjectPanel = { scope.launch { drawerState.open() } },
                 )
             }
@@ -133,13 +183,36 @@ fun WorkspaceScreen(modifier: Modifier = Modifier) {
 
 @Composable
 private fun EditorArea(
-    editorState: EditorState?,
-    openedPath: String?,
+    files: OpenFilesState,
+    dismissed: androidx.compose.runtime.MutableState<Set<String>>,
+    onSave: (OpenFile) -> Unit,
+    onReload: (OpenFile) -> Unit,
     modifier: Modifier = Modifier,
     onOpenProjectPanel: (() -> Unit)? = null,
 ) {
+    val active = files.active
     Column(modifier = modifier.fillMaxSize()) {
-        if (editorState == null) {
+        if (files.tabs.isNotEmpty()) {
+            EditorTabs(files, onSave = onSave)
+            HorizontalDivider()
+        }
+
+        // Only a dirty buffer (or a vanished file) needs the user's decision;
+        // the clean case is reloaded by the status loop without a prompt.
+        if (active != null &&
+            (active.hasDiskChange || active.isDeleted) &&
+            active.path !in dismissed.value
+        ) {
+            FileConflictBar(
+                file = active,
+                onReload = { onReload(active) },
+                onSave = { onSave(active) },
+                onDismiss = { dismissed.value = dismissed.value + active.path },
+            )
+            HorizontalDivider()
+        }
+
+        if (active == null) {
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -155,15 +228,18 @@ private fun EditorArea(
             }
         } else {
             EditorPane(
-                state = editorState,
-                modifier = Modifier.weight(1f)
+                state = active.editor,
+                modifier = Modifier.weight(1f),
+                onSave = { onSave(active) },
             )
         }
         HorizontalDivider()
         StatusBar(
-            cursorRow = editorState?.cursorRow ?: 0,
-            cursorCol = editorState?.cursorCol ?: 0,
-            filePath = openedPath,
+            cursorRow = active?.editor?.cursorRow ?: 0,
+            cursorCol = active?.editor?.cursorCol ?: 0,
+            filePath = active?.path,
+            isDirty = active?.isDirty == true,
+            onSave = active?.let { file -> { onSave(file) } },
             onOpenProjectPanel = onOpenProjectPanel,
         )
     }

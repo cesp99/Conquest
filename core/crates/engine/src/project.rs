@@ -120,6 +120,7 @@ impl crate::Engine {
         self.projects.lock().unwrap().insert(id, state.clone());
 
         let path: Arc<Path> = Arc::from(path);
+        let buffers = self.buffers.clone();
         self.runtime().spawn(move |cx| {
             let global = cx.global::<FsGlobal>();
             let fs = global.fs.clone();
@@ -170,8 +171,23 @@ impl crate::Engine {
                 let scan_complete = cx.update(|cx| {
                     mirror(&worktree, &state, cx);
                     let mirrored = state.clone();
+                    // The worktree reports changes relative to its root, but
+                    // open buffers hold canonical paths. Resolve the root once
+                    // here rather than canonicalizing every changed path: on
+                    // Android in particular, `filesDir` is
+                    // /data/user/0/<pkg>/files, a symlink to /data/data/<pkg>,
+                    // so the two spellings would never match.
+                    let root = worktree.read(cx).abs_path();
+                    let root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.to_path_buf());
                     let subscription =
-                        cx.subscribe(&worktree, move |worktree, _event: &worktree::Event, cx| {
+                        cx.subscribe(&worktree, move |worktree, event: &worktree::Event, cx| {
+                            if let worktree::Event::UpdatedEntries(changes) = event {
+                                let paths: Vec<PathBuf> = changes
+                                    .iter()
+                                    .map(|(path, _, _)| root.join(path.as_std_path()))
+                                    .collect();
+                                crate::file::note_disk_changes(&buffers, &paths);
+                            }
                             mirror(&worktree, &mirrored, cx);
                         });
                     let registry = cx.global_mut::<WorktreeRegistry>();
@@ -476,6 +492,53 @@ mod tests {
         );
         assert_eq!(engine.project_entry_abs_path(id, "../secrets"), None);
         assert_eq!(engine.project_entry_abs_path(id, "src//main.rs"), None);
+    }
+
+    #[test]
+    fn the_worktree_watcher_flags_an_open_buffer() {
+        let dir = fixture();
+        let engine = Engine::new();
+        let id = engine.open_project(dir.path());
+        wait_for_scan(&engine, id);
+
+        let file = dir.path().join("src/main.rs");
+        let buffer = engine.open_file(&file).unwrap();
+        assert!(!engine.buffer_has_disk_change(buffer));
+
+        // Write from "outside" and let the watcher notice. This exercises the
+        // real notify-backed path, not `note_disk_changes` directly, so a
+        // watcher that silently does nothing fails the test.
+        std::fs::write(&file, "fn main() { /* edited elsewhere */ }\n").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && !engine.buffer_has_disk_change(buffer) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            engine.buffer_has_disk_change(buffer),
+            "the worktree watcher never reported the change"
+        );
+        // Flagged only — the buffer still holds what was loaded.
+        assert_eq!(engine.text(buffer).unwrap(), "fn main() {}\n");
+    }
+
+    #[test]
+    fn saving_from_the_engine_is_not_an_external_change() {
+        let dir = fixture();
+        let engine = Engine::new();
+        let id = engine.open_project(dir.path());
+        wait_for_scan(&engine, id);
+
+        let buffer = engine.open_file(&dir.path().join("src/main.rs")).unwrap();
+        let end = engine.text(buffer).unwrap().len();
+        engine.edit(buffer, end, end, "// ours\n").unwrap();
+        engine.save_buffer(buffer).unwrap();
+
+        // Give the watcher time to deliver our own write, which must not be
+        // mistaken for somebody else's.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!engine.buffer_has_disk_change(buffer));
+        assert!(!engine.buffer_is_dirty(buffer));
     }
 
     #[test]

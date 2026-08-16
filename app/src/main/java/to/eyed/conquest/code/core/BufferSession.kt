@@ -33,15 +33,48 @@ class BufferSession private constructor(val id: Long) {
      */
     fun setLanguage(language: String): Boolean = CoreBridge.bufferSetLanguage(id, language)
 
+    /** Absolute path of the backing file; null for scratch buffers. */
+    val path: String?
+        get() = CoreBridge.bufferPath(id)
+
+    /** Edits not yet written to disk. Always false without a backing file. */
+    val isDirty: Boolean
+        get() = CoreBridge.bufferIsDirty(id)
+
+    /**
+     * The file changed on disk since this buffer last synced with it, as
+     * reported by the engine's file watcher. Cleared by [save] or [reload].
+     */
+    val hasDiskChange: Boolean
+        get() = CoreBridge.bufferHasDiskChange(id)
+
+    /** The backing file has been deleted from disk. */
+    val isFileDeleted: Boolean
+        get() = CoreBridge.bufferFileDeleted(id)
+
+    /**
+     * Write to the backing file. Returns false if there is none or the write
+     * failed. **Blocking** — call from [kotlinx.coroutines.Dispatchers.IO].
+     */
+    fun save(): Boolean = applyVersion(CoreBridge.saveBuffer(id))
+
+    /**
+     * Re-read the backing file, discarding local edits (undoably). Returns
+     * false on failure. **Blocking** — call from
+     * [kotlinx.coroutines.Dispatchers.IO].
+     */
+    fun reload(): Boolean = applyVersion(CoreBridge.reloadBuffer(id))
+
     /** Undo the last edit transaction. Returns false if nothing to undo. */
-    fun undo(): Boolean = applyHistory(CoreBridge.undoBuffer(id))
+    fun undo(): Boolean = applyVersion(CoreBridge.undoBuffer(id))
 
     /** Redo the last undone transaction. Returns false if nothing to redo. */
-    fun redo(): Boolean = applyHistory(CoreBridge.redoBuffer(id))
+    fun redo(): Boolean = applyVersion(CoreBridge.redoBuffer(id))
 
     fun close(): Boolean = CoreBridge.closeBuffer(id)
 
-    private fun applyHistory(newVersion: Long): Boolean {
+    /** Adopt a version the engine returned, or report the -1 failure. */
+    private fun applyVersion(newVersion: Long): Boolean {
         if (newVersion < 0) return false
         version = newVersion
         return true

@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use rope::Point;
 use sum_tree::Bias;
 
+mod file;
 mod highlight;
 mod platform;
 mod project;
@@ -58,7 +59,9 @@ static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
 pub struct Engine {
-    buffers: Mutex<HashMap<BufferId, BufferState>>,
+    /// Shared so the worktree watcher can reach open buffers from the
+    /// runtime thread without a handle on the whole engine (see file.rs).
+    buffers: Arc<Mutex<HashMap<BufferId, BufferState>>>,
     projects: Mutex<HashMap<ProjectId, Arc<Mutex<project::ProjectState>>>>,
     next_project_id: AtomicU64,
     /// Started on the first `open_project`, so buffer-only use (and most
@@ -74,6 +77,8 @@ struct BufferState {
     /// Present once a language has been assigned (interim tree-sitter
     /// highlighting; see highlight.rs).
     highlight: Option<highlight::HighlightState>,
+    /// Present for buffers backed by a file on disk (see file.rs).
+    file: Option<file::FileState>,
 }
 
 impl BufferState {
@@ -106,20 +111,6 @@ impl Engine {
         self.next_project_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Read a file from disk into a new buffer, picking the language from its
-    /// name. **Blocking** — call it off the Android main thread.
-    pub fn open_file(&self, path: &Path) -> Result<BufferId, EngineError> {
-        let text = std::fs::read_to_string(path).map_err(|err| EngineError::Io {
-            path: path.display().to_string(),
-            message: err.to_string(),
-        })?;
-        let id = self.create_buffer(&text);
-        if let Some(language) = language_for_path(&path.to_string_lossy()) {
-            let _ = self.set_language(id, language);
-        }
-        Ok(id)
-    }
-
     pub fn create_buffer(&self, initial_text: &str) -> BufferId {
         let id = NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed);
         let remote_id = text::BufferId::new(id).expect("buffer ids start at 1");
@@ -130,6 +121,7 @@ impl Engine {
                 buffer,
                 version: 0,
                 highlight: None,
+                file: None,
             },
         );
         id
@@ -317,8 +309,16 @@ impl Engine {
 #[derive(Debug, PartialEq, Eq)]
 pub enum EngineError {
     UnknownBuffer(BufferId),
-    InvalidRange { start: usize, end: usize },
-    Io { path: String, message: String },
+    InvalidRange {
+        start: usize,
+        end: usize,
+    },
+    /// The operation needs a file behind the buffer, and there isn't one.
+    NoFile(BufferId),
+    Io {
+        path: String,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for EngineError {
@@ -328,6 +328,7 @@ impl std::fmt::Display for EngineError {
             EngineError::InvalidRange { start, end } => {
                 write!(f, "invalid range {start}..{end}")
             }
+            EngineError::NoFile(id) => write!(f, "buffer {id} is not backed by a file"),
             EngineError::Io { path, message } => write!(f, "{path}: {message}"),
         }
     }

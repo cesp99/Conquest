@@ -56,7 +56,7 @@ narrow, coarse-grained JNI boundary. See
 | Tree-sitter syntax highlighting | ✅ in-engine, 21 languages |
 | Custom high-performance editor surface | ✅ v1: virtualized canvas, IME editing, selection & clipboard, Zed themes |
 | Project tree (Zed worktree in-engine) | ✅ lazy, gitignore-aware; open files from the panel |
-| Tabs, save & external change detection | 🚧 next |
+| Tabs, save & external change detection | ✅ dirty dots, atomic save, live reload |
 | Terminal emulator | ⬜ planned |
 | LSP on-device | ⬜ planned |
 | ACP agent panel | ⬜ planned |

@@ -468,6 +468,97 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_openFile(
     }
 }
 
+/// Absolute path of the file behind a buffer; null for scratch buffers.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferPath(
+    env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+) -> jstring {
+    match engine().buffer_path(buffer_id as u64) {
+        Some(path) => to_jstring(&env, path.to_string_lossy().into_owned()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Whether the buffer has edits not yet written to disk.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferIsDirty(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+) -> jboolean {
+    if engine().buffer_is_dirty(buffer_id as u64) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Whether the file changed on disk since the buffer last synced with it.
+/// Set by the worktree's watcher; cleared by save or reload.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferHasDiskChange(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+) -> jboolean {
+    if engine().buffer_has_disk_change(buffer_id as u64) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Whether the file behind the buffer has been deleted from disk.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferFileDeleted(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+) -> jboolean {
+    if engine().buffer_file_deleted(buffer_id as u64) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Write the buffer to its file. Returns the version now on disk, or -1 if
+/// the buffer has no file or the write failed. **Blocking**: call it off the
+/// main thread.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_saveBuffer(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+) -> jlong {
+    match engine().save_buffer(buffer_id as u64) {
+        Ok(version) => version as jlong,
+        Err(err) => {
+            log::warn!("saveBuffer failed: {err}");
+            -1
+        }
+    }
+}
+
+/// Re-read the file into the buffer, discarding local edits (undoably).
+/// Returns the new version, or -1. **Blocking**: call it off the main thread.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_reloadBuffer(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+) -> jlong {
+    match engine().reload_buffer(buffer_id as u64) {
+        Ok(version) => version as jlong,
+        Err(err) => {
+            log::warn!("reloadBuffer failed: {err}");
+            -1
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferText(
     env: JNIEnv,
