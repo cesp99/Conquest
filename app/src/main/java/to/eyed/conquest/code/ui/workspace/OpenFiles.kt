@@ -7,6 +7,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import to.eyed.conquest.code.core.BufferSession
 import to.eyed.conquest.code.ui.editor.EditorState
+import to.eyed.conquest.code.ui.git.DiffTarget
 import to.eyed.conquest.code.ui.media.MediaKind
 
 /** How many closed files Ctrl+Shift+T can walk back through. */
@@ -35,12 +36,17 @@ class OpenFile(
     val editor: EditorState?,
     /** What this file is, when it is not text. */
     val media: MediaKind? = null,
+    /**
+     * A diff, when the tab is one. Like a picture, it has no buffer: it is a
+     * view of what git says, and it cannot be edited or saved.
+     */
+    val diff: DiffTarget? = null,
     /** The file on disk, for a tab the engine never opened. */
     val absolutePath: String? = null,
 ) {
     val session: BufferSession? get() = editor?.session
 
-    val name: String = path.substringAfterLast('/')
+    val name: String = diff?.title ?: path.substringAfterLast('/')
 
     /**
      * A media tab has no buffer, so nothing in the engine is watching its

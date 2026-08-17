@@ -43,6 +43,7 @@ mod find;
 mod git;
 mod git_diff;
 mod git_history;
+mod git_patch;
 mod guest;
 mod highlight;
 mod highlight_worker;

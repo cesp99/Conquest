@@ -94,6 +94,24 @@ on disk, and once it is edited those line numbers describe a file that is not
 there any more. It runs git when the file is opened and after each save, never
 on a keystroke.
 
+## Diffs
+
+Tapping a changed file in the git panel opens its **diff** — what Zed does with
+a click on a change, and the more useful answer to "what did I do here". It is
+a tab, not a dock: a diff is a document, and it belongs beside the file it is
+about. **View diff** at the top of the panel opens every change at once.
+
+The view is unified — old and new in one column, added lines on green, removed
+on red, both line numbers down the left — rather than side by side, which on a
+phone means two twenty-column panes. It follows the repository: stage a file or
+type in the editor beside it and the diff catches up.
+
+`Push` sends the commits you have made; on a branch nobody has pushed it reads
+**Publish** and creates it on the remote, which is Zed's wording and the
+accurate one. There is no credential helper inside the userland, so an HTTPS
+remote will fail with git's own words about authentication — SSH with a key in
+the userland's `~/.ssh` is the way that works today.
+
 ## Wrapping long lines
 
 Off by default, as in Zed. **Settings** → *Wrap long lines*, `☰` → **Wrap long

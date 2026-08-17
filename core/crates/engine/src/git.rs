@@ -183,6 +183,10 @@ pub struct BranchInfo {
     pub behind: u32,
     /// The branch exists but has no commits yet — a repository just created.
     pub unborn: bool,
+    /// The upstream it tracks, `origin/main`-style, or `None` for a branch
+    /// that has never been pushed — the difference between "push" and Zed's
+    /// "Publish".
+    pub upstream: Option<String>,
 }
 
 /// Everything the git panel draws, as one snapshot.
@@ -814,6 +818,15 @@ pub(crate) fn parse_branch(output: &[u8]) -> Option<BranchInfo> {
     if let Some(rest) = rest {
         info.ahead = drift(rest, "ahead ");
         info.behind = drift(rest, "behind ");
+        // `main...origin/main [ahead 1]` — the upstream is what sits between
+        // the `...` and the drift, and its *absence* is what makes a push a
+        // publish.
+        if text.contains("...") {
+            let upstream = rest.split_once(" [").map_or(rest, |(head, _)| head).trim();
+            if !upstream.is_empty() {
+                info.upstream = Some(upstream.to_owned());
+            }
+        }
     }
     Some(info)
 }
@@ -1345,6 +1358,51 @@ impl crate::Engine {
         }
     }
 
+    /// Send commits to the remote — Zed's push, and its "Publish" when the
+    /// branch has no upstream yet (that is the only difference: `-u`).
+    ///
+    /// There is no credential helper inside the guest and nothing here can
+    /// answer a password prompt, so `GIT_TERMINAL_PROMPT=0` (already set by
+    /// [`git_command`]) makes an HTTPS remote fail immediately with git's own
+    /// explanation rather than hanging until the deadline. SSH with a key in
+    /// the userland's `~/.ssh` works.
+    ///
+    /// **Blocking**: it talks to the network.
+    pub fn git_push(&self, id: ProjectId, branch: &str, set_upstream: bool) -> Result<String, String> {
+        let branch = branch.trim();
+        // A branch name is not a path, and this one is handed to git as an
+        // argument: refuse anything that could be read as an option or a
+        // refspec of its own.
+        if branch.is_empty()
+            || branch.starts_with('-')
+            || branch.contains(char::is_whitespace)
+            || branch.contains(':')
+        {
+            return Err(format!("{branch:?} is not a branch name"));
+        }
+        let repo = self.repo_for(id)?;
+        let mut args: Vec<OsString> = vec![OsString::from("push")];
+        if set_upstream {
+            args.push(OsString::from("--set-upstream"));
+        }
+        args.push(OsString::from("origin"));
+        args.push(OsString::from(branch));
+        let run = run_git(
+            &repo.userland,
+            &repo.repo_root,
+            "git push",
+            git_argv(&repo.project_root, &args),
+        )?;
+        self.git_state_changed(id);
+        if run.status == 0 {
+            // git writes its progress to stderr and says nothing on stdout;
+            // the wrapper merges them, so this is what actually happened.
+            Ok(run.output.trim().to_owned())
+        } else {
+            Err(run.message())
+        }
+    }
+
     /// The identity commits will be recorded under, as git resolves it here.
     ///
     /// Empty strings for "git has none", which is the state a fresh Debian is
@@ -1439,7 +1497,7 @@ fn checked_paths(paths: &[String]) -> Result<Vec<String>, String> {
 /// One path, checked. Also the gate every path *we* produce goes through —
 /// a rename's source comes from git rather than from the UI, and "git said it"
 /// is not a reason to hand it to a command that deletes things.
-fn checked_path(path: &str) -> Result<String, String> {
+pub(crate) fn checked_path(path: &str) -> Result<String, String> {
     // One trailing slash is git's own spelling for an untracked directory
     // (`?? newdir/`), which is a row the panel draws and a path the user can
     // stage or discard like any other. Trimming it here rather than rejecting
@@ -2706,6 +2764,24 @@ mod tests {
     /// "git could not run" and "nothing has changed" are the same empty list,
     /// and a panel that cannot tell them apart tells the user their tree is
     /// clean when it has no idea. Found on a device whose Debian had no git.
+    /// The upstream half of porcelain's branch header is what tells "push"
+    /// from Zed's "Publish": a branch nobody has pushed has no `...` at all.
+    #[test]
+    fn the_branch_header_says_whether_there_is_an_upstream() {
+        let tracked = parse_branch(b"## main...origin/main [ahead 1, behind 2]\0").unwrap();
+        assert_eq!(tracked.name.as_deref(), Some("main"));
+        assert_eq!(tracked.upstream.as_deref(), Some("origin/main"));
+        assert_eq!((tracked.ahead, tracked.behind), (1, 2));
+
+        let local_only = parse_branch(b"## feature/new-thing\0").unwrap();
+        assert_eq!(local_only.name.as_deref(), Some("feature/new-thing"));
+        assert!(local_only.upstream.is_none());
+
+        let detached = parse_branch(b"## HEAD (no branch)\0").unwrap();
+        assert!(detached.name.is_none());
+        assert!(detached.upstream.is_none());
+    }
+
     #[test]
     fn a_status_that_could_not_run_git_says_so_rather_than_reading_as_clean() {
         let dir = tempfile::tempdir().unwrap();

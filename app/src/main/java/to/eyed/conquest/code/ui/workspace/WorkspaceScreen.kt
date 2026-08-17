@@ -72,8 +72,11 @@ import to.eyed.conquest.code.ui.editor.EditorPane
 import to.eyed.conquest.code.ui.editor.EditorState
 import to.eyed.conquest.code.ui.editor.SoftWrapMode
 import to.eyed.conquest.code.ui.media.MediaKind
+import to.eyed.conquest.code.ui.git.DiffPane
+import to.eyed.conquest.code.ui.git.DiffTarget
 import to.eyed.conquest.code.ui.git.GitPanel
 import to.eyed.conquest.code.ui.git.GitPanelDockWidth
+import to.eyed.conquest.code.ui.git.rememberGitBranch
 import to.eyed.conquest.code.ui.media.MediaPane
 import to.eyed.conquest.code.ui.preview.MarkdownPreview
 import to.eyed.conquest.code.ui.preview.PreviewDockWidth
@@ -693,6 +696,31 @@ fun WorkspaceScreen(
     // looked like it had happened.
     val onOpenEntry: (ProjectEntry) -> Unit = { entry -> openFromDock(entry.path) }
 
+    /**
+     * Show a diff — one file's, or the whole project's.
+     *
+     * A tab rather than a dock: a diff is a *document*, it is read left to
+     * right and scrolled, and it belongs beside the file it is about. Keyed by
+     * a path of its own so a diff and its file can be open at once.
+     */
+    fun openDiff(path: String?) {
+        val open = project ?: return
+        val target = DiffTarget(path)
+        val key = "git-diff:${path ?: ""}"
+        val existing = files.indexOfPath(key)
+        if (existing >= 0) {
+            files.select(existing)
+        } else {
+            files.open(OpenFile(path = key, editor = null, diff = target))
+        }
+        // The panel that asked may have been holding the whole screen.
+        dockTookWorkArea?.let { side ->
+            docks.closeDock(side)
+            terminalFocused = false
+            rootFocus.requestFocus()
+        }
+    }
+
     fun openProjectSearch(): Boolean {
         if (project == null) return false
         docks.open(WorkspacePanel.Search, settings)
@@ -843,9 +871,17 @@ fun WorkspaceScreen(
         Column(modifier = Modifier.fillMaxSize()) {
             TitleBar(
                 projectName = project?.rootName,
-                filePath = active?.path,
+                // A diff tab's path is a key, not a file; it has a name of
+                // its own and that is what belongs in the title bar.
+                filePath = active?.let { it.diff?.title ?: it.path },
                 isDirty = active?.isDirty == true,
                 menuGroups = menuGroups,
+                branch = rememberGitBranch(project),
+                onBranch = if (project != null) {
+                    { runCommand(WorkspaceCommand.ToggleGitPanel) }
+                } else {
+                    null
+                },
             )
             DockDivider()
             // Compact screens have no room to split: the dock takes the whole
@@ -891,6 +927,7 @@ fun WorkspaceScreen(
                         onOpenEntry = onOpenEntry,
                         onOpenMatch = ::openMatch,
                         onOpenPath = ::openFromDock,
+                        onOpenDiff = ::openDiff,
                         onEntryRemoved = ::closeTabsUnder,
                         onEntryMoved = ::retitleTabs,
                         openedPath = files.active?.path,
@@ -927,6 +964,8 @@ fun WorkspaceScreen(
                                     },
                                     isPreviewOpen = docks.isOpen(WorkspacePanel.Preview, settings),
                                     onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
+                                    diffProject = project,
+                                    onOpenPath = { path -> project?.let { openFile(it, path) } },
                                     softWrap = settings.softWrap,
                                     showInlineBlame = settings.inlineBlame,
                                     modifier = Modifier.weight(1f),
@@ -967,6 +1006,7 @@ fun WorkspaceScreen(
                                         onOpenEntry = onOpenEntry,
                                         onOpenMatch = ::openMatch,
                                         onOpenPath = ::openFromDock,
+                                        onOpenDiff = ::openDiff,
                                         onEntryRemoved = ::closeTabsUnder,
                                         onEntryMoved = ::retitleTabs,
                                         openedPath = files.active?.path,
@@ -1253,6 +1293,9 @@ private fun EditorArea(
     onSearchDismissed: () -> Unit,
     isPreviewOpen: Boolean,
     onTogglePreview: () -> Unit,
+    /** For a diff tab, which needs the project rather than a buffer. */
+    diffProject: ProjectSession?,
+    onOpenPath: (String) -> Unit,
     softWrap: SoftWrapMode,
     showInlineBlame: Boolean,
     modifier: Modifier = Modifier,
@@ -1325,6 +1368,13 @@ private fun EditorArea(
                 onSave = { onSave(active) },
                 softWrap = softWrap,
                 showInlineBlame = showInlineBlame,
+            )
+        } else if (active.diff != null && diffProject != null) {
+            DiffPane(
+                project = diffProject,
+                target = active.diff,
+                onOpenFile = onOpenPath,
+                modifier = Modifier.weight(1f),
             )
         } else {
             MediaPane(
@@ -1405,6 +1455,7 @@ private fun DockPanel(
     onOpenEntry: (ProjectEntry) -> Unit,
     onOpenMatch: (String, ProjectSearchMatch) -> Unit,
     onOpenPath: (String) -> Unit,
+    onOpenDiff: (String?) -> Unit,
     onEntryRemoved: (String) -> Unit,
     onEntryMoved: (String, String) -> Unit,
     onDismiss: () -> Unit,
@@ -1436,6 +1487,7 @@ private fun DockPanel(
             project = project ?: return,
             focusToken = gitFocus,
             onOpenFile = onOpenPath,
+            onOpenDiff = onOpenDiff,
             onDismiss = onDismiss,
         )
     }

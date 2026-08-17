@@ -30,6 +30,14 @@ import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.res.painterResource
+import to.eyed.conquest.code.R
+import to.eyed.conquest.code.core.GitBranch
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
 // Zed: max(1.75rem, 34px) — 34 at the default 16px rem
@@ -61,6 +69,10 @@ fun TitleBar(
     isDirty: Boolean,
     menuGroups: List<List<MenuAction>>,
     modifier: Modifier = Modifier,
+    /** The branch the project is on, as Zed shows it beside the name. */
+    branch: GitBranch? = null,
+    /** Opens the git panel, which is what Zed's branch control leads to. */
+    onBranch: (() -> Unit)? = null,
 ) {
     val theme = LocalZedTheme.current
     var menuOpen by remember { mutableStateOf(false) }
@@ -132,6 +144,55 @@ fun TitleBar(
                 modifier = Modifier.padding(start = 4.dp, end = 10.dp),
             )
         }
+        // Zed's own order: the app menu, the project, then the branch
+        // (title_bar/src/title_bar.rs). A repository with no commits yet has a
+        // branch name and nothing on it, which is worth seeing too.
+        if (branch != null) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(4.dp))
+                    .then(
+                        if (onBranch != null) {
+                            Modifier
+                                .clickable(onClickLabel = "Open the git panel", onClick = onBranch)
+                                .pointerHoverIcon(PointerIcon.Hand)
+                        } else {
+                            Modifier
+                        }
+                    )
+                    .padding(horizontal = 6.dp, vertical = 3.dp),
+            ) {
+                Image(
+                    painter = painterResource(R.drawable.ic_ui_git_branch),
+                    contentDescription = null,
+                    colorFilter = ColorFilter.tint(MaterialTheme.colorScheme.onSurfaceVariant),
+                    modifier = Modifier.size(12.dp),
+                )
+                Text(
+                    text = branch.name ?: "no branch",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    modifier = Modifier.padding(start = 5.dp),
+                )
+                // Ahead and behind, in git's own arrows — the same pair the
+                // git panel's header shows.
+                val drift = buildString {
+                    if (branch.ahead > 0) append(" ↑${branch.ahead}")
+                    if (branch.behind > 0) append(" ↓${branch.behind}")
+                }
+                if (drift.isNotEmpty()) {
+                    Text(
+                        text = drift.trim(),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        modifier = Modifier.padding(start = 3.dp),
+                    )
+                }
+            }
+        }
         if (filePath != null) {
             Text(
                 text = if (isDirty) "$filePath •" else filePath,
@@ -139,7 +200,9 @@ fun TitleBar(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f, fill = false),
+                modifier = Modifier
+                    .padding(start = 6.dp)
+                    .weight(1f, fill = false),
             )
         }
     }

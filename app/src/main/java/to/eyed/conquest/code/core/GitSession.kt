@@ -44,6 +44,27 @@ class GitSession(private val project: ProjectSession) {
         CoreBridge.gitStage(project.id, JSONArray(paths).toString())
 
     /**
+     * Send this branch's commits to `origin`; publish it when it has no
+     * upstream yet. Null when it worked. **Blocking** — it uses the network.
+     */
+    fun push(branch: String, setUpstream: Boolean): String? =
+        CoreBridge.gitPush(project.id, branch, setUpstream)
+
+    /**
+     * What changed, line by line — the whole patch, or one file's.
+     *
+     * **Blocking** — call it from [kotlinx.coroutines.Dispatchers.IO].
+     */
+    fun patch(path: String? = null, staged: Boolean = false): PatchResult {
+        val root = JSONObject(CoreBridge.gitPatch(project.id, path.orEmpty(), staged))
+        if (!root.isNull("error")) return PatchResult(error = root.getString("error"))
+        val files = root.optJSONArray("files") ?: JSONArray()
+        return PatchResult(
+            files = List(files.length()) { index -> FileDiff.parse(files.getJSONObject(index)) },
+        )
+    }
+
+    /**
      * A page of history, newest first. Empty for a repository with no commits.
      *
      * **Blocking** — call it from [kotlinx.coroutines.Dispatchers.IO].
@@ -142,7 +163,14 @@ data class GitBranch(
     val behind: Int = 0,
     /** The branch exists but has no commits yet — a repository just created. */
     val unborn: Boolean = false,
-)
+    /**
+     * The upstream it tracks, or null for a branch nobody has pushed — which
+     * is the difference between a push and Zed's "Publish".
+     */
+    val upstream: String? = null,
+) {
+    val hasUpstream: Boolean get() = upstream != null
+}
 
 /**
  * One changed file.
@@ -230,6 +258,7 @@ data class GitPanelState(
                         ahead = it.optInt("ahead"),
                         behind = it.optInt("behind"),
                         unborn = it.optBoolean("unborn"),
+                        upstream = if (it.isNull("upstream")) null else it.getString("upstream"),
                     )
                 },
                 entries = List(entries.length()) { index ->
@@ -261,6 +290,74 @@ data class GitPanelState(
 data class GitIdentity(val name: String, val email: String) {
     val isComplete: Boolean get() = name.isNotBlank() && email.isNotBlank()
 }
+
+/** One file's diff, and what a diff view draws. */
+data class FileDiff(
+    val path: String,
+    /** Where a rename came from. */
+    val original: String?,
+    /** git said the content is binary; there are no hunks to show. */
+    val isBinary: Boolean,
+    val hunks: List<PatchHunk>,
+) {
+    /** How many lines the patch adds and removes, for a summary line. */
+    val added: Int get() = hunks.sumOf { hunk -> hunk.lines.count { it.kind == '+' } }
+    val removed: Int get() = hunks.sumOf { hunk -> hunk.lines.count { it.kind == '-' } }
+
+    internal companion object {
+        fun parse(json: JSONObject): FileDiff {
+            val hunks = json.optJSONArray("hunks") ?: JSONArray()
+            return FileDiff(
+                path = json.optString("path"),
+                original = if (json.isNull("original")) null else json.getString("original"),
+                isBinary = json.optBoolean("is_binary"),
+                hunks = List(hunks.length()) { index ->
+                    val hunk = hunks.getJSONObject(index)
+                    val lines = hunk.optJSONArray("lines") ?: JSONArray()
+                    PatchHunk(
+                        oldStart = hunk.optInt("old_start"),
+                        newStart = hunk.optInt("new_start"),
+                        heading = hunk.optString("heading"),
+                        lines = List(lines.length()) { at ->
+                            val line = lines.getJSONObject(at)
+                            PatchLine(
+                                kind = line.optString("kind").firstOrNull() ?: ' ',
+                                text = line.optString("text"),
+                                oldLine = line.optInt("old_line"),
+                                newLine = line.optInt("new_line"),
+                            )
+                        },
+                    )
+                },
+            )
+        }
+    }
+}
+
+/** One `@@` block of a patch. */
+data class PatchHunk(
+    val oldStart: Int,
+    val newStart: Int,
+    /** The enclosing function, when git found one. */
+    val heading: String,
+    val lines: List<PatchLine>,
+)
+
+/** One line of a hunk: `' '` unchanged, `'+'` added, `'-'` removed. */
+data class PatchLine(
+    val kind: Char,
+    val text: String,
+    /** Its number on the old side, or 0 for an added line. */
+    val oldLine: Int,
+    /** Its number on the new side, or 0 for a removed line. */
+    val newLine: Int,
+)
+
+/** A patch, or why there is none. */
+data class PatchResult(
+    val files: List<FileDiff> = emptyList(),
+    val error: String? = null,
+)
 
 /** One commit, as the History tab draws it. */
 data class Commit(

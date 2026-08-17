@@ -635,6 +635,44 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitCommit(
     command_result(&env, engine().git_commit(project_id as u64, &message))
 }
 
+/// Push the named branch to `origin`, setting its upstream when it has none —
+/// Zed's "Publish". Null when it worked (git's own output is logged), and the
+/// reason when it did not. **Blocking**: it talks to the network.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitPush(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    branch: JString,
+    set_upstream: jboolean,
+) -> jstring {
+    let branch = get_string(&mut env, &branch);
+    let result = engine().git_push(project_id as u64, &branch, set_upstream != 0);
+    command_result(&env, result.map(|_| ()))
+}
+
+/// The working tree's diff as a patch, as JSON — `{"files":[…]}` with each
+/// file `{path, original, is_binary, hunks}` and each hunk
+/// `{old_start, new_start, heading, lines:[{kind, text, old_line, new_line}]}`.
+/// An empty `path` means every changed file. `{"error":…}` when git failed.
+/// **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitPatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    path: JString,
+    staged: jboolean,
+) -> jstring {
+    let path = get_string(&mut env, &path);
+    let path = Some(path.as_str()).filter(|path| !path.is_empty());
+    let json = match engine().git_patch(project_id as u64, path, staged != 0) {
+        Ok(files) => serde_json::json!({ "files": files }).to_string(),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    };
+    to_jstring(&env, json)
+}
+
 /// A page of commit history, newest first, as a JSON array of
 /// `{sha, parents, author, author_email, author_time, subject, refs}`.
 /// `[]` for a repository with no commits; the error text when git failed.

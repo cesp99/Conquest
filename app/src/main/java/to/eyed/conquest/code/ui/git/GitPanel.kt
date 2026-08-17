@@ -156,6 +156,8 @@ fun GitPanel(
      */
     focusToken: Int,
     onOpenFile: (String) -> Unit,
+    /** Open a diff view — one file's, or the whole project's for null. */
+    onOpenDiff: (String?) -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -322,6 +324,23 @@ fun GitPanel(
         }
     }
 
+    /**
+     * Push, or publish a branch that has no upstream yet.
+     *
+     * Zed's own button says "Publish" for the second case and shows the push
+     * for the first; the difference is `-u`, and it is the difference between
+     * "send these commits" and "make this branch exist on the remote".
+     *
+     * There is no credential helper inside the guest, so an HTTPS remote will
+     * ask for a password nobody can type and git will fail — with its own
+     * words, which is what the strip below shows. SSH with a key in the
+     * userland's `~/.ssh` works.
+     */
+    fun push() {
+        val branch = state.branch ?: return
+        perform({ session.push(branch.name.orEmpty(), setUpstream = !branch.hasUpstream) })
+    }
+
     /** Save the identity, then commit — which is what the user asked for. */
     fun saveIdentity() {
         perform({ session.setIdentity(identityName.text, identityEmail.text) }) {
@@ -396,7 +415,7 @@ fun GitPanel(
                     Key.PageUp -> { move(-PAGE_ROWS); true }
                     Key.Enter, Key.NumPadEnter -> {
                         val change = selectedChange
-                        if (change == null) move(1) else onOpenFile(change.path)
+                        if (change == null) move(1) else onOpenDiff(change.path)
                         true
                     }
                     // Zed's `space: git::ToggleStaged`.
@@ -431,6 +450,16 @@ fun GitPanel(
                 },
             )
             HorizontalDivider(color = theme.color("border.variant"))
+
+            if (tab == GitPanelTab.Changes) {
+                ActionBar(
+                    state = state,
+                    busy = busy,
+                    onViewDiff = { onOpenDiff(null) },
+                    onPush = ::push,
+                )
+                HorizontalDivider(color = theme.color("border.variant"))
+            }
 
             if (tab == GitPanelTab.History) {
                 HistoryList(
@@ -481,9 +510,12 @@ fun GitPanel(
                                 isSelected = index == selection,
                                 enabled = !busy,
                                 onSelect = { selected = index },
+                                // Zed opens the *diff* when a change is
+                                // clicked, not the file: the question a
+                                // changed row asks is "what changed".
                                 onOpen = {
                                     selected = index
-                                    onOpenFile(row.change.path)
+                                    onOpenDiff(row.change.path)
                                 },
                                 onToggleStaged = {
                                     selected = index
@@ -1534,4 +1566,68 @@ private fun statusOf(letter: Char): to.eyed.conquest.code.ui.workspace.GitFileSt
     'D' -> to.eyed.conquest.code.ui.workspace.GitFileStatus.Deleted
     'R', 'C' -> to.eyed.conquest.code.ui.workspace.GitFileStatus.Renamed
     else -> to.eyed.conquest.code.ui.workspace.GitFileStatus.Modified
+}
+
+/**
+ * Zed's row above the change list: what the whole diff is, and what to do with
+ * the commits that are already made.
+ *
+ * "Publish" rather than "Push" for a branch with no upstream, which is Zed's
+ * wording and the more accurate one: the branch does not exist on the remote
+ * yet, and this is what makes it.
+ */
+@Composable
+private fun ActionBar(
+    state: GitPanelState,
+    busy: Boolean,
+    onViewDiff: () -> Unit,
+    onPush: () -> Unit,
+) {
+    val theme = LocalZedTheme.current
+    val branch = state.branch
+    val canPush = branch?.name != null && !busy && (branch.ahead > 0 || !branch.hasUpstream)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(theme.color("toolbar.background"))
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        BarAction(
+            label = "View diff",
+            enabled = !state.isClean,
+            onClick = onViewDiff,
+        )
+        Spacer(modifier = Modifier.weight(1f))
+        if (branch?.name != null) {
+            BarAction(
+                label = when {
+                    !branch.hasUpstream -> "Publish"
+                    branch.ahead > 0 -> "Push ${branch.ahead}"
+                    else -> "Pushed"
+                },
+                enabled = canPush,
+                onClick = onPush,
+            )
+        }
+    }
+}
+
+@Composable
+private fun BarAction(label: String, enabled: Boolean, onClick: () -> Unit) {
+    val theme = LocalZedTheme.current
+    Text(
+        text = label,
+        style = MaterialTheme.typography.labelLarge,
+        color = if (enabled) {
+            theme.color("text.accent", MaterialTheme.colorScheme.primary)
+        } else {
+            theme.color("text.disabled", theme.color("text.muted"))
+        },
+        modifier = Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .then(if (enabled) Modifier.clickable(onClickLabel = label, onClick = onClick) else Modifier)
+            .pointerHoverIcon(PointerIcon.Hand)
+            .padding(horizontal = 8.dp, vertical = 8.dp),
+    )
 }

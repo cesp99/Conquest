@@ -250,6 +250,18 @@ object CoreBridge {
     external fun gitCommit(projectId: Long, message: String): String?
 
     /**
+     * Push [branch] to `origin`, setting its upstream when it has none. Null
+     * when it worked, the reason when it did not. **Blocking** — network.
+     */
+    external fun gitPush(projectId: Long, branch: String, setUpstream: Boolean): String?
+
+    /**
+     * The working tree's diff as a patch, as JSON. An empty [path] means every
+     * changed file. **Blocking** — it runs git.
+     */
+    external fun gitPatch(projectId: Long, path: String, staged: Boolean): String
+
+    /**
      * A page of commit history, newest first, as JSON — `{"commits":[…]}` or
      * `{"error":…}`. **Blocking** — it runs git.
      */
