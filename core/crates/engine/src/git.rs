@@ -295,7 +295,13 @@ fn git_argv(project: &Path) -> Vec<OsString> {
 /// git's own is the argv, a bind for a repository that lives outside the
 /// projects directory, and these two variables.
 fn capture(userland: &Userland, repo_root: &Path, project: &Path) -> Option<Vec<u8>> {
-    let command = GuestCommand::new("git status", git_argv(project))
+    guest::capture(userland, &git_command(repo_root, project), RUN_TIMEOUT)
+}
+
+/// git's half of the guest command: the argv, the bind for a repository that
+/// lives outside the projects directory, and two variables.
+fn git_command(repo_root: &Path, project: &Path) -> GuestCommand {
+    GuestCommand::new("git status", git_argv(project))
         .bind(repo_root)
         // `--no-optional-locks` in its environment form, which git(1) gives as
         // equivalent; unlike the flag it is inherited, so a git that runs
@@ -303,8 +309,7 @@ fn capture(userland: &Userland, repo_root: &Path, project: &Path) -> Option<Vec<
         .env("GIT_OPTIONAL_LOCKS", "0")
         // There is nobody on this end to answer a credential prompt, and a git
         // waiting for one would sit there until the deadline killed it.
-        .env("GIT_TERMINAL_PROMPT", "0");
-    guest::capture(userland, &command, RUN_TIMEOUT)
+        .env("GIT_TERMINAL_PROMPT", "0")
 }
 
 /// The enclosing repository's root, or `None` if there isn't one.
@@ -753,6 +758,37 @@ mod tests {
     /// which matters more now that the two halves are written in different
     /// files, because a flag lost in either is invisible until a phone shows
     /// an uncoloured panel.
+    /// The bind and the two variables are as load-bearing as the argv and were
+    /// pinned by nothing: dropping the bind silently reports no status for an
+    /// imported project whose repository lives elsewhere, and dropping
+    /// GIT_TERMINAL_PROMPT hangs every poll of a private https remote until
+    /// the deadline kills it. Both stay green in every other test here.
+    #[test]
+    fn the_git_command_binds_the_repository_and_silences_prompts() {
+        let command = git_command(
+            Path::new("/elsewhere/repo"),
+            Path::new("/elsewhere/repo/sub"),
+        );
+        assert_eq!(command.binds(), [PathBuf::from("/elsewhere/repo")]);
+        let env: Vec<(String, String)> = command
+            .env_pairs()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            env,
+            vec![
+                ("GIT_OPTIONAL_LOCKS".to_owned(), "0".to_owned()),
+                ("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()),
+            ]
+        );
+    }
+
     #[test]
     fn the_git_argv_is_exactly_this() {
         let argv: Vec<String> = git_argv(Path::new("/files/projects/thing"))

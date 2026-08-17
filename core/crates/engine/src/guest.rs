@@ -165,6 +165,20 @@ impl GuestCommand {
             .push((key.as_ref().to_owned(), value.as_ref().to_owned()));
         self
     }
+
+    /// What a caller asked to be bound and set, so its own tests can pin it.
+    /// The proot half is pinned here; the caller's half is only pinned where
+    /// the caller lives, and both halves have to be, because either one lost
+    /// is a silent behaviour change.
+    #[cfg(test)]
+    pub(crate) fn binds(&self) -> &[PathBuf] {
+        &self.binds
+    }
+
+    #[cfg(test)]
+    pub(crate) fn env_pairs(&self) -> &[(OsString, OsString)] {
+        &self.env
+    }
 }
 
 /// The proot invocation for a command: flags, binds, guest environment, argv.
@@ -324,6 +338,11 @@ pub(crate) fn capture(
 /// is read or written here either — the pipes belong to the caller, who is the
 /// only one who knows the protocol on them.
 ///
+/// **Whoever calls this owes stderr a reader.** All three pipes are piped, and
+/// an unread one fills its 64 KiB buffer and blocks the server for good — the
+/// same deadlock [`capture`] spawns two threads to avoid. A server that logs
+/// as it works, which is most of them, will hit it.
+///
 /// **P5-1 still has to add**, and this deliberately does not:
 ///
 /// * *Framing.* `Content-Length` headers off a live stdout, parsed as bytes
@@ -339,6 +358,9 @@ pub(crate) fn capture(
 ///   needs a number attached to it, which is P5-4's.
 #[allow(dead_code, reason = "the seam exists before its first caller, in P5-1")]
 pub(crate) fn spawn(userland: &Userland, command: &GuestCommand) -> Option<GuestProcess> {
+    if !userland.is_installed() {
+        return None;
+    }
     let mut proot = proot_command(userland, command);
     proot
         .stdin(Stdio::piped())
@@ -358,6 +380,7 @@ pub(crate) fn spawn(userland: &Userland, command: &GuestCommand) -> Option<Guest
         stdout: child.stdout.take(),
         stderr: child.stderr.take(),
         child,
+        exited: None,
     })
 }
 
@@ -372,6 +395,10 @@ pub(crate) struct GuestProcess {
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
+    /// Set the moment a wait observes the process gone. After that its pid
+    /// belongs to the kernel again and must never be signalled — see
+    /// [`GuestProcess::exit_status`].
+    exited: Option<std::process::ExitStatus>,
 }
 
 #[allow(dead_code, reason = "the seam exists before its first caller, in P5-1")]
@@ -396,9 +423,22 @@ impl GuestProcess {
 
     /// Has it exited? Never blocks; `None` means still running (or that the
     /// wait itself failed, which is reported once and then indistinguishable).
+    ///
+    /// Asking is not free of consequence: a successful wait **reaps** the
+    /// process, and the kernel is then free to hand that pid to somebody else.
+    /// So the answer is remembered, and [`Drop`] signals nothing once it is
+    /// known — otherwise a restart that polls this and then drops the handle
+    /// would send SIGQUIT to whatever now holds the number, which on a phone
+    /// where pids wrap at 32768 is plausibly one of our own shells.
     pub(crate) fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        if self.exited.is_some() {
+            return self.exited;
+        }
         match self.child.try_wait() {
-            Ok(status) => status,
+            Ok(status) => {
+                self.exited = status;
+                status
+            }
             Err(err) => {
                 log::debug!("{} could not be waited on: {err}", self.label);
                 None
@@ -409,6 +449,14 @@ impl GuestProcess {
 
 impl Drop for GuestProcess {
     fn drop(&mut self) {
+        if self.exited.is_some() {
+            return;
+        }
+        // Fields are dropped *after* this body, so an stdin the caller never
+        // took would still be open while we wait — and a server that would
+        // have exited politely on EOF would never see one. Close it first and
+        // give the polite path its chance; `terminate` then costs nothing.
+        self.stdin.take();
         terminate(&mut self.child);
     }
 }
@@ -422,7 +470,11 @@ impl Drop for GuestProcess {
 fn bind_dirs(userland: &Userland, extra: &[PathBuf]) -> Vec<PathBuf> {
     let mut dirs = vec![userland.projects_dir.clone()];
     for dir in extra {
-        if !dir.starts_with(&userland.projects_dir) {
+        // Two callers naming the same directory, or one naming a directory
+        // already covered, must not produce two `-b` for it: the doc above
+        // says deduplicated, and with several callers sharing this seam that
+        // stops being theoretical.
+        if !dir.starts_with(&userland.projects_dir) && !dirs.iter().any(|seen| seen == dir) {
             dirs.push(dir.clone());
         }
     }
@@ -723,16 +775,29 @@ mod tests {
         // Android a survivor spends the process budget with nobody left to
         // stop it.
         let pid = process.child.id();
+        let before = start_time(pid).expect("the process is running");
         drop(stdin);
         drop(process);
-        #[cfg(unix)]
-        // Signal 0 only asks whether the pid is still ours to signal; the
-        // process has been reaped by `terminate`, so it cannot be.
-        assert_eq!(
-            unsafe { libc::kill(pid as libc::pid_t, 0) },
-            -1,
+        // Not "does this pid exist": the suite spawns processes in parallel
+        // and the kernel is free to hand this number straight to one of them,
+        // which made this assertion fail about one run in three. Ask whether
+        // *this* process is still there, which its start time answers and a
+        // recycled pid cannot fake.
+        assert_ne!(
+            start_time(pid),
+            Some(before),
             "the process outlived its handle"
         );
+    }
+
+    /// Field 22 of `/proc/<pid>/stat`, which with the pid identifies a process
+    /// for as long as the machine is up. The comm field can contain spaces and
+    /// parentheses, so the split starts after its closing one.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn start_time(pid: u32) -> Option<u64> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_comm = stat.rsplit_once(")").map(|(_, rest)| rest)?;
+        after_comm.split_whitespace().nth(19)?.parse().ok()
     }
 
     #[test]
