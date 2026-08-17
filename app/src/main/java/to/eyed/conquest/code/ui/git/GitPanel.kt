@@ -158,6 +158,8 @@ fun GitPanel(
     onOpenFile: (String) -> Unit,
     /** Open a diff view — one file's, or the whole project's for null. */
     onOpenDiff: (String?) -> Unit,
+    /** Open the commit graph, which is a view of the whole repository. */
+    onOpenGraph: () -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -462,6 +464,17 @@ fun GitPanel(
             }
 
             if (tab == GitPanelTab.History) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(theme.color("toolbar.background"))
+                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Spacer(modifier = Modifier.weight(1f))
+                    BarAction(label = "Graph", enabled = true, onClick = onOpenGraph)
+                }
+                HorizontalDivider(color = theme.color("border.variant"))
                 HistoryList(
                     page = history,
                     open = openCommit,

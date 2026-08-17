@@ -41,12 +41,18 @@ class OpenFile(
      * view of what git says, and it cannot be edited or saved.
      */
     val diff: DiffTarget? = null,
+    /** True for the commit graph, which is a view of the repository itself. */
+    val graph: Boolean = false,
     /** The file on disk, for a tab the engine never opened. */
     val absolutePath: String? = null,
 ) {
     val session: BufferSession? get() = editor?.session
 
-    val name: String = diff?.title ?: path.substringAfterLast('/')
+    val name: String = when {
+        graph -> "Git graph"
+        diff != null -> diff.title
+        else -> path.substringAfterLast('/')
+    }
 
     /**
      * A media tab has no buffer, so nothing in the engine is watching its

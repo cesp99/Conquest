@@ -74,7 +74,9 @@ import to.eyed.conquest.code.ui.editor.SoftWrapMode
 import to.eyed.conquest.code.ui.media.MediaKind
 import to.eyed.conquest.code.ui.git.DiffPane
 import to.eyed.conquest.code.ui.git.DiffTarget
+import to.eyed.conquest.code.ui.git.GitGraphPane
 import to.eyed.conquest.code.ui.git.GitPanel
+import to.eyed.conquest.code.ui.git.GitGraphPane
 import to.eyed.conquest.code.ui.git.GitPanelDockWidth
 import to.eyed.conquest.code.ui.git.rememberGitBranch
 import to.eyed.conquest.code.ui.media.MediaPane
@@ -490,6 +492,23 @@ fun WorkspaceScreen(
      * `terminalFocused` still says the shell has the keys. Returns whether the
      * panel is now open.
      */
+    /** The commit graph, as a tab of its own — Zed opens it as a pane item. */
+    fun openGraph() {
+        if (project == null) return
+        val key = "git-graph:"
+        val existing = files.indexOfPath(key)
+        if (existing >= 0) {
+            files.select(existing)
+        } else {
+            files.open(OpenFile(path = key, editor = null, graph = true))
+        }
+        dockTookWorkArea?.let { side ->
+            docks.closeDock(side)
+            terminalFocused = false
+            rootFocus.requestFocus()
+        }
+    }
+
     /** Whether [panel] is not just open but on screen. See [drawnDocks]. */
     fun panelIsDrawn(panel: WorkspacePanel): Boolean =
         docks.isOpen(panel, settings) && panel.sideIn(settings) in drawnDocks
@@ -610,6 +629,10 @@ fun WorkspaceScreen(
                     }
                     if (updated != null) onSettingsChanged(updated)
                 }
+            }
+            WorkspaceCommand.OpenGitGraph -> {
+                if (project == null) return false
+                openGraph()
             }
             WorkspaceCommand.ToggleGitPanel -> {
                 if (project == null) return false
@@ -806,6 +829,9 @@ fun WorkspaceScreen(
                 ) {
                     runCommand(WorkspaceCommand.ToggleSoftWrap)
                 },
+                MenuAction("Git graph", null, enabled = project != null) {
+                    runCommand(WorkspaceCommand.OpenGitGraph)
+                },
                 MenuAction(
                     "Git panel",
                     shortcutLabel(WorkspaceCommand.ToggleGitPanel),
@@ -871,9 +897,10 @@ fun WorkspaceScreen(
         Column(modifier = Modifier.fillMaxSize()) {
             TitleBar(
                 projectName = project?.rootName,
-                // A diff tab's path is a key, not a file; it has a name of
-                // its own and that is what belongs in the title bar.
-                filePath = active?.let { it.diff?.title ?: it.path },
+                // A tab with no buffer — a diff, the graph, a picture — has a
+                // key rather than a path, and a name of its own; that is what
+                // belongs in the title bar.
+                filePath = active?.let { if (it.editor == null) it.name else it.path },
                 isDirty = active?.isDirty == true,
                 menuGroups = menuGroups,
                 branch = rememberGitBranch(project),
@@ -928,6 +955,7 @@ fun WorkspaceScreen(
                         onOpenMatch = ::openMatch,
                         onOpenPath = ::openFromDock,
                         onOpenDiff = ::openDiff,
+                        onOpenGraph = ::openGraph,
                         onEntryRemoved = ::closeTabsUnder,
                         onEntryMoved = ::retitleTabs,
                         openedPath = files.active?.path,
@@ -1007,6 +1035,7 @@ fun WorkspaceScreen(
                                         onOpenMatch = ::openMatch,
                                         onOpenPath = ::openFromDock,
                                         onOpenDiff = ::openDiff,
+                                        onOpenGraph = ::openGraph,
                                         onEntryRemoved = ::closeTabsUnder,
                                         onEntryMoved = ::retitleTabs,
                                         openedPath = files.active?.path,
@@ -1369,6 +1398,12 @@ private fun EditorArea(
                 softWrap = softWrap,
                 showInlineBlame = showInlineBlame,
             )
+        } else if (active.graph && diffProject != null) {
+            GitGraphPane(
+                project = diffProject,
+                onOpenFile = onOpenPath,
+                modifier = Modifier.weight(1f),
+            )
         } else if (active.diff != null && diffProject != null) {
             DiffPane(
                 project = diffProject,
@@ -1456,6 +1491,7 @@ private fun DockPanel(
     onOpenMatch: (String, ProjectSearchMatch) -> Unit,
     onOpenPath: (String) -> Unit,
     onOpenDiff: (String?) -> Unit,
+    onOpenGraph: () -> Unit,
     onEntryRemoved: (String) -> Unit,
     onEntryMoved: (String, String) -> Unit,
     onDismiss: () -> Unit,
@@ -1488,6 +1524,7 @@ private fun DockPanel(
             focusToken = gitFocus,
             onOpenFile = onOpenPath,
             onOpenDiff = onOpenDiff,
+            onOpenGraph = onOpenGraph,
             onDismiss = onDismiss,
         )
     }

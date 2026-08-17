@@ -112,6 +112,19 @@ accurate one. There is no credential helper inside the userland, so an HTTPS
 remote will fail with git's own words about authentication — SSH with a key in
 the userland's `~/.ssh` is the way that works today.
 
+## The commit graph
+
+**Graph** in the git panel's History tab — or `git: open graph` in the palette,
+or `☰` → **Git graph** — opens the history as Zed's graph: the lanes down the
+left that show where a branch forked and where it came back, then the
+description, the date, the author and the short hash. Below 640dp the last
+three fold onto a second line, because five columns on a phone is one column of
+ellipses.
+
+It loads a hundred commits at a time and asks for more as you reach the end.
+Tapping a row shows that commit's message and the files it touched; tapping a
+file opens it.
+
 ## Wrapping long lines
 
 Off by default, as in Zed. **Settings** → *Wrap long lines*, `☰` → **Wrap long

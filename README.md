@@ -79,6 +79,7 @@ Samsung DeX.
 | Git panel | ✅ `Ctrl+Shift+G`, stage/unstage/discard/commit, keyboard and touch |
 | Diff bars in the gutter, inline blame | ✅ Zed's own widths and colours; blame while the file is clean |
 | Diff view, history, push | ✅ unified diffs as tabs, Changes/History tabs, push and publish |
+| Commit graph | ✅ lanes, refs, paging, per-commit files |
 | Markdown and SVG preview | ✅ the toolbar's 👁, split beside the editor or full screen |
 | Images, audio and video | ✅ opened as media, never as a text buffer |
 | Soft wrap | ✅ `soft_wrap`, off by default as in Zed |

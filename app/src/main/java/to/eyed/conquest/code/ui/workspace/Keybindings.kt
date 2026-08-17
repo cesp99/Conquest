@@ -139,6 +139,12 @@ enum class WorkspaceCommand(
     ToggleSoftWrap("editor::ToggleSoftWrap"),
 
     /**
+     * The commit graph — Zed's `git::OpenGraph`, which it opens as a pane item
+     * and so does this: it is a view of the repository, read and scrolled.
+     */
+    OpenGitGraph("git::OpenGraph", isAvailable = { it.hasProject }),
+
+    /**
      * Show or hide the git panel — Zed's `git_panel::ToggleFocus`, on the
      * chord Zed gives it (default-linux.json:700).
      */
