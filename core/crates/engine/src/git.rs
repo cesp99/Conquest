@@ -232,10 +232,10 @@ pub struct ChangedFile {
 
 /// Cached status for one project.
 #[derive(Default)]
-struct ProjectGit {
+pub(crate) struct ProjectGit {
     statuses: Arc<BTreeMap<String, GitStatus>>,
     /// The same run's output, unreduced, for the git panel.
-    changes: Arc<Vec<FileChange>>,
+    pub(crate) changes: Arc<Vec<FileChange>>,
     branch: Option<BranchInfo>,
     /// Where the enclosing repository is, once a run has looked. `None` after
     /// a completed run means the project is not in a repository.
@@ -412,7 +412,7 @@ impl crate::Engine {
         }
     }
 
-    fn with_git<T>(&self, id: ProjectId, f: impl FnOnce(&ProjectGit) -> T) -> Option<T> {
+    pub(crate) fn with_git<T>(&self, id: ProjectId, f: impl FnOnce(&ProjectGit) -> T) -> Option<T> {
         let cache = self.git.projects.lock().unwrap().get(&id).cloned()?;
         let git = cache.lock().unwrap();
         Some(f(&git))
@@ -1043,13 +1043,36 @@ pub(crate) fn run_git(
     label: &str,
     argv: Vec<OsString>,
 ) -> Result<GitRun, String> {
+    // What was actually run, which is the one thing missing when a command
+    // works by hand in the terminal and fails here.
+    log::debug!("{label}: {argv:?}");
+    let retry_argv = argv.clone();
     let output = guest::capture(
         userland,
         &git_command(label, repo_root, wrapped_argv(argv)),
         COMMAND_TIMEOUT,
     )
     .ok_or_else(|| "Could not run git in the Linux userland".to_owned())?;
-    parse_run(&output)
+    let run = parse_run(&output)?;
+    if run.status == 0 {
+        return Ok(run);
+    }
+    log::debug!("{label} exited {}: {:?}", run.status, run.output);
+    // A guest that has just told git the project does not exist is a guest
+    // that was not ready, not a repository that is missing: the same command
+    // run a moment later — by hand, or by this retry — finds it. Seen with a
+    // terminal session alive, and only ever once in a row.
+    if run.output.contains("cannot change to") {
+        log::debug!("{label}: the guest lost the project; running it once more");
+        let output = guest::capture(
+            userland,
+            &git_command(label, repo_root, wrapped_argv(retry_argv)),
+            COMMAND_TIMEOUT,
+        )
+        .ok_or_else(|| "Could not run git in the Linux userland".to_owned())?;
+        return parse_run(&output);
+    }
+    Ok(run)
 }
 
 /// git's argv, wrapped in the shell that makes its failure readable.
@@ -1369,24 +1392,23 @@ impl crate::Engine {
     ///
     /// **Blocking**: it talks to the network.
     pub fn git_push(&self, id: ProjectId, branch: &str, set_upstream: bool) -> Result<String, String> {
-        let branch = branch.trim();
-        // A branch name is not a path, and this one is handed to git as an
-        // argument: refuse anything that could be read as an option or a
-        // refspec of its own.
-        if branch.is_empty()
-            || branch.starts_with('-')
-            || branch.contains(char::is_whitespace)
-            || branch.contains(':')
-        {
-            return Err(format!("{branch:?} is not a branch name"));
-        }
+        let branch = checked_branch(branch)?;
         let repo = self.repo_for(id)?;
+        // The remote the branch actually tracks, when it tracks one: pushing
+        // `fork/main` to `origin` would send it to a different repository from
+        // the one the ahead count was measured against.
+        let remote = self
+            .with_git(id, |git| git.branch.clone())
+            .flatten()
+            .and_then(|branch| branch.upstream)
+            .and_then(|upstream| upstream.split_once('/').map(|(remote, _)| remote.to_owned()))
+            .unwrap_or_else(|| "origin".to_owned());
         let mut args: Vec<OsString> = vec![OsString::from("push")];
         if set_upstream {
             args.push(OsString::from("--set-upstream"));
         }
-        args.push(OsString::from("origin"));
-        args.push(OsString::from(branch));
+        args.push(OsString::from(checked_branch(&remote)?));
+        args.push(OsString::from(&branch));
         let run = run_git(
             &repo.userland,
             &repo.repo_root,
@@ -1476,6 +1498,32 @@ impl crate::Engine {
         }
         Ok(())
     }
+}
+
+/// A branch or remote name this will hand to git as an argument.
+///
+/// Not a general `check-ref-format`: a *whitelist*, because the failure mode
+/// is git reading the value as something else entirely. `+main` is a legal
+/// branch name **and** a force refspec — push it and git happily force-updates
+/// a different branch on the remote and discards a commit — which is exactly
+/// what a guard that only refused `-`, spaces and `:` let through.
+pub(crate) fn checked_branch(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-');
+    if name.is_empty()
+        || name.len() > 255
+        || !name.chars().all(allowed)
+        || name.starts_with('-')
+        || name.starts_with('.')
+        || name.starts_with('/')
+        || name.ends_with('/')
+        || name.ends_with(".lock")
+        || name.contains("..")
+        || name.contains("//")
+    {
+        return Err(format!("{name:?} is not a name this can push"));
+    }
+    Ok(name.to_owned())
 }
 
 /// Turn caller-supplied project-relative paths into arguments, or refuse.
@@ -2764,6 +2812,25 @@ mod tests {
     /// "git could not run" and "nothing has changed" are the same empty list,
     /// and a panel that cannot tell them apart tells the user their tree is
     /// clean when it has no idea. Found on a device whose Debian had no git.
+    /// The one-character hole a skeptic found: `+main` is a legal branch name
+    /// *and* refspec syntax, and `git push origin +main` force-updates `main`
+    /// on the remote — discarding whatever was there.
+    #[test]
+    fn a_branch_name_that_is_also_a_refspec_is_refused() {
+        assert!(checked_branch("main").is_ok());
+        assert!(checked_branch("feature/new-thing").is_ok());
+        assert!(checked_branch("release-1.2.3").is_ok());
+        assert!(checked_branch("+main").is_err());
+        assert!(checked_branch("--force").is_err());
+        assert!(checked_branch("main:other").is_err());
+        assert!(checked_branch("a b").is_err());
+        assert!(checked_branch("../etc").is_err());
+        assert!(checked_branch("main.lock").is_err());
+        assert!(checked_branch("HEAD~2").is_err());
+        assert!(checked_branch("main^{}").is_err());
+        assert!(checked_branch("").is_err());
+    }
+
     /// The upstream half of porcelain's branch header is what tells "push"
     /// from Zed's "Publish": a branch nobody has pushed has no `...` at all.
     #[test]

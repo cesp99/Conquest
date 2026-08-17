@@ -58,23 +58,31 @@ fun layoutGraph(commits: List<Commit>): List<GraphRow> {
         // counted as passing through.
         val through = lanes.indices.filter { it != lane && lanes[it] != null }
 
-        // The first parent keeps this lane; the rest fork off.
-        lanes[lane] = commit.parents.firstOrNull()
-        val parentLanes = commit.parents.mapIndexed { index, parent ->
-            if (index == 0) {
-                // It may *already* be somewhere — two branches whose next
-                // commit is the same one — in which case this lane merges
-                // into that one rather than duplicating it.
-                val elsewhere = lanes.indexOfFirst { it == parent }
-                if (elsewhere != lane && elsewhere >= 0) {
+        // The first parent keeps this lane — unless some *other* lane is
+        // already waiting for it, in which case this lane merges into that one
+        // and closes. Asked before the lane is written, not after: writing
+        // first made the search find the lane it had just written, so the
+        // duplicate was never noticed and one lane ran on for ever. That is
+        // the everyday "side branch newer than the fork point" shape.
+        val first = commit.parents.firstOrNull()
+        val firstLane = when {
+            first == null -> {
+                lanes[lane] = null
+                null
+            }
+            else -> {
+                val elsewhere = lanes.indexOfFirst { it == first }
+                if (elsewhere >= 0 && elsewhere != lane) {
                     lanes[lane] = null
                     elsewhere
                 } else {
+                    lanes[lane] = first
                     lane
                 }
-            } else {
-                claim(parent)
             }
+        }
+        val parentLanes = commit.parents.mapIndexed { index, parent ->
+            if (index == 0) firstLane ?: lane else claim(parent)
         }
 
         // Trailing free lanes are dropped so the diagram narrows again once a

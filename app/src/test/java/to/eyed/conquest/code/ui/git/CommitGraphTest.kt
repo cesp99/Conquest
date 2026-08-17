@@ -123,4 +123,57 @@ class CommitGraphTest {
         assertTrue(rows.all { row -> row.parentLanes.all { it < row.laneCount } })
         assertTrue(rows.all { row -> row.through.all { it < row.laneCount } })
     }
+
+    /**
+     * The shape a skeptic found: a side branch whose commit is *newer* than
+     * the fork point, so the lane waiting for the shared parent is the later
+     * one. The lane must still close — before this it drew a line running off
+     * the bottom of the graph, past the root commit.
+     *
+     *     M(A,B)   A(X)   B(P)   X(P)   P(R)   R
+     */
+    @Test
+    fun aLaneClosesEvenWhenTheOtherLaneClaimedTheParentFirst() {
+        val rows = layoutGraph(
+            listOf(
+                commit("M", "A", "B"),
+                commit("A", "X"),
+                commit("B", "P"),
+                commit("X", "P"),
+                commit("P", "R"),
+                commit("R"),
+            )
+        )
+        val root = rows.last()
+        assertEquals("R", root.commit.sha)
+        // Nothing passes the root any more. The merged lane keeps its column
+        // — a line that jumped sideways would be worse than one that is a
+        // column further right — but it no longer *draws*, which is the bug.
+        assertTrue(
+            "a lane was still open at the root: ${root.through}",
+            root.through.isEmpty(),
+        )
+        val shared = rows.first { it.commit.sha == "P" }
+        assertTrue("a lane was still open at the shared parent", shared.through.isEmpty())
+        assertEquals(1, rows.count { it.commit.sha == "P" })
+    }
+
+    /** Every row's indices stay inside the width it reports. */
+    @Test
+    fun noRowPointsPastItsOwnLaneCount() {
+        val rows = layoutGraph(
+            listOf(
+                commit("M", "A", "B", "C"),
+                commit("A", "P"),
+                commit("B", "P"),
+                commit("C", "P"),
+                commit("P"),
+            )
+        )
+        for (row in rows) {
+            assertTrue(row.lane < row.laneCount)
+            assertTrue(row.through.all { it < row.laneCount })
+            assertTrue(row.parentLanes.all { it < row.laneCount })
+        }
+    }
 }

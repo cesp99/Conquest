@@ -76,7 +76,6 @@ import to.eyed.conquest.code.ui.git.DiffPane
 import to.eyed.conquest.code.ui.git.DiffTarget
 import to.eyed.conquest.code.ui.git.GitGraphPane
 import to.eyed.conquest.code.ui.git.GitPanel
-import to.eyed.conquest.code.ui.git.GitGraphPane
 import to.eyed.conquest.code.ui.git.GitPanelDockWidth
 import to.eyed.conquest.code.ui.git.rememberGitBranch
 import to.eyed.conquest.code.ui.media.MediaPane
@@ -281,7 +280,11 @@ fun WorkspaceScreen(
     fun closeTabsUnder(path: String) {
         for (index in files.tabs.indices.reversed()) {
             val tab = files.tabs[index]
-            if (tab.path == path || tab.path.startsWith("$path/")) files.close(index)
+            // A diff of a file that has just been deleted is a diff of
+            // nothing; its key names the same path.
+            val diffed = tab.diff?.path
+            val matches = { candidate: String -> candidate == path || candidate.startsWith("$path/") }
+            if (matches(tab.path) || (diffed != null && matches(diffed))) files.close(index)
         }
     }
 
@@ -300,7 +303,15 @@ fun WorkspaceScreen(
      */
     fun retitleTabs(from: String, to: String) {
         val open = project ?: return
-        val moved = files.tabs.filter { it.path == from || it.path.startsWith("$from/") }
+        // A diff tab is about the old name; it is closed rather than moved,
+        // since reopening it is one tap and a stale patch is a lie.
+        for (index in files.tabs.indices.reversed()) {
+            val diffed = files.tabs[index].diff?.path ?: continue
+            if (diffed == from || diffed.startsWith("$from/")) files.close(index)
+        }
+        val moved = files.tabs.filter {
+            it.editor != null && (it.path == from || it.path.startsWith("$from/"))
+        }
         if (moved.isEmpty()) return
         val wasActive = files.active?.path
         val movedPaths = moved.map { it.path }

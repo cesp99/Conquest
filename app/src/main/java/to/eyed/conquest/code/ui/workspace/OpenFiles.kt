@@ -48,6 +48,14 @@ class OpenFile(
 ) {
     val session: BufferSession? get() = editor?.session
 
+    /**
+     * Whether Ctrl+Shift+T could bring this back. A diff, the graph and a
+     * picture are opened by a *view*, not by a path the file opener knows, and
+     * pushing their keys onto the reopen stack spent a keypress on a file that
+     * cannot be opened — and skipped the real last file.
+     */
+    val isReopenable: Boolean get() = diff == null && !graph
+
     val name: String = when {
         graph -> "Git graph"
         diff != null -> diff.title
@@ -185,7 +193,7 @@ class OpenFilesState {
         _tabs.removeAt(index)
         closing.remove(file)
         file.session?.close()
-        rememberClosed(file.path)
+        if (file.isReopenable) rememberClosed(file.path)
         activeIndex = when {
             _tabs.isEmpty() -> -1
             index <= activeIndex -> (activeIndex - 1).coerceAtLeast(0)

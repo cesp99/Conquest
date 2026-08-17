@@ -1598,7 +1598,10 @@ private fun ActionBar(
 ) {
     val theme = LocalZedTheme.current
     val branch = state.branch
-    val canPush = branch?.name != null && !busy && (branch.ahead > 0 || !branch.hasUpstream)
+    // An unborn branch — `git init`, nothing committed — has no commit to
+    // push, and git answers a publish with "src refspec does not match any".
+    val canPush = branch?.name != null && !busy && !branch.unborn &&
+        (branch.ahead > 0 || !branch.hasUpstream)
     Row(
         modifier = Modifier
             .fillMaxWidth()

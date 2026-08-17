@@ -27,6 +27,17 @@ import java.util.zip.GZIPInputStream
  */
 internal fun createUserlandBackend(): UserlandBackend = DebianUserland
 
+/**
+ * Where proot builds its scaffolding for the *terminal's* instances.
+ *
+ * Its own directory, not the cache root, because the engine spawns short-lived
+ * proots of its own and the two sharing one directory made each other's binds
+ * disappear: with a shell open, a `git diff` from the panel came back "cannot
+ * change to <the project>: No such file or directory".
+ */
+internal fun prootScratch(context: android.content.Context): java.io.File =
+    java.io.File(context.cacheDir, "proot-terminal").apply { mkdirs() }
+
 private const val TAG = "conquest-userland"
 
 /** Debian's official container base image. `slim` is the smallest with apt. */
@@ -126,7 +137,7 @@ private object DebianUserland : UserlandBackend {
             executable = proot(context).absolutePath,
             argv = argv,
             environment = listOf(
-                "PROOT_TMP_DIR=${context.cacheDir.absolutePath}",
+                "PROOT_TMP_DIR=${prootScratch(context).absolutePath}",
                 "HOME=/root",
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 "TERM=xterm-256color",
@@ -320,7 +331,7 @@ private object DebianUserland : UserlandBackend {
         )
             .redirectErrorStream(true)
             .redirectOutput(log)
-            .also { it.environment()["PROOT_TMP_DIR"] = context.cacheDir.absolutePath }
+            .also { it.environment()["PROOT_TMP_DIR"] = prootScratch(context).absolutePath }
             .start()
 
         GZIPInputStream(blob.inputStream().buffered()).use { source ->

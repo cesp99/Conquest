@@ -41,6 +41,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -97,13 +98,22 @@ impl crate::Engine {
     /// userland reports itself installed. The `play` flavour never calls it,
     /// and every guest run simply stays quiet.
     pub fn set_userland(&self, proot: &Path, rootfs: &Path, tmp_dir: &Path, projects_dir: &Path) {
+        // Resolved, because Android hands the app `/data/user/0/<package>`,
+        // which is a *symlink* to `/data/data/<package>`. proot binds what it
+        // is given; a guest asked to `cd` into a path that only exists as a
+        // link outside the fake root gets "No such file or directory", which
+        // is what a `git diff` intermittently came back with.
+        let real = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let userland = Userland {
-            proot: proot.to_path_buf(),
-            rootfs: rootfs.to_path_buf(),
-            tmp_dir: tmp_dir.to_path_buf(),
-            projects_dir: projects_dir.to_path_buf(),
+            proot: real(proot),
+            rootfs: real(rootfs),
+            tmp_dir: real(tmp_dir),
+            projects_dir: real(projects_dir),
         };
         log::info!("userland configured: {userland:?}");
+        // Anything left by a previous launch is dead; this is the moment
+        // nothing of ours is running, so it is the moment to sweep.
+        sweep_scratch(&userland.tmp_dir);
         *self.userland.lock().unwrap() = Some(Arc::new(userland));
     }
 
@@ -220,9 +230,22 @@ fn proot_command(userland: &Userland, command: &GuestCommand) -> Command {
         // program that cares about its directory says so itself (git's `-C`).
         .args(["-w", "/"])
         .args(&command.argv);
+    log::debug!(
+        "{}: binds {:?}",
+        command.label,
+        bind_dirs(userland, &command.binds)
+    );
 
     proot
-        .env("PROOT_TMP_DIR", &userland.tmp_dir)
+        // A scratch directory of this run's own.
+        //
+        // proot builds its bind scaffolding under `PROOT_TMP_DIR`, and the
+        // terminal's long-lived proot pointed at the same place as every short
+        // one the engine spawns. With a shell open, a `git diff` from the
+        // panel intermittently came back "cannot change to <the project>: No
+        // such file or directory" — the bind was simply not there. Separate
+        // directories, and the interaction cannot happen.
+        .env("PROOT_TMP_DIR", scratch_dir(userland))
         // The child inherits *our* environment, in which PATH points at
         // /system/bin — a directory that does not exist inside the fake root,
         // which is why the spike saw "command not found" for everything. Give
@@ -481,6 +504,43 @@ fn bind_dirs(userland: &Userland, extra: &[PathBuf]) -> Vec<PathBuf> {
     dirs
 }
 
+/// A directory for one proot instance to build its scaffolding in.
+///
+/// Named per process and per call rather than shared: two instances that
+/// share one have been seen to lose each other's binds. Created here and swept
+/// by [`sweep_scratch`] rather than removed on exit, because proot is killed
+/// as often as it is waited for and a directory removed under a live instance
+/// is the very problem this avoids.
+fn scratch_dir(userland: &Userland) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let run = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = userland
+        .tmp_dir
+        .join(format!("guest-{}-{run}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Remove the scratch directories of runs that are over.
+///
+/// Called when the engine is told where the userland is — once per launch,
+/// when nothing of ours is running — because proot leaves its own directory
+/// behind whenever it is killed rather than waited for, and a cache directory
+/// that only grows is a bug of its own.
+pub(crate) fn sweep_scratch(tmp_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(tmp_dir) else {
+        return;
+    };
+    let ours = format!("guest-{}-", std::process::id());
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("guest-") && !name.starts_with(&ours) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// `-b <path>:<path>`: the host path mounted at the identical guest path.
 fn identity_bind(path: &Path) -> String {
     let path = path.to_string_lossy();
@@ -598,6 +658,15 @@ mod tests {
         let command = GuestCommand::new("test", vec![OsString::from("true")]);
         let env = env_of(&proot_command(&userland(), &command));
 
+        let scratch = env.get("PROOT_TMP_DIR").cloned().unwrap_or_default();
+        // A directory of this run's own under the cache, never the cache
+        // itself: see `scratch_dir`.
+        assert!(
+            scratch.starts_with("/cache/guest-"),
+            "PROOT_TMP_DIR was {scratch:?}"
+        );
+        let mut env = env;
+        env.insert("PROOT_TMP_DIR".to_owned(), "/cache".to_owned());
         assert_eq!(
             env,
             BTreeMap::from([

@@ -13,13 +13,17 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -73,16 +77,21 @@ fun DiffPane(
 ) {
     val theme = LocalZedTheme.current
     val session = remember(project) { GitSession(project) }
-    // Re-read whenever the repository's own counter moves, so staging a file
-    // or editing it in the editor beside this updates the diff.
-    val version by produceState(0L, session) {
+    // One read per *change*, not one per poll: the version started at zero and
+    // was corrected a frame later, so opening a diff ran git twice within
+    // fifteen milliseconds — which is wasteful at best, and the second of the
+    // pair is what the pane ended up showing.
+    var patch by remember(session, target) { mutableStateOf<PatchResult?>(null) }
+    LaunchedEffect(session, target) {
+        var seen = -1L
         while (true) {
-            value = withContext(Dispatchers.Default) { session.version }
+            val version = withContext(Dispatchers.Default) { session.version }
+            if (version != seen) {
+                seen = version
+                patch = withContext(Dispatchers.IO) { session.patch(target.path, target.staged) }
+            }
             kotlinx.coroutines.delay(400)
         }
-    }
-    val patch by produceState<PatchResult?>(null, session, target, version) {
-        value = withContext(Dispatchers.IO) { session.patch(target.path, target.staged) }
     }
 
     val result = patch
@@ -115,24 +124,50 @@ private fun DiffBody(files: List<FileDiff>, onOpenFile: (String) -> Unit) {
     }
     // One scroll for the whole patch, horizontal as well: a diff of a long
     // line must not be wrapped, or the two sides stop lining up.
+    //
+    // Every row is given the *same* content width — that of the longest line —
+    // because `horizontalScroll` writes its maximum from each node's own
+    // measure and the setter clamps the offset down to it. Sharing one state
+    // across rows of different widths meant the shortest visible row decided
+    // how far the patch could scroll, which for a short last line was: not at
+    // all.
     val across = rememberScrollState()
+    val measurer = androidx.compose.ui.text.rememberTextMeasurer()
+    val contentWidth = remember(files, code) {
+        val longest = files.asSequence()
+            .flatMap { file -> file.hunks.asSequence() }
+            .flatMap { hunk -> hunk.lines.asSequence() }
+            .maxOfOrNull { it.text.length + 1 } ?: 0
+        // Measured from the font rather than guessed: the buffer font is
+        // monospaced, so one character's width times the longest line is
+        // exactly right.
+        val character = measurer.measure("M", code).size.width
+        (longest * character).coerceAtLeast(1)
+    }
     LazyColumn(modifier = Modifier.fillMaxSize()) {
-        for (file in files) {
-            item(key = "file:${file.path}") {
+        for ((fileIndex, file) in files.withIndex()) {
+            item(key = "file:$fileIndex") {
                 FileHeader(file, onOpenFile)
             }
             if (file.isBinary) {
-                item(key = "binary:${file.path}") {
+                item(key = "binary:$fileIndex") {
                     Notice("Binary file — nothing to show line by line.")
                 }
                 continue
             }
+            if (file.hunks.isEmpty()) {
+                item(key = "empty:$fileIndex") {
+                    Notice("Only the file's mode changed.")
+                }
+                continue
+            }
             for ((index, hunk) in file.hunks.withIndex()) {
-                item(key = "hunk:${file.path}:$index") {
+                item(key = "hunk:$fileIndex:$index") {
                     Text(
                         // git's own header, minus the line counts, which are
                         // in the numbers down the side anyway.
-                        text = "@@ -${hunk.oldStart} +${hunk.newStart} @@ ${hunk.heading}".trimEnd(),
+                        text = "@@ -${hunk.oldStart},${hunk.oldCount} " +
+                            "+${hunk.newStart},${hunk.newCount} @@ ${hunk.heading}".trimEnd(),
                         style = code.copy(fontSize = settings.bufferFontSize.sp * 0.85f),
                         color = theme.color("text.muted"),
                         maxLines = 1,
@@ -142,11 +177,14 @@ private fun DiffBody(files: List<FileDiff>, onOpenFile: (String) -> Unit) {
                             .padding(horizontal = 8.dp, vertical = 3.dp),
                     )
                 }
-                items(
+                itemsIndexed(
                     items = hunk.lines,
-                    key = { line -> "line:${file.path}:$index:${line.oldLine}:${line.newLine}:${line.kind}" },
-                ) { line ->
-                    DiffLineRow(line, code, across)
+                    // Keyed by *position*, not by content: two files whose
+                    // names git could not give us would otherwise collide, and
+                    // a duplicate key throws inside LazyLayout.
+                    key = { at, _ -> "line:$fileIndex:$index:$at" },
+                ) { _, line ->
+                    DiffLineRow(line, code, across, contentWidth)
                 }
             }
         }
@@ -205,6 +243,7 @@ private fun DiffLineRow(
     line: PatchLine,
     code: TextStyle,
     across: androidx.compose.foundation.ScrollState,
+    contentWidth: Int,
 ) {
     val theme = LocalZedTheme.current
     // Zed flattens the hunk colour over the editor background rather than
@@ -222,16 +261,16 @@ private fun DiffLineRow(
     ) {
         LineNumber(if (line.oldLine == 0) "" else line.oldLine.toString(), code)
         LineNumber(if (line.newLine == 0) "" else line.newLine.toString(), code)
-        Text(
-            text = "${line.kind}${line.text}",
-            style = code,
-            color = theme.color("editor.foreground"),
-            maxLines = 1,
-            softWrap = false,
-            modifier = Modifier
-                .horizontalScroll(across)
-                .padding(end = 12.dp),
-        )
+        Box(modifier = Modifier.horizontalScroll(across)) {
+            Text(
+                text = "${line.kind}${line.text}",
+                style = code,
+                color = theme.color("editor.foreground"),
+                maxLines = 1,
+                softWrap = false,
+                modifier = Modifier.width(with(LocalDensity.current) { contentWidth.toDp() }),
+            )
+        }
     }
 }
 

@@ -341,7 +341,11 @@ data class PatchHunk(
     /** The enclosing function, when git found one. */
     val heading: String,
     val lines: List<PatchLine>,
-)
+) {
+    /** How many lines the block covers on each side, as git's header writes. */
+    val oldCount: Int get() = lines.count { it.kind != '+' }
+    val newCount: Int get() = lines.count { it.kind != '-' }
+}
 
 /** One line of a hunk: `' '` unchanged, `'+'` added, `'-'` removed. */
 data class PatchLine(

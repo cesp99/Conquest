@@ -67,6 +67,12 @@ impl crate::Engine {
         let mut args: Vec<OsString> = vec![OsString::from("diff")];
         if staged {
             args.push(OsString::from("--staged"));
+        } else {
+            // Against HEAD, not against the index: "what changed in this file"
+            // means everything since the last commit, staged or not. Diffing
+            // the worktree against the index hides a change the moment it is
+            // staged, which read as "this file matches the last commit".
+            args.push(OsString::from("HEAD"));
         }
         args.push(OsString::from("--no-color"));
         args.push(OsString::from("--no-ext-diff"));
@@ -93,43 +99,105 @@ impl crate::Engine {
         }
 
         // Nothing — which for a single path may mean "untracked", not
-        // "unchanged". `--no-index` against the empty tree prints the whole
-        // file as additions, and exits 1 *because* there is a difference.
+        // "unchanged". The two are told apart from the status the engine
+        // already has, and the patch for an untracked file is built here from
+        // the file itself: `git diff --no-index` needs both sides to be paths
+        // git can stat, and inside proot `/dev/null` and a bound project
+        // directory are not the pair they look like — it failed with "failed
+        // to stat" on a file that was right there.
         let Some(path) = path.filter(|_| !staged) else {
             return Ok(Vec::new());
         };
-        let untracked: Vec<OsString> = vec![
-            OsString::from("diff"),
-            OsString::from("--no-color"),
-            OsString::from("--no-ext-diff"),
-            OsString::from("--no-index"),
-            OsString::from("-U3"),
-            OsString::from("--"),
-            OsString::from("/dev/null"),
-            OsString::from(crate::git::checked_path(path)?),
-        ];
-        let run = run_git(
-            &repo.userland,
-            &repo.repo_root,
-            "git diff",
-            git_argv(&repo.project_root, &untracked),
-        )?;
-        // 0 means identical to /dev/null (an empty file), 1 means it differs;
-        // anything else is a failure worth reporting.
-        if run.status > 1 {
+        if !self.is_untracked(id, path) {
             return Ok(Vec::new());
         }
-        Ok(parse_patch(&run.output)
-            .into_iter()
-            .map(|mut diff| {
-                // `--no-index` writes the path it was given; the caller asked
-                // about the project-relative one.
-                diff.path = path.to_owned();
-                diff.original = None;
-                diff
-            })
-            .collect())
+        Ok(new_file_patch(&repo.project_root, path))
     }
+
+    /// Whether the project's last `git status` called this path untracked.
+    ///
+    /// Read from the cache every other git surface shares rather than asked
+    /// again: it is the same question `??` already answered.
+    fn is_untracked(&self, id: ProjectId, path: &str) -> bool {
+        self.with_git(id, |git| {
+            git.changes
+                .iter()
+                .any(|change| change.path == path && change.x == b'?')
+        })
+        .unwrap_or(false)
+    }
+}
+
+/// A file git has never seen, as the patch it would be: every line added.
+///
+/// Capped, because this is the one path that materialises a whole file to show
+/// it, and a 40 MB log dropped into a project should not be a 40 MB patch in
+/// the Java heap.
+fn new_file_patch(project_root: &std::path::Path, path: &str) -> Vec<FileDiff> {
+    const MAX_BYTES: u64 = 2 * 1024 * 1024;
+    let full = project_root.join(path);
+    let Ok(meta) = std::fs::metadata(&full) else {
+        return Vec::new();
+    };
+    if !meta.is_file() {
+        return Vec::new();
+    }
+    let binary_or_huge = meta.len() > MAX_BYTES;
+    let contents = if binary_or_huge {
+        None
+    } else {
+        std::fs::read(&full).ok()
+    };
+    // git's own rule: a NUL in the first 8000 bytes means binary.
+    let is_binary = contents
+        .as_ref()
+        .map(|bytes| bytes.iter().take(8000).any(|byte| *byte == 0))
+        .unwrap_or(true);
+    if is_binary {
+        return vec![FileDiff {
+            path: path.to_owned(),
+            original: None,
+            is_binary: true,
+            hunks: Vec::new(),
+        }];
+    }
+    let text = String::from_utf8_lossy(&contents.unwrap_or_default()).into_owned();
+    let lines: Vec<&str> = {
+        let mut lines: Vec<&str> = text.split('\n').collect();
+        if lines.last() == Some(&"") {
+            lines.pop();
+        }
+        lines
+    };
+    if lines.is_empty() {
+        return vec![FileDiff {
+            path: path.to_owned(),
+            original: None,
+            is_binary: false,
+            hunks: Vec::new(),
+        }];
+    }
+    let hunk = PatchHunk {
+        old_start: 0,
+        new_start: 1,
+        heading: String::new(),
+        lines: lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| PatchLine {
+                kind: '+',
+                text: (*line).to_owned(),
+                old_line: 0,
+                new_line: index as u32 + 1,
+            })
+            .collect(),
+    };
+    vec![FileDiff {
+        path: path.to_owned(),
+        original: None,
+        is_binary: false,
+        hunks: vec![hunk],
+    }]
 }
 
 /// Read `git diff`'s unified output.
@@ -142,15 +210,30 @@ pub(crate) fn parse_patch(output: &str) -> Vec<FileDiff> {
     let mut files: Vec<FileDiff> = Vec::new();
     let mut old_line = 0u32;
     let mut new_line = 0u32;
+    // The `---`/`+++` pair is the authority on the two names, not the
+    // `diff --git a/x b/y` header: that header has no unambiguous separator
+    // (a file called `x b/y` splits wrongly) and git *quotes* a non-ASCII
+    // name in it, which left the path empty. These two lines carry one path
+    // each, and `/dev/null` for the side that does not exist.
+    let mut old_path: Option<String> = None;
+    // Kept for the shapes that have no `---`/`+++` at all: a binary file, and
+    // a change of mode with no content. Ambiguous for a name containing
+    // " b/", which is why it is the fallback rather than the rule.
+    let mut headers: Vec<String> = Vec::new();
 
-    // `lines()` rather than `split('\n')`: the latter yields one empty
-    // segment for the trailing newline, which the hunk arm then reads as an
-    // empty context line and counts.
-    for line in output.lines() {
+    // A trailing newline is not a line; anything else is kept verbatim,
+    // carriage returns included — a CRLF file's diff is about its bytes.
+    let mut lines: Vec<&str> = output.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+
+    for line in lines {
         if let Some(rest) = line.strip_prefix("diff --git ") {
-            let (a, b) = split_paths(rest);
+            old_path = None;
+            headers.push(rest.trim_end_matches('\r').to_owned());
             files.push(FileDiff {
-                path: b.unwrap_or_else(|| a.clone().unwrap_or_default()),
+                path: String::new(),
                 original: None,
                 is_binary: false,
                 hunks: Vec::new(),
@@ -159,12 +242,29 @@ pub(crate) fn parse_patch(output: &str) -> Vec<FileDiff> {
         }
         let Some(file) = files.last_mut() else { continue };
 
+        if let Some(rest) = line.strip_prefix("--- ") {
+            let rest = rest.strip_suffix('\r').unwrap_or(rest);
+            old_path = strip_prefix_path(rest, "a/");
+            if file.path.is_empty() {
+                if let Some(path) = &old_path {
+                    file.path = path.clone();
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let rest = rest.strip_suffix('\r').unwrap_or(rest);
+            if let Some(path) = strip_prefix_path(rest, "b/") {
+                file.path = path;
+            }
+            continue;
+        }
         if let Some(from) = line.strip_prefix("rename from ") {
-            file.original = Some(from.to_owned());
+            file.original = Some(from.trim_end_matches('\r').to_owned());
             continue;
         }
         if let Some(to) = line.strip_prefix("rename to ") {
-            file.path = to.to_owned();
+            file.path = to.trim_end_matches('\r').to_owned();
             continue;
         }
         if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
@@ -180,6 +280,15 @@ pub(crate) fn parse_patch(output: &str) -> Vec<FileDiff> {
             };
             old_line = old;
             new_line = new;
+            // A rename with a content change names both sides; `---`/`+++`
+            // give the same two names, so this is belt and braces.
+            if file.original.is_none() {
+                if let Some(from) = &old_path {
+                    if *from != file.path {
+                        file.original = Some(from.clone());
+                    }
+                }
+            }
             file.hunks.push(PatchHunk {
                 old_start: old,
                 new_start: new,
@@ -198,12 +307,10 @@ pub(crate) fn parse_patch(output: &str) -> Vec<FileDiff> {
             Some('+') => ('+', &line[1..]),
             Some('-') => ('-', &line[1..]),
             Some(' ') => (' ', &line[1..]),
-            // A truly empty line inside a hunk is git writing a context line
-            // that is itself empty, with the leading space stripped by
-            // something along the way. Treated as context rather than dropped.
+            // A truly empty line inside a hunk is a context line whose
+            // leading space something along the way has eaten.
             None => (' ', ""),
-            // Anything else ends the hunk: the next file's header, or the
-            // trailing "-- " of a mail-formatted patch.
+            // Anything else ends the hunk.
             _ => continue,
         };
         hunk.lines.push(PatchLine {
@@ -219,18 +326,37 @@ pub(crate) fn parse_patch(output: &str) -> Vec<FileDiff> {
             new_line += 1;
         }
     }
+    // Binary files and mode-only changes have no `---`/`+++` pair; their name
+    // is only in the header.
+    for (index, file) in files.iter_mut().enumerate() {
+        if file.path.is_empty() {
+            if let Some(header) = headers.get(index) {
+                file.path = header_path(header);
+            }
+        }
+    }
+    files.retain(|file| !file.path.is_empty());
     files
 }
 
-/// `a/src/main.rs b/src/main.rs` → both sides, without their prefixes.
-fn split_paths(rest: &str) -> (Option<String>, Option<String>) {
-    // Paths with spaces in them make this ambiguous in general; git's own
-    // answer is the `a/`…`b/` prefixes, so the split is at " b/".
-    if let Some((a, b)) = rest.split_once(" b/") {
-        let a = a.strip_prefix("a/").unwrap_or(a).to_owned();
-        return (Some(a), Some(b.to_owned()));
+/// `a/logo.png b/logo.png` → `logo.png`.
+///
+/// Split from the *right*, because the left-hand name is the one that may
+/// contain " b/" — and git quotes a name with anything stranger in it, which
+/// is why this is only ever reached for binary and mode-only changes.
+fn header_path(header: &str) -> String {
+    match header.rsplit_once(" b/") {
+        Some((_, b)) => b.to_owned(),
+        None => String::new(),
     }
-    (None, None)
+}
+
+/// `a/src/main.rs` → `src/main.rs`; `/dev/null` → nothing.
+fn strip_prefix_path(rest: &str, prefix: &str) -> Option<String> {
+    if rest == "/dev/null" {
+        return None;
+    }
+    Some(rest.strip_prefix(prefix).unwrap_or(rest).to_owned())
 }
 
 /// `-12,7 +12,9` → the two starting lines.
@@ -348,6 +474,71 @@ Binary files a/logo.png and b/logo.png differ\n",
             "diff --git a/a b/a\n@@ -1 +1 @@\n-one\n\\ No newline at end of file\n+one\n",
         );
         assert_eq!(files[0].hunks[0].lines.len(), 2);
+    }
+
+    /// The shapes the skeptic fed it: a name git quotes, a name with " b/" in
+    /// it, a new file, a deletion, CRLF content, and a hunk header with no
+    /// counts. All of them come from `---`/`+++` rather than from the header,
+    /// which is what makes them work.
+    #[test]
+    fn the_paths_come_from_the_two_marker_lines() {
+        let quoted = parse_patch(
+            &[
+                "diff --git \"a/caff\\303\\250.txt\" \"b/caff\\303\\250.txt\"",
+                "--- a/caffè.txt",
+                "+++ b/caffè.txt",
+                "@@ -1 +1 @@",
+                "-a",
+                "+b",
+            ]
+            .join("\n"),
+        );
+        assert_eq!(quoted[0].path, "caffè.txt");
+
+        let awkward = parse_patch(
+            &["diff --git a/x b/y b/x b/y", "--- a/x b/y", "+++ b/x b/y", "@@ -1 +1 @@", "-a", "+b"]
+                .join("\n"),
+        );
+        assert_eq!(awkward[0].path, "x b/y");
+
+        let created = parse_patch(
+            &["diff --git a/new.txt b/new.txt", "new file mode 100644", "--- /dev/null", "+++ b/new.txt", "@@ -0,0 +1 @@", "+hello"]
+                .join("\n"),
+        );
+        assert_eq!(created[0].path, "new.txt");
+        assert!(created[0].original.is_none(), "a new file was not renamed");
+        assert_eq!(created[0].hunks[0].lines[0].new_line, 1);
+
+        let deleted = parse_patch(
+            &["diff --git a/gone.txt b/gone.txt", "deleted file mode 100644", "--- a/gone.txt", "+++ /dev/null", "@@ -1 +0,0 @@", "-bye"]
+                .join("\n"),
+        );
+        assert_eq!(deleted[0].path, "gone.txt");
+        assert!(deleted[0].original.is_none());
+    }
+
+    /// A carriage return belongs to the line's content; dropping it makes the
+    /// diff of a CRLF file disagree with the file.
+    #[test]
+    fn crlf_content_keeps_its_carriage_return() {
+        let files = parse_patch(
+            &["diff --git a/a.txt b/a.txt", "--- a/a.txt", "+++ b/a.txt", "@@ -1 +1 @@", "-one\r", "+two\r"]
+                .join("\n"),
+        );
+        assert_eq!(files[0].hunks[0].lines[0].text, "one\r");
+        assert_eq!(files[0].hunks[0].lines[1].text, "two\r");
+    }
+
+    /// `@@ -1 +1 @@` — no counts at all, which git writes for a single line.
+    #[test]
+    fn a_hunk_header_without_counts_still_parses() {
+        let files = parse_patch(
+            &["diff --git a/a b/a", "--- a/a", "+++ b/a", "@@ -7 +9 @@", " ctx"].join("\n"),
+        );
+        assert_eq!(files[0].hunks[0].old_start, 7);
+        assert_eq!(files[0].hunks[0].new_start, 9);
+        assert_eq!(files[0].hunks[0].lines[0].old_line, 7);
+        assert_eq!(files[0].hunks[0].lines[0].new_line, 9);
     }
 
     #[test]

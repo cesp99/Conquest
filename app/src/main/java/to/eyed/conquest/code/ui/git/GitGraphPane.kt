@@ -52,6 +52,12 @@ import java.util.Locale
 /** One page of history; more are fetched as the list is scrolled. */
 private const val PAGE = 100
 
+/** One formatter, not one per row per frame. */
+private val DATE_FORMAT = SimpleDateFormat("d MMM yyyy HH:mm", Locale.getDefault())
+
+/** However tangled the history, the diagram may not eat the whole row. */
+private const val MAX_DRAWN_LANES = 8
+
 /** Row metrics. The lane column is a diagram, so it is measured, not padded. */
 private val RowHeight = 44.dp
 private val LaneWidth = 16.dp
@@ -95,7 +101,13 @@ fun GitGraphPane(
     }
 
     val listState = rememberLazyListState()
-    val rows = remember(commits) { layoutGraph(commits) }
+    // Laid out off the main thread: it is O(commits) per page and the page
+    // grows, so doing it in composition made every page cost more than the
+    // last on the frame's own thread.
+    var rows by remember(session) { mutableStateOf<List<GraphRow>>(emptyList()) }
+    LaunchedEffect(commits) {
+        rows = withContext(Dispatchers.Default) { layoutGraph(commits) }
+    }
 
     suspend fun loadMore() {
         if (exhausted) return
@@ -111,24 +123,53 @@ fun GitGraphPane(
             exhausted = true
             return
         }
+        // A page that is entirely commits already seen — history rewritten
+        // under us — would leave the list unchanged and the paging waiting for
+        // a change that never comes.
+        val before = commits.size
         // Deduplicate: a commit made while this is open shifts the window, and
         // the same sha arriving twice would draw two rows and two lanes.
         val seen = commits.mapTo(mutableSetOf()) { it.sha }
         commits = commits + page.commits.filter { seen.add(it.sha) }
+        if (commits.size == before) exhausted = true
     }
 
     LaunchedEffect(session) { loadMore() }
 
-    // Paging: when the last few rows come into view, ask for the next page.
-    val nearTheEnd by remember {
-        derivedStateOf {
-            val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            last >= rows.size - 5
+    // A commit made while this tab is open belongs at the top of it. Watched
+    // through the same counter everything else uses; a move resets the list
+    // rather than appending, since history can be rewritten as well as added
+    // to.
+    LaunchedEffect(session) {
+        var seen = withContext(Dispatchers.Default) { session.version }
+        while (true) {
+            kotlinx.coroutines.delay(500)
+            val now = withContext(Dispatchers.Default) { session.version }
+            if (now != seen) {
+                seen = now
+                commits = emptyList()
+                exhausted = false
+                error = null
+                loadMore()
+            }
         }
     }
-    LaunchedEffect(rows.size) {
+
+    // Paging: when the last few rows come into view, ask for the next page.
+    //
+    // `rows` is snapshot state and the derived block is keyed on it, because a
+    // `derivedStateOf` created once over a plain local captures the *first*
+    // value — which was the empty list, so the condition read `last >= -5`,
+    // was always true, and the graph loaded the entire history at once.
+    val nearTheEnd by remember(rows) {
+        derivedStateOf {
+            val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+            rows.isNotEmpty() && last >= rows.size - 5
+        }
+    }
+    LaunchedEffect(session) {
         snapshotFlow { nearTheEnd }.collect { near ->
-            if (near && !loading && rows.isNotEmpty()) loadMore()
+            if (near && !loading && !exhausted) loadMore()
         }
     }
 
@@ -161,7 +202,11 @@ fun GitGraphPane(
                             CommitFiles(open!!, onOpenFile)
                         }
                     }
-                    if (!exhausted) {
+                    if (error != null) {
+                        item(key = "error") {
+                            Message(error!!, isError = true, inline = true)
+                        }
+                    } else if (!exhausted) {
                         item(key = "loading") {
                             Message("Reading more…", inline = true)
                         }
@@ -214,8 +259,7 @@ private fun GraphRowView(
 ) {
     val theme = LocalZedTheme.current
     val date = remember(row.commit.authorTime) {
-        SimpleDateFormat("d MMM yyyy HH:mm", Locale.getDefault())
-            .format(Date(row.commit.authorTime * 1000L))
+        DATE_FORMAT.format(Date(row.commit.authorTime * 1000L))
     }
     Row(
         modifier = Modifier
@@ -310,14 +354,16 @@ private fun Lanes(row: GraphRow, theme: ZedTheme) {
             theme.color("text.muted", Color(0xFFC678DD)),
         )
     }
-    val laneCount = maxOf(row.laneCount, 1)
+    val laneCount = row.laneCount.coerceIn(1, MAX_DRAWN_LANES)
     Canvas(
         modifier = Modifier
             .width(LaneWidth * laneCount)
             .fillMaxHeight()
     ) {
         val laneWidth = LaneWidth.toPx()
-        fun x(lane: Int) = laneWidth * lane + laneWidth / 2f
+        // A history tangled past the cap is drawn in the last column rather
+        // than off the side of the canvas.
+        fun x(lane: Int) = laneWidth * lane.coerceAtMost(laneCount - 1) + laneWidth / 2f
         val top = 0f
         val middle = size.height / 2f
         val bottom = size.height
