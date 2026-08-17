@@ -54,8 +54,12 @@ editor.
 | `Ctrl` `B` | Show/hide the project panel |
 | `Ctrl` `O` | Open the project picker (switch, create, import, export) |
 | `Ctrl` `P` | Find a file by name (fuzzy) |
+| `Ctrl` `F` | Find in the open file |
+| `Ctrl` `Shift` `T` | Reopen the tab you closed last |
+| `Ctrl` `Shift` `E` | Reveal the open file in the project panel |
 | `Ctrl` `Shift` `G` | Clone a git repository into a new project |
 | `Ctrl` `,` | Open settings |
+| — | Pick a theme (`theme selector: toggle` in the palette, or the ☰ menu) |
 | ``Ctrl` ` `` | Show/hide the terminal |
 | ``Ctrl` `Shift` ` `` | Open another terminal |
 
@@ -70,6 +74,23 @@ project list.
 inside the Linux userland, so the edition that has no userland leaves the
 command and its menu entry out entirely rather than showing them greyed —
 see [USERLAND.md](USERLAND.md).
+
+## Find in file
+
+`Ctrl` `F` opens a bar above the editor. Every match in the file is
+highlighted and the current one is picked out; the count is honest about a
+file with more matches than the engine will hand back at once.
+
+| Shortcut | Action |
+|---|---|
+| `Enter` / `F3` | Next match |
+| `Shift` `Enter` / `Shift` `F3` | Previous match |
+| `Esc` | Close the bar and clear the highlights |
+| `Aa` `ab` `.*` | Match case / whole word / regular expression |
+
+A regular expression that does not compile yet — `[`, halfway through
+typing — outlines the field rather than clearing the file's highlights and
+claiming there are no results.
 
 ## Editor
 

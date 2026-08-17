@@ -330,6 +330,41 @@ class EditorState private constructor(
         lineCount = buffer.lineCount
     }
 
+    /**
+     * Ranges the search bar wants painted, and which of them is current.
+     *
+     * Held here rather than in the bar because only the canvas can draw over
+     * the text, and only this class knows where a row is. Rows are 0-based and
+     * columns are UTF-16, like everything else the renderer works in.
+     */
+    var searchMatches: List<SelectionRange> by mutableStateOf(emptyList())
+        private set
+    var activeMatch: Int by mutableIntStateOf(-1)
+        private set
+
+    fun showSearchMatches(matches: List<SelectionRange>, active: Int) {
+        searchMatches = matches
+        activeMatch = active
+    }
+
+    fun clearSearchMatches() {
+        if (searchMatches.isEmpty() && activeMatch < 0) return
+        searchMatches = emptyList()
+        activeMatch = -1
+    }
+
+    /**
+     * Put the caret on [range] and bring it into view — what following a
+     * search hit means. The selection is the hit, so the next thing typed
+     * replaces it, which is what every editor does here.
+     */
+    fun selectRange(range: SelectionRange) {
+        setCarets(
+            listOf(Caret(range.startRow, range.startCol, range.endRow, range.endCol)),
+            Caret(range.startRow, range.startCol, range.endRow, range.endCol),
+        )
+    }
+
     /** Track line widths seen during drawing to bound horizontal scroll. */
     fun noteContentWidth(width: Float) {
         if (width > contentWidthPx) contentWidthPx = width
@@ -1283,7 +1318,7 @@ class EditorState private constructor(
     }
 
     /** The inverse: how many UTF-16 units [byteCol] bytes of [line] span. */
-    private fun utf16Col(line: String, byteCol: Int): Int {
+    internal fun utf16Col(line: String, byteCol: Int): Int {
         var bytes = 0
         var i = 0
         while (i < line.length && bytes < byteCol) {

@@ -102,6 +102,9 @@ enum class WorkspaceCommand(
     /** Open the fuzzy file finder. */
     FindFile("file_finder::Toggle", isAvailable = { it.hasProject }),
 
+    /** Find within the open file — Zed's buffer search. */
+    FindInFile("buffer_search::Deploy", isAvailable = { it.hasActiveFile }),
+
     /** Open the settings screen. */
     OpenSettings("conquest::OpenSettings"),
 
@@ -214,6 +217,14 @@ private val BINDINGS: List<Binding> = listOf(
         InWorkspace,
     ),
     Binding(WorkspaceCommand.FindFile, Chord(AndroidKeyEvent.KEYCODE_P, "P"), InWorkspace),
+    // Ctrl+F is free in the editor — it moves nothing there — and this is
+    // where every editor puts find. In a terminal it is readline's "forward
+    // one character", so the bar is not offered while a shell has the keys.
+    Binding(
+        WorkspaceCommand.FindInFile,
+        Chord(AndroidKeyEvent.KEYCODE_F, "F", shift = null),
+        InWorkspace,
+    ),
     Binding(
         WorkspaceCommand.OpenSettings,
         Chord(AndroidKeyEvent.KEYCODE_COMMA, ",", shift = null),

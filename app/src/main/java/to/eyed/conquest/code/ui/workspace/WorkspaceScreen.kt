@@ -62,6 +62,7 @@ import to.eyed.conquest.code.terminal.TerminalSessions
 import to.eyed.conquest.code.terminal.Userland
 import to.eyed.conquest.code.terminal.UserlandState
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
+import to.eyed.conquest.code.ui.search.BufferSearchBar
 import to.eyed.conquest.code.ui.editor.EditorPane
 import to.eyed.conquest.code.ui.editor.EditorState
 import to.eyed.conquest.code.ui.terminal.TerminalDock
@@ -160,6 +161,7 @@ fun WorkspaceScreen(
     var revealInPanel by remember { mutableStateOf(false) }
     var settingsOpen by remember { mutableStateOf(false) }
     var themeSelectorOpen by remember { mutableStateOf(false) }
+    var searchBarOpen by remember { mutableStateOf(false) }
     var settingsValid by remember { mutableStateOf(true) }
     var projects by remember { mutableStateOf(emptyList<ProjectSummary>()) }
     var transferMessage by remember { mutableStateOf<String?>(null) }
@@ -409,6 +411,10 @@ fun WorkspaceScreen(
                 finderOpen = true
             }
             WorkspaceCommand.SelectTheme -> themeSelectorOpen = true
+            WorkspaceCommand.FindInFile -> {
+                if (files.active == null) return false
+                searchBarOpen = true
+            }
             WorkspaceCommand.OpenSettings -> {
                 scope.launch {
                     settingsValid = withContext(Dispatchers.IO) { CoreBridge.settingsAreValid() }
@@ -587,6 +593,11 @@ fun WorkspaceScreen(
                             onSave = ::save,
                             onReload = ::reload,
                             onReopen = { runCommand(WorkspaceCommand.ReopenClosedTab) },
+                            searchOpen = searchBarOpen,
+                            onSearchDismissed = {
+                                searchBarOpen = false
+                                rootFocus.requestFocus()
+                            },
                             modifier = Modifier.weight(1f),
                         )
                     }
@@ -617,6 +628,11 @@ fun WorkspaceScreen(
                             onSave = ::save,
                             onReload = ::reload,
                             onReopen = { runCommand(WorkspaceCommand.ReopenClosedTab) },
+                            searchOpen = searchBarOpen,
+                            onSearchDismissed = {
+                                searchBarOpen = false
+                                rootFocus.requestFocus()
+                            },
                         )
                     }
                 }
@@ -829,12 +845,24 @@ private fun EditorArea(
     onSave: (OpenFile) -> Unit,
     onReload: (OpenFile) -> Unit,
     onReopen: () -> Unit,
+    searchOpen: Boolean,
+    onSearchDismissed: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val active = files.active
     Column(modifier = modifier.fillMaxSize()) {
         if (files.tabs.isNotEmpty()) {
             EditorTabs(files, onSave = onSave, onReopen = onReopen)
+            DockDivider()
+        }
+        if (searchOpen && active != null) {
+            BufferSearchBar(
+                editor = active.editor,
+                onDismiss = {
+                    active.editor.clearSearchMatches()
+                    onSearchDismissed()
+                },
+            )
             DockDivider()
         }
 

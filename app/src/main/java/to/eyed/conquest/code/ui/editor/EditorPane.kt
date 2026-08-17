@@ -297,6 +297,39 @@ fun EditorPane(
 
             val spansWindow = state.spansWindow()
             clipRect(left = gutterWidth) {
+                // Search hits, under everything else: Zed paints them as a
+                // background wash with the current one picked out
+                // (`search.match_background` / `search.active_match_background`).
+                if (state.searchMatches.isNotEmpty()) {
+                    val match = theme.color("search.match_background")
+                    val active = theme.color("search.active_match_background")
+                    state.searchMatches.forEachIndexed { index, range ->
+                        for (row in max(range.startRow, firstRow)..min(range.endRow, lastRow - 1)) {
+                            val line = lines[row - firstRow]
+                            val layout = layoutCache.layoutFor(
+                                line,
+                                spansWindow.getOrElse(row - firstRow) { emptyList() },
+                            )
+                            val from = if (row == range.startRow) {
+                                range.startCol.coerceAtMost(line.length)
+                            } else {
+                                0
+                            }
+                            val to = if (row == range.endRow) {
+                                range.endCol.coerceAtMost(line.length)
+                            } else {
+                                line.length
+                            }
+                            val left = textLeft + layout.getHorizontalPosition(from, true)
+                            val right = textLeft + layout.getHorizontalPosition(to, true)
+                            drawRect(
+                                color = if (index == state.activeMatch) active else match,
+                                topLeft = Offset(left, row * lineHeight - state.scrollY),
+                                size = Size((right - left).coerceAtLeast(1f), lineHeight),
+                            )
+                        }
+                    }
+                }
                 fun paintSelection(startRow: Int, startCol: Int, endRow: Int, endCol: Int) {
                     for (row in max(startRow, firstRow)..min(endRow, lastRow - 1)) {
                         val line = lines[row - firstRow]
