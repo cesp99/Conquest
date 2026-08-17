@@ -299,16 +299,33 @@ object CoreBridge {
     // Every field may be omitted; the last three are project-search only.
     // [SearchQuery] builds it — nothing should be spelling this out by hand.
     //
+    // `whole_word` means the same thing for every kind of query: a hit counts
+    // only when neither neighbouring character is a word character
+    // (alphanumeric or '_'). A regex is filtered on where its match landed,
+    // never rewritten, so `foo|bar` and `\w+` obey the toggle like everything
+    // else does.
+    //
     // Buffer search answers on the calling thread: it is one pass over a rope,
     // which is what lets the search bar re-run it on every keystroke. Project
     // search cannot answer at all — it reads thousands of files — so it runs
     // on an engine thread and publishes a counter to poll, exactly like
     // [gitStatusVersion].
+    //
+    // Project search silently skips four kinds of file: ones it cannot read,
+    // ones over 4 MiB, ones holding a NUL byte anywhere, and ones that are not
+    // valid UTF-8. They still count towards `files_searched`, so a UI that
+    // says "searched 400 of 400" is telling the truth about the walk — it just
+    // cannot promise a hit inside a 5 MB log or a Latin-1 file.
     // -----------------------------------------------------------------------
 
     /**
      * Why [queryJson] will not compile, or null if it will. Ask this to
      * explain a half-typed regex instead of silently showing no results.
+     *
+     * It compiles the query to find out, which a pathological pattern can drag
+     * out to tens of milliseconds — so ask it when a search has *failed*, not
+     * on every keystroke beside the search itself, which compiles the query
+     * again. **Off the main thread** if the query is regex.
      */
     external fun searchQueryError(queryJson: String): String?
 
@@ -320,12 +337,22 @@ object CoreBridge {
      *
      * Null for an unknown buffer or a query that doesn't compile; ask
      * [searchQueryError] which. Wrapped by [BufferSearch].
+     *
+     * One pass over the whole buffer, so it costs what the buffer is big —
+     * a couple of milliseconds at 100k lines. Fine on the keystroke path for
+     * an ordinary file; **off the main thread** for a generated one.
      */
     external fun bufferSearch(bufferId: Long, queryJson: String, limit: Long): LongArray?
 
     /**
      * Starts searching a project. Returns a search id to poll with, or -1 if
-     * the project is unknown or the query doesn't compile. Returns at once.
+     * the project is unknown or the query doesn't compile. Returns at once —
+     * it only compiles the query and starts a thread.
+     *
+     * A project still being scanned is neither of those failures: the search
+     * starts, reports [ProjectSearchState.Scanning] until the scan lands, and
+     * then searches the whole tree. Results are never reported over a partly
+     * scanned project, so `done` always means done over all of it.
      *
      * Starting a search cancels whatever was already running for that project,
      * so there is only ever one live id per project.
@@ -333,8 +360,9 @@ object CoreBridge {
     external fun projectSearchStart(projectId: Long, queryJson: String): Long
 
     /**
-     * Generation counter for a search; 0 before the first results and for an
-     * id the engine has forgotten. Poll it exactly like [projectVersion].
+     * Generation counter for a search. Non-zero from the moment
+     * [projectSearchStart] returns, so 0 means one thing only: an id the
+     * engine has forgotten. Poll it exactly like [projectVersion].
      */
     external fun projectSearchVersion(searchId: Long): Long
 
@@ -342,9 +370,19 @@ object CoreBridge {
      * Everything a search has found from [fromFile] onwards, as JSON — see
      * [ProjectSearchResults] for the shape. Results only grow, so a caller
      * holding `n` files passes `n` and gets what it is missing. Never null.
+     *
+     * Costs what it hands back: the engine publishes every 100 ms, so one poll
+     * can carry megabytes of JSON to serialize here and parse on the Kotlin
+     * side. **Call it off the main thread** — poll [projectSearchVersion],
+     * which is a single load, and only read when it moves.
      */
     external fun projectSearchResults(searchId: Long, fromFile: Long): String
 
-    /** Stops a search and forgets it. False if the id is already gone. */
+    /**
+     * Stops a search and forgets it. False if the id is already gone. Also how
+     * its results are freed: the engine holds the last search per project
+     * until this is called or the project closes, which for a big result set
+     * is megabytes — so a panel that closes must cancel.
+     */
     external fun projectSearchCancel(searchId: Long): Boolean
 }

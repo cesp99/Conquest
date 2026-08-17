@@ -14,6 +14,12 @@ data class SearchQuery(
     /** Treat [query] as a regular expression rather than literal text. */
     val regex: Boolean = false,
     val caseSensitive: Boolean = false,
+    /**
+     * Keep only hits with a non-word character (or nothing) either side, where
+     * a word character is alphanumeric or '_'. The rule is the same for a
+     * literal and for a regex — a regex is filtered on where its match landed,
+     * not rewritten — so it never quietly means something else.
+     */
     val wholeWord: Boolean = false,
     /** Project search: also search files git ignores. */
     val includeIgnored: Boolean = false,
@@ -96,14 +102,26 @@ fun searchBuffer(bufferId: Long, query: SearchQuery, limit: Int = 10_000): Buffe
 
 /** How far a project search has got. */
 enum class ProjectSearchState {
+    /**
+     * The project's first scan hasn't finished, so there is nothing to search
+     * yet. The search is alive and starts itself when the scan lands — show a
+     * spinner, not an error, and never "no results".
+     */
+    Scanning,
     Running,
+
+    /** Finished, over the whole project. */
     Done,
 
     /** Cancelled, superseded by a newer search, or an id the engine forgot. */
     Cancelled;
 
+    /** Still to come — the caller should keep polling. */
+    val isLive: Boolean get() = this == Scanning || this == Running
+
     internal companion object {
         fun parse(name: String): ProjectSearchState = when (name) {
+            "scanning" -> Scanning
             "running" -> Running
             "done" -> Done
             else -> Cancelled
@@ -135,8 +153,12 @@ data class ProjectSearchMatch(
     val endUtf16: Int,
     /** The line, windowed around the match if it was very long. */
     val text: String,
-    /** [text] starts / ends mid-line, so draw an ellipsis. */
+    /** [text] starts mid-line, so draw an ellipsis. */
     val clippedStart: Boolean,
+    /**
+     * Something was cut off the end — [text] stops before the line does, or
+     * the match itself ran on past this line. Either way, draw an ellipsis.
+     */
     val clippedEnd: Boolean,
 )
 
@@ -158,11 +180,20 @@ data class ProjectSearchResults(
     val version: Long,
     /** Set only for a failure that stopped the search, not a skipped file. */
     val error: String?,
+    /**
+     * Files walked. Includes the ones the engine skipped without reading —
+     * over 4 MiB, binary, not UTF-8, unreadable — see [CoreBridge].
+     */
     val filesSearched: Int,
     /** Files the worktree offered, for a progress bar. */
     val totalFiles: Int,
     /** Files with a match in all — not just in [newFiles]. */
     val fileCount: Int,
+    /**
+     * Matches in all, counted the way [ProjectSearchFile.matchCount] is:
+     * matches dropped by the engine's per-file cap are in here too, so this is
+     * the honest "N results" figure rather than the number drawn.
+     */
     val matchCount: Int,
     /** One of the engine's caps bit, so this is not the whole truth. */
     val truncated: Boolean,
@@ -181,6 +212,15 @@ data class ProjectSearchResults(
  *
  * Starting a search cancels whatever was running for the same project, so a
  * search bar can simply start a new one on every change of the query.
+ *
+ * A project that is still scanning is searched all the same: the session
+ * reports [ProjectSearchState.Scanning] and starts itself when the scan lands,
+ * so a search over a freshly opened repo is a wait, never a wrong answer.
+ *
+ * [poll] is not free — it parses everything found since the last call, which
+ * can be megabytes — so call it off the main thread and only when [version]
+ * has moved. [cancel] frees the results; a panel that closes without calling
+ * it leaves them alive until the project does.
  */
 class ProjectSearchSession(project: ProjectSession, query: SearchQuery) {
     /** -1 if the project is unknown or the query didn't compile. */
@@ -191,7 +231,8 @@ class ProjectSearchSession(project: ProjectSession, query: SearchQuery) {
 
     /**
      * Staleness token, of the same shape as [ProjectSession.version]: it moves
-     * when there is something new to [poll]. 0 until the first results.
+     * when there is something new to [poll]. Non-zero for as long as the
+     * engine remembers the search, so 0 means forgotten, never "not yet".
      */
     val version: Long
         get() = if (id < 0) 0 else CoreBridge.projectSearchVersion(id)

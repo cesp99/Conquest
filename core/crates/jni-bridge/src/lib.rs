@@ -810,11 +810,19 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_reloadBuffer(
 //
 // Every field may be omitted. The last three are project-search only.
 //
+// `whole_word` means one thing for every kind of query: a hit counts only when
+// neither neighbouring character is a word character (`alphanumeric || '_'`).
+// A regex is filtered on where its match landed, never rewritten.
+//
 // Buffer search answers on the calling thread because it is a single pass over
 // a rope — milliseconds on a 100k-line file, which is what lets the search bar
 // re-run it on every keystroke of the query. Project search cannot answer at
 // all: it reads thousands of files, so it runs on a thread of its own and
 // publishes a generation counter to poll, the same shape as `gitStatusVersion`.
+//
+// Project search silently skips four kinds of file: unreadable ones, ones over
+// 4 MiB, ones holding a NUL byte anywhere, and ones that are not valid UTF-8.
+// They are counted in `files_searched` but can never produce a hit.
 // ---------------------------------------------------------------------------
 
 /// Why a query will not compile, or null if it will. The search bar calls this
@@ -892,6 +900,9 @@ const MAX_BUFFER_MATCHES: jlong = 10_000;
 /// project is unknown or the query does not compile. Returns at once: the
 /// search runs on a thread of its own.
 ///
+/// A project still being scanned is neither of those things: the search starts,
+/// reports `"scanning"` until the scan lands, and then searches the whole tree.
+///
 /// Starting a search cancels whatever was already running for that project.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectSearchStart(
@@ -918,8 +929,9 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectSearchS
 }
 
 /// Generation counter for a search, bumped whenever there is something new to
-/// read; 0 before the first results and for a forgotten id. Poll it exactly
-/// like `projectVersion`.
+/// read. Non-zero from the moment `projectSearchStart` returns, so 0 means
+/// only one thing: an id the engine has forgotten. Poll it like
+/// `projectVersion`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectSearchVersion(
     _env: JNIEnv,
@@ -932,6 +944,10 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectSearchV
 /// Everything a search has found from `from_file` onwards, as JSON. Results
 /// only grow, so a caller holding `n` files passes `n` and gets the rest.
 /// Never null: a forgotten id reports itself cancelled with nothing in it.
+///
+/// `state` is `scanning`, `running`, `done` or `cancelled`. Not free: this
+/// clones and serializes every file found since the last call, which after a
+/// 100 ms publish interval can be megabytes — call it off the main thread.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectSearchResults(
     env: JNIEnv,

@@ -31,6 +31,10 @@ pub struct SearchOptions {
     /// Treat `query` as a regular expression rather than literal text.
     pub regex: bool,
     pub case_sensitive: bool,
+    /// Keep only hits with a non-word character (or nothing) on either side,
+    /// where a word character is `alphanumeric || '_'`. The rule is the same
+    /// for a literal and for a regex: a regex is filtered on where its match
+    /// landed, never rewritten.
     pub whole_word: bool,
     /// Project search: also search files git ignores.
     pub include_ignored: bool,
@@ -43,15 +47,18 @@ pub struct SearchOptions {
 /// A compiled query, ready to run against any text.
 pub(crate) struct SearchQuery {
     matcher: Matcher,
+    /// Checked around every hit, whichever matcher produced it. Zed splices
+    /// `\b` into the pattern for its regex path, but a spliced anchor is not
+    /// the same rule: `foo|bar` becomes `(\bfoo)|(bar\b)`, and a pattern that
+    /// starts on punctuation cannot be anchored at all, so whole-word would
+    /// silently mean three different things depending on what was typed. One
+    /// test around the hit means it always means what the contract says.
+    whole_word: bool,
 }
 
 enum Matcher {
-    /// Aho-Corasick has no notion of a word boundary, so whole-word is checked
-    /// around each hit — the same shape as Zed's `SearchQuery::search_str`.
-    Literal {
-        search: Box<AhoCorasick>,
-        whole_word: bool,
-    },
+    /// Aho-Corasick has no notion of a word boundary — hence the test above.
+    Literal(Box<AhoCorasick>),
     Regex(Box<Regex>),
 }
 
@@ -85,12 +92,12 @@ impl SearchQuery {
                 .ascii_case_insensitive(!options.case_sensitive)
                 .build([&query])
                 .map_err(|err| err.to_string())?;
-            Matcher::Literal {
-                search: Box::new(search),
-                whole_word: options.whole_word,
-            }
+            Matcher::Literal(Box::new(search))
         };
-        Ok(Some(Self { matcher }))
+        Ok(Some(Self {
+            matcher,
+            whole_word: options.whole_word,
+        }))
     }
 
     /// Every match in `text`, ascending and non-overlapping, keeping at most
@@ -103,8 +110,16 @@ impl SearchQuery {
     pub(crate) fn matches_in(&self, text: &str, limit: usize) -> (Vec<Range<usize>>, usize) {
         let mut ranges = Vec::new();
         let mut total = 0;
+        let whole_word = self.whole_word;
         let mut keep = |range: Range<usize>| {
             if range.is_empty() {
+                return;
+            }
+            // Both offsets sit on character boundaries: UTF-8 is
+            // self-synchronising, so a valid needle cannot match halfway into
+            // a character of a valid haystack, and `regex` refuses to compile
+            // a pattern that could match invalid UTF-8.
+            if whole_word && !is_whole_word(text, range.start, range.end) {
                 return;
             }
             total += 1;
@@ -114,14 +129,8 @@ impl SearchQuery {
         };
 
         match &self.matcher {
-            Matcher::Literal { search, whole_word } => {
+            Matcher::Literal(search) => {
                 for found in search.find_iter(text) {
-                    // Both offsets sit on character boundaries: UTF-8 is
-                    // self-synchronising, so a valid needle cannot match
-                    // halfway into a character of a valid haystack.
-                    if *whole_word && !is_whole_word(text, found.start(), found.end()) {
-                        continue;
-                    }
                     keep(found.start()..found.end());
                 }
             }
@@ -136,25 +145,21 @@ impl SearchQuery {
 }
 
 fn build_regex(pattern: &str, options: &SearchOptions) -> Result<Regex, String> {
-    let mut pattern = pattern.to_owned();
-    if options.whole_word {
-        // `\b` asserts a *change* of character class, so anchoring a pattern
-        // that already starts on punctuation would make it unmatchable.
-        // Zed guards the same way, with a `\B` probe instead of this test.
-        if pattern.starts_with(is_word_char) {
-            pattern.insert_str(0, r"\b");
-        }
-        if pattern.ends_with(is_word_char) {
-            pattern.push_str(r"\b");
-        }
-    }
-    RegexBuilder::new(&pattern)
+    RegexBuilder::new(pattern)
         .case_insensitive(!options.case_sensitive)
         .multi_line(true)
         .build()
         .map_err(|err| err.to_string())
 }
 
+/// Neither neighbour of `start..end` is a word character — the whole of what
+/// `whole_word` promises, and the same test for every matcher.
+///
+/// One consequence of testing rather than anchoring: the regex engine picks
+/// its match before we judge it, so `foo|foobar` over "foobar" finds `foo`,
+/// has it rejected, and does not go back for the alternative that would have
+/// qualified. An anchored pattern would; it would also mis-anchor alternation
+/// outright, which is the worse failure of the two.
 fn is_whole_word(text: &str, start: usize, end: usize) -> bool {
     !text[..start].chars().next_back().is_some_and(is_word_char)
         && !text[end..].chars().next().is_some_and(is_word_char)
@@ -282,15 +287,68 @@ mod tests {
     }
 
     #[test]
-    fn whole_word_still_matches_a_punctuation_pattern() {
-        // `\b` next to `(` would assert a boundary that can never hold, so a
-        // pattern starting on punctuation must not be anchored.
+    fn whole_word_judges_a_punctuation_pattern_by_its_neighbours() {
+        // A pattern that begins on punctuation is not exempt: the rule is
+        // about the characters either side of the hit, not about the pattern.
         let whole = SearchOptions {
             regex: true,
             whole_word: true,
             ..options(r"\(x\)")
         };
-        assert_eq!(found("f(x) g(x)", &whole), vec!["(x)", "(x)"]);
+        assert_eq!(found("f(x) g(x)", &whole), Vec::<String>::new());
+        assert_eq!(found("f (x) g", &whole), vec!["(x)"]);
+        // The literal path, given the same text, says the same thing.
+        let literal = SearchOptions {
+            regex: false,
+            ..options("(x)")
+        };
+        assert_eq!(
+            found(
+                "f(x) g(x)",
+                &SearchOptions {
+                    whole_word: true,
+                    ..literal
+                }
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn whole_word_holds_for_alternation_and_for_patterns_that_cannot_be_anchored() {
+        // Splicing `\b` onto the ends of the raw pattern turned `foo|bar` into
+        // `(\bfoo)|(bar\b)`, which matched inside longer words, and did
+        // nothing at all to a pattern that started or ended on punctuation.
+        let cases = [
+            ("foo|bar", "xxfoo barbar foobar", vec![]),
+            ("foo|bar", "foo bar", vec!["foo", "bar"]),
+            ("(?i)foo", "xxfoo foo", vec!["foo"]),
+            (r"\w+", "one two", vec!["one", "two"]),
+            ("[a-z]+", "9abc abc", vec!["abc"]),
+        ];
+        for (pattern, text, expected) in cases {
+            let whole = SearchOptions {
+                regex: true,
+                whole_word: true,
+                ..options(pattern)
+            };
+            assert_eq!(found(text, &whole), expected, "{pattern:?} over {text:?}");
+        }
+    }
+
+    #[test]
+    fn whole_word_does_not_depend_on_the_case_toggle() {
+        // A non-ASCII literal only reaches the regex engine when the search is
+        // case-insensitive; before, that detour changed what whole-word meant.
+        for case_sensitive in [true, false] {
+            let whole = SearchOptions {
+                case_sensitive,
+                whole_word: true,
+                ..options("«x»")
+            };
+            assert_eq!(found("a«x»b", &whole), Vec::<String>::new());
+            assert_eq!(found("a «x» b", &whole), vec!["«x»"]);
+        }
     }
 
     #[test]

@@ -20,9 +20,17 @@
 //! is in the project. One consequence is worth knowing: Zed only scans an
 //! ignored directory once it is expanded, so `include_ignored` reaches the
 //! ignored files the panel can currently see, not the whole of `target/`.
+//! Another: a search asked for before the scan finishes waits for it rather
+//! than answering over half a tree — see [`Engine::start_project_search`].
+//!
+//! Four kinds of file never produce a result, and none of them is an error:
+//! one that cannot be read, one bigger than [`MAX_FILE_BYTES`], one holding a
+//! NUL byte anywhere, and one that is not valid UTF-8. That list is repeated
+//! on the bridge, because a user who greps a 5 MB log or a Latin-1 file and
+//! gets nothing deserves better than silence from the UI too.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -33,7 +41,7 @@ use util::paths::PathMatcher;
 use worktree::Snapshot;
 
 use crate::EngineError;
-use crate::project::ProjectId;
+use crate::project::{ProjectId, ProjectState};
 use crate::search::{SearchOptions, SearchQuery};
 
 pub type SearchId = u64;
@@ -50,9 +58,6 @@ const MAX_MATCHES_PER_FILE: usize = 500;
 /// reading it costs more than the result is worth.
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
-/// How much of a file to inspect for a NUL before calling it binary.
-const BINARY_SNIFF_BYTES: usize = 8 * 1024;
-
 /// A result line longer than this is windowed around its match. Long lines are
 /// generated code, and shipping a megabyte of one to the UI to draw forty
 /// pixels of it is pure waste.
@@ -65,10 +70,16 @@ const CONTEXT_BEFORE_MATCH: usize = 64;
 /// enough that the results lock is not the bottleneck.
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How often a search started mid-scan looks to see whether the scan landed.
+const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 /// How far a search has got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchState {
+    /// The project is still being scanned, so there is nothing to search yet.
+    /// The search is alive and will start itself when the scan lands.
+    Scanning,
     Running,
     Done,
     /// Superseded by a newer search on the same project, or cancelled
@@ -96,8 +107,10 @@ pub struct LineMatch {
     pub end_utf16: usize,
     /// The line, windowed around the match if it was very long.
     pub text: String,
-    /// `text` starts / ends mid-line, so the UI should show an ellipsis.
+    /// `text` starts mid-line, so the UI should show an ellipsis.
     pub clipped_start: bool,
+    /// Something was cut off the end: either `text` stops before the line does
+    /// or the match itself ran on past this line. Either way, an ellipsis.
     pub clipped_end: bool,
 }
 
@@ -130,6 +143,8 @@ pub struct SearchResults {
     pub total_files: usize,
     /// Files with at least one match, in all — not just in `files`.
     pub file_count: usize,
+    /// Matches found in all, counted the same way `FileMatches::match_count`
+    /// is: matches dropped by the per-file cap are in here too.
     pub match_count: usize,
     /// One of the caps bit, so this is not the whole truth.
     pub truncated: bool,
@@ -161,6 +176,8 @@ impl SearchResults {
 struct Found {
     files: Vec<FileMatches>,
     version: u64,
+    /// Waiting for the project's initial scan; nothing has been read yet.
+    scanning: bool,
     finished: bool,
     error: Option<String>,
     files_searched: usize,
@@ -214,6 +231,13 @@ impl crate::Engine {
     ///
     /// Any search already running for this project is cancelled, so the id
     /// returned here is the only live one for it.
+    ///
+    /// A project whose initial scan has not finished is *not* an error and is
+    /// not searched early either: the search reports [`SearchState::Scanning`]
+    /// and starts itself the moment the scan lands. Both alternatives are
+    /// worse — refusing looks to the UI exactly like a bad query, and
+    /// searching the half-scanned tree would answer "done, no results" over a
+    /// subset of the project.
     pub fn start_project_search(
         &self,
         project: ProjectId,
@@ -223,9 +247,7 @@ impl crate::Engine {
         let include = path_matcher(&options.include_globs).map_err(EngineError::InvalidQuery)?;
         let exclude = path_matcher(&options.exclude_globs).map_err(EngineError::InvalidQuery)?;
 
-        let Some((root, Some(snapshot))) = self.with_project(project, |state| {
-            (state.root.clone(), state.snapshot.clone())
-        }) else {
+        let Some(state) = self.projects.lock().unwrap().get(&project).cloned() else {
             return Err(EngineError::UnknownProject(project));
         };
 
@@ -233,7 +255,12 @@ impl crate::Engine {
         let search = Arc::new(Search {
             id,
             cancelled: AtomicBool::new(false),
-            found: Mutex::new(Found::default()),
+            // Version 1 from birth, so "0" only ever means an id the engine
+            // has forgotten — the UI polls this as its liveness signal.
+            found: Mutex::new(Found {
+                version: 1,
+                ..Default::default()
+            }),
         });
         if let Some(previous) = self
             .searches
@@ -250,15 +277,19 @@ impl crate::Engine {
         let Some(query) = query else {
             let mut found = search.found.lock().unwrap();
             found.finished = true;
-            found.version = 1;
+            found.version += 1;
             return Ok(id);
         };
 
+        search.found.lock().unwrap().scanning = true;
         let include_ignored = options.include_ignored;
         let worker = search.clone();
         let spawned = thread::Builder::new()
             .name("conquest-project-search".to_owned())
             .spawn(move || {
+                let Some((snapshot, root)) = await_scan(&worker, &state) else {
+                    return;
+                };
                 run(
                     &worker,
                     &snapshot,
@@ -271,6 +302,7 @@ impl crate::Engine {
             });
         if let Err(err) = spawned {
             let mut found = search.found.lock().unwrap();
+            found.scanning = false;
             found.finished = true;
             found.error = Some(format!("could not start the search: {err}"));
             found.version += 1;
@@ -303,6 +335,8 @@ impl crate::Engine {
                 SearchState::Cancelled
             } else if found.finished {
                 SearchState::Done
+            } else if found.scanning {
+                SearchState::Scanning
             } else {
                 SearchState::Running
             },
@@ -342,6 +376,45 @@ fn path_matcher(globs: &[String]) -> Result<Option<PathMatcher>, String> {
     PathMatcher::new(globs, PathStyle::Unix)
         .map(Some)
         .map_err(|err| err.to_string())
+}
+
+/// Wait for the project's initial scan and hand back what to search, or
+/// `None` if the search was cancelled or the project failed to open.
+///
+/// This polls rather than waiting on the runtime: the mirrored state has no
+/// notification of its own (`project.rs` publishes a version counter, which is
+/// what every other consumer polls), and a search that has not started yet is
+/// not costing anybody a frame. It is the search *thread* that sleeps here,
+/// never the caller.
+fn await_scan(search: &Search, project: &Mutex<ProjectState>) -> Option<(Snapshot, PathBuf)> {
+    loop {
+        if search.is_cancelled() {
+            return None;
+        }
+        {
+            let state = project.lock().unwrap();
+            if let Some(error) = &state.error {
+                // The project never opened, so there is no tree to walk and
+                // waiting would be waiting forever. That is exactly the
+                // failure `error` exists for.
+                let mut found = search.found.lock().unwrap();
+                found.scanning = false;
+                found.finished = true;
+                found.error = Some(error.clone());
+                found.version += 1;
+                return None;
+            }
+            if state.scan_complete
+                && let Some(snapshot) = state.snapshot.clone()
+            {
+                let root = state.root.clone();
+                drop(state);
+                search.found.lock().unwrap().scanning = false;
+                return Some((snapshot, root));
+            }
+        }
+        thread::sleep(SCAN_POLL_INTERVAL);
+    }
 }
 
 /// Walk the snapshot, search each file, publish as we go.
@@ -402,7 +475,10 @@ fn run(
         }
 
         if let Some(found) = search_file(&root.join(entry.path.as_std_path()), query, path) {
-            matches += found.matches.len();
+            // Every match the file holds, not just the ones that survived the
+            // per-file cap, so this counter means the same thing as the
+            // per-file one and a "5 000 results" header is not a lie.
+            matches += found.match_count;
             files_with_matches += 1;
             batch.push(found);
 
@@ -434,14 +510,19 @@ fn run(
 /// Read one file and collect its hits, or `None` when there is nothing to
 /// report — no matches, or nothing searchable in the first place.
 ///
-/// A file that cannot be read is skipped in silence. During a search of a
-/// whole tree, a permission error or a file deleted a moment ago is ordinary,
-/// and there is no useful place to put a thousand of them.
+/// Three kinds of file are skipped in silence, all of them documented on the
+/// bridge because a user will otherwise wonder where their hit went: one that
+/// cannot be read (a permission error, or a file deleted a moment ago —
+/// ordinary during a walk of a whole tree, and there is no useful place to put
+/// a thousand of them), one holding a NUL byte, and one that is not UTF-8.
 fn search_file(path: &Path, query: &SearchQuery, relative: &str) -> Option<FileMatches> {
     let bytes = std::fs::read(path).ok()?;
-    // A NUL byte is the same binary test `grep` uses, and it saves the far
-    // more expensive UTF-8 validation below on the files it catches.
-    if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
+    // A NUL byte is the same binary test `grep` uses. It looks at the whole
+    // file rather than a prefix: NUL is valid UTF-8, so a binary blob whose
+    // first NUL sits past any sniff window would otherwise come back as a
+    // "text" result and be drawn as one. Finding a byte is memchr-fast next
+    // to the read that just happened.
+    if bytes.contains(&0) {
         return None;
     }
     let mut text = String::from_utf8(bytes).ok()?;
@@ -474,12 +555,15 @@ fn search_file(path: &Path, query: &SearchQuery, relative: &str) -> Option<FileM
                 .unwrap_or(text.len());
             // A match may run past its line, either because the query spans
             // lines or because a regex crossed one. It is reported where it
-            // starts, clipped to that line — a results panel draws one line.
+            // starts, clipped to that line — a results panel draws one line —
+            // and the clipping is flagged, or the panel would draw a highlight
+            // ending flush at the edge with nothing to say it goes on.
             line_match(
                 &text[line_start..line_end],
                 line,
                 range.start - line_start,
                 range.end.min(line_end) - line_start,
+                range.end > line_end,
             )
         })
         .collect();
@@ -492,8 +576,9 @@ fn search_file(path: &Path, query: &SearchQuery, relative: &str) -> Option<FileM
 }
 
 /// Package one hit for display, windowing the line if it is long enough that
-/// shipping all of it would be waste.
-fn line_match(line: &str, number: u32, start: usize, end: usize) -> LineMatch {
+/// shipping all of it would be waste. `spans_lines` says the match itself
+/// continued past this line, which the window cannot tell from the text alone.
+fn line_match(line: &str, number: u32, start: usize, end: usize, spans_lines: bool) -> LineMatch {
     let (from, to) = if line.len() <= MAX_LINE_BYTES {
         (0, line.len())
     } else {
@@ -516,7 +601,7 @@ fn line_match(line: &str, number: u32, start: usize, end: usize) -> LineMatch {
         end_utf16: text[..window_end].chars().map(char::len_utf16).sum(),
         text: text.to_owned(),
         clipped_start: from > 0,
-        clipped_end: to < line.len(),
+        clipped_end: to < line.len() || spans_lines,
     }
 }
 
@@ -587,7 +672,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let results = engine.project_search_results(id, 0);
-            if results.state != SearchState::Running {
+            if !matches!(results.state, SearchState::Running | SearchState::Scanning) {
                 return results;
             }
             assert!(Instant::now() < deadline, "the search never finished");
@@ -808,6 +893,9 @@ mod tests {
         let file = &results.files[0];
         assert_eq!(file.matches.len(), MAX_MATCHES_PER_FILE);
         assert_eq!(file.match_count, MAX_MATCHES_PER_FILE + 50);
+        // The aggregate counts the same thing the per-file count does: every
+        // match in the file, not the 500 that were kept.
+        assert_eq!(results.match_count, MAX_MATCHES_PER_FILE + 50);
         assert!(
             results.truncated,
             "truncation has to be reported, not hidden"
@@ -827,7 +915,10 @@ mod tests {
 
         let id = engine.start_project_search(1, &options("needle")).unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
-        while engine.project_search_results(id, 0).state == SearchState::Running {
+        while matches!(
+            engine.project_search_results(id, 0).state,
+            SearchState::Running | SearchState::Scanning
+        ) {
             assert!(Instant::now() < deadline, "the search never finished");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -883,6 +974,151 @@ mod tests {
             ),
             Err(EngineError::InvalidQuery(_))
         ));
+    }
+
+    /// Opening a project and searching it in the same breath is what
+    /// Ctrl+Shift+F on a cold repo does. It used to answer `UnknownProject`,
+    /// which the bridge turns into the same -1 a bad query gets.
+    #[test]
+    fn a_search_started_before_the_scan_finishes_waits_for_the_whole_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for name in ["a.txt", "b.txt", "src/c.txt"] {
+            std::fs::write(root.join(name), "needle\n").unwrap();
+        }
+
+        let engine = Engine::new();
+        let project = engine.open_project(root);
+        let id = engine
+            .start_project_search(project, &options("needle"))
+            .expect("a project that is still scanning is not an unknown project");
+
+        // Read the state before asking whether the scan landed: if the search
+        // is not scanning, the scan must already have finished, and it cannot
+        // un-finish.
+        let first = engine.project_search_results(id, 0);
+        if first.state != SearchState::Scanning {
+            assert!(
+                engine.project_scan_complete(project),
+                "left Scanning before the scan completed, state {:?}",
+                first.state
+            );
+        }
+        assert!(first.files.is_empty(), "nothing is searched while scanning");
+        assert!(
+            engine.project_search_version(id) > 0,
+            "a live search must never look like a forgotten one"
+        );
+
+        // Whatever it reported on the way, `done` is only ever said over the
+        // whole tree.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let results = engine.project_search_results(id, 0);
+            match results.state {
+                SearchState::Running | SearchState::Scanning => {
+                    assert!(Instant::now() < deadline, "the search never finished");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                state => {
+                    assert_eq!(state, SearchState::Done);
+                    assert_eq!(results.error, None);
+                    assert_eq!(paths(&results), vec!["a.txt", "b.txt", "src/c.txt"]);
+                    assert_eq!(results.total_files, 3);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The other way out of the wait: a project that never opens at all must
+    /// not leave a search parked forever.
+    #[test]
+    fn a_search_on_a_project_that_cannot_open_reports_the_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-here");
+        let engine = Engine::new();
+        let project = engine.open_project(&missing);
+        let id = engine
+            .start_project_search(project, &options("needle"))
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let results = engine.project_search_results(id, 0);
+            if !matches!(results.state, SearchState::Running | SearchState::Scanning) {
+                assert_eq!(results.state, SearchState::Done);
+                assert!(
+                    results
+                        .error
+                        .is_some_and(|error| error.contains("not-here")),
+                    "the project's own failure is the search's failure"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "the search waited forever");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_match_that_runs_past_its_line_is_flagged_as_clipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("poem.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let engine = Engine::new();
+        wait_for_scan(&engine, engine.open_project(dir.path()));
+
+        for query in [
+            options("alpha\nbeta"),
+            SearchOptions {
+                regex: true,
+                ..options("(?s)alpha.*gamma")
+            },
+        ] {
+            let results = search(&engine, &query);
+            let found = &results.files[0].matches[0];
+            assert_eq!(found.line, 1);
+            assert_eq!(found.text, "alpha");
+            assert_eq!((found.start, found.end), (0, 5));
+            assert!(
+                found.clipped_end,
+                "{:?} spans lines, so its highlight is cut short",
+                query.query
+            );
+            assert!(!found.clipped_start);
+        }
+    }
+
+    /// All three of the engine's silent skips, in one project so the scan is
+    /// paid for once. Each is documented on the bridge; each is proven here.
+    #[test]
+    fn unreadably_large_binary_and_non_utf8_files_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        // Bigger than the cap, with the needle at the very end.
+        let mut huge = "x".repeat(MAX_FILE_BYTES as usize);
+        huge.push_str("\nneedle\n");
+        std::fs::write(root.join("huge.log"), huge).unwrap();
+        // A NUL well past any prefix-sized sniff: still binary.
+        let mut binary = b"x".repeat(20_000);
+        binary.extend_from_slice(b"needle\0");
+        std::fs::write(root.join("late.bin"), binary).unwrap();
+        // Latin-1: the needle is plain ASCII, the file is not UTF-8.
+        std::fs::write(root.join("latin1.txt"), b"needle caf\xe9\n").unwrap();
+        // A control: something that is searchable.
+        std::fs::write(root.join("ok.txt"), "needle\n").unwrap();
+
+        let engine = Engine::new();
+        wait_for_scan(&engine, engine.open_project(root));
+        let results = search(&engine, &options("needle"));
+        assert_eq!(paths(&results), vec!["ok.txt"]);
+        // They were walked, just not searched — the progress bar still counts
+        // them, which is why `files_searched` is 4 and `file_count` is 1.
+        assert_eq!(results.files_searched, 4);
+        assert_eq!(results.file_count, 1);
     }
 
     #[test]
