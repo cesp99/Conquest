@@ -145,6 +145,12 @@ data class GitPanelState(
      * it is unknown, and the panel says so rather than claiming a clean tree.
      */
     val scanned: Boolean = false,
+    /**
+     * git actually ran. False and [scanned] both true means it could not be
+     * run at all — no Linux userland, or no git inside it — which is *not*
+     * the same as a clean tree, though both arrive as an empty list.
+     */
+    val ran: Boolean = false,
     /** The project is inside a git repository at all. */
     val hasRepo: Boolean = false,
     val branch: GitBranch? = null,
@@ -163,6 +169,7 @@ data class GitPanelState(
             val branch = root.optJSONObject("branch")
             return GitPanelState(
                 scanned = root.optBoolean("scanned"),
+                ran = root.optBoolean("ran"),
                 hasRepo = root.optBoolean("has_repo"),
                 branch = branch?.let {
                     GitBranch(

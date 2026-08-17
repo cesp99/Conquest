@@ -522,6 +522,11 @@ private fun EmptyMessage(state: GitPanelState) {
     val text = when {
         !state.hasRepo -> "This project is not in a git repository"
         !state.scanned -> "Asking git…"
+        // An empty list is what "clean" looks like *and* what "git never ran"
+        // looks like. Claiming the first when it is the second told a user
+        // with no git in their Debian that their tree was clean.
+        !state.ran -> "Could not run git here — ${Userland.backend.displayName} needs git " +
+            "installed before the panel can show anything"
         else -> "Nothing has changed since the last commit"
     }
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

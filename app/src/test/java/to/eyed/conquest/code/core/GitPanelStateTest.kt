@@ -165,4 +165,19 @@ class GitPanelStateTest {
         )
         assertNull(plain.unstaged.single().original)
     }
+
+    /**
+     * "git could not run" and "the tree is clean" arrive as the same empty
+     * list. A device whose Debian had no git was told its tree was clean.
+     */
+    @Test
+    fun aStatusThatNeverRanIsNotACleanTree() {
+        val neverRan = GitPanelState.parse("""{"scanned":true,"ran":false,"has_repo":true,"entries":[]}""")
+        assertTrue(neverRan.scanned)
+        assertFalse(neverRan.ran)
+        assertTrue(neverRan.isClean)
+
+        val ranAndClean = GitPanelState.parse("""{"scanned":true,"ran":true,"has_repo":true,"entries":[]}""")
+        assertTrue(ranAndClean.ran)
+    }
 }

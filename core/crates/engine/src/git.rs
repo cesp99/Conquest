@@ -58,6 +58,9 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How many times one refresh may immediately re-run because the worktree
 /// moved again while it was running. See [`run_until_settled`].
+/// How long a run that could not reach git is believed before it is retried.
+const FAILED_RUN_RETRY: Duration = Duration::from_secs(5);
+
 const MAX_CHAINED_RUNS: u32 = 4;
 
 /// What happened to one path, as the project panel needs to colour it.
@@ -188,6 +191,10 @@ pub struct GitChanges {
     /// A status run has completed. Until it has, an empty list means "not
     /// asked yet" rather than "nothing changed", and the panel says so.
     pub scanned: bool,
+    /// A `git status` actually ran and was parsed. False means git could not
+    /// be run at all — no userland, or no git inside it — and *not* that the
+    /// tree is clean, which is what an empty change list on its own says.
+    pub ran: bool,
     /// The project is inside a git repository at all.
     pub has_repo: bool,
     pub branch: Option<BranchInfo>,
@@ -234,6 +241,10 @@ struct ProjectGit {
     version: u64,
     /// A run has completed at least once (successfully or not).
     scanned: bool,
+    /// Whether the last run actually ran git. See [`GitChanges::ran`].
+    ran: bool,
+    /// When the last run finished, for the retry above.
+    last_run: Option<Instant>,
     /// The worktree version the last completed run observed.
     scanned_worktree_version: u64,
     /// A run is in flight. Never more than one per project: git is the
@@ -314,6 +325,7 @@ impl crate::Engine {
         self.refresh_git_status(id);
         self.with_git(id, |git| GitChanges {
             scanned: git.scanned,
+            ran: git.ran,
             has_repo: git.repo_root.is_some(),
             branch: git.branch.clone(),
             entries: git
@@ -364,7 +376,22 @@ impl crate::Engine {
             .clone();
         {
             let mut git = cache.lock().unwrap();
-            if git.running || (git.scanned && git.scanned_worktree_version == worktree_version) {
+            // A run that could not reach git is not an answer worth keeping:
+            // the userland can gain git while the app is open — `apt install
+            // git` in the terminal two lines below the panel — and a cache
+            // that only refreshes when the *worktree* changes would go on
+            // saying "could not run git" over a repository it can now read.
+            // Retried on a timer rather than every poll, because the failure
+            // costs a proot spawn.
+            let failed_run_is_stale = !git.ran
+                && git
+                    .last_run
+                    .is_none_or(|at| at.elapsed() >= FAILED_RUN_RETRY);
+            if git.running
+                || (git.scanned
+                    && git.scanned_worktree_version == worktree_version
+                    && !failed_run_is_stale)
+            {
                 return;
             }
             git.running = true;
@@ -431,6 +458,8 @@ fn run_until_settled(
                 bump_generation();
             }
             git.scanned = true;
+            git.ran = outcome.ran;
+            git.last_run = Some(Instant::now());
             git.scanned_worktree_version = observed;
         }
 
@@ -454,6 +483,8 @@ struct RunOutcome {
     changes: Vec<FileChange>,
     branch: Option<BranchInfo>,
     statuses: BTreeMap<String, GitStatus>,
+    /// git ran and its output was parsed. See [`GitChanges::ran`].
+    ran: bool,
 }
 
 /// One status run.
@@ -490,6 +521,7 @@ fn status_for(id: ProjectId, userland: &Userland, root: &Path) -> RunOutcome {
         branch: parse_branch(&output),
         changes,
         statuses,
+        ran: true,
         ..outcome
     }
 }
@@ -2595,6 +2627,31 @@ mod tests {
     fn plain_status(repo: &Path) -> String {
         let out = host_git(repo, &["status", "--porcelain"]);
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// "git could not run" and "nothing has changed" are the same empty list,
+    /// and a panel that cannot tell them apart tells the user their tree is
+    /// clean when it has no idea. Found on a device whose Debian had no git.
+    #[test]
+    fn a_status_that_could_not_run_git_says_so_rather_than_reading_as_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        // A userland that is not installed: `status_for` can spawn nothing,
+        // which is exactly the device this was found on — a Debian with no
+        // git in it answers the same way.
+        let engine = crate::Engine::new();
+        engine.set_userland(
+            &dir.path().join("no-such-proot"),
+            &dir.path().join("no-such-rootfs"),
+            dir.path(),
+            dir.path(),
+        );
+        let userland = engine.userland().unwrap();
+        let outcome = status_for(1, &userland, &root);
+        assert!(outcome.repo_root.is_some(), "the .git directory is right there");
+        assert!(!outcome.ran, "no git ran, so the empty change list means nothing");
+        assert!(outcome.changes.is_empty());
     }
 
     /// Discarding a rename used to delete the file and lose everything typed
