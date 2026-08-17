@@ -2,6 +2,7 @@ package to.eyed.conquest.code.ui.editor
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -11,29 +12,51 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.gestures.rememberScrollableState
 import androidx.compose.foundation.gestures.scrollable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.isImeVisible
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isAltPressed
 import androidx.compose.ui.input.key.isCtrlPressed
 import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.isAltPressed
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.key.utf16CodePoint
@@ -45,6 +68,7 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalTextToolbar
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.platform.TextToolbar
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextLayoutResult
@@ -71,9 +95,9 @@ private const val CURSOR_BLINK_MILLIS = 530L
  * The editor surface: a custom canvas that draws only the visible window
  * of the engine buffer — no whole-buffer state on the UI side. Virtualized
  * line rendering with per-content-line layout caching, pixel-based
- * scrolling with fling, tap cursor, tree-sitter highlight spans, selection
- * with drag handles + floating toolbar, soft-keyboard editing
- * (editorTextInput) and hardware keys.
+ * scrolling with fling, tap cursor, tree-sitter highlight spans, multiple
+ * cursors and selections with drag handles + floating toolbar,
+ * soft-keyboard editing (editorTextInput) and hardware keys.
  */
 @Composable
 fun EditorPane(
@@ -105,6 +129,7 @@ fun EditorPane(
             textPadding = 8.dp.toPx(),
         )
     }
+    state.tabSize = settings.tabSize
     val handleRadiusPx = with(density) { 6.dp.toPx() }
     val handleTouchRadiusPx = with(density) { 24.dp.toPx() }
 
@@ -140,200 +165,330 @@ fun EditorPane(
     val layoutForLine: (String) -> TextLayoutResult =
         remember(layoutCache) { { line -> layoutCache.layoutFor(line) } }
 
-    Canvas(
-        modifier = modifier
-            .fillMaxSize()
-            .clipToBounds()
-            .background(theme.color("editor.background"))
-            // DeX and paired keyboards mean a mouse is ordinary here, not
-            // exotic; text should say so under the pointer.
-            .pointerHoverIcon(PointerIcon.Text)
-            .onGloballyPositioned { paneCoordinates = it }
-            .scrollable(verticalScroll, Orientation.Vertical)
-            .scrollable(horizontalScroll, Orientation.Horizontal)
-            .focusRequester(focusRequester)
-            .editorTextInput(state)
-            .onKeyEvent { event -> handleEditorKey(state, actions, event, onSave, settings.tabSize) }
-            .focusable()
-            .pointerInput(state) {
-                detectDragGesturesAfterLongPress(
-                    onDragStart = { position ->
+    Box(modifier = modifier) {
+        Canvas(
+            modifier = Modifier
+                .fillMaxSize()
+                .clipToBounds()
+                .background(theme.color("editor.background"))
+                // DeX and paired keyboards mean a mouse is ordinary here, not
+                // exotic; text should say so under the pointer.
+                .pointerHoverIcon(PointerIcon.Text)
+                .onGloballyPositioned { paneCoordinates = it }
+                .scrollable(verticalScroll, Orientation.Vertical)
+                .scrollable(horizontalScroll, Orientation.Horizontal)
+                .focusRequester(focusRequester)
+                .editorTextInput(state)
+                .onKeyEvent { event -> handleEditorKey(state, actions, event, onSave) }
+                .focusable()
+                // Alt+click drops an extra caret. Claimed in the *initial* pass,
+                // before the tap and long-press detectors below get a look, so
+                // an Alt-held click never also moves the cursor it just added.
+                .pointerInput(state) {
+                    awaitEachGesture {
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        if (event.type != PointerEventType.Press) return@awaitEachGesture
+                        if (!event.keyboardModifiers.isAltPressed) return@awaitEachGesture
+                        val down = event.changes.firstOrNull() ?: return@awaitEachGesture
+                        down.consume()
                         actions.hideToolbar()
-                        state.selectWordAt(position, layoutForLine)
+                        state.addCaretAt(down.position, layoutForLine)
                         focusRequester.requestFocus()
-                    },
-                    onDrag = { change, _ ->
-                        change.consume()
-                        state.extendSelectionTo(change.position, layoutForLine)
-                    },
-                    onDragEnd = { actions.showToolbar() },
-                    onDragCancel = { actions.showToolbar() },
-                )
-            }
-            .pointerInput(state) {
-                detectTapGestures(
-                    onDoubleTap = { tap ->
-                        state.selectWordAt(tap, layoutForLine)
-                        focusRequester.requestFocus()
+                    }
+                }
+                .pointerInput(state) {
+                    detectDragGesturesAfterLongPress(
+                        onDragStart = { position ->
+                            actions.hideToolbar()
+                            state.selectWordAt(position, layoutForLine)
+                            focusRequester.requestFocus()
+                        },
+                        onDrag = { change, _ ->
+                            change.consume()
+                            state.extendSelectionTo(change.position, layoutForLine)
+                        },
+                        onDragEnd = { actions.showToolbar() },
+                        onDragCancel = { actions.showToolbar() },
+                    )
+                }
+                .pointerInput(state) {
+                    detectTapGestures(
+                        onDoubleTap = { tap ->
+                            state.selectWordAt(tap, layoutForLine)
+                            focusRequester.requestFocus()
+                            actions.showToolbar()
+                        },
+                        // No-op: the long press belongs to
+                        // detectDragGesturesAfterLongPress above; registering it
+                        // here stops onTap from also firing on release (which
+                        // would clear the fresh selection).
+                        onLongPress = {},
+                        onTap = { tap ->
+                            actions.hideToolbar()
+                            state.moveCursorTo(tap, layoutForLine)
+                            focusRequester.requestFocus()
+                            keyboard?.show()
+                        },
+                    )
+                }
+                // Selection-handle dragging. Innermost pointer input: it must
+                // inspect the down before the tap detector consumes it. A down
+                // near a handle claims the gesture and moves that selection
+                // end; otherwise the event flows on untouched.
+                .pointerInput(state) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = true)
+                        val handles = selectionHandles(state, layoutCache) ?: return@awaitEachGesture
+                        val distStart = (down.position - handles.first).getDistance()
+                        val distEnd = (down.position - handles.second).getDistance()
+                        if (min(distStart, distEnd) > handleTouchRadiusPx) return@awaitEachGesture
+                        val movingStart = distStart <= distEnd
+                        down.consume()
+                        actions.hideToolbar()
+                        drag(down.id) { change ->
+                            change.consume()
+                            // The handle hangs below the line: aim the hit point
+                            // back up into the text.
+                            val target = change.position - Offset(0f, state.lineHeightPx * 0.75f)
+                            state.dragSelectionEndTo(target, movingStart, layoutForLine)
+                        }
                         actions.showToolbar()
-                    },
-                    // No-op: the long press belongs to
-                    // detectDragGesturesAfterLongPress above; registering it
-                    // here stops onTap from also firing on release (which
-                    // would clear the fresh selection).
-                    onLongPress = {},
-                    onTap = { tap ->
-                        actions.hideToolbar()
-                        state.moveCursorTo(tap, layoutForLine)
-                        focusRequester.requestFocus()
-                        keyboard?.show()
-                    },
-                )
-            }
-            // Selection-handle dragging. Innermost pointer input: it must
-            // inspect the down before the tap detector consumes it. A down
-            // near a handle claims the gesture and moves that selection
-            // end; otherwise the event flows on untouched.
-            .pointerInput(state) {
-                awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = true)
-                    val handles = selectionHandles(state, layoutCache) ?: return@awaitEachGesture
-                    val distStart = (down.position - handles.first).getDistance()
-                    val distEnd = (down.position - handles.second).getDistance()
-                    if (min(distStart, distEnd) > handleTouchRadiusPx) return@awaitEachGesture
-                    val movingStart = distStart <= distEnd
-                    down.consume()
-                    actions.hideToolbar()
-                    drag(down.id) { change ->
-                        change.consume()
-                        // The handle hangs below the line: aim the hit point
-                        // back up into the text.
-                        val target = change.position - Offset(0f, state.lineHeightPx * 0.75f)
-                        state.dragSelectionEndTo(target, movingStart, layoutForLine)
                     }
-                    actions.showToolbar()
                 }
-            }
-    ) {
-        state.updateViewport(size.width, size.height)
-        val lineHeight = state.lineHeightPx
-        val gutterWidth = state.gutterWidthPx
-        val firstRow = (state.scrollY / lineHeight).toInt().coerceAtLeast(0)
-        val lastRow = min(
-            firstRow + ceil(size.height / lineHeight).toInt() + 1,
-            state.lineCount,
-        )
-        val lines = state.linesWindow(firstRow, lastRow)
-        val textLeft = gutterWidth + state.textPaddingPx - state.scrollX
+        ) {
+            state.updateViewport(size.width, size.height)
+            val lineHeight = state.lineHeightPx
+            val gutterWidth = state.gutterWidthPx
+            val firstRow = (state.scrollY / lineHeight).toInt().coerceAtLeast(0)
+            val lastRow = min(
+                firstRow + ceil(size.height / lineHeight).toInt() + 1,
+                state.lineCount,
+            )
+            val lines = state.linesWindow(firstRow, lastRow)
+            val textLeft = gutterWidth + state.textPaddingPx - state.scrollX
 
-        // Current-line highlight, under everything else.
-        val cursorTop = state.cursorRow * lineHeight - state.scrollY
-        val selection = state.selectionRange()
-        if (selection == null && cursorTop + lineHeight > 0 && cursorTop < size.height) {
-            clipRect(left = gutterWidth) {
-                drawRect(
-                    color = theme.color("editor.active_line.background"),
-                    topLeft = Offset(gutterWidth, cursorTop),
-                    size = Size(size.width - gutterWidth, lineHeight),
-                )
-            }
-        }
-
-        val spansWindow = state.spansWindow()
-        clipRect(left = gutterWidth) {
-            // Selection background.
-            if (selection != null) {
-                for (row in max(selection.startRow, firstRow)..
-                    min(selection.endRow, lastRow - 1)) {
-                    val line = lines[row - firstRow]
-                    val layout = layoutCache.layoutFor(
-                        line,
-                        spansWindow.getOrElse(row - firstRow) { emptyList() },
-                    )
-                    val startCol =
-                        if (row == selection.startRow)
-
-                            selection.startCol.coerceAtMost(line.length)
-                        else 0
-                    val left = textLeft + layout.getHorizontalPosition(startCol, true)
-                    val right = if (row == selection.endRow) {
-                        textLeft + layout.getHorizontalPosition(
-                            selection.endCol.coerceAtMost(line.length),
-                            true,
-                        )
-                    } else {
-                        // Full-line rows: include a half-char for the newline.
-                        textLeft + layout.getHorizontalPosition(line.length, true) +
-                            state.charWidthPx / 2f
-                    }
+            // Current-line highlight, under everything else. It is the *one*
+            // cursor's line: with a column of carets there is no single active
+            // line, and striping half the screen would only be noise.
+            val cursorTop = state.cursorRow * lineHeight - state.scrollY
+            val selection = state.selectionRange()
+            val extras = state.extraCarets
+            if (selection == null && extras.isEmpty() &&
+                cursorTop + lineHeight > 0 && cursorTop < size.height
+            ) {
+                clipRect(left = gutterWidth) {
                     drawRect(
-                        color = theme.selection,
-                        topLeft = Offset(left, row * lineHeight - state.scrollY),
-                        size = Size((right - left).coerceAtLeast(0f), lineHeight),
+                        color = theme.color("editor.active_line.background"),
+                        topLeft = Offset(gutterWidth, cursorTop),
+                        size = Size(size.width - gutterWidth, lineHeight),
                     )
                 }
             }
 
-            // Buffer text.
-            lines.forEachIndexed { index, line ->
-                val layout =
-                    layoutCache.layoutFor(line, spansWindow.getOrElse(index) { emptyList() })
-                state.noteContentWidth(layout.size.width.toFloat())
-                val top = (firstRow + index) * lineHeight - state.scrollY
-                drawText(
-                    textLayoutResult = layout,
-                    topLeft = Offset(textLeft, top + (lineHeight - layout.size.height) / 2f),
-                )
-            }
+            val spansWindow = state.spansWindow()
+            clipRect(left = gutterWidth) {
+                fun paintSelection(startRow: Int, startCol: Int, endRow: Int, endCol: Int) {
+                    for (row in max(startRow, firstRow)..min(endRow, lastRow - 1)) {
+                        val line = lines[row - firstRow]
+                        val layout = layoutCache.layoutFor(
+                            line,
+                            spansWindow.getOrElse(row - firstRow) { emptyList() },
+                        )
+                        val from = if (row == startRow) startCol.coerceAtMost(line.length) else 0
+                        val left = textLeft + layout.getHorizontalPosition(from, true)
+                        val right = if (row == endRow) {
+                            textLeft + layout.getHorizontalPosition(
+                                endCol.coerceAtMost(line.length),
+                                true,
+                            )
+                        } else {
+                            // Full-line rows: include a half-char for the newline.
+                            textLeft + layout.getHorizontalPosition(line.length, true) +
+                                state.charWidthPx / 2f
+                        }
+                        drawRect(
+                            color = theme.selection,
+                            topLeft = Offset(left, row * lineHeight - state.scrollY),
+                            size = Size((right - left).coerceAtLeast(0f), lineHeight),
+                        )
+                    }
+                }
 
-            // Cursor.
-            if (cursorVisible && state.cursorRow in firstRow until lastRow) {
-                val line = lines[state.cursorRow - firstRow]
-                val layout = layoutCache.layoutFor(line, state.spansFor(state.cursorRow))
-                val col = state.cursorCol.coerceAtMost(line.length)
-                val cursorX = textLeft + layout.getHorizontalPosition(col, true)
-                if (cursorX >= gutterWidth - 1f) {
+                fun paintCaret(row: Int, col: Int) {
+                    if (row !in firstRow until lastRow) return
+                    val line = lines[row - firstRow]
+                    val layout = layoutCache.layoutFor(line, state.spansFor(row))
+                    val caretX = textLeft + layout.getHorizontalPosition(col.coerceAtMost(line.length), true)
+                    if (caretX < gutterWidth - 1f) return
                     drawRect(
                         color = theme.cursor,
-                        topLeft = Offset(cursorX, cursorTop),
+                        topLeft = Offset(caretX, row * lineHeight - state.scrollY),
                         size = Size(2f, lineHeight),
                     )
                 }
+
+                // Selection backgrounds.
+                if (selection != null) {
+                    paintSelection(
+                        selection.startRow,
+                        selection.startCol,
+                        selection.endRow,
+                        selection.endCol,
+                    )
+                }
+                for (caret in extras) {
+                    if (!caret.isEmpty) {
+                        paintSelection(caret.startRow, caret.startCol, caret.endRow, caret.endCol)
+                    }
+                }
+
+                // Buffer text.
+                lines.forEachIndexed { index, line ->
+                    val layout =
+                        layoutCache.layoutFor(line, spansWindow.getOrElse(index) { emptyList() })
+                    state.noteContentWidth(layout.size.width.toFloat())
+                    val top = (firstRow + index) * lineHeight - state.scrollY
+                    drawText(
+                        textLayoutResult = layout,
+                        topLeft = Offset(textLeft, top + (lineHeight - layout.size.height) / 2f),
+                    )
+                }
+
+                // Carets. The extra ones don't blink: a blinking column is hard
+                // to read as one thing, and their whole job is to show where the
+                // next keystroke lands.
+                if (cursorVisible) paintCaret(state.cursorRow, state.cursorCol)
+                for (caret in extras) paintCaret(caret.headRow, caret.headCol)
+
+                // Selection drag handles, for the primary selection only —
+                // handles on every caret of a column would be unusable, and the
+                // column is a keyboard and Alt+click construct anyway.
+                if (extras.isEmpty()) {
+                    selectionHandles(state, layoutCache)?.let { (start, end) ->
+                        drawCircle(theme.cursor, handleRadiusPx, start + Offset(0f, handleRadiusPx))
+                        drawCircle(theme.cursor, handleRadiusPx, end + Offset(0f, handleRadiusPx))
+                    }
+                }
             }
 
-            // Selection drag handles.
-            selectionHandles(state, layoutCache)?.let { (start, end) ->
-                drawCircle(theme.cursor, handleRadiusPx, start + Offset(0f, handleRadiusPx))
-                drawCircle(theme.cursor, handleRadiusPx, end + Offset(0f, handleRadiusPx))
-            }
-        }
-
-        // Gutter: background, divider, right-aligned line numbers.
-        drawRect(
-            color = theme.color("editor.gutter.background"),
-            topLeft = Offset.Zero,
-            size = Size(gutterWidth, size.height),
-        )
-        drawLine(
-            color = theme.color("border.variant"),
-            start = Offset(gutterWidth, 0f),
-            end = Offset(gutterWidth, size.height),
-        )
-        val lineNumber = theme.color("editor.line_number")
-        val activeLineNumber = theme.color("editor.active_line_number")
-        for (row in firstRow until lastRow) {
-            val layout = layoutCache.layoutFor((row + 1).toString())
-            val top = row * lineHeight - state.scrollY
-            drawText(
-                textLayoutResult = layout,
-                color = if (row == state.cursorRow) activeLineNumber else lineNumber,
-                topLeft = Offset(
-                    gutterWidth - state.gutterPaddingPx - layout.size.width,
-                    top + (lineHeight - layout.size.height) / 2f,
-                ),
+            // Gutter: background, divider, right-aligned line numbers.
+            drawRect(
+                color = theme.color("editor.gutter.background"),
+                topLeft = Offset.Zero,
+                size = Size(gutterWidth, size.height),
             )
+            drawLine(
+                color = theme.color("border.variant"),
+                start = Offset(gutterWidth, 0f),
+                end = Offset(gutterWidth, size.height),
+            )
+            val lineNumber = theme.color("editor.line_number")
+            val activeLineNumber = theme.color("editor.active_line_number")
+            for (row in firstRow until lastRow) {
+                val layout = layoutCache.layoutFor((row + 1).toString())
+                val top = row * lineHeight - state.scrollY
+                drawText(
+                    textLayoutResult = layout,
+                    color = if (row == state.cursorRow) activeLineNumber else lineNumber,
+                    topLeft = Offset(
+                        gutterWidth - state.gutterPaddingPx - layout.size.width,
+                        top + (lineHeight - layout.size.height) / 2f,
+                    ),
+                )
+            }
         }
+
+        EditorActionRow(
+            state = state,
+            paneCoordinates = paneCoordinates,
+            onActed = { focusRequester.requestFocus() },
+            modifier = Modifier.align(Alignment.BottomStart),
+        )
     }
+}
+
+/**
+ * The commands a soft keyboard can't reach, on a strip that appears with the
+ * IME and sits just above it.
+ *
+ * This is the same answer the terminal already gives (`ExtraKeysRow`): the
+ * on-screen keyboard has no Alt, no Ctrl and no arrow cluster, so every
+ * chord in `handleEditorKey` would otherwise be keyboard-only — and the
+ * convention in this codebase is that nothing is. It costs nothing on DeX or
+ * with a paired keyboard, where no IME comes up and the row never appears.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun EditorActionRow(
+    state: EditorState,
+    paneCoordinates: LayoutCoordinates?,
+    onActed: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    // The insets are read here rather than in EditorPane so the keyboard's
+    // open and close animation recomposes this strip and not the canvas.
+    if (!WindowInsets.isImeVisible) return
+    val density = LocalDensity.current
+    // How far to lift the row so it lands on top of the keyboard.
+    // `imePadding` can't do it: it would pad by the whole keyboard, and part
+    // of that keyboard is already below this pane — the status bar's worth of
+    // window sits between them. What is left after subtracting that is the
+    // overlap, and it comes out at zero on the devices that resize the window
+    // for the IME instead of letting it float over.
+    val windowHeight = LocalWindowInfo.current.containerSize.height
+    val paneBottom = paneCoordinates
+        ?.takeIf { it.isAttached }
+        ?.let { it.localToWindow(Offset(0f, it.size.height.toFloat())).y }
+        ?: windowHeight.toFloat()
+    val overlap = (WindowInsets.ime.getBottom(density) - (windowHeight - paneBottom))
+        .coerceAtLeast(0f)
+    val theme = LocalZedTheme.current
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(bottom = with(density) { overlap.toDp() })
+            .height(38.dp)
+            .background(theme.color("status_bar.background"))
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        fun act(action: () -> Unit): () -> Unit = {
+            action()
+            // Tapping a key must not take focus off the canvas, or the IME
+            // session ends and the keyboard drops away under the finger.
+            onActed()
+        }
+        ActionKey("esc", act { state.cancel() })
+        ActionKey("tab", act { state.insertAtCursor(" ".repeat(state.tabSize)) })
+        ActionKey("undo", act { state.undo() })
+        ActionKey("redo", act { state.redo() })
+        ActionKey("＋cur↑", act { state.addCaretVertically(-1) })
+        ActionKey("＋cur↓", act { state.addCaretVertically(1) })
+        ActionKey("＋next", act { state.selectNextOccurrence() })
+        ActionKey("line↑", act { state.moveLines(-1) })
+        ActionKey("line↓", act { state.moveLines(1) })
+        ActionKey("dup", act { state.duplicateLines(above = false) })
+        ActionKey("del line", act { state.deleteLines() })
+        ActionKey("join", act { state.joinLines() })
+        ActionKey("//", act { state.toggleComment() })
+    }
+}
+
+@Composable
+private fun ActionKey(label: String, onClick: () -> Unit) {
+    Text(
+        text = label,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .background(Color.Transparent)
+            .pointerHoverIcon(PointerIcon.Hand)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+    )
 }
 
 /**
@@ -422,22 +577,46 @@ internal class EditorActions(
 }
 
 /**
- * Hardware-key (and IME-forwarded key event) editing: character input,
- * backspace/enter, arrow navigation with shift-selection, clipboard
- * shortcuts, undo/redo.
+ * Hardware-key (and IME-forwarded key event) editing: character input with
+ * auto-closing pairs, backspace/enter, arrow navigation with
+ * shift-selection, the multi-cursor and line commands, clipboard shortcuts,
+ * undo/redo.
+ *
+ * The chords follow Zed's `default-linux.json` wherever it has one, which is
+ * why duplicate-line is Ctrl+Alt+Shift+Arrow rather than the Ctrl+Shift+D
+ * other editors use. The one addition is Ctrl+Alt+Arrow as a second way to
+ * add a cursor: Zed spells that Shift+Alt+Arrow, but Shift+Alt is where a
+ * lot of Android keyboards put their own layout switch.
+ *
+ * The workspace's table (`Keybindings.kt`) is matched in a preview pass
+ * above this one and must never claim any of these.
  */
 private fun handleEditorKey(
     state: EditorState,
     actions: EditorActions,
     event: KeyEvent,
     onSave: (() -> Unit)?,
-    tabSize: Int,
 ): Boolean {
     if (event.type != KeyEventType.KeyDown) return false
-    if (event.isCtrlPressed) {
+    val ctrl = event.isCtrlPressed
+    val alt = event.isAltPressed
+    val shift = event.isShiftPressed
+
+    // Alt chords first: the Ctrl block below would otherwise swallow the
+    // Ctrl+Alt+Shift twins before their Alt half was ever looked at.
+    if (alt && (event.key == Key.DirectionUp || event.key == Key.DirectionDown)) {
+        val delta = if (event.key == Key.DirectionUp) -1 else 1
+        when {
+            ctrl && shift -> state.duplicateLines(above = delta < 0)
+            ctrl || shift -> state.addCaretVertically(delta)
+            else -> state.moveLines(delta)
+        }
+        return true
+    }
+    if (ctrl) {
         return when (event.key) {
             Key.Z -> {
-                if (event.isShiftPressed) state.redo() else state.undo()
+                if (shift) state.redo() else state.undo()
                 true
             }
             Key.Y -> {
@@ -455,23 +634,35 @@ private fun handleEditorKey(
                 onSave?.invoke()
                 onSave != null
             }
+            Key.D -> state.selectNextOccurrence()
+            Key.L -> shift && state.selectAllOccurrences()
+            Key.K -> {
+                if (shift) state.deleteLines()
+                shift
+            }
+            Key.J -> {
+                if (shift) state.joinLines()
+                shift
+            }
+            Key.Slash -> state.toggleComment()
             else -> false
         }
     }
-    val extend = event.isShiftPressed
+    val extend = shift
     return when (event.key) {
+        Key.Escape -> state.cancel()
         Key.Backspace -> {
             state.backspace()
             true
         }
         Key.Enter, Key.NumPadEnter -> {
-            state.insertAtCursor("\n")
+            state.insertNewline()
             true
         }
         // Spaces, not a tab character: mixed indentation is a bug factory,
         // and the width is the user's to choose.
         Key.Tab -> {
-            state.insertAtCursor(" ".repeat(tabSize))
+            state.insertAtCursor(" ".repeat(state.tabSize))
             true
         }
         Key.DirectionLeft -> {
@@ -492,8 +683,8 @@ private fun handleEditorKey(
         }
         else -> {
             val codePoint = event.utf16CodePoint
-            if (codePoint >= 32 && codePoint != 127) {
-                state.insertAtCursor(String(Character.toChars(codePoint)))
+            if (!alt && codePoint >= 32 && codePoint != 127) {
+                state.typeCharacter(String(Character.toChars(codePoint)))
                 true
             } else {
                 false

@@ -79,13 +79,66 @@ see [USERLAND.md](USERLAND.md).
 | `Ctrl` `Shift` `Z` / `Ctrl` `Y` | Redo |
 | `Ctrl` `A` | Select all |
 | `Ctrl` `C` / `X` / `V` | Copy / cut / paste |
-| `←` `→` `↑` `↓` | Move the cursor |
+| `←` `→` `↑` `↓` | Move every cursor |
 | `Shift` + arrows | Extend the selection |
 | `Backspace` | Delete backwards (joins lines at column 0) |
-| `Enter` | Insert a line break |
+| `Enter` | New line, keeping the indent |
+| `Tab` | Insert one indent's worth of spaces |
 
-All of these are also in the `☰` menu in the title bar, with their
-shortcuts listed beside them.
+Undo and redo, copy, cut, paste and select-all are also in the `☰` menu in
+the title bar, with their shortcuts listed beside them.
+
+### Multiple cursors
+
+The bindings are Zed's, from its Linux keymap.
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl` `D` | Select the word under the cursor, then add a cursor on the next occurrence of it |
+| `Ctrl` `Shift` `L` | Put a cursor on every occurrence at once |
+| `Shift` `Alt` `↑` / `↓` | Add a cursor above / below (press the other way to take one back) |
+| `Ctrl` `Alt` `↑` / `↓` | The same, for keyboards that spend `Shift` `Alt` on a layout switch |
+| `Alt` + click | Place a cursor where you click |
+| `Esc` | Back to one cursor, then to no selection |
+
+Everything else applies to every cursor at once: typing, `Backspace`,
+paste, the line operations below, and comment toggling. A multi-cursor
+edit is one step in the undo history, so a single `Ctrl` `Z` takes all of
+it back.
+
+### Lines
+
+| Shortcut | Action |
+|---|---|
+| `Alt` `↑` / `↓` | Move the line (or the selected lines) up or down |
+| `Ctrl` `Alt` `Shift` `↑` / `↓` | Duplicate the line above or below |
+| `Ctrl` `Shift` `K` | Delete the line |
+| `Ctrl` `Shift` `J` | Join the next line onto this one |
+| `Ctrl` `/` | Comment or uncomment, with the token for the file's language |
+
+`Ctrl` `/` does nothing in a language with no line comment — CSS,
+Markdown and diffs among them.
+
+### Brackets, quotes and indentation
+
+These need no binding; they are how typing behaves.
+
+- Typing an opening bracket or quote brings its partner with it, unless
+  what follows the cursor is a word — the closer would land in the middle
+  of it. A quote right after a word character stays a plain apostrophe,
+  so `don't` types as you'd expect.
+- Typing the closer when it is already in front of the cursor steps over
+  it rather than doubling it.
+- With text selected, an opening bracket or quote wraps the selection
+  instead of replacing it, and the selection survives.
+- `Backspace` between the two halves of an empty pair deletes both.
+- `Enter` keeps the current line's indent, adds one level after an
+  opening bracket (or after a `:` in Python), and if the closing bracket
+  was waiting on the other side of the cursor it goes down onto a line of
+  its own.
+
+Indent width is the `tab_size` setting. Whether it is tabs or spaces is
+read off the line you are on, so an existing file keeps its own style.
 
 ## Terminal
 
@@ -133,7 +186,16 @@ edition the shell runs inside Debian once you install it — see
 
 Everything above is reachable by touch too: long-press to select a word,
 drag the handles to adjust a selection, and use the floating toolbar for
-copy/paste. The status bar carries a **Save** action while the current
+copy/paste.
+
+While the soft keyboard is up, a row above it carries the editor commands
+the on-screen keyboard has no keys for: `esc`, `tab`, undo and redo, add a
+cursor above or below, select the next occurrence, move a line up or down,
+duplicate, delete and join lines, and toggle the comment. It appears with
+the keyboard and goes away with it, so a paired keyboard or DeX never
+sees it.
+
+The status bar carries a **Save** action while the current
 file has unsaved changes, `☰ files` toggles the project panel, `▤` toggles the project
 panel and `⌕` opens the file finder, and `❯_` opens the terminal. Project,
 file and settings commands live in the `☰` menu in the title bar, and
