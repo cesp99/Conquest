@@ -291,11 +291,17 @@ fun WorkspaceScreen(
         }
     }
 
-    LaunchedEffect(Unit) {
-        // The engine runs Debian's git through proot for status, and cannot
-        // guess where either lives. Harmless and idempotent when there is no
-        // userland: the call is simply never made, and status stays empty.
+    // The engine runs Debian's git through proot for status, and cannot guess
+    // where either lives. Keyed on the installer's state, not on `Unit`: the
+    // userland can be installed and removed while the app runs, and told once
+    // at startup the engine kept pointing at whatever was true then. Install
+    // Debian and git status stayed silently empty until the next launch;
+    // remove it and the engine went on running a git that was no longer there.
+    LaunchedEffect(UserlandInstaller.state) {
         withContext(Dispatchers.IO) { syncUserlandWithEngine(context) }
+    }
+
+    LaunchedEffect(Unit) {
         val root = withContext(Dispatchers.IO) { ProjectsRoot.defaultProject(context) }
         val opened = ProjectSession(root)
         project = opened
