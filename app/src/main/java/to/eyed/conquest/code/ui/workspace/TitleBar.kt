@@ -5,9 +5,12 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.DropdownMenu
@@ -21,6 +24,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.text.font.FontWeight
@@ -89,7 +93,24 @@ fun TitleBar(
                     MaterialTheme.colorScheme.surface,
                 ),
             ) {
-                Column(modifier = Modifier.widthIn(min = 260.dp)) {
+                // Scrollable, and it has to be: the menu has outgrown the
+                // screen. Material's DropdownMenu clips to the window and does
+                // not scroll on its own, so the last entries — settings, and
+                // removing the userland — were simply unreachable on a
+                // 674dp-tall window, and worse on a phone.
+                // Bounded *and* scrollable, in that order: DropdownMenu
+                // measures its content with an infinite maximum height, and a
+                // scroller inside that throws. Capping it against the window
+                // is what gives the scroller something finite to work with —
+                // and without the cap the menu simply ran off the bottom of
+                // the screen, taking settings and "remove userland" with it.
+                val maxMenuHeight = (LocalConfiguration.current.screenHeightDp * 0.7f).dp
+                Column(
+                    modifier = Modifier
+                        .widthIn(min = 260.dp)
+                        .heightIn(max = maxMenuHeight)
+                        .verticalScroll(rememberScrollState())
+                ) {
                     menuGroups.forEachIndexed { index, group ->
                         if (index > 0) HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
                         for (action in group) {
