@@ -1,9 +1,15 @@
 package to.eyed.conquest.code.ui.workspace
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -24,6 +30,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -36,6 +43,7 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
@@ -46,6 +54,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import to.eyed.conquest.code.core.FileMatch
@@ -53,6 +62,79 @@ import to.eyed.conquest.code.core.ProjectSession
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
 private const val MAX_RESULTS = 50
+
+// Zed's picker is one widget with several contents: `DEFAULT_MODAL_WIDTH` is
+// `rems(34)` and `DEFAULT_MODAL_MAX_HEIGHT` `rems(24)`, which are 544 and 384
+// at the default 16px rem (crates/picker/src/picker.rs:45-46). Elevated
+// surfaces are `rounded_lg` = 8px with a 1px `border.variant`
+// (crates/ui/src/traits/styled_ext.rs:6-12).
+private val ModalWidth = 544.dp
+private val ModalMaxHeight = 384.dp
+private val ModalRadius = 8.dp
+
+/**
+ * The shell every picker in this app wears: the file finder and the command
+ * palette are the same widget in Zed, so they are the same widget here.
+ *
+ * [modifier] lands on the surface itself, which is where a caller hangs the
+ * key handling it needs to see before the text field does. Tapping outside
+ * dismisses: the content fills the window so that nothing is ever "outside" it
+ * as far as the dialog is concerned, and the dimmed area has to close us by
+ * hand.
+ */
+@Composable
+internal fun PickerModal(
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val theme = LocalZedTheme.current
+    Dialog(
+        onDismissRequest = onDismiss,
+        // A picker has to stay usable with the soft keyboard up — on a phone
+        // it is the *only* way to type — and a dialog only learns where the IME
+        // is once it stops fitting the system windows itself.
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false,
+        ),
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .fillMaxSize()
+                .safeDrawingPadding()
+                .padding(16.dp)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onDismiss,
+                ),
+        ) {
+            Surface(
+                shape = RoundedCornerShape(ModalRadius),
+                color = theme.color(
+                    "elevated_surface.background",
+                    MaterialTheme.colorScheme.surface,
+                ),
+                border = BorderStroke(
+                    1.dp,
+                    theme.color("border.variant", MaterialTheme.colorScheme.outlineVariant),
+                ),
+                modifier = modifier
+                    .widthIn(max = ModalWidth)
+                    .heightIn(max = ModalMaxHeight)
+                    .fillMaxWidth()
+                    // Swallow taps, or they would reach the dismiss handler
+                    // above and close the picker from inside it. `clickable`
+                    // would do it too, and would ripple the whole panel.
+                    .pointerInput(Unit) { detectTapGestures { } },
+            ) {
+                Column(modifier = Modifier.padding(vertical = 16.dp), content = content)
+            }
+        }
+    }
+}
 
 /**
  * Fuzzy file finder, in the shape every editor uses: type to filter, arrows
@@ -107,76 +189,69 @@ fun FileFinder(
         results.getOrNull(selected)?.let(onOpen)
     }
 
-    Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            shape = RoundedCornerShape(12.dp),
-            color = theme.color("elevated_surface.background", MaterialTheme.colorScheme.surface),
+    PickerModal(
+        onDismiss = onDismiss,
+        // Arrows and Enter must reach us even though the text field has focus,
+        // so they are intercepted before it sees them.
+        modifier = Modifier.onPreviewKeyEvent { event ->
+            if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+            when (event.key) {
+                Key.DirectionDown -> { move(1); true }
+                Key.DirectionUp -> { move(-1); true }
+                Key.Enter, Key.NumPadEnter -> { openSelected(); true }
+                Key.Escape -> { onDismiss(); true }
+                else -> false
+            }
+        },
+    ) {
+        Box(
             modifier = Modifier
-                .widthIn(min = 320.dp, max = 640.dp)
-                // Arrows and Enter must reach us even though the text field
-                // has focus, so they are intercepted before it sees them.
-                .onPreviewKeyEvent { event ->
-                    if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
-                    when (event.key) {
-                        Key.DirectionDown -> { move(1); true }
-                        Key.DirectionUp -> { move(-1); true }
-                        Key.Enter, Key.NumPadEnter -> { openSelected(); true }
-                        Key.Escape -> { onDismiss(); true }
-                        else -> false
-                    }
-                },
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp)
+                .background(theme.color("editor.background"), RoundedCornerShape(6.dp))
+                .padding(horizontal = 12.dp, vertical = 10.dp)
         ) {
-            Column(modifier = Modifier.padding(vertical = 16.dp)) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 20.dp)
-                        .background(theme.color("editor.background"), RoundedCornerShape(6.dp))
-                        .padding(horizontal = 12.dp, vertical = 10.dp)
-                ) {
-                    BasicTextField(
-                        value = query,
-                        onValueChange = { query = it },
-                        singleLine = true,
-                        textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
-                        cursorBrush = SolidColor(theme.color("editor.foreground")),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .focusRequester(focus),
-                    )
-                    if (query.text.isEmpty()) {
-                        Text(
-                            text = "Search files by name",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
+            BasicTextField(
+                value = query,
+                onValueChange = { query = it },
+                singleLine = true,
+                textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
+                cursorBrush = SolidColor(theme.color("editor.foreground")),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .focusRequester(focus),
+            )
+            if (query.text.isEmpty()) {
+                Text(
+                    text = "Search files by name",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
 
-                HorizontalDivider(modifier = Modifier.padding(top = 12.dp))
+        HorizontalDivider(modifier = Modifier.padding(top = 12.dp))
 
-                if (results.isEmpty()) {
-                    Text(
-                        text = if (query.text.isEmpty()) "No files" else "No matches",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 14.dp),
+        if (results.isEmpty()) {
+            Text(
+                text = if (query.text.isEmpty()) "No files" else "No matches",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 14.dp),
+            )
+        } else {
+            LazyColumn(
+                state = listState,
+                // Whatever is left of the modal's 384dp, and no more: the
+                // picker's height is Zed's number, not the result count's.
+                modifier = Modifier.fillMaxWidth().weight(1f, fill = false),
+            ) {
+                itemsIndexed(results, key = { _, match -> match.path }) { index, match ->
+                    ResultRow(
+                        match = match,
+                        isSelected = index == selected,
+                        onClick = { onOpen(match) },
                     )
-                } else {
-                    LazyColumn(
-                        state = listState,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 380.dp),
-                    ) {
-                        itemsIndexed(results, key = { _, match -> match.path }) { index, match ->
-                            ResultRow(
-                                match = match,
-                                isSelected = index == selected,
-                                onClick = { onOpen(match) },
-                            )
-                        }
-                    }
                 }
             }
         }

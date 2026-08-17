@@ -105,6 +105,9 @@ enum class WorkspaceCommand(
     /** Open the settings screen. */
     OpenSettings("conquest::OpenSettings"),
 
+    /** Pick a theme, previewing each as the selection moves — Zed's own. */
+    SelectTheme("theme_selector::Toggle"),
+
     /**
      * Clone a git repository into a new project.
      *

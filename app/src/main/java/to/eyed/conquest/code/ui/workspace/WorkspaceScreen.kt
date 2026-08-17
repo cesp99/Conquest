@@ -159,6 +159,7 @@ fun WorkspaceScreen(
     /** Ctrl+Shift+E asked the panel to show the active file and take the keyboard. */
     var revealInPanel by remember { mutableStateOf(false) }
     var settingsOpen by remember { mutableStateOf(false) }
+    var themeSelectorOpen by remember { mutableStateOf(false) }
     var settingsValid by remember { mutableStateOf(true) }
     var projects by remember { mutableStateOf(emptyList<ProjectSummary>()) }
     var transferMessage by remember { mutableStateOf<String?>(null) }
@@ -407,6 +408,7 @@ fun WorkspaceScreen(
                 if (project == null) return false
                 finderOpen = true
             }
+            WorkspaceCommand.SelectTheme -> themeSelectorOpen = true
             WorkspaceCommand.OpenSettings -> {
                 scope.launch {
                     settingsValid = withContext(Dispatchers.IO) { CoreBridge.settingsAreValid() }
@@ -529,6 +531,9 @@ fun WorkspaceScreen(
                     runCommand(WorkspaceCommand.NewTerminal)
                 },
 
+                MenuAction("Theme…", shortcutLabel(WorkspaceCommand.SelectTheme)) {
+                    runCommand(WorkspaceCommand.SelectTheme)
+                },
                 MenuAction("Settings…", shortcutLabel(WorkspaceCommand.OpenSettings)) {
                     runCommand(WorkspaceCommand.OpenSettings)
                 },
@@ -694,6 +699,22 @@ fun WorkspaceScreen(
                 openFile(openedProject, match.path)
             },
             onDismiss = { finderOpen = false },
+        )
+    }
+
+    if (themeSelectorOpen) {
+        ThemeSelector(
+            mode = settings.theme,
+            onSetMode = { mode ->
+                onSettingsChanged(settings.copy(theme = mode))
+                scope.launch(Dispatchers.IO) {
+                    CoreBridge.setSetting(AppSettings.KEY_THEME, mode.key)
+                }
+            },
+            onDismiss = {
+                themeSelectorOpen = false
+                rootFocus.requestFocus()
+            },
         )
     }
 

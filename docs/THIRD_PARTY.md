@@ -11,7 +11,7 @@ obligation we intend to meet properly.
 |---|---|---|---|---|
 | Zed engine crates | [zed-industries/zed](https://github.com/zed-industries/zed) | `bc538de` | GPL-3.0-or-later, some Apache-2.0 | `core/vendor/` — see `core/vendor/VENDOR.md` |
 | Termux `terminal-emulator`, `terminal-view` | [termux/termux-app](https://github.com/termux/termux-app) | `3df69d1` (v0.118.0) | GPL-3.0-only, with an Apache-2.0 heritage from [Android Terminal Emulator](https://github.com/jackpal/Android-Terminal-Emulator) | `vendor/` — see `vendor/VENDOR.md` |
-| Zed themes (One Dark / One Light) | zed-industries/zed | `bc538de` | GPL-3.0-or-later | `app/src/main/assets/themes/` |
+| Zed themes (One, Ayu, Gruvbox — 11 themes in 3 family files) | zed-industries/zed | `bc538de` | The theme *files* are GPL-3.0-or-later with Zed; the palettes they carry are the upstream authors' — Ayu is MIT (© Ike Ku), Gruvbox is MIT (© Pavel Pertsev). Both licence texts travel with them. | `app/src/main/assets/themes/`, licences at `app/src/main/assets/themes/LICENSES.txt` |
 | IBM Plex Sans (Zed's UI face) | [IBM/plex](https://github.com/IBM/plex), via Zed's `assets/fonts/` | `bc538de` | SIL Open Font License 1.1 | `app/src/main/res/font/ibm_plex_sans_*.ttf`; licence at `app/src/main/assets/fonts/IBMPlexSans-LICENSE.txt` |
 | Lilex (Zed's editor face) | [mishamyrt/Lilex](https://github.com/mishamyrt/Lilex), via Zed's `assets/fonts/` | `bc538de` | SIL Open Font License 1.1 | `app/src/main/res/font/lilex_*.ttf`; licence at `app/src/main/assets/fonts/Lilex-LICENSE.txt` |
 

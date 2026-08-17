@@ -15,6 +15,10 @@ import androidx.compose.ui.unit.sp
  * ui/src/styles/typography.rs:138-141). Material's defaults are 16sp bodies
  * with tracking, which is why our chrome reads looser and larger than Zed's.
  *
+ * The ratios rather than the sizes are what is written down here, because the
+ * scale is a function of `ui_font_size` — a user who sets 20 gets 20/17.5/15/
+ * 12.5, exactly as Zed does, instead of a setting that moves nothing.
+ *
  * **Tracking is zero everywhere.** Zed sets none, anywhere; Material3 ships
  * 0.25sp on bodyMedium and 0.5sp on the labels, and at 12-14sp that is
  * visible — it is most of why a row of ours never quite matched a row of
@@ -24,27 +28,48 @@ import androidx.compose.ui.unit.sp
  */
 private const val PHI = 1.618034f
 
-private fun ui(sizeSp: Float, weight: FontWeight = FontWeight.Normal) = TextStyle(
-    fontFamily = UiFontFamily,
-    fontWeight = weight,
-    fontSize = sizeSp.sp,
-    lineHeight = (sizeSp * PHI).sp,
-    letterSpacing = 0.sp,
-)
+/** `TextSize::Large` — `rems(1.0)`, `ui/src/styles/typography.rs:138`. */
+private const val LARGE = 1.0f
 
-val Typography = Typography(
+/** `TextSize::Default` — `rems(0.875)`, the size nearly all chrome uses. */
+private const val DEFAULT = 0.875f
+
+/** `TextSize::Small` — `rems(0.75)`. */
+private const val SMALL = 0.75f
+
+/** `TextSize::XSmall` — `rems(0.625)`, keybinding chips and the like. */
+private const val XSMALL = 0.625f
+
+private fun ui(
+    uiFontSize: Float,
+    ratio: Float,
+    weight: FontWeight = FontWeight.Normal,
+): TextStyle {
+    val size = uiFontSize * ratio
+    return TextStyle(
+        fontFamily = UiFontFamily,
+        fontWeight = weight,
+        fontSize = size.sp,
+        lineHeight = (size * PHI).sp,
+        letterSpacing = 0.sp,
+    )
+}
+
+/** The scale at a given `ui_font_size`. */
+fun zedTypography(uiFontSize: Float): Typography = Typography(
     // Zed's TextSize::Large — the biggest thing chrome uses.
-    bodyLarge = ui(16f),
+    bodyLarge = ui(uiFontSize, LARGE),
     // TextSize::Default. Tabs, panel rows, menu items, the status bar: if a
     // widget does not say otherwise, it is this.
-    bodyMedium = ui(14f),
-    // TextSize::Small.
-    bodySmall = ui(12f),
-    labelLarge = ui(14f, FontWeight.Medium),
-    labelMedium = ui(12f),
-    // TextSize::XSmall — keybinding chips and the like.
-    labelSmall = ui(10f),
-    titleLarge = ui(18f, FontWeight.Medium),
-    titleMedium = ui(16f, FontWeight.Medium),
-    titleSmall = ui(14f, FontWeight.Medium),
+    bodyMedium = ui(uiFontSize, DEFAULT),
+    bodySmall = ui(uiFontSize, SMALL),
+    labelLarge = ui(uiFontSize, DEFAULT, FontWeight.Medium),
+    labelMedium = ui(uiFontSize, SMALL),
+    labelSmall = ui(uiFontSize, XSMALL),
+    // Zed has no type larger than 1rem in its chrome; the three title roles
+    // exist because Material components reach for them, and they step up from
+    // Large rather than jumping to Material's 22 and 28sp.
+    titleLarge = ui(uiFontSize, 1.125f, FontWeight.Medium),
+    titleMedium = ui(uiFontSize, LARGE, FontWeight.Medium),
+    titleSmall = ui(uiFontSize, DEFAULT, FontWeight.Medium),
 )

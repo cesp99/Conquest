@@ -1,6 +1,5 @@
 package to.eyed.conquest.code.ui.theme
 
-import android.content.Context
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.SpanStyle
@@ -9,12 +8,18 @@ import androidx.compose.ui.text.font.FontWeight
 import org.json.JSONObject
 
 /**
- * A parsed Zed theme. The source of truth is Zed's theme JSON
- * (assets/themes/one.json, vendored from the Zed repository — GPL, see
- * README credits); no hardcoded palettes remain in the app.
+ * A parsed Zed theme. The source of truth is Zed's theme JSON (the family
+ * files under assets/themes/, vendored from the Zed repository — see
+ * docs/THIRD_PARTY.md); no hardcoded palettes remain in the app.
+ *
+ * A *family* file holds several themes — One is two, Gruvbox is six — so a
+ * theme's identity is its full name ("Gruvbox Dark Hard"), not its file.
+ * [ZedThemes] is the index that maps one to the other.
  */
 class ZedTheme(
     val name: String,
+    /** The family the theme is shipped in: "One", "Ayu", "Gruvbox". */
+    val family: String,
     val isDark: Boolean,
     private val colors: Map<String, Color>,
     syntax: Map<String, SyntaxStyle>,
@@ -22,6 +27,9 @@ class ZedTheme(
     val selection: Color,
 ) {
     data class SyntaxStyle(val color: Color?, val italic: Boolean, val bold: Boolean)
+
+    /** A theme's identity, as the picker lists it before anything is loaded. */
+    data class Meta(val name: String, val family: String, val isDark: Boolean)
 
     /**
      * Style-table lookup by Zed style key, e.g. `"editor.background"`.
@@ -83,6 +91,17 @@ class ZedTheme(
         )
 
         /**
+         * The one omitted key no other key can stand in for.
+         *
+         * `element.selection_background` tints selected text inside chrome
+         * inputs — the palette's query field, the rename box. Zed's default is
+         * the same wash the editor selects with, which lives in `players[0]`
+         * rather than in the flat style table, so it is seeded at parse time
+         * instead of being borrowed by [DERIVED].
+         */
+        private const val UI_SELECTION = "element.selection_background"
+
+        /**
          * Mirrors `STYLE_NAMES` in `core/crates/engine/src/highlight.rs` —
          * the engine's highlight style ids index this list. Keep in sync.
          */
@@ -99,29 +118,42 @@ class ZedTheme(
         )
 
         /**
-         * Load the theme matching [dark] from the bundled theme family
-         * (One Dark / One Light).
+         * The themes a family file contains, without parsing their palettes.
+         *
+         * The picker lists every installed theme, and listing them must not
+         * cost eleven palette parses — so this reads only the identity of
+         * each, and [parse] is paid for the one theme actually shown.
          */
-        fun load(context: Context, dark: Boolean): ZedTheme {
-            val json = context.assets.open("themes/one.json")
-                .bufferedReader()
-                .use { it.readText() }
-            return parse(json, dark)
+        internal fun index(json: String): List<Meta> {
+            val family = JSONObject(json)
+            val familyName = family.optString("name")
+            val themes = family.optJSONArray("themes") ?: return emptyList()
+            return (0 until themes.length()).mapNotNull { i ->
+                val theme = themes.optJSONObject(i) ?: return@mapNotNull null
+                val name = theme.optString("name").takeIf { it.isNotEmpty() }
+                    ?: return@mapNotNull null
+                Meta(
+                    name = name,
+                    family = familyName,
+                    isDark = theme.optString("appearance") != "light",
+                )
+            }
         }
 
-        internal fun parse(json: String, dark: Boolean): ZedTheme {
+        /** The theme called [name] from a family file, or null if it isn't in it. */
+        internal fun parse(json: String, name: String): ZedTheme? {
             val family = JSONObject(json)
-            val themes = family.getJSONArray("themes")
-            val wanted = if (dark) "dark" else "light"
-            var chosen: JSONObject? = null
+            val themes = family.optJSONArray("themes") ?: return null
             for (i in 0 until themes.length()) {
                 val theme = themes.getJSONObject(i)
-                if (theme.getString("appearance") == wanted) {
-                    chosen = theme
-                    break
+                if (theme.optString("name") == name) {
+                    return parseTheme(theme, family.optString("name"))
                 }
             }
-            val theme = requireNotNull(chosen) { "no $wanted theme in family" }
+            return null
+        }
+
+        private fun parseTheme(theme: JSONObject, family: String): ZedTheme {
             val style = theme.getJSONObject("style")
 
             val colors = mutableMapOf<String, Color>()
@@ -146,14 +178,17 @@ class ZedTheme(
 
             val player0 = style.optJSONArray("players")?.optJSONObject(0)
             val accent = colors["text.accent"] ?: Color.White
+            val selection = player0?.optString("selection")?.let(::parseColor)
+                ?: accent.copy(alpha = 0.24f)
+            colors.getOrPut(UI_SELECTION) { selection }
             return ZedTheme(
                 name = theme.getString("name"),
-                isDark = dark,
+                family = family,
+                isDark = theme.optString("appearance") != "light",
                 colors = colors,
                 syntax = syntax,
                 cursor = player0?.optString("cursor")?.let(::parseColor) ?: accent,
-                selection = player0?.optString("selection")?.let(::parseColor)
-                    ?: accent.copy(alpha = 0.24f),
+                selection = selection,
             )
         }
 

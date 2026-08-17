@@ -1,20 +1,23 @@
 package to.eyed.conquest.code.ui.workspace
 
 import android.os.SystemClock
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.focusable
-import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -39,6 +42,10 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.key.KeyEventType
@@ -57,7 +64,6 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
@@ -72,8 +78,27 @@ import to.eyed.conquest.code.core.ProjectSession
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import java.io.File
 
-private val RowHeightPadding = 5.dp
-private val IndentPerLevel = 14.dp
+/** Zed's `indent_size` (assets/settings/default.json:828). */
+private val IndentPerLevel = 20.dp
+
+/** `px(Base06)` on the row; the indent is applied inside it (list_item.rs:364). */
+private val RowPadding = 6.dp
+
+/** `Base06` between the disclosure slot and what follows (list_item.rs:429). */
+private val RowGap = 6.dp
+
+/**
+ * Zed's row is its label's line box — about 22.7px — with no vertical padding
+ * at all (list_item.rs:365). That is 3.6mm on a phone: too small to hit, and
+ * this panel is driven by a finger as often as by a mouse. So the *content*
+ * runs at Zed's density and the row box alone is held open to 40dp, which is
+ * the smallest target Android considers reliable. It is the one number in this
+ * file that is deliberately not Zed's.
+ */
+private val RowMinHeight = 40.dp
+
+/** `IconSize::Small` — a 14px glyph (crates/ui/src/components/icon.rs:75). */
+private val ChevronSize = 14.dp
 
 /** How often to check the engine for a newer worktree snapshot. */
 private const val SCANNING_POLL_MS = 120L
@@ -207,7 +232,6 @@ fun ProjectPanel(
             .background(theme.color("panel.background"))
     ) {
         if (project == null) {
-            PanelHeading(name = null, menu = null)
             PanelMessage("No project open")
             return@Column
         }
@@ -228,10 +252,15 @@ fun ProjectPanel(
         val icons = remember(theme, onSurfaceVariant) {
             EntryIconColours.from(theme, onSurfaceVariant)
         }
+        // `ghost_element.*`, not `element.*`: a project-panel row is a
+        // borderless `ListItem`, and Zed paints those from the ghost ramp
+        // (list_item.rs:323-329). The `element.*` ramp belongs to things that
+        // look like buttons.
         val rowColours = remember(theme, onSurfaceVariant) {
             RowColours(
-                open = theme.color("element.selected"),
-                hover = theme.color("element.hover", Color.Transparent),
+                open = theme.color("ghost_element.selected"),
+                hover = theme.color("ghost_element.hover", Color.Transparent),
+                pressed = theme.color("ghost_element.active", Color.Transparent),
                 selection = theme.color("border.focused", onSurfaceVariant),
             )
         }
@@ -599,20 +628,24 @@ fun ProjectPanel(
             openedPath?.let { reshape { tree.reveal(it) } }
         }
 
-        PanelHeading(
+        ProjectRootRow(
             name = project.rootName,
+            rowColours = rowColours,
+            iconColour = icons.colorFor(EntryIcon.Folder),
+            onClick = { reshape { tree.collapseAll() } },
+            onContextMenu = { at -> menu = PanelMenu(null, at) },
             menu = {
                 // Also where the keyboard's menu key lands when nothing in
                 // the tree is selected: a menu for the project root.
-                if (menu.let { it != null && it.entry == null }) {
+                val open = menu
+                if (open != null && open.entry == null) {
                     ProjectContextMenu(
                         entries = menuFor(null),
-                        offset = DpOffset.Zero,
+                        offset = with(density) { DpOffset(open.at.x.toDp(), open.at.y.toDp()) },
                         onDismiss = { menu = null },
                     )
                 }
             },
-            onMenu = { menu = PanelMenu(null, Offset.Zero) },
         )
 
         val error = project.error
@@ -635,7 +668,10 @@ fun ProjectPanel(
                     items(tree.rows, key = { it.entry.path }) { row ->
                         ProjectRow(
                             entry = row.entry,
-                            depth = row.depth,
+                            // One level in from the root row above, which is
+                            // where Zed puts a worktree's top-level entries
+                            // (project_panel.rs:5547).
+                            depth = row.depth + 1,
                             status = row.status,
                             colours = colours,
                             icons = icons,
@@ -753,50 +789,91 @@ fun ProjectPanel(
     }
 }
 
-/** The panel's title, and the button that opens the project-root menu. */
+/**
+ * The worktree root — an ordinary row, not a header.
+ *
+ * Zed has no panel title: the project's own name is the first row of the tree
+ * and everything else is indented under it (project_panel.rs:6138). Ours is
+ * held out of the scrolling list because a phone's panel is short and the row
+ * that says which project you are in is the one worth never losing.
+ *
+ * The root cannot be hidden the way a folder can, so its chevron stays open
+ * and a tap means the only thing collapsing a root can mean here: shut
+ * everything underneath. Its menu is the project's, reached the same three
+ * ways every other row's is — right-click, long-press, or the menu key.
+ */
 @Composable
-private fun PanelHeading(
-    name: String?,
-    menu: (@Composable () -> Unit)?,
-    onMenu: (() -> Unit)? = null,
+private fun ProjectRootRow(
+    name: String,
+    rowColours: RowColours,
+    iconColour: Color,
+    onClick: () -> Unit,
+    onContextMenu: (Offset) -> Unit,
+    menu: @Composable () -> Unit,
 ) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(start = 12.dp, end = 6.dp, top = 12.dp, bottom = 8.dp)
-            .then(
-                if (onMenu == null) Modifier else rememberPointerContextMenu { onMenu() }
-            ),
-    ) {
-        Text(
-            text = name?.uppercase().orEmpty().ifEmpty { "PROJECT" },
-            style = MaterialTheme.typography.labelSmall,
-            fontWeight = FontWeight.SemiBold,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
-        if (onMenu != null) {
-            Box {
-                Text(
-                    text = "⋯",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier
-                        .pointerHoverIcon(PointerIcon.Hand)
-                        .clickable(onClick = onMenu)
-                        .padding(horizontal = 6.dp, vertical = 2.dp),
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val isPressed by interaction.collectIsPressedAsState()
+    val pressed = remember { mutableStateOf(Offset.Zero) }
+    val contextGesture = rememberPointerContextMenu(
+        onPress = { pressed.value = it },
+        onContext = onContextMenu,
+    )
+    Box(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(RowGap),
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = RowMinHeight)
+                .background(
+                    when {
+                        isPressed -> rowColours.pressed
+                        hovered -> rowColours.hover
+                        else -> Color.Transparent
+                    }
                 )
-                menu?.invoke()
+                .pointerHoverIcon(PointerIcon.Hand)
+                .then(contextGesture)
+                .focusProperties { canFocus = false }
+                .combinedClickable(
+                    interactionSource = interaction,
+                    indication = null,
+                    onClick = onClick,
+                    onLongClick = { onContextMenu(pressed.value) },
+                )
+                .padding(horizontal = RowPadding),
+        ) {
+            DisclosureChevron(
+                isExpanded = true,
+                isVisible = true,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Box(
+                modifier = Modifier.width(EntryIconWidth),
+                contentAlignment = Alignment.CenterStart,
+            ) {
+                EntryIconMark(icon = EntryIcon.Folder, color = iconColour)
             }
+            Text(
+                text = name,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
+        menu()
     }
 }
 
-/** The three backgrounds a row can have, resolved once per theme. */
-private class RowColours(val open: Color, val hover: Color, val selection: Color)
+/** The backgrounds a row can have, resolved once per theme. */
+private class RowColours(
+    val open: Color,
+    val hover: Color,
+    val pressed: Color,
+    val selection: Color,
+)
 
 @Composable
 private fun ProjectRow(
@@ -827,8 +904,10 @@ private fun ProjectRow(
     val icon = remember(entry.name, entry.isDir) { entryIconFor(entry.name, entry.isDir) }
     val interaction = remember { MutableInteractionSource() }
     val hovered by interaction.collectIsHoveredAsState()
+    val isPressed by interaction.collectIsPressedAsState()
     val background = when {
         isOpen -> rowColours.open
+        isPressed -> rowColours.pressed
         isSelected || hovered -> rowColours.hover
         else -> Color.Transparent
     }
@@ -846,8 +925,10 @@ private fun ProjectRow(
     Box(modifier = Modifier.fillMaxWidth()) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(RowGap),
             modifier = Modifier
                 .fillMaxWidth()
+                .heightIn(min = RowMinHeight)
                 .background(background)
                 .drawBehind {
                     // A stripe rather than a border: it marks where the
@@ -858,30 +939,23 @@ private fun ProjectRow(
                 }
                 .pointerHoverIcon(PointerIcon.Hand)
                 .then(contextGesture)
-                .hoverable(interaction)
                 // The panel is the single focus target; rows would otherwise
                 // take it in turn and fight the arrows for the selection.
                 .focusProperties { canFocus = false }
                 .combinedClickable(
+                    interactionSource = interaction,
+                    // Zed swaps a row's colour instantly and has no ripple at
+                    // all; the pressed background below is the whole feedback.
+                    indication = null,
                     onClick = onClick,
                     onLongClick = { onContextMenu(pressed.value) },
                 )
-                .padding(
-                    start = 12.dp + IndentPerLevel * depth,
-                    end = 12.dp,
-                    top = RowHeightPadding,
-                    bottom = RowHeightPadding,
-                ),
+                .padding(start = RowPadding + IndentPerLevel * depth, end = RowPadding),
         ) {
-            Text(
-                text = when {
-                    entry.isDir && isExpanded -> "▾"
-                    entry.isDir -> "▸"
-                    else -> " "
-                },
-                style = MaterialTheme.typography.bodyMedium,
+            DisclosureChevron(
+                isExpanded = isExpanded,
+                isVisible = entry.isDir,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(end = 6.dp),
             )
             Box(
                 modifier = Modifier.width(EntryIconWidth),
@@ -901,6 +975,42 @@ private fun ProjectRow(
             )
         }
         menu()
+    }
+}
+
+/**
+ * The disclosure triangle, drawn rather than typed.
+ *
+ * Zed's is an SVG at `IconSize::Small` (project_panel.rs:6577); ours was the
+ * text glyph `▾`, which every font sizes and baselines differently and which
+ * therefore never sat still between a folder row and a file row. Two strokes
+ * of `Canvas` cost nothing and land on the same 14dp box every time.
+ *
+ * Files keep the box and draw nothing in it, so names line up whether or not
+ * the row above them can be opened.
+ */
+@Composable
+private fun DisclosureChevron(isExpanded: Boolean, isVisible: Boolean, color: Color) {
+    Canvas(modifier = Modifier.size(ChevronSize)) {
+        if (!isVisible) return@Canvas
+        val stroke = size.width * 0.1f
+        val inset = size.width * 0.28f
+        val far = size.width - inset
+        val path = Path()
+        if (isExpanded) {
+            path.moveTo(inset, size.height * 0.38f)
+            path.lineTo(size.width / 2f, size.height * 0.66f)
+            path.lineTo(far, size.height * 0.38f)
+        } else {
+            path.moveTo(size.width * 0.38f, inset)
+            path.lineTo(size.width * 0.66f, size.height / 2f)
+            path.lineTo(size.width * 0.38f, far)
+        }
+        drawPath(
+            path = path,
+            color = color,
+            style = Stroke(width = stroke, cap = StrokeCap.Round, join = StrokeJoin.Round),
+        )
     }
 }
 

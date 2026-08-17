@@ -8,7 +8,7 @@ import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -31,6 +31,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerIcon
@@ -43,9 +46,33 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
-private val TabBarHeight = 40.dp
+// Zed: `DynamicSpacing::Base32` — 32px at the default 16px rem
+// (crates/ui/src/components/tab.rs:84). A tab is only 32 tall but as wide as
+// its label, so the target it presents to a finger is a strip, not a square.
+private val TabBarHeight = 32.dp
+
+/** Base32 − 1px: the border, or the selected tab's `pb_px`, eats it (tab.rs:79). */
+private val TabContentHeight = 31.dp
+
+/** `px(Base04)` inside the tab, and the gap between its slots (tab.rs:173-174). */
+private val TabContentPadding = 4.dp
+private val TabContentGap = 4.dp
+
+/** Zed's `border_1`, which is every border in the chrome (styles.rs:1337). */
+private val TabBorder = 1.dp
+
+/** `Indicator::dot()` — `w_1p5`/`h_1p5` (crates/ui/src/components/indicator.rs:74). */
+private val DirtyDotSize = 6.dp
+
+// Zed's slots are fixed 12px and 14px squares (tab.rs:8-9) — mouse targets on
+// a desktop. Ours are doubled, because the dot is also the save button and the
+// ✕ is the only way to close a tab by hand. They stop here rather than at the
+// 40dp a finger really wants: any wider and either the tab outgrows its label
+// or the slots start overlapping the neighbouring tab's own targets.
+private val StartSlotWidth = 24.dp
+private val EndSlotWidth = 28.dp
+
 private val MaxTabLabelWidth = 180.dp
-private val DotTouchTarget = 28.dp
 
 /** How far one notch of the wheel moves the strip. About one narrow tab. */
 private val WheelStep = 96.dp
@@ -76,6 +103,7 @@ fun EditorTabs(
     onReopen: (() -> Unit)? = null,
 ) {
     val theme = LocalZedTheme.current
+    val border = theme.color("border")
     val strip = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val wheelStep = with(LocalDensity.current) { WheelStep.toPx() }
@@ -103,6 +131,18 @@ fun EditorTabs(
             .fillMaxWidth()
             .height(TabBarHeight)
             .background(theme.color("tab_bar.background"))
+            // The strip's own bottom border, drawn *behind* the tabs so the
+            // selected one's background covers its share of it — which is what
+            // makes the active tab read as open into the editor below rather
+            // than as a label sitting on a line (tab_bar.rs:122-128).
+            .drawBehind {
+                val thickness = TabBorder.toPx()
+                drawRect(
+                    color = border,
+                    topLeft = Offset(0f, size.height - thickness),
+                    size = Size(size.width, thickness),
+                )
+            }
             .pointerInput(wheelStep) {
                 // A horizontally scrolling row ignores a vertical wheel, which
                 // is the only wheel most mice have. Taken in the initial pass
@@ -138,6 +178,7 @@ private fun LazyListScope.tabItems(
         EditorTab(
             file = file,
             isActive = index == files.activeIndex,
+            borders = tabBorders(index, files.activeIndex, files.tabs.size),
             menu = { tabMenu(files, index, onReopen) },
             onSelect = { files.select(index) },
             onSave = { onSave(file) },
@@ -190,10 +231,39 @@ private fun tabMenu(
     }
 }
 
+/**
+ * Which edges of one tab are drawn, and which are 1px of padding instead.
+ *
+ * Every case leaves exactly 1px on each side and 1px at the bottom, so the
+ * label sits in the same place whichever tab is selected — that is why Zed
+ * pads where it does not draw (tab.rs:150-165).
+ */
+private data class TabBorders(val left: Boolean, val right: Boolean, val bottom: Boolean)
+
+/**
+ * Zed's five cases, by where a tab sits relative to the selected one.
+ *
+ * The selected tab is the one with side borders and *no* bottom border; its
+ * neighbours carry a bottom border and lend it the side they face. That is the
+ * whole trick: the active tab is the only break in the line under the strip.
+ */
+private fun tabBorders(index: Int, activeIndex: Int, count: Int): TabBorders {
+    val selected = index == activeIndex
+    return when {
+        // The first tab has nothing to its left to separate it from.
+        index == 0 -> TabBorders(left = false, right = selected, bottom = !selected)
+        selected -> TabBorders(left = true, right = true, bottom = false)
+        index == count - 1 -> TabBorders(left = false, right = true, bottom = true)
+        index < activeIndex -> TabBorders(left = true, right = false, bottom = true)
+        else -> TabBorders(left = false, right = true, bottom = true)
+    }
+}
+
 @Composable
 private fun EditorTab(
     file: OpenFile,
     isActive: Boolean,
+    borders: TabBorders,
     menu: () -> List<ContextMenuItem>,
     onSelect: () -> Unit,
     onSave: () -> Unit,
@@ -214,22 +284,87 @@ private fun EditorTab(
         isActive -> MaterialTheme.colorScheme.onSurface
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
-    Box {
+    val border = theme.color("border")
+    Box(
+        modifier = Modifier
+            .height(TabBarHeight)
+            .background(background)
+            .drawBehind {
+                val thickness = TabBorder.toPx()
+                if (borders.left) {
+                    drawRect(border, Offset.Zero, Size(thickness, size.height))
+                }
+                if (borders.right) {
+                    drawRect(
+                        border,
+                        Offset(size.width - thickness, 0f),
+                        Size(thickness, size.height),
+                    )
+                }
+                if (borders.bottom) {
+                    drawRect(
+                        border,
+                        Offset(0f, size.height - thickness),
+                        Size(size.width, thickness),
+                    )
+                }
+            }
+            .pointerHoverIcon(PointerIcon.Hand)
+            .onSecondaryClick { position -> menuAt = position }
+            .onMiddleClick { if (!file.isPinned) onClose() }
+            .combinedClickable(
+                onClick = onSelect,
+                onLongClick = { menuAt = DpOffset.Zero },
+            ),
+    ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            horizontalArrangement = Arrangement.spacedBy(TabContentGap),
             modifier = Modifier
-                .height(TabBarHeight)
-                .background(background)
-                .pointerHoverIcon(PointerIcon.Hand)
-                .onSecondaryClick { position -> menuAt = position }
-                .onMiddleClick { if (!file.isPinned) onClose() }
-                .combinedClickable(
-                    onClick = onSelect,
-                    onLongClick = { menuAt = DpOffset.Zero },
-                )
-                .padding(start = 14.dp, end = 8.dp),
+                // The pixel the border takes, whether or not this tab draws
+                // one: the content box is 31px tall and inset by 1 on each
+                // side in all five cases.
+                .padding(start = TabBorder, end = TabBorder, bottom = TabBorder)
+                .height(TabContentHeight)
+                .padding(horizontal = TabContentPadding),
         ) {
+            // The dot leads the label, as Zed's start slot does, and doubles as
+            // the save button. The status bar has one too, but the soft
+            // keyboard covers the status bar — and typing is exactly when you
+            // want to save, so the affordance has to live up here.
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .width(StartSlotWidth)
+                    .fillMaxHeight()
+                    .then(
+                        if (file.isDirty) {
+                            Modifier
+                                .pointerHoverIcon(PointerIcon.Hand)
+                                .clickable(onClick = onSave)
+                        } else {
+                            Modifier
+                        }
+                    ),
+            ) {
+                if (file.isDirty || file.hasDiskChange) {
+                    Box(
+                        modifier = Modifier
+                            .size(DirtyDotSize)
+                            .clip(CircleShape)
+                            .background(
+                                // `warning` is a file that moved under the
+                                // buffer; plain unsaved work is `text.accent`
+                                // (pane.rs:4973-4979).
+                                if (file.hasDiskChange) {
+                                    theme.color("warning", foreground)
+                                } else {
+                                    theme.color("text.accent", foreground)
+                                }
+                            ),
+                    )
+                }
+            }
             Text(
                 text = file.name,
                 style = MaterialTheme.typography.bodyMedium,
@@ -238,42 +373,23 @@ private fun EditorTab(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.widthIn(max = MaxTabLabelWidth),
             )
-            if (file.isDirty) {
-                // The dot doubles as the save button. The status bar has one too,
-                // but the soft keyboard covers the status bar — and typing is
-                // exactly when you want to save, so the affordance has to live up
-                // here where it stays visible.
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier = Modifier
-                        .size(DotTouchTarget)
-                        .clip(CircleShape)
-                        .pointerHoverIcon(PointerIcon.Hand)
-                        .clickable(onClick = onSave),
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(7.dp)
-                            .clip(CircleShape)
-                            .background(theme.color("conflict", foreground)),
-                    )
-                }
-            } else {
-                Spacer(modifier = Modifier.width(DotTouchTarget))
-            }
             // A pinned tab shows the pin where the ✕ would be, as Zed does:
             // the way out of a pinned tab is to unpin it, and the mark is the
             // button that does that.
-            Text(
-                text = if (file.isPinned) "⚑" else "✕",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            Box(
+                contentAlignment = Alignment.Center,
                 modifier = Modifier
-                    .clip(CircleShape)
+                    .width(EndSlotWidth)
+                    .fillMaxHeight()
                     .pointerHoverIcon(PointerIcon.Hand)
-                    .clickable(onClick = if (file.isPinned) onTogglePin else onClose)
-                    .padding(horizontal = 6.dp, vertical = 4.dp),
-            )
+                    .clickable(onClick = if (file.isPinned) onTogglePin else onClose),
+            ) {
+                Text(
+                    text = if (file.isPinned) "⚑" else "✕",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
         val position = menuAt
         if (position != null) {
