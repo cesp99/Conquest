@@ -61,6 +61,7 @@ import android.content.Context
 import to.eyed.conquest.code.terminal.GitClone
 import to.eyed.conquest.code.terminal.TerminalSessions
 import to.eyed.conquest.code.terminal.Userland
+import to.eyed.conquest.code.terminal.UserlandInstaller
 import to.eyed.conquest.code.terminal.UserlandState
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import to.eyed.conquest.code.core.ProjectSearchMatch
@@ -898,6 +899,14 @@ fun WorkspaceScreen(
                             // that is no longer there.
                             CoreBridge.clearUserland()
                         }
+                        // And tell the installer, which is what the terminal's
+                        // banner and the ☰ entry both read. Without this the
+                        // dock goes on believing there is a userland — it only
+                        // asks the disk when the pane is first composed — so
+                        // the offer to install never came back and the shell
+                        // sat at a prompt inside a rootfs that no longer
+                        // existed.
+                        UserlandInstaller.refresh(context)
                     }
                 }) { Text("Remove") }
             },
@@ -1027,18 +1036,28 @@ private fun EditorArea(
 /**
  * The userland entry, or nothing at all in a build that has no userland —
  * an editor should not advertise a feature it cannot perform.
+ *
+ * The state comes from [UserlandInstaller] first, because that one is Compose
+ * state: asking the backend directly reads the disk and tells the truth, but
+ * tells it *once*, so the menu built before an install finished kept saying
+ * there was nothing to remove until something unrelated happened to
+ * recompose it. Measured on the emulator: install Debian, open the menu, and
+ * the entry is missing.
  */
+@Composable
 private fun userlandActions(
     context: android.content.Context,
     onRemove: () -> Unit,
-): List<MenuAction> =
-    if (Userland.backend.state(context) is UserlandState.Ready) {
+): List<MenuAction> {
+    val installed = UserlandInstaller.state ?: Userland.backend.state(context)
+    return if (installed is UserlandState.Ready) {
         listOf(
             MenuAction("Remove ${Userland.backend.displayName} userland…", null) { onRemove() }
         )
     } else {
         emptyList()
     }
+}
 
 /**
  * Point the engine at the Linux userland, so it can run git for project-panel
