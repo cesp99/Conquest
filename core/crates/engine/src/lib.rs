@@ -314,6 +314,31 @@ impl Engine {
         })
     }
 
+    /// The symbol path containing the caret, outermost first — Zed's
+    /// breadcrumbs after the file name (editor.rs `breadcrumbs` →
+    /// `buffer.symbols_containing`). Reads the last parsed tree only; a
+    /// caret move never pays for a parse, so right after an edit the answer
+    /// can be one worker round-trip stale, exactly like the highlights.
+    pub fn outline_path(
+        &self,
+        id: BufferId,
+        row: u32,
+        col_utf16: u32,
+    ) -> Result<Vec<String>, EngineError> {
+        self.with_buffer(id, |state| {
+            let Some(highlighter) = &state.highlight else {
+                return Vec::new();
+            };
+            let rope = state.buffer.as_rope();
+            let point = rope.clip_point_utf16(
+                rope::Unclipped(rope::PointUtf16::new(row, col_utf16)),
+                text::Bias::Left,
+            );
+            let offset = rope.point_utf16_to_offset(point);
+            highlighter.outline_path(rope, offset)
+        })
+    }
+
     /// The grammar the buffer is highlighted with ("rust", "markdown"), or
     /// None if it has no language.
     /// Bumped when a reparse lands. The content version doesn't move then,
@@ -708,6 +733,29 @@ mod tests {
     /// The question a Kotlin table could never answer: Go's `"` pair carries
     /// `not_in = ["comment", "string"]`, so a quote typed inside either must
     /// not bring a closer with it.
+    #[test]
+    fn outline_path_names_the_symbols_containing_the_caret() {
+        let engine = Engine::new();
+        let text = "struct Foo;\n\nimpl Foo {\n    fn bar(&self) {\n        let x = 1;\n    }\n}\n";
+        let id = engine.create_buffer(text);
+        assert!(engine.set_language(id, "rust").unwrap());
+
+        // Inside `bar`'s body: impl first, fn second — outermost first.
+        let path = engine.outline_path(id, 4, 9).unwrap();
+        assert_eq!(path, vec!["impl Foo".to_owned(), "fn bar".to_owned()]);
+
+        // On the struct line.
+        let path = engine.outline_path(id, 0, 8).unwrap();
+        assert_eq!(path, vec!["struct Foo".to_owned()]);
+
+        // On the blank line between them: no symbol contains the caret.
+        assert!(engine.outline_path(id, 1, 0).unwrap().is_empty());
+
+        // A buffer with no language answers with nothing, not an error.
+        let plain = engine.create_buffer("just text\n");
+        assert!(engine.outline_path(plain, 0, 2).unwrap().is_empty());
+    }
+
     #[test]
     fn bracket_scopes_follow_the_syntax_tree() {
         let engine = Engine::new();

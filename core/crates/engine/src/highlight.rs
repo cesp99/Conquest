@@ -74,6 +74,19 @@ struct LanguageEntry {
     /// Compiled highlights query and per-capture-index style (None for
     /// captures we don't map, e.g. locals or `_`-prefixed).
     highlights: Option<(Query, Vec<Option<u16>>)>,
+    /// Compiled `outline.scm`, for the symbol path under the caret.
+    outline: Option<OutlineQuery>,
+}
+
+/// Zed's outline capture scheme: `@item` is the whole declaration, `@name`
+/// its identifier, `@context` the keywords worth echoing ("fn", "struct") —
+/// see any vendored `outline.scm` and Zed's `Grammar::outline_config`
+/// (crates/language/src/language.rs, `OutlineConfig`).
+struct OutlineQuery {
+    query: Query,
+    item: u32,
+    name: u32,
+    context: Option<u32>,
 }
 
 fn registry() -> &'static HashMap<&'static str, LanguageEntry> {
@@ -98,11 +111,38 @@ fn registry() -> &'static HashMap<&'static str, LanguageEntry> {
                     }
                 }
             });
+            let outline = queries.outline.and_then(|source| {
+                match Query::new(&language, source.as_ref()) {
+                    Ok(query) => {
+                        let index = |wanted: &str| {
+                            query
+                                .capture_names()
+                                .iter()
+                                .position(|name| *name == wanted)
+                                .map(|i| i as u32)
+                        };
+                        match (index("item"), index("name")) {
+                            (Some(item), Some(name)) => Some(OutlineQuery {
+                                item,
+                                name,
+                                context: index("context"),
+                                query,
+                            }),
+                            _ => None,
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!("failed to compile outline query for {name}: {err}");
+                        None
+                    }
+                }
+            });
             map.insert(
                 name,
                 LanguageEntry {
                     language,
                     highlights,
+                    outline,
                 },
             );
         }
@@ -364,6 +404,72 @@ impl HighlightState {
     /// Highlight spans intersecting the byte range, split per row, with
     /// columns converted to UTF-16 offsets. Spans are emitted in capture
     /// order; the UI applies them in order (later wins on overlap).
+    /// The symbol path containing `offset`, outermost first — what Zed's
+    /// breadcrumbs show after the file name ("impl Foo" › "fn bar").
+    ///
+    /// Each entry is the item's `@context` and `@name` captures in source
+    /// order, joined with single spaces, exactly how Zed's outline items get
+    /// their text (crates/language/src/buffer.rs, `outline_items_containing`).
+    /// Reads whatever tree the last parse produced — a caret move must never
+    /// pay for a reparse; a stale answer lasts one worker round-trip.
+    pub fn outline_path(&self, text: &Rope, offset: usize) -> Vec<String> {
+        let Some(tree) = &self.tree else {
+            return Vec::new();
+        };
+        let Some(outline) = &self.language.outline else {
+            return Vec::new();
+        };
+        let mut items: Vec<(usize, usize, String)> = Vec::new();
+        let mut cursor = QueryCursor::new();
+        let mut matches =
+            cursor.matches(&outline.query, tree.root_node(), RopeTextProvider(text));
+        while let Some(match_) = matches.next() {
+            let Some(item) = match_
+                .captures
+                .iter()
+                .find(|capture| capture.index == outline.item)
+            else {
+                continue;
+            };
+            let start = item.node.start_byte();
+            let end = item.node.end_byte();
+            if offset < start || offset > end {
+                continue;
+            }
+            let mut parts: Vec<(usize, String)> = match_
+                .captures
+                .iter()
+                .filter(|capture| {
+                    capture.index == outline.name || Some(capture.index) == outline.context
+                })
+                .map(|capture| {
+                    let range = capture.node.byte_range();
+                    let mut piece = String::with_capacity(range.len().min(64));
+                    for chunk in text.chunks_in_range(range.clone()) {
+                        piece.push_str(chunk);
+                    }
+                    (range.start, piece)
+                })
+                .collect();
+            if parts.is_empty() {
+                continue;
+            }
+            parts.sort_by_key(|(at, _)| *at);
+            let mut label = String::new();
+            for (_, piece) in parts {
+                if !label.is_empty() {
+                    label.push(' ');
+                }
+                // A multi-line name (a long impl type) collapses to one line.
+                label.push_str(&piece.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+            items.push((start, end, label));
+        }
+        // Outermost first: containing ranges start earlier or end later.
+        items.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        items.into_iter().map(|(_, _, label)| label).collect()
+    }
+
     pub fn highlights(&self, text: &Rope, range: Range<usize>) -> Vec<HighlightSpan> {
         let Some(tree) = &self.tree else {
             return Vec::new();

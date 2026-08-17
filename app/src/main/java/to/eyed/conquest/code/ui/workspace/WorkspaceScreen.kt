@@ -129,6 +129,35 @@ private const val STARTUP_FILE = "src/main.rs"
 private const val STATUS_POLL_MS = 250L
 
 /**
+ * How long the caret rests before the breadcrumbs ask the engine for the
+ * symbol path. Arrow-key travel and typing move the caret in bursts; a
+ * per-move JNI query would be noise, and the answer only matters once the
+ * eye has somewhere to settle.
+ */
+private const val BREADCRUMB_SETTLE_MS = 80L
+
+/**
+ * The engine's outline path — a JSON array of strings, outermost first.
+ * Parsed defensively: a null (unknown buffer) or garbage answer is an empty
+ * trail, never a crash. `getString`, not `optString`: Android's `org.json`
+ * renders a JSON null as the string "null" through `optString`.
+ */
+private fun parseOutlinePath(json: String?): List<String> {
+    if (json.isNullOrEmpty()) return emptyList()
+    return try {
+        val array = org.json.JSONArray(json)
+        buildList {
+            for (i in 0 until array.length()) {
+                val label = array.getString(i)
+                if (label.isNotBlank()) add(label)
+            }
+        }
+    } catch (_: org.json.JSONException) {
+        emptyList()
+    }
+}
+
+/**
  * The line between two docks.
  *
  * Material's dividers default to `outlineVariant`, which our theme maps to
@@ -1002,6 +1031,7 @@ fun WorkspaceScreen(
                                         searchBarOpen = false
                                         rootFocus.requestFocus()
                                     },
+                                    onToggleSearch = { searchBarOpen = !searchBarOpen },
                                     isPreviewOpen = docks.isOpen(WorkspacePanel.Preview, settings),
                                     onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
                                     diffProject = project,
@@ -1332,6 +1362,8 @@ private fun EditorArea(
     onReopen: () -> Unit,
     searchOpen: Boolean,
     onSearchDismissed: () -> Unit,
+    /** The toolbar magnifier — the touch twin of Ctrl+F. */
+    onToggleSearch: () -> Unit,
     isPreviewOpen: Boolean,
     onTogglePreview: () -> Unit,
     /** For a diff tab, which needs the project rather than a buffer. */
@@ -1347,21 +1379,44 @@ private fun EditorArea(
             EditorTabs(files, onSave = onSave, onReopen = onReopen)
             DockDivider()
         }
-        // Zed's toolbar, which for now is only its quick action bar: shown
-        // when the open file has a preview, and absent otherwise rather than
-        // sitting there empty. A picture is not previewable — it *is* the
-        // preview — so a media tab never gets one.
-        val previewKind = active?.editor?.let { PreviewKind.of(active.path) }
-        if (previewKind != null) {
+        // Zed's toolbar: breadcrumbs on the left — the file name, then the
+        // engine's symbol path at the caret — and the quick action bar on the
+        // right. Shown for every text buffer, as Zed shows it; a picture is
+        // not previewable — it *is* the preview — so a media tab never gets
+        // one.
+        val activeEditor = active?.editor
+        if (active != null && activeEditor != null) {
+            val previewKind = PreviewKind.of(active.path)
+            var symbolPath by remember(active.path) {
+                mutableStateOf<List<String>>(emptyList())
+            }
+            // Re-asked when the caret settles or a reparse lands — all
+            // observable state, and the JNI read runs off the main thread.
+            LaunchedEffect(
+                activeEditor,
+                activeEditor.cursorRow,
+                activeEditor.cursorCol,
+                activeEditor.highlightVersion,
+            ) {
+                delay(BREADCRUMB_SETTLE_MS)
+                val id = activeEditor.session.id
+                val row = activeEditor.cursorRow.toLong()
+                val col = activeEditor.cursorCol.toLong()
+                symbolPath = withContext(Dispatchers.Default) {
+                    parseOutlinePath(CoreBridge.bufferOutlinePath(id, row, col))
+                }
+            }
             EditorToolbar(
+                fileName = active.name,
+                symbolPath = symbolPath,
+                onToggleSearch = onToggleSearch,
                 kind = previewKind,
                 isPreviewOpen = isPreviewOpen,
-                onTogglePreview = onTogglePreview,
+                onTogglePreview = if (previewKind != null) onTogglePreview else null,
             )
             DockDivider()
         }
         // Find-in-file is a text question; a picture has nothing to search.
-        val activeEditor = active?.editor
         if (searchOpen && activeEditor != null) {
             BufferSearchBar(
                 editor = activeEditor,

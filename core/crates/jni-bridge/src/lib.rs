@@ -290,6 +290,35 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferHighligh
     }
 }
 
+/// The symbol path containing the caret — Zed's breadcrumbs after the file
+/// name — as a JSON array of strings, outermost first. Empty array when the
+/// buffer has no language or no symbol contains the caret; null for an
+/// unknown buffer. Columns are UTF-16, like every caret the UI holds.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferOutlinePath(
+    env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+    row: jlong,
+    col_utf16: jlong,
+) -> jstring {
+    let row = row.max(0).min(u32::MAX as jlong) as u32;
+    let col = col_utf16.max(0).min(u32::MAX as jlong) as u32;
+    match engine().outline_path(buffer_id as u64, row, col) {
+        Ok(path) => {
+            let json = serde_json::to_string(&path).unwrap_or_else(|err| {
+                log::warn!("bufferOutlinePath failed to serialize: {err}");
+                "[]".to_owned()
+            });
+            to_jstring(&env, json)
+        }
+        Err(err) => {
+            log::warn!("bufferOutlinePath failed: {err}");
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Byte offset of (row, byte column), clipped to the buffer. -1 for an
 /// unknown buffer or negative arguments.
 #[unsafe(no_mangle)]

@@ -92,6 +92,16 @@ object CoreBridge {
     external fun bufferHighlights(bufferId: Long, firstLine: Long, lastLine: Long): IntArray?
 
     /**
+     * The symbol path containing the caret — Zed's breadcrumbs after the
+     * file name — as a JSON array of strings, outermost first ("impl Foo",
+     * "fn bar"). Empty array when the buffer has no language or the caret
+     * sits outside every symbol; null for unknown buffers. The column is
+     * UTF-16, like every caret the UI holds. Reads the last parsed tree, so
+     * the answer can be one highlight-worker round-trip stale.
+     */
+    external fun bufferOutlinePath(bufferId: Long, row: Long, colUtf16: Long): String?
+
+    /**
      * Byte offset of (row, byte column), clipped to the buffer. -1 for an
      * unknown buffer or negative arguments.
      */
