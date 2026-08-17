@@ -15,7 +15,7 @@ import org.junit.Test
 class MultiCaretEditingTest {
 
     private fun editorOf(text: String, language: String? = null): Pair<EditorState, FakeEditorBuffer> {
-        val buffer = FakeEditorBuffer(text, language)
+        val buffer = FakeEditorBuffer(text, language, LanguageFixtures.of(language))
         return EditorState(buffer) to buffer
     }
 

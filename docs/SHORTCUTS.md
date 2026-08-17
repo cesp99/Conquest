@@ -192,29 +192,47 @@ it back.
 | `Ctrl` `Shift` `J` | Join the next line onto this one |
 | `Ctrl` `/` | Comment or uncomment, with the token for the file's language |
 
-`Ctrl` `/` does nothing in a language with no line comment — CSS,
-Markdown and diffs among them.
+`Ctrl` `/` uses the language's own tokens: `//` in Rust and Go, `#` in
+Python, shell and YAML. A language with no line comment but a block one
+gets that instead, wrapped around what you selected — `<!-- … -->` in
+Markdown, `/* … */` in CSS — and pressing it again takes the delimiters
+back off. A diff has neither, and there `Ctrl` `/` does nothing rather
+than writing a token the format has no meaning for.
 
 ### Brackets, quotes and indentation
 
-These need no binding; they are how typing behaves.
+These need no binding; they are how typing behaves. Which pairs a
+language has, and where, is the language's own business — the rules come
+from the same grammar that colours the file.
 
 - Typing an opening bracket or quote brings its partner with it, unless
   what follows the cursor is a word — the closer would land in the middle
   of it. A quote right after a word character stays a plain apostrophe,
   so `don't` types as you'd expect.
+- **A quote typed inside a comment or a string stays a lone quote.** The
+  editor asks where the cursor is in the file's syntax tree, so this is
+  the real answer and not a guess about the characters around it.
+- Openers longer than one character work too: `f"` in Python closes as
+  one pair, and so do `r#"` in Rust and `/*` in C, Go and Rust.
 - Typing the closer when it is already in front of the cursor steps over
-  it rather than doubling it.
+  it rather than doubling it — inside a string as much as outside one.
 - With text selected, an opening bracket or quote wraps the selection
   instead of replacing it, and the selection survives.
 - `Backspace` between the two halves of an empty pair deletes both.
-- `Enter` keeps the current line's indent, adds one level after an
-  opening bracket (or after a `:` in Python), and if the closing bracket
-  was waiting on the other side of the cursor it goes down onto a line of
-  its own.
+- `Enter` keeps the current line's indent and adds one level where the
+  language says a block opens: after a bracket that expects a line of its
+  own, after a `:` in Python, a `do` or `then` in a shell script, a key
+  with nothing after it in YAML. If the closing bracket was waiting on
+  the other side of the cursor it goes down onto a line of its own.
+
+Rust's `<` is the one opener that never closes itself — it starts a
+generic far less often than it is a comparison — but it still wraps a
+selection, and `Enter` inside `<…>` still indents.
 
 Indent width is the `tab_size` setting. Whether it is tabs or spaces is
-read off the line you are on, so an existing file keeps its own style.
+read off the file you are in, so an existing file keeps its own style;
+only a file with nothing to say falls back to the language (Go indents
+with tabs).
 
 ## Terminal
 

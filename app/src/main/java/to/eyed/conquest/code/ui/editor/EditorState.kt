@@ -739,6 +739,25 @@ class EditorState private constructor(
     val language: String? by lazy { buffer.language }
 
     /**
+     * The language's editing rules, straight from the grammar's own
+     * `config.toml` by way of the engine. Read once per pane; the parsed
+     * config itself is shared between every pane of the same language.
+     */
+    internal val languageConfig: LanguageConfig by lazy {
+        EditorLanguage.configFor(language) { buffer.languageConfigJson }
+    }
+
+    /**
+     * For each of [offsets], a bitmask of the pairs of [languageConfig]'s
+     * `brackets` that are live there — the `not_in` question, which needs the
+     * syntax tree the engine holds and this side does not.
+     *
+     * One call for every caret at once, and only when a pair character has
+     * actually been typed: it can cost the engine a reparse.
+     */
+    internal fun enabledPairsAt(offsets: LongArray): LongArray = buffer.bracketScopes(offsets)
+
+    /**
      * Width of one indent level, in spaces, from the `tab_size` setting. A
      * plain field pushed in from composition: it changes only when the user
      * edits their settings, and the commands that read it — Enter's
@@ -771,7 +790,7 @@ class EditorState private constructor(
                 text.startsWith("  ") -> spaces++
             }
         }
-        if (tabs == 0 && spaces == 0) EditorLanguage.hardTabs(language) else tabs > spaces
+        if (tabs == 0 && spaces == 0) languageConfig.hardTabs else tabs > spaces
     }
 
     /**
@@ -958,7 +977,7 @@ class EditorState private constructor(
             insertNewline()
             return true
         }
-        if (typed != null && EditorLanguage.isPairCharacter(language, typed)) {
+        if (typed != null && languageConfig.isPairCharacter(typed)) {
             typeCharacter(typed)
             return true
         }
@@ -1192,7 +1211,7 @@ class EditorState private constructor(
      * it with the `<` would be deleting something they did not ask about.
      */
     private fun enclosingPairAt(text: String, col: Int): BracketPair? =
-        EditorLanguage.pairs(language).firstOrNull { pair ->
+        languageConfig.brackets.firstOrNull { pair ->
             pair.autoClose &&
                 col >= pair.open.length &&
                 text.startsWith(pair.open, col - pair.open.length) &&

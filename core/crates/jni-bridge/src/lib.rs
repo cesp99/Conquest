@@ -13,7 +13,7 @@
 //! undo/redo". Functions returning strings use `null` for unknown buffers.
 
 use jni::JNIEnv;
-use jni::objects::{JClass, JString};
+use jni::objects::{JClass, JLongArray, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jintArray, jlong, jlongArray, jstring};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -707,6 +707,72 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferLanguage
         Some(name) => to_jstring(&env, name.to_owned()),
         None => std::ptr::null_mut(),
     }
+}
+
+/// A language's whole editing config as JSON, straight from the grammar's own
+/// `config.toml` — comment tokens, bracket pairs with their `close`,
+/// `surround`, `newline` and `not_in` flags, `autoclose_before`, `hard_tabs`
+/// and `increase_indent_pattern`. Null for a grammar we do not carry.
+///
+/// One call per language, for the life of the process: the answer is the same
+/// for every buffer in it, and the UI caches it.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_languageConfig(
+    mut env: JNIEnv,
+    _class: JClass,
+    language: JString,
+) -> jstring {
+    let language = get_string(&mut env, &language);
+    match engine::language_config_json(&language) {
+        Some(json) => to_jstring(&env, json.to_owned()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// For each byte offset, a bitmask of the bracket pairs live there — bit *i*
+/// for pair *i* of `languageConfig`'s `brackets`. This is what
+/// `not_in = ["string", "comment"]` needs: the tree-sitter scope at the caret,
+/// which only the engine has.
+///
+/// Every bit is set for a buffer with no language, for an unknown buffer, and
+/// for a language whose pairs are all unconditional — so the UI must only ask
+/// when the pair it is about to insert actually carries a `not_in`, which no
+/// plain bracket does.
+///
+/// It reparses the buffer if the tree is stale, so it takes every caret's
+/// offset in one call and belongs on the pair-character path, not the typing
+/// path.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferBracketScopes<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    buffer_id: jlong,
+    offsets: JLongArray<'local>,
+) -> jlongArray {
+    let count = env.get_array_length(&offsets).unwrap_or(0).max(0) as usize;
+    let mut raw = vec![0 as jlong; count];
+    // Never null and never short: the caller indexes this array by caret, and
+    // "everything is live" is the answer that leaves autoclose as it was.
+    let all_live = || vec![u64::MAX as jlong; count];
+    let flat = if count > 0 && env.get_long_array_region(&offsets, 0, &mut raw).is_err() {
+        log::warn!("bufferBracketScopes: could not read the offsets");
+        all_live()
+    } else {
+        let offsets: Vec<usize> = raw.iter().map(|&at| at.max(0) as usize).collect();
+        match engine().bracket_scopes(buffer_id as u64, &offsets) {
+            Ok(masks) => masks.into_iter().map(|mask| mask as jlong).collect(),
+            Err(err) => {
+                log::warn!("bufferBracketScopes failed: {err}");
+                all_live()
+            }
+        }
+    };
+    let array = env
+        .new_long_array(flat.len() as i32)
+        .expect("failed to allocate bracket-scope array");
+    env.set_long_array_region(&array, 0, &flat)
+        .expect("failed to fill bracket-scope array");
+    array.into_raw()
 }
 
 /// Absolute path of the file behind a buffer; null for scratch buffers.

@@ -258,6 +258,45 @@ object CoreBridge {
      */
     external fun bufferLanguage(bufferId: Long): String?
 
+    /**
+     * A language's whole editing config as JSON, straight from the grammar's
+     * own `config.toml`:
+     *
+     *     {"name": "Rust", "line_comments": ["// ", "/// "],
+     *      "block_comment": {"start": "/*", "end": "*/", "prefix": "* ",
+     *                        "tab_size": 1},
+     *      "autoclose_before": ";:.,=}])>", "hard_tabs": false,
+     *      "tab_size": null, "increase_indent_pattern": null,
+     *      "brackets": [{"start": "{", "end": "}", "close": true,
+     *                    "surround": true, "newline": true, "not_in": []}]}
+     *
+     * Null for a grammar we do not carry. One call per language for the life
+     * of the process — [to.eyed.conquest.code.ui.editor.EditorLanguage] caches
+     * what comes back, and nothing may call this on the typing path.
+     */
+    external fun languageConfig(language: String): String?
+
+    /**
+     * For each byte offset, a bitmask of the bracket pairs live there: bit *i*
+     * for pair *i* of [languageConfig]'s `brackets`.
+     *
+     * This is the half of the language config that is not data. A pair
+     * carrying `not_in = ["string", "comment"]` is live or not depending on
+     * where the caret sits in the *syntax tree*, and the tree is the engine's:
+     * the highlight spans this side caches are style ids over the visible
+     * window, they trail the text by a parse, and the character that decides
+     * the answer is the one not typed yet.
+     *
+     * Every bit is set for an unknown buffer, for a buffer with no language,
+     * and for a language whose pairs carry no `not_in` at all — which is every
+     * plain bracket, so the UI never needs to ask about `(` or `{`.
+     *
+     * It reparses the buffer when the tree is stale, so it takes every caret's
+     * offset in one call and must only be called when a pair character is
+     * actually typed — never per keystroke.
+     */
+    external fun bufferBracketScopes(bufferId: Long, offsets: LongArray): LongArray
+
     /** Absolute path of the file behind a buffer; null for scratch buffers. */
     external fun bufferPath(bufferId: Long): String?
 

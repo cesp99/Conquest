@@ -1,143 +1,203 @@
 package to.eyed.conquest.code.ui.editor
 
+import org.json.JSONObject
+
 /**
- * A pair the editor closes for you, and wraps a selection in.
+ * A pair the editor closes for you, and wraps a selection in — Zed's
+ * `BracketPair`, as the grammar's `config.toml` writes it.
  *
- * [close] is Zed's flag of the same name: `<` opens a generic in Rust but is
- * far too often a comparison to close automatically, so it may still surround
- * a selection while never auto-closing on its own.
+ * [autoClose] is its `close` flag: `<` opens a generic in Rust but is far too
+ * often a comparison to close automatically, so it may still surround a
+ * selection while never auto-closing on its own. [newline] is its `newline`:
+ * whether Enter between the two halves gives the closer a line of its own.
+ * Quotes are `newline = false` in every config we carry, which is why
+ * `x = "hello"` + Enter does not indent.
+ *
+ * [notIn] is the list the old hardcoded table dropped entirely: the
+ * tree-sitter scopes — "string", "comment" — where the pair is *not* live. It
+ * cannot be answered from here; see [EditorState.enabledPairsAt].
  */
 internal data class BracketPair(
     val open: String,
     val close: String,
-    val autoClose: Boolean = true,
+    val autoClose: Boolean,
+    val surround: Boolean,
+    val newline: Boolean,
+    val notIn: List<String>,
 ) {
     /** Quotes are their own closer, which changes how they may be typed. */
     val isQuote: Boolean get() = open == close
+
+    /**
+     * Whether typing [text] can open this pair — the pair's opener ends with
+     * it, and it is not a word.
+     *
+     * The word test is why `do`/`done` and `then`/`fi` are in the shell
+     * config without every `o` and `n` typed in a shell script taking the
+     * pair path: those pairs exist for matching and for Enter, not for
+     * typing, and Zed's own autoclose never fires on them either.
+     */
+    fun openedByTyping(text: String): Boolean =
+        open.endsWith(text) && !open.last().isLetterOrDigit()
+}
+
+/** A language's block comment: `/*` … `*/`, `<!--` … `-->`. */
+internal data class BlockComment(val start: String, val end: String)
+
+/**
+ * One language's editing rules, as the engine reads them out of the vendored
+ * grammar's own `config.toml`.
+ *
+ * **Nothing in this file decides what a language's rules are.** It parses what
+ * `CoreBridge.languageConfig` hands over and applies it. The table that used
+ * to live here claimed to mirror those configs and did not: one
+ * `autocloseBefore` string for every language where six of them differ, no
+ * `not_in` at all, and a `'` pair for JSON that its grammar has never had.
+ *
+ * The one rule applied here rather than in the engine is
+ * [increaseIndentPattern], and the reason is the keystroke path: the pattern
+ * is data from the same config, but Enter is a keypress, and crossing JNI on
+ * every one of them is exactly the chatter the bridge forbids. It is compiled
+ * once per language, next to the config it came from.
+ */
+internal data class LanguageConfig(
+    /** The language's display name ("Rust"), or "" when there is none. */
+    val name: String,
+    val lineComments: List<String>,
+    val blockComment: BlockComment?,
+    val brackets: List<BracketPair>,
+    val autocloseBefore: String,
+    val hardTabs: Boolean,
+    val increaseIndentPattern: String?,
+) {
+    /**
+     * The token `toggle comment` writes. Zed uses the first of
+     * `line_comments` and keeps the rest for continuing a comment onto the
+     * next line, which we do not do yet.
+     */
+    val lineComment: String? get() = lineComments.firstOrNull()
+
+    private val increaseIndent: Regex? by lazy {
+        increaseIndentPattern?.let { pattern ->
+            runCatching { Regex(pattern) }.getOrNull()
+        }
+    }
+
+    /**
+     * Whether a line ending in [text] opens an indented block — Python's
+     * trailing colon, a shell `do`/`then`, a YAML key with nothing after it.
+     * Languages whose blocks are brackets have no pattern and answer false;
+     * the bracket's own [BracketPair.newline] covers them.
+     */
+    fun opensBlock(text: String): Boolean = increaseIndent?.containsMatchIn(text) == true
+
+    /** The pair typing [text] opens, longest opener first (`f"` beats `"`). */
+    fun opener(text: String): BracketPair? =
+        brackets.filter { it.openedByTyping(text) }.maxByOrNull { it.open.length }
+
+    /** The pair [text] closes, if any. Quotes answer to both. */
+    fun closer(text: String): BracketPair? = brackets.firstOrNull { it.close == text }
+
+    /**
+     * The longest pair whose opener [text] ends with — what Enter looks for
+     * behind the caret, so `r#"` beats `"`.
+     *
+     * Word openers are left out for the same reason [BracketPair.openedByTyping]
+     * leaves them out: a shell's `do`/`done` pair would make `echo begin`
+     * open a block, and the shell's own `increase_indent_pattern` already
+     * recognises a real `do` with the word boundaries this cannot see.
+     */
+    fun openerBefore(text: String): BracketPair? =
+        brackets
+            .filter { !it.open.last().isLetterOrDigit() && text.endsWith(it.open) }
+            .maxByOrNull { it.open.length }
+
+    /** Whether [text] is either half of any pair, so typing it needs care. */
+    fun isPairCharacter(text: String): Boolean =
+        brackets.any { it.openedByTyping(text) || it.close == text }
+
+    /** The pairs typing [text] could touch, by index into [brackets]. */
+    fun pairsTriggeredBy(text: String): List<Int> =
+        brackets.indices.filter { index ->
+            val pair = brackets[index]
+            pair.openedByTyping(text) || pair.close == text
+        }
 }
 
 /**
- * The per-language editing tokens: the line-comment prefix, the pairs that
- * auto-close, and the characters an opener may be closed in front of.
- *
- * **This table is a stopgap and should not grow.** The engine already carries
- * every value in it — `line_comments`, `brackets`, `autoclose_before` and
- * `hard_tabs` in the vendored `grammars/src/<language>/config.toml` files
- * that `engine::highlight` loads to build its registry — so the right home
- * is a JNI accessor that hands the buffer's language config to the UI, and
- * this object then becomes a deletion rather than a rewrite. The values
- * below are read off those configs for exactly that reason.
- *
- * One thing in them is *not* copied, and cannot be from here: every quote
- * pair carries `not_in = ["string", "comment"]`, which asks where the caret
- * is in the syntax tree. The bridge hands out highlight style ids, not
- * scopes, and they trail the text by a parse — so a quote typed inside a
- * comment still auto-closes here where Zed leaves it alone. That wants the
- * same JNI accessor, and is the reason this file is a stopgap.
+ * The parsed configs, one per grammar, for the life of the process.
  *
  * Keys are grammar names as `BufferSession.language` reports them, which is
  * the engine's registry name: a `.js` file parses with the `tsx` grammar and
- * therefore answers "tsx", not "javascript".
+ * therefore answers "tsx", not "javascript". The two configs differ only in
+ * their name and their Prettier parser.
  */
 internal object EditorLanguage {
 
     /**
-     * The line-comment prefix, trailing space included the way Zed writes it
-     * in `line_comments`. Null for languages that have no line comment —
-     * CSS, Markdown and diffs toggle nothing rather than corrupting the file.
+     * What a buffer with no language gets: no comment to toggle, no pair to
+     * close, nothing to indent. Zed's plain text behaves the same way — there
+     * is no grammar to say otherwise, and guessing would be inventing rules
+     * for a file we know nothing about.
      */
-    fun lineComment(language: String?): String? = when (language) {
-        "rust", "c", "cpp", "go", "gomod", "gowork", "json", "jsonc",
-        "tsx", "typescript", "javascript", "jsdoc" -> "// "
-        "bash", "python", "yaml", "gitcommit" -> "# "
-        else -> null
-    }
+    val None = LanguageConfig(
+        name = "",
+        lineComments = emptyList(),
+        blockComment = null,
+        brackets = emptyList(),
+        autocloseBefore = "",
+        hardTabs = false,
+        increaseIndentPattern = null,
+    )
+
+    private val cache = HashMap<String, LanguageConfig>()
 
     /**
-     * Characters an opener is allowed to auto-close in front of, on top of
-     * whitespace and the end of the line. Closing `(` when a word follows
-     * would push the closer into the middle of that word.
+     * The rules for [language], fetching them through [fetch] — one bridge
+     * call per grammar, ever — and parsing them once.
      *
-     * These differ per language and the differences are not cosmetic: a
-     * shell script that closed `(` in front of `;` or `=` would be closing
-     * it in the middle of an assignment.
+     * Synchronized because two editor panes can open files of the same
+     * language on different threads, and the whole point of the cache is that
+     * the second one does not cross the bridge.
      */
-    fun autocloseBefore(language: String?): String = when (language) {
-        "bash" -> "}])"
-        "json", "jsonc", "yaml" -> ",]}"
-        "jsdoc" -> "]}"
-        "gomod", "gowork" -> ")"
-        else -> ";:.,=}])>"
+    @Synchronized
+    fun configFor(language: String?, fetch: () -> String?): LanguageConfig {
+        if (language == null) return None
+        cache[language]?.let { return it }
+        val config = parse(fetch())
+        cache[language] = config
+        return config
     }
 
-    /**
-     * Whether one indent level is a tab, for a language that says so —
-     * `hard_tabs` in the config. Go is the only one of ours that does.
-     * Otherwise the file's own indentation decides; see
-     * [EditorState.indentUnit].
-     */
-    fun hardTabs(language: String?): Boolean = language == "go"
-
-    /**
-     * The token that, at the end of a line, opens an indented block in a
-     * language whose blocks are indentation rather than braces. Python's
-     * colon is the case that matters; without it, Enter after `def f():`
-     * would leave you at column zero.
-     */
-    fun blockOpener(language: String?): String? = when (language) {
-        "python" -> ":"
-        else -> null
+    /** Visible for tests, which have no engine to fetch a config from. */
+    internal fun parse(json: String?): LanguageConfig {
+        if (json == null) return None
+        val root = runCatching { JSONObject(json) }.getOrNull() ?: return None
+        val lineComments = root.optJSONArray("line_comments")
+        val brackets = root.optJSONArray("brackets")
+        return LanguageConfig(
+            name = root.optString("name"),
+            lineComments = List(lineComments?.length() ?: 0) { lineComments!!.getString(it) },
+            blockComment = root.optJSONObject("block_comment")?.let {
+                BlockComment(it.getString("start"), it.getString("end"))
+            },
+            brackets = List(brackets?.length() ?: 0) { index ->
+                val pair = brackets!!.getJSONObject(index)
+                val notIn = pair.optJSONArray("not_in")
+                BracketPair(
+                    open = pair.getString("start"),
+                    close = pair.getString("end"),
+                    autoClose = pair.optBoolean("close"),
+                    surround = pair.optBoolean("surround", true),
+                    newline = pair.optBoolean("newline"),
+                    notIn = List(notIn?.length() ?: 0) { notIn!!.getString(it) },
+                )
+            },
+            autocloseBefore = root.optString("autoclose_before"),
+            hardTabs = root.optBoolean("hard_tabs"),
+            increaseIndentPattern = root.optString("increase_indent_pattern").takeIf {
+                it.isNotEmpty() && !root.isNull("increase_indent_pattern")
+            },
+        )
     }
-
-    /**
-     * The pairs to close and to surround with.
-     *
-     * Rust is the one language that has to differ: `'` starts a lifetime far
-     * more often than a character literal, so Zed's Rust config has no `'`
-     * pair at all and neither do we. JSON is the other: its only string
-     * delimiter is `"`, and closing a `'` into a `.json` file would be
-     * closing it into invalid JSON.
-     */
-    fun pairs(language: String?): List<BracketPair> = when (language) {
-        "rust" -> RustPairs
-        "json", "jsonc" -> JsonPairs
-        "python", "bash", "yaml", "gitcommit" -> ScriptPairs
-        else -> DefaultPairs
-    }
-
-    private val Brackets = listOf(
-        BracketPair("(", ")"),
-        BracketPair("[", "]"),
-        BracketPair("{", "}"),
-    )
-
-    private val DefaultPairs = Brackets + listOf(
-        BracketPair("\"", "\""),
-        BracketPair("'", "'"),
-        BracketPair("`", "`"),
-    )
-
-    private val JsonPairs = Brackets + BracketPair("\"", "\"")
-
-    private val ScriptPairs = Brackets + listOf(
-        BracketPair("\"", "\""),
-        BracketPair("'", "'"),
-    )
-
-    private val RustPairs = Brackets + listOf(
-        BracketPair("\"", "\""),
-        BracketPair("<", ">", autoClose = false),
-    )
-
-    /** The pair [text] opens, if any. */
-    fun opener(language: String?, text: String): BracketPair? =
-        pairs(language).firstOrNull { it.open == text }
-
-    /** The pair [text] closes, if any. Quotes answer to both. */
-    fun closer(language: String?, text: String): BracketPair? =
-        pairs(language).firstOrNull { it.close == text }
-
-    /** Whether [text] is either half of any pair. */
-    fun isPairCharacter(language: String?, text: String): Boolean =
-        pairs(language).any { it.open == text || it.close == text }
 }

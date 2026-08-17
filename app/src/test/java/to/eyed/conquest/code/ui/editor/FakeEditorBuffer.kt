@@ -11,10 +11,34 @@ package to.eyed.conquest.code.ui.editor
  * up at an offset the buffer never had, and the batch machinery has to
  * notice.
  */
-internal class FakeEditorBuffer(text: String, override val language: String? = null) :
-    EditorBuffer {
+internal class FakeEditorBuffer(
+    text: String,
+    override val language: String? = null,
+    /**
+     * The language config the engine would hand over, verbatim. Tests that
+     * care about a language's rules paste the real thing; the rest pass none
+     * and get the empty config, which closes nothing and comments nothing.
+     */
+    override val languageConfigJson: String? = null,
+) : EditorBuffer {
 
     var text: String = text
+        private set
+
+    /**
+     * The scopes [bracketScopes] reports, as byte-offset ranges in which
+     * *no* pair is live — a comment or a string, as far as the caret is
+     * concerned. Empty means everything is live everywhere, which is what the
+     * engine answers for a buffer with no language.
+     *
+     * The real answer comes from the syntax tree and is tested in Rust
+     * (`engine::tests::bracket_scopes_follow_the_syntax_tree`); what these
+     * tests need from it is only that the editor obeys it.
+     */
+    val deadZones = mutableListOf<LongRange>()
+
+    /** How many times the editor went to the engine for a scope. */
+    var scopeQueries = 0
         private set
 
     override var version: Long = 1L
@@ -37,6 +61,13 @@ internal class FakeEditorBuffer(text: String, override val language: String? = n
     }
 
     override fun highlights(firstRow: Int, lastRow: Int): IntArray? = IntArray(0)
+
+    override fun bracketScopes(offsets: LongArray): LongArray {
+        scopeQueries++
+        return LongArray(offsets.size) { index ->
+            if (deadZones.any { offsets[index] in it }) 0L else -1L
+        }
+    }
 
     override fun rowStart(row: Int): Long {
         val all = rows

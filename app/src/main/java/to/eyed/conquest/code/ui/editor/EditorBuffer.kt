@@ -22,8 +22,22 @@ internal interface EditorBuffer {
     val lineCount: Int
     val language: String?
 
+    /**
+     * The language's editing rules as JSON, for
+     * [EditorLanguage.configFor] to parse. Asked at most once per grammar —
+     * the answer is the same for every buffer in it.
+     */
+    val languageConfigJson: String?
+
     /** Text of rows [firstRow, lastRow), joined by '\n', clipped. */
     fun lines(firstRow: Int, lastRow: Int): String
+
+    /**
+     * Per offset, a bitmask of the bracket pairs live there (bit *i* for pair
+     * *i* of the language's `brackets`). Answers the `not_in` scopes, which
+     * need the syntax tree — see [to.eyed.conquest.code.core.CoreBridge.bufferBracketScopes].
+     */
+    fun bracketScopes(offsets: LongArray): LongArray
 
     /** Flat [row, start, end, style] highlight groups for the same range. */
     fun highlights(firstRow: Int, lastRow: Int): IntArray?
@@ -53,8 +67,14 @@ internal class SessionBuffer(private val session: BufferSession) : EditorBuffer 
     override val lineCount: Int get() = session.lineCount
     override val language: String? get() = session.language
 
+    override val languageConfigJson: String?
+        get() = session.language?.let(CoreBridge::languageConfig)
+
     override fun lines(firstRow: Int, lastRow: Int): String =
         CoreBridge.bufferLines(session.id, firstRow.toLong(), lastRow.toLong()).orEmpty()
+
+    override fun bracketScopes(offsets: LongArray): LongArray =
+        CoreBridge.bufferBracketScopes(session.id, offsets)
 
     override fun highlights(firstRow: Int, lastRow: Int): IntArray? =
         CoreBridge.bufferHighlights(session.id, firstRow.toLong(), lastRow.toLong())

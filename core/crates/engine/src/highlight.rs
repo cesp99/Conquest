@@ -110,6 +110,12 @@ fn registry() -> &'static HashMap<&'static str, LanguageEntry> {
     })
 }
 
+/// The tree-sitter language behind a grammar name, for the queries that live
+/// outside this module (`language_config`'s `overrides.scm`).
+pub(crate) fn ts_language(name: &str) -> Option<&'static tree_sitter::Language> {
+    registry().get(name).map(|entry| &entry.language)
+}
+
 /// Language configs whose grammar name differs from their directory name in
 /// `grammars/src/`, so an extension lookup would otherwise miss them.
 /// JavaScript is the only one that matters to us — Zed parses it with the
@@ -212,6 +218,32 @@ impl HighlightState {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// Bring the tree up to date with the text *now*, on the caller's thread.
+    ///
+    /// Highlighting never needs this — it can afford to trail a parse, which
+    /// is the whole reason the worker exists. Asking which syntax scope the
+    /// caret is in cannot: the answer turns on the character just typed, and a
+    /// tree that predates it would say "code" for a quote that has already
+    /// opened a string. Reparsing is incremental and this is one keypress, not
+    /// one keystroke — see `Engine::bracket_scopes`.
+    pub fn ensure_parsed(&mut self, text: &Rope) {
+        if !self.dirty && self.tree.is_some() {
+            return;
+        }
+        let old = if self.needs_full_parse {
+            None
+        } else {
+            self.tree.clone()
+        };
+        if let Some(tree) = Self::parse(&mut self.parser, self.name, text, old.as_ref()) {
+            self.install(tree);
+        }
+    }
+
+    pub fn tree(&self) -> Option<&Tree> {
+        self.tree.as_ref()
     }
 
     /// The inputs a background reparse needs, taken while the buffer lock is
@@ -385,9 +417,9 @@ fn ts_point(point: Point) -> tree_sitter::Point {
     }
 }
 
-struct RopeTextProvider<'a>(&'a Rope);
+pub(crate) struct RopeTextProvider<'a>(pub(crate) &'a Rope);
 
-struct RopeByteChunks<'a>(rope::Chunks<'a>);
+pub(crate) struct RopeByteChunks<'a>(rope::Chunks<'a>);
 
 impl<'a> tree_sitter::TextProvider<&'a [u8]> for RopeTextProvider<'a> {
     type I = RopeByteChunks<'a>;

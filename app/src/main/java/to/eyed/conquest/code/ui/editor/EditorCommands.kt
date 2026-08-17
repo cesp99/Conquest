@@ -423,16 +423,18 @@ private class ColumnShift(val at: Int, val removed: Int, val inserted: Int) {
 }
 
 /**
- * Zed's `editor::ToggleComments`, line-comment half. Rows that are all
- * commented get uncommented; otherwise every row gets a prefix, all of them
- * at the shallowest indent in the range so the tokens line up.
+ * Zed's `editor::ToggleComments`. The tokens are the grammar's own, so this
+ * writes `#` in Python, `//` in Rust and `<!--` … `-->` in Markdown, and
+ * writes nothing at all in a language that has neither.
  *
- * Returns false for a language with no line comment — CSS and Markdown among
- * them — where the alternative would be writing a token that doesn't mean
- * anything to the parser.
+ * Zed's order of preference, and ours: line comments where the language has
+ * them, the block comment where it does not. Markdown and CSS are the two of
+ * ours with only a block comment; a diff has neither, and toggling in one
+ * does nothing rather than corrupting the patch.
  */
 internal fun EditorState.toggleComment(): Boolean {
-    val token = EditorLanguage.lineComment(language) ?: return false
+    val token = languageConfig.lineComment
+        ?: return languageConfig.blockComment?.let { toggleBlockComment(it) } ?: false
     val prefix = token.trimEnd(' ')
     val padding = token.substring(prefix.length)
 
@@ -506,51 +508,221 @@ internal fun EditorState.toggleComment(): Boolean {
     return true
 }
 
+/**
+ * The block-comment half, for the languages that have no line comment:
+ * Markdown's `<!--` … `-->` and CSS's C-style pair. The delimiters wrap the
+ * range the carets cover — the opener at the shallowest indent of the first
+ * row, the closer past the last row's content — and come off again when they
+ * are already there.
+ *
+ * The space either side goes in with them and comes off tolerantly, so
+ * `<!-- note -->` round-trips and a hand-written `<!--note-->` still
+ * uncomments.
+ */
+private fun EditorState.toggleBlockComment(comment: BlockComment): Boolean {
+    val edits = ArrayList<EditorState.CaretEdit>()
+    val shifts = HashMap<Int, MutableList<ColumnShift>>()
+    fun note(row: Int, shift: ColumnShift) {
+        shifts.getOrPut(row) { mutableListOf() }.add(shift)
+    }
+
+    for ((rows, _) in rowGroups()) {
+        // A blank row inside a multi-row range is passed over, as it is for
+        // line comments; a range that is only a blank row still comments.
+        val affected = rows.filter { rows.first == rows.last || line(it).isNotBlank() }
+        if (affected.isEmpty()) continue
+        val firstRow = affected.first()
+        val lastRow = affected.last()
+        val head = line(firstRow)
+        val tail = line(lastRow)
+        val open = head.indexOfFirst { it != ' ' && it != '\t' }
+            .let { if (it < 0) head.length else it }
+        val close = tail.trimEnd().length
+        // On one row the two delimiters have to fit side by side before the
+        // text can be said to be commented at all.
+        val roomForBoth = firstRow != lastRow ||
+            close - open >= comment.start.length + comment.end.length
+        val commented = roomForBoth &&
+            head.startsWith(comment.start, open) &&
+            tail.trimEnd().endsWith(comment.end)
+
+        if (commented) {
+            var from = open + comment.start.length
+            if (head.getOrNull(from) == ' ') from++
+            var to = close - comment.end.length
+            if (tail.getOrNull(to - 1) == ' ' && (firstRow != lastRow || to - 1 >= from)) to--
+            edits.add(
+                EditorState.CaretEdit(
+                    start = byteOffsetOf(firstRow, open),
+                    end = byteOffsetOf(firstRow, from),
+                    replacement = "",
+                )
+            )
+            edits.add(
+                EditorState.CaretEdit(
+                    start = byteOffsetOf(lastRow, to),
+                    end = byteOffsetOf(lastRow, close),
+                    replacement = "",
+                )
+            )
+            note(firstRow, ColumnShift(open, from - open, 0))
+            note(lastRow, ColumnShift(to, close - to, 0))
+        } else if (open == close) {
+            // Nothing to wrap: an empty pair with a space either side, and
+            // the caret between them ready to type into — so that what is
+            // typed there uncomments again cleanly. The shift is counted from
+            // one column earlier than the insertion because a caret standing
+            // exactly at an insertion point does not move.
+            val at = byteOffsetOf(firstRow, open)
+            edits.add(
+                EditorState.CaretEdit(
+                    start = at,
+                    end = at,
+                    replacement = "${comment.start}  ${comment.end}",
+                )
+            )
+            note(firstRow, ColumnShift(open - 1, 0, comment.start.length + 1))
+        } else {
+            val opener = byteOffsetOf(firstRow, open)
+            val closer = byteOffsetOf(lastRow, close)
+            edits.add(
+                EditorState.CaretEdit(start = opener, end = opener, replacement = "${comment.start} ")
+            )
+            edits.add(
+                EditorState.CaretEdit(start = closer, end = closer, replacement = " ${comment.end}")
+            )
+            note(firstRow, ColumnShift(open, 0, comment.start.length + 1))
+            note(lastRow, ColumnShift(close, 0, comment.end.length + 1))
+        }
+    }
+    if (edits.isEmpty()) return true
+
+    // Two shifts can land on one row, and each is measured against the row as
+    // it stands now — so they are applied from the right, where an earlier
+    // one cannot have moved the column a later one is counted from.
+    fun moved(row: Int, col: Int): Int =
+        shifts[row]?.sortedByDescending { it.at }?.fold(col) { at, shift -> shift.apply(at) } ?: col
+
+    val primary = primaryCaret()
+    var newPrimary: Caret? = null
+    val carets = caretsInOrder().map { caret ->
+        val moved = Caret(
+            caret.anchorRow,
+            moved(caret.anchorRow, caret.anchorCol),
+            caret.headRow,
+            moved(caret.headRow, caret.headCol),
+        )
+        if (caret == primary) newPrimary = moved
+        moved
+    }
+    applyEdits(edits, carets, newPrimary ?: carets.last())
+    return true
+}
+
 // ---- Typing: auto-close, surround, auto-indent ---------------------------
 
 /**
  * Type [text] at every caret, honouring the bracket and quote pairs.
  *
- * Three behaviours, in the order they are tested, because the order is what
+ * Four behaviours, in the order they are tested, because the order is what
  * makes them bearable:
  *
- * 1. With something selected, an opener wraps the selection instead of
+ * 1. A pair the language disables here does not apply at all: `not_in =
+ *    ["string", "comment"]` is on every quote pair Zed ships, and it is why a
+ *    `"` typed inside a comment stays a lone `"`. That question needs the
+ *    syntax tree, so it is the engine's — see [EditorState.enabledPairsAt] —
+ *    and it is asked once for every caret, only when a pair character was
+ *    typed, and only when some candidate pair actually carries a `not_in`.
+ * 2. With something selected, an opener wraps the selection instead of
  *    replacing it, and the selection survives (Zed's `auto_surround`).
- * 2. Typing a closer that is already sitting in front of the caret steps
+ * 3. Typing a closer that is already sitting in front of the caret steps
  *    over it rather than doubling it.
- * 3. An opener brings its closer with it, but only where the closer would
+ * 4. An opener brings its closer with it, but only where the closer would
  *    land somewhere sensible: at the end of the line, before whitespace, or
  *    before one of the language's `autoclose_before` characters. A quote
  *    additionally refuses to open right after a word character, so the
  *    apostrophe in `don't` stays an apostrophe.
+ *
+ * Openers can be more than one character — Python's `f"`, Rust's `r#"`, the
+ * two that open a C-style block comment — so what counts as an opener is
+ * "the longest pair whose start ends with what was typed, and whose earlier
+ * characters are already behind the caret".
  *
  * Anything else is a plain insert, and single-caret plain inserts go back
  * through [EditorState.insertAtCursor] so typing keeps costing exactly what
  * it did before.
  */
 internal fun EditorState.typeCharacter(text: String) {
-    val opener = EditorLanguage.opener(language, text)
-    val closer = EditorLanguage.closer(language, text)
-    if (opener == null && closer == null) {
+    val config = languageConfig
+    val candidates = config.pairsTriggeredBy(text)
+    if (candidates.isEmpty()) {
         insertAtCursor(text)
         return
     }
-    val allowedBefore = EditorLanguage.autocloseBefore(language)
+    val carets = caretsInOrder()
+
+    /** Whether the rest of [pair]'s opener is already on the line at [col]. */
+    fun opensHere(pair: BracketPair, lineText: String, col: Int): Boolean {
+        val alreadyTyped = pair.open.length - text.length
+        return pair.openedByTyping(text) &&
+            col >= alreadyTyped &&
+            lineText.startsWith(pair.open.dropLast(text.length), col - alreadyTyped)
+    }
+
+    // The scope is only worth a bridge call for a pair that could actually
+    // open here *and* carries a `not_in`. That is a narrow set: no plain
+    // bracket has one, and Rust's block-comment pair — the reason typing `*`
+    // reaches this at all — needs the `/` in front of it before it counts.
+    val needsScope = carets.any { caret ->
+        val lineText = line(caret.headRow)
+        candidates.any { index ->
+            val pair = config.brackets[index]
+            pair.notIn.isNotEmpty() && opensHere(pair, lineText, caret.startCol)
+        }
+    }
+    val masks = if (needsScope) {
+        enabledPairsAt(
+            LongArray(carets.size) { byteOffsetOf(carets[it].startRow, carets[it].startCol) }
+        )
+    } else {
+        null
+    }
+
+    val allowedBefore = config.autocloseBefore
     val primary = primaryCaret()
-    val edits = caretsInOrder().map { caret ->
+    val edits = carets.mapIndexed { index, caret ->
         val isPrimary = caret == primary
         val start = byteOffsetOf(caret.startRow, caret.startCol)
         val end = byteOffsetOf(caret.endRow, caret.endCol)
         val lineText = line(caret.headRow)
+        val live = { pair: Int ->
+            val mask = masks?.getOrNull(index)
+            mask == null || (mask ushr pair) and 1L == 1L
+        }
+        // The longest opener whose earlier characters are already typed:
+        // `f"` in Python only opens when the `f` is right there.
+        val opener = candidates
+            .filter { live(it) }
+            .map { config.brackets[it] }
+            .filter { opensHere(it, lineText, caret.startCol) }
+            .maxByOrNull { it.open.length }
+        // Deliberately *not* filtered by the scope: `not_in` says where a pair
+        // may be opened, and Zed applies it to the opening half alone. A `"`
+        // typed in front of the one that ends the string you are inside must
+        // still step over it rather than doubling it.
+        val closer = candidates.map { config.brackets[it] }.firstOrNull { it.close == text }
 
-        if (!caret.isEmpty && opener != null) {
+        if (!caret.isEmpty && opener != null && opener.surround) {
             val inner = textIn(caret)
-            return@map EditorState.CaretEdit(
+            // Only what was typed goes in front: the earlier characters of a
+            // multi-character opener are already on the line, which is the
+            // precondition for it having matched at all.
+            return@mapIndexed EditorState.CaretEdit(
                 start = start,
                 end = end,
-                replacement = opener.open + inner + opener.close,
-                anchor = utf8Length(opener.open),
-                head = utf8Length(opener.open) + utf8Length(inner),
+                replacement = text + inner + opener.close,
+                anchor = utf8Length(text),
+                head = utf8Length(text) + utf8Length(inner),
                 isPrimary = isPrimary,
             )
         }
@@ -558,7 +730,7 @@ internal fun EditorState.typeCharacter(text: String) {
             lineText.startsWith(closer.close, caret.headCol)
         ) {
             // Step over: no edit at all, just a caret that moved.
-            return@map EditorState.CaretEdit(
+            return@mapIndexed EditorState.CaretEdit(
                 start = start,
                 end = start,
                 replacement = "",
@@ -569,11 +741,13 @@ internal fun EditorState.typeCharacter(text: String) {
         if (caret.isEmpty && opener != null && opener.autoClose &&
             closesWellHere(lineText, caret.headCol, opener, allowedBefore)
         ) {
-            return@map EditorState.CaretEdit(
+            return@mapIndexed EditorState.CaretEdit(
                 start = start,
                 end = end,
-                replacement = opener.open + opener.close,
-                head = utf8Length(opener.open),
+                // Only the character just typed goes in; the rest of a
+                // multi-character opener is already on the line.
+                replacement = text + opener.close,
+                head = utf8Length(text),
                 isPrimary = isPrimary,
             )
         }
@@ -590,25 +764,36 @@ private fun closesWellHere(
 ): Boolean {
     val following = text.getOrNull(col)
     if (following != null && !following.isWhitespace() && following !in allowedBefore) return false
+    // Zed's rule, and only for a pair that is its own closer: a quote right
+    // after a word is an apostrophe or a suffix, not an opening quote, and one
+    // right after its own kind is closing a string. `f"` is exempt by
+    // construction — its halves differ — which is what lets the `f` in front
+    // of it be a word character.
     if (!pair.isQuote) return true
-    // A quote right after a word is an apostrophe or a suffix, not an
-    // opening quote; and one right after its own kind is closing a string.
     val preceding = text.getOrNull(col - 1) ?: return true
     return !preceding.isLetterOrDigit() && preceding != '_' && !text.startsWith(pair.open, col - 1)
 }
 
 /**
  * Enter, with the indent carried over: the new row starts at the current
- * row's indent, one level deeper after an opener, and an opener whose closer
- * is waiting on the far side of the caret gets a row of its own with the
- * closer pushed down below it.
+ * row's indent, one level deeper after a pair or a pattern that opens a
+ * block, and an opener whose closer is waiting on the far side of the caret
+ * gets a row of its own with the closer pushed down below it.
+ *
+ * Both rules are the language's own. `newline` on a bracket pair is exactly
+ * "an extra newline belongs between these two", which is `true` for every
+ * bracket and `false` for every quote in Zed's configs — that flag is why
+ * `x = "hello"` + Enter does not indent. `increase_indent_pattern` is the
+ * rest: Python's trailing colon, a shell `do`/`then`, a YAML key with nothing
+ * after it. Neither is spelled out here.
  *
  * The indent width is the `tab_size` setting; whether it is tabs or spaces
  * is [EditorState.indentUnit]'s question, because the settings file has no
- * hard-tabs key yet and the file in front of you is better evidence than a
- * default would be.
+ * hard-tabs key yet and the file in front of you is better evidence than the
+ * language's `hard_tabs` would be.
  */
 internal fun EditorState.insertNewline() {
+    val config = languageConfig
     val primary = primaryCaret()
     val edits = caretsInOrder().map { caret ->
         val text = line(caret.startRow)
@@ -618,19 +803,12 @@ internal fun EditorState.insertNewline() {
         val unit = indentUnit(indent)
 
         val before = text.take(caret.startCol).trimEnd()
-        // A quote is not a block opener. It ends a string as often as it
-        // starts one, and Zed's configs say as much: every quote pair in
-        // them is `newline = false` where the brackets are `newline = true`.
-        // Without this, `x = "hello"` + Enter indents.
-        val opener = before.lastOrNull()
-            ?.let { EditorLanguage.opener(language, it.toString()) }
-            ?.takeIf { it.autoClose && !it.isQuote }
+        val opener = config.openerBefore(before)?.takeIf { it.newline }
         val after = line(caret.endRow).drop(caret.endCol).trimStart()
-        val opensBlock = opener != null ||
-            EditorLanguage.blockOpener(language)?.let(before::endsWith) == true
+        val opensBlock = opener != null || config.opensBlock(before)
         // An opener whose closer is waiting on the other side of the caret
         // gets a line of its own, with the closer pushed down below it.
-        val splitsPair = opener != null && after.startsWith(opener.close)
+        val splitsPair = opener != null && after.startsWith(opener.close.trimStart())
 
         val replacement = when {
             splitsPair -> "\n$indent$unit\n$indent"

@@ -11,7 +11,7 @@ import org.junit.Test
 class EditorTypingTest {
 
     private fun editorOf(text: String, language: String? = null): Pair<EditorState, FakeEditorBuffer> {
-        val buffer = FakeEditorBuffer(text, language)
+        val buffer = FakeEditorBuffer(text, language, LanguageFixtures.of(language))
         return EditorState(buffer) to buffer
     }
 
@@ -84,7 +84,7 @@ class EditorTypingTest {
         state.typeCharacter("'")
 
         assertEquals("'", buffer.text)
-        assertFalse(EditorLanguage.pairs("json").any { it.open == "'" || it.open == "`" })
+        assertFalse(state.languageConfig.brackets.any { it.open == "'" || it.open == "`" })
     }
 
     /** Shell scripts close in front of far fewer characters than Rust. */
@@ -96,9 +96,9 @@ class EditorTypingTest {
         state.typeCharacter("(")
 
         assertEquals("foo(;", buffer.text)
-        assertEquals("}])", EditorLanguage.autocloseBefore("bash"))
-        assertEquals(",]}", EditorLanguage.autocloseBefore("json"))
-        assertEquals(";:.,=}])>", EditorLanguage.autocloseBefore("rust"))
+        assertEquals("}])", state.languageConfig.autocloseBefore)
+        assertEquals(",]}", EditorLanguage.parse(LanguageFixtures.Json).autocloseBefore)
+        assertEquals(";:.,=}])>", EditorLanguage.parse(LanguageFixtures.Rust).autocloseBefore)
     }
 
     /** Rust's `(` still closes in front of one, which is why it differs. */

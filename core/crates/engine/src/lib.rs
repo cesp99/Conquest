@@ -42,6 +42,7 @@ mod git;
 mod guest;
 mod highlight;
 mod highlight_worker;
+mod language_config;
 mod platform;
 mod project;
 mod project_search;
@@ -52,6 +53,7 @@ pub use config::{GitignoredFiles, ProjectPanelSettings, Settings, ThemeMode};
 pub use find::FileMatch;
 pub use git::GitStatus;
 pub use highlight::{HighlightSpan, STYLE_NAMES, language_for_path};
+pub use language_config::config_json as language_config_json;
 pub use project::{ProjectId, TreeEntry};
 pub use project_search::{FileMatches, LineMatch, SearchId, SearchResults, SearchState};
 pub use search::{BufferMatch, BufferSearch, SearchOptions};
@@ -316,6 +318,40 @@ impl Engine {
                 .unwrap_or(0)
         })
         .unwrap_or(0)
+    }
+
+    /// For each byte offset, a bitmask of the bracket pairs of the buffer's
+    /// language that are live there — bit *i* for pair *i* of the `brackets`
+    /// list in `language_config_json`.
+    ///
+    /// This is the half of the language config that is not data: a pair
+    /// carrying `not_in = ["string", "comment"]` is live or not depending on
+    /// where the caret sits in the syntax tree, and only the engine has the
+    /// tree. Everything is live for a buffer with no language, and for a
+    /// language whose pairs are unconditional — the ordinary brackets — so the
+    /// UI never needs to ask about `(` or `{`.
+    ///
+    /// It costs an incremental reparse when the tree is stale, which is why it
+    /// takes every caret's offset at once and why the UI must only call it
+    /// when a pair character is actually typed.
+    pub fn bracket_scopes(&self, id: BufferId, offsets: &[usize]) -> Result<Vec<u64>, EngineError> {
+        let mut buffers = self.buffers.lock().unwrap();
+        let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
+        let rope = state.buffer.as_rope().clone();
+        let Some(highlighter) = &mut state.highlight else {
+            return Ok(vec![u64::MAX; offsets.len()]);
+        };
+        highlighter.ensure_parsed(&rope);
+        let name = highlighter.name();
+        let Some(tree) = highlighter.tree() else {
+            return Ok(vec![u64::MAX; offsets.len()]);
+        };
+        Ok(offsets
+            .iter()
+            .map(|&offset| {
+                language_config::enabled_brackets(name, tree, &rope, offset.min(rope.len()))
+            })
+            .collect())
     }
 
     pub fn buffer_language(&self, id: BufferId) -> Option<&'static str> {
@@ -645,6 +681,91 @@ mod tests {
             engine.open_file(&dir.path().join("absent.rs")),
             Err(EngineError::Io { .. })
         ));
+    }
+
+    /// The question a Kotlin table could never answer: Go's `"` pair carries
+    /// `not_in = ["comment", "string"]`, so a quote typed inside either must
+    /// not bring a closer with it.
+    #[test]
+    fn bracket_scopes_follow_the_syntax_tree() {
+        let engine = Engine::new();
+        let text = "func main() {\n\t// a comment\n\ts := \"text\"\n}\n";
+        let id = engine.create_buffer(text);
+        assert!(engine.set_language(id, "go").unwrap());
+
+        let quote = quote_pair_index(&engine, id);
+        let live = |row: u32, column: u32| {
+            let offset = engine.point_to_offset(id, row, column).unwrap();
+            engine.bracket_scopes(id, &[offset]).unwrap()[0] >> quote & 1 == 1
+        };
+
+        // Ordinary code: the pair is live.
+        assert!(live(2, 1));
+        // Inside the line comment, and at its very end — `overrides.scm`
+        // marks comments `.inclusive`, so the end points count as inside too.
+        assert!(!live(1, 5));
+        assert!(!live(1, 13));
+        // Inside the string literal.
+        assert!(!live(2, 8));
+
+        // A brace has no `not_in` at all, so it stays live in the comment —
+        // which is why the UI never has to ask about one.
+        let brace = 0;
+        let in_comment = engine.point_to_offset(id, 1, 5).unwrap();
+        assert_eq!(
+            engine.bracket_scopes(id, &[in_comment]).unwrap()[0] >> brace & 1,
+            1
+        );
+    }
+
+    /// The tree is brought up to date before the question is answered:
+    /// otherwise the text typed a keystroke ago would not be in it, and a
+    /// caret inside a comment that has only just been opened would read as
+    /// ordinary code.
+    #[test]
+    fn bracket_scopes_see_the_text_just_typed() {
+        let engine = Engine::new();
+        let id = engine.create_buffer("func main() {\n\ts := 1\n}\n");
+        assert!(engine.set_language(id, "go").unwrap());
+        let quote = quote_pair_index(&engine, id);
+
+        let at = engine.point_to_offset(id, 1, 1).unwrap();
+        assert_eq!(
+            engine.bracket_scopes(id, &[at + 3]).unwrap()[0] >> quote & 1,
+            1
+        );
+
+        // Comment the line out; the same offset is now inside a comment.
+        engine.edit(id, at, at, "// ").unwrap();
+        assert_eq!(
+            engine.bracket_scopes(id, &[at + 3]).unwrap()[0] >> quote & 1,
+            0
+        );
+    }
+
+    /// A buffer with no language keeps every pair: there is nothing to say it
+    /// otherwise, and refusing to auto-close in a scratch file would be worse.
+    #[test]
+    fn bracket_scopes_without_a_language_are_all_live() {
+        let engine = Engine::new();
+        let id = engine.create_buffer("anything at all");
+        assert_eq!(engine.bracket_scopes(id, &[0, 5]).unwrap(), [u64::MAX; 2]);
+        assert_eq!(
+            engine.bracket_scopes(999, &[0]),
+            Err(EngineError::UnknownBuffer(999))
+        );
+    }
+
+    fn quote_pair_index(engine: &Engine, id: BufferId) -> u32 {
+        let name = engine.buffer_language(id).expect("a language");
+        let config: serde_json::Value =
+            serde_json::from_str(language_config_json(name).expect("a config")).unwrap();
+        config["brackets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|pair| pair["start"] == "\"")
+            .expect("a quote pair") as u32
     }
 
     #[test]
