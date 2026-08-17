@@ -5,6 +5,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.util.Log
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.termux.terminal.TerminalSession
@@ -34,9 +35,35 @@ class TerminalSessionHost(
     var shellTitle by mutableStateOf<String?>(null)
         private set
 
+    /**
+     * A name the user gave this session. It outranks the shell's own title and
+     * survives a restart — the point of naming a session is that it keeps the
+     * name while the program inside it comes and goes.
+     */
+    var customTitle by mutableStateOf<String?>(null)
+        private set
+
+    /** What the session chip shows, most specific first. */
+    val title: String get() = customTitle ?: shellTitle ?: label
+
+    /**
+     * Bells rung since the session was last typed in.
+     *
+     * A count rather than a flag so the UI can flash again on the second bell;
+     * Zed marks the terminal's tab the same way and clears it on input.
+     */
+    var bells by mutableIntStateOf(0)
+        private set
+
     /** Non-null once the process has exited: >= 0 exit code, < 0 negated signal. */
     var exitStatus by mutableStateOf<Int?>(null)
         private set
+
+    /** How the exit reads to a person, or null while the shell is running. */
+    val exitDescription: String?
+        get() = exitStatus?.let { status ->
+            if (status < 0) "killed by signal ${-status}" else "exited with status $status"
+        }
 
     var session: TerminalSession by mutableStateOf(startSession())
         private set
@@ -72,8 +99,19 @@ class TerminalSessionHost(
         session.finishIfRunning()
         exitStatus = null
         shellTitle = null
+        bells = 0
         session = startSession()
         view?.attachSession(session)
+    }
+
+    /** Name this session; an empty name hands the chip back to the shell. */
+    fun rename(title: String) {
+        customTitle = title.trim().takeIf { it.isNotEmpty() }
+    }
+
+    /** Called when the session is looked at or typed in: the bell has been heard. */
+    fun clearBell() {
+        if (bells != 0) bells = 0
     }
 
     fun finish() {
@@ -84,6 +122,15 @@ class TerminalSessionHost(
     fun write(text: String) {
         if (exitStatus == null) session.write(text)
     }
+
+    /** Put terminal text on the clipboard, as the copy action and the toolbar do. */
+    fun copy(text: String?) {
+        if (text.isNullOrEmpty()) return
+        clipboard()?.setPrimaryClip(ClipData.newPlainText("", text))
+    }
+
+    /** Paste the clipboard into the shell. Null session: the caller is our UI. */
+    fun paste() = onPasteTextFromClipboard(null)
 
     // --- TerminalSessionClient -------------------------------------------
 
@@ -100,8 +147,7 @@ class TerminalSessionHost(
     }
 
     override fun onCopyTextToClipboard(session: TerminalSession, text: String?) {
-        if (text.isNullOrEmpty()) return
-        clipboard()?.setPrimaryClip(ClipData.newPlainText("", text))
+        copy(text)
     }
 
     override fun onPasteTextFromClipboard(session: TerminalSession?) {
@@ -110,8 +156,10 @@ class TerminalSessionHost(
     }
 
     override fun onBell(session: TerminalSession) {
-        // A visual or haptic bell is a preference we don't have a home for
-        // yet; staying silent beats buzzing without a way to turn it off.
+        // Visual only, and deliberately: a sound or a buzz needs a setting to
+        // turn it off, and the settings file has no terminal section yet. A
+        // flash of the dock costs nothing and can't wake anybody up.
+        if (session === this.session) bells += 1
     }
 
     override fun onColorsChanged(session: TerminalSession) {

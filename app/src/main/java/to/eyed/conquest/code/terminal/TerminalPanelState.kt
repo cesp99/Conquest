@@ -60,13 +60,21 @@ class TerminalPanelState(context: Context) {
     }
 
     fun select(index: Int) {
-        if (index in entries.indices) activeIndex = index
+        if (index !in entries.indices) return
+        activeIndex = index
+        // Looking at a session is hearing its bell, the same rule Zed uses.
+        entries[index].clearBell()
+    }
+
+    /** Give a session a name of its own; empty hands the chip back to the shell. */
+    fun rename(index: Int, title: String) {
+        entries.getOrNull(index)?.rename(title)
     }
 
     fun selectRelative(delta: Int) {
         if (entries.isEmpty()) return
         val size = entries.size
-        activeIndex = ((activeIndex + delta) % size + size) % size
+        select(((activeIndex + delta) % size + size) % size)
     }
 
     /** Kill a session and drop it. Hides the dock when the last one goes. */
