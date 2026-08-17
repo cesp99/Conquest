@@ -25,6 +25,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import to.eyed.conquest.code.core.AppSettings
+import to.eyed.conquest.code.ui.editor.SoftWrapMode
 import to.eyed.conquest.code.core.GitignoredFiles
 import to.eyed.conquest.code.core.ThemeMode
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
@@ -102,6 +103,16 @@ fun SettingsScreen(
                         options = TAB_SIZES.map { it to it.toString() },
                         selected = settings.tabSize,
                         onSelect = { onSet(AppSettings.KEY_TAB_SIZE, it.toString()) },
+                    )
+                    ChoiceRow(
+                        label = "Wrap long lines",
+                        detail = "Zed's soft_wrap",
+                        options = listOf(
+                            SoftWrapMode.None to "Off",
+                            SoftWrapMode.EditorWidth to "At the editor's width",
+                        ),
+                        selected = settings.softWrap,
+                        onSelect = { onSet(AppSettings.KEY_SOFT_WRAP, "\"${it.key}\"") },
                     )
                     ChoiceRow(
                         label = "Gitignored files",

@@ -1,6 +1,7 @@
 package to.eyed.conquest.code.core
 
 import org.json.JSONObject
+import to.eyed.conquest.code.ui.editor.SoftWrapMode
 
 /** How the project tree treats gitignored entries. */
 enum class GitignoredFiles(val key: String) {
@@ -42,6 +43,8 @@ data class AppSettings(
     val bufferFontSize: Float = 14f,
     /** Spaces inserted by the Tab key. */
     val tabSize: Int = 4,
+    /** What a line longer than the editor does. */
+    val softWrap: SoftWrapMode = SoftWrapMode.None,
     /** How gitignored entries appear in the project tree. */
     val gitignoredFiles: GitignoredFiles = GitignoredFiles.Dimmed,
 ) {
@@ -50,6 +53,7 @@ data class AppSettings(
         const val KEY_THEME = "theme"
         const val KEY_FONT_SIZE = "buffer_font_size"
         const val KEY_TAB_SIZE = "tab_size"
+        const val KEY_SOFT_WRAP = "soft_wrap"
         const val KEY_GITIGNORED = "project_panel.gitignored_files"
 
         fun parse(json: String): AppSettings = runCatching {
@@ -59,6 +63,7 @@ data class AppSettings(
                 theme = ThemeMode.fromKey(root.optString("theme", "system")),
                 bufferFontSize = root.optDouble("buffer_font_size", 14.0).toFloat(),
                 tabSize = root.optInt("tab_size", 4),
+                softWrap = SoftWrapMode.fromKey(root.optString("soft_wrap", "none")),
                 gitignoredFiles = GitignoredFiles.fromKey(
                     panel?.optString("gitignored_files", "dimmed") ?: "dimmed"
                 ),

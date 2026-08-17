@@ -80,6 +80,17 @@ exists only in the `full` edition — cloning runs the git inside the Linux
 userland, so the edition with no userland leaves the command and its menu entry
 out entirely rather than showing them greyed — see [USERLAND.md](USERLAND.md).
 
+## Wrapping long lines
+
+Off by default, as in Zed. **Settings** → *Wrap long lines*, `☰` → **Wrap long
+lines**, or the command palette's `editor: toggle soft wrap` — Zed's own action,
+which it binds to `Ctrl` `K` `Ctrl` `Z`, a two-key sequence this keymap cannot
+express yet. Whichever route, it writes `soft_wrap` to settings.json, so it
+survives a restart.
+
+Wrapped or not, the caret keys mean what they always meant: `Home` and `End` go
+to the ends of the *line*, not of the screen row.
+
 ## Git panel
 
 `Ctrl` `Shift` `G` shows the changes in the project — Zed's

@@ -70,6 +70,7 @@ import to.eyed.conquest.code.ui.search.ProjectSearchPanel
 import to.eyed.conquest.code.ui.search.revealProjectSearchMatch
 import to.eyed.conquest.code.ui.editor.EditorPane
 import to.eyed.conquest.code.ui.editor.EditorState
+import to.eyed.conquest.code.ui.editor.SoftWrapMode
 import to.eyed.conquest.code.ui.media.MediaKind
 import to.eyed.conquest.code.ui.git.GitPanel
 import to.eyed.conquest.code.ui.git.GitPanelDockWidth
@@ -530,6 +531,15 @@ fun WorkspaceScreen(
                     RightDock.Preview
                 }
             }
+            WorkspaceCommand.ToggleSoftWrap -> {
+                val next = if (settings.softWrap.wraps) SoftWrapMode.None else SoftWrapMode.EditorWidth
+                scope.launch {
+                    val updated = withContext(Dispatchers.IO) {
+                        AppSettings.set(AppSettings.KEY_SOFT_WRAP, "\"${'$'}{next.key}\"")
+                    }
+                    if (updated != null) onSettingsChanged(updated)
+                }
+            }
             WorkspaceCommand.ToggleGitPanel -> {
                 if (project == null) return false
                 if (rightDock == RightDock.Git) {
@@ -675,6 +685,12 @@ fun WorkspaceScreen(
                 },
                 MenuAction("Find file…", shortcutLabel(WorkspaceCommand.FindFile), enabled = project != null) {
                     runCommand(WorkspaceCommand.FindFile)
+                },
+                MenuAction(
+                    if (settings.softWrap.wraps) "Stop wrapping lines" else "Wrap long lines",
+                    shortcutLabel(WorkspaceCommand.ToggleSoftWrap),
+                ) {
+                    runCommand(WorkspaceCommand.ToggleSoftWrap)
                 },
                 MenuAction(
                     "Git panel",
@@ -832,6 +848,7 @@ fun WorkspaceScreen(
                             },
                             isPreviewOpen = rightDock == RightDock.Preview,
                             onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
+                            softWrap = settings.softWrap,
                             modifier = Modifier.weight(1f),
                         )
                         // Each panel draws its own left edge, which is also
@@ -887,6 +904,7 @@ fun WorkspaceScreen(
                             },
                             isPreviewOpen = rightDock == RightDock.Preview,
                             onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
+                            softWrap = settings.softWrap,
                         )
                     }
                 }
@@ -1134,6 +1152,7 @@ private fun EditorArea(
     onSearchDismissed: () -> Unit,
     isPreviewOpen: Boolean,
     onTogglePreview: () -> Unit,
+    softWrap: SoftWrapMode,
     modifier: Modifier = Modifier,
 ) {
     val active = files.active
@@ -1202,6 +1221,7 @@ private fun EditorArea(
                 state = activeEditor,
                 modifier = Modifier.weight(1f),
                 onSave = { onSave(active) },
+                softWrap = softWrap,
             )
         } else {
             MediaPane(

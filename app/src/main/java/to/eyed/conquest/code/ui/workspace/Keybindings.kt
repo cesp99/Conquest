@@ -132,6 +132,13 @@ enum class WorkspaceCommand(
     CloneRepository("git::Clone", isOffered = { it.canClone }),
 
     /**
+     * Wrap long lines, or stop — Zed's `editor::ToggleSoftWrap`, which it
+     * binds to `ctrl-k ctrl-z`, a two-key sequence this table cannot express
+     * yet. It writes the setting, so it survives a restart the way Zed's does.
+     */
+    ToggleSoftWrap("editor::ToggleSoftWrap"),
+
+    /**
      * Show or hide the git panel — Zed's `git_panel::ToggleFocus`, on the
      * chord Zed gives it (default-linux.json:700).
      */

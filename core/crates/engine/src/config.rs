@@ -44,6 +44,21 @@ pub enum GitignoredFiles {
     Hide,
 }
 
+/// What a line longer than the pane does — Zed's `soft_wrap`, with the two
+/// values that mean something on a screen this size. Zed's other two,
+/// `preferred_line_length` and `bounded`, both wrap at a column the user
+/// picks; a phone is narrower than any column worth picking, so they would
+/// only ever behave as one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SoftWrap {
+    /// Zed's default: the line runs off the right edge and scrolls.
+    #[default]
+    None,
+    /// Wrap at the width of the text area.
+    EditorWidth,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ProjectPanelSettings {
@@ -60,6 +75,8 @@ pub struct Settings {
     pub buffer_font_size: f32,
     /// Spaces inserted by the Tab key.
     pub tab_size: u32,
+    /// What a line longer than the pane does.
+    pub soft_wrap: SoftWrap,
     pub project_panel: ProjectPanelSettings,
 }
 
@@ -69,6 +86,7 @@ impl Default for Settings {
             theme: ThemeMode::System,
             buffer_font_size: 14.0,
             tab_size: 4,
+            soft_wrap: SoftWrap::default(),
             project_panel: ProjectPanelSettings::default(),
         }
     }
@@ -102,6 +120,10 @@ const DEFAULT_FILE: &str = r#"// Conquest Code settings.
 
   // Spaces inserted by the Tab key.
   "tab_size": 4,
+
+  // What a line longer than the editor does: "none" scrolls it off the
+  // right edge, "editor_width" wraps it.
+  "soft_wrap": "none",
 
   "project_panel": {
     // Gitignored files in the tree: "show", "dimmed" or "hide".
@@ -187,7 +209,8 @@ impl crate::Engine {
         let Some(path) = settings_path() else {
             return Err(EngineError::NoSettingsFile);
         };
-        let mut text = self.settings_text();
+        let original = self.settings_text();
+        let mut text = original.clone();
         let indent = settings_json::infer_json_indent_size(&text).max(1);
         // Surgical: this returns the byte range of just that key's value (or
         // where to insert it), so everything around it — comments included —
@@ -195,6 +218,19 @@ impl crate::Engine {
         let (range, replacement) =
             settings_json::replace_value_in_json_text(&text, key_path, indent, Some(&value), None);
         text.replace_range(range, &replacement);
+        // A value of the wrong shape — a string where an enum has two names,
+        // a bool where a number goes — does not break one setting, it breaks
+        // the *file*, and `settings()` answers an unparseable file with the
+        // defaults. Written blind, one bad key silently reset every other one.
+        // So: if the file parsed before and does not now, this write is what
+        // broke it, and it is put back.
+        let was_valid = settings_json::parse_json_with_comments::<Settings>(&original).is_ok();
+        if was_valid && settings_json::parse_json_with_comments::<Settings>(&text).is_err() {
+            return Err(EngineError::InvalidSettings(format!(
+                "\"{}\" cannot be set to {value}",
+                key_path.join(".")
+            )));
+        }
         std::fs::write(&path, &text).map_err(|err| EngineError::Io {
             path: path.display().to_string(),
             message: err.to_string(),
@@ -264,6 +300,46 @@ mod tests {
             assert!(text.contains("\"buffer_font_size\": 18"));
             // Untouched keys keep their values.
             assert!(text.contains("\"tab_size\": 4"));
+        });
+    }
+
+    /// The documented default file has to *parse* as the settings it
+    /// documents, or a first run writes a file the next read falls back from
+    /// — silently, since a bad parse is defaults.
+    #[test]
+    fn the_default_file_is_the_default_settings() {
+        let parsed: Settings =
+            settings_json::parse_json_with_comments(DEFAULT_FILE).unwrap();
+        assert_eq!(parsed, Settings::default());
+    }
+
+    #[test]
+    fn soft_wrap_takes_zeds_two_names_and_refuses_others() {
+        with_settings_dir(|engine, _dir| {
+            engine.settings_text();
+            let updated = engine
+                .set_setting(&["soft_wrap"], json!("editor_width"))
+                .unwrap();
+            assert_eq!(updated.soft_wrap, SoftWrap::EditorWidth);
+            // A value that is not one of the two leaves the setting alone
+            // rather than turning wrapping off under the user.
+            assert!(engine.set_setting(&["soft_wrap"], json!("bounded")).is_err());
+            assert_eq!(engine.settings().soft_wrap, SoftWrap::EditorWidth);
+        });
+    }
+
+    /// The rollback above, on the key that has the most ways to be wrong.
+    #[test]
+    fn a_write_that_would_break_the_file_leaves_every_other_setting_alone() {
+        with_settings_dir(|engine, dir| {
+            engine.settings_text();
+            engine.set_setting(&["tab_size"], json!(8)).unwrap();
+            assert!(engine.set_setting(&["tab_size"], json!("eight")).is_err());
+            // Not defaults: the bad write never reached the file.
+            assert_eq!(engine.settings().tab_size, 8);
+            let text = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+            assert!(text.contains("\"tab_size\": 8"));
+            assert!(engine.settings_are_valid());
         });
     }
 
