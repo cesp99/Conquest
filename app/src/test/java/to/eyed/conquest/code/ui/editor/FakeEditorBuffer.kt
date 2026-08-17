@@ -53,10 +53,19 @@ internal class FakeEditorBuffer(
 
     override val lineCount: Int get() = rows.size
 
+    /**
+     * Rows this buffer has handed out, for the tests that care what a query
+     * costs rather than what it answers. The display map's whole claim is
+     * that it reads a block of the file, not the file.
+     */
+    var rowsRead = 0
+        private set
+
     override fun lines(firstRow: Int, lastRow: Int): String {
         val all = rows
         val first = firstRow.coerceIn(0, all.size)
         val last = lastRow.coerceIn(first, all.size)
+        rowsRead += last - first
         return all.subList(first, last).joinToString("\n")
     }
 

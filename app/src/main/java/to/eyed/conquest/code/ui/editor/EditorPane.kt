@@ -117,11 +117,37 @@ private fun indentLevels(text: String, tabSize: Int): Int {
     return 0
 }
 
+/**
+ * The spans of [spans] that fall inside UTF-16 range [start, end), rebased on
+ * [start] — one wrapped segment's share of its row's highlighting.
+ *
+ * The whole row hands its own list back untouched, which matters more than it
+ * looks: the layout cache is keyed by text *and* spans, so an unwrapped row
+ * keys exactly as it did before wrapping existed and every measurement it
+ * already holds still hits.
+ */
+private fun spansIn(spans: List<HighlightSpan>, start: Int, end: Int): List<HighlightSpan> {
+    if (spans.isEmpty() || (start == 0 && end == Int.MAX_VALUE)) return spans
+    val sliced = ArrayList<HighlightSpan>(spans.size)
+    for (span in spans) {
+        val from = max(span.start, start)
+        val to = min(span.end, end)
+        if (from < to) sliced.add(HighlightSpan(from - start, to - start, span.style))
+    }
+    return sliced
+}
+
 @Composable
 fun EditorPane(
     state: EditorState,
     modifier: Modifier = Modifier,
     onSave: (() -> Unit)? = null,
+    /**
+     * Zed's `soft_wrap`, whose default is `"none"`
+     * (assets/settings/default.json:1536). Defaulted here so a caller that
+     * has no setting to pass gets Zed's behaviour rather than ours.
+     */
+    softWrap: SoftWrapMode = SoftWrapMode.None,
 ) {
     val theme = LocalZedTheme.current
     val settings = LocalAppSettings.current
@@ -141,6 +167,10 @@ fun EditorPane(
     // changes.
     val lineHeight = settings.bufferFontSize * 1.618034f
 
+    // Before the metrics: both feed the wrap width, and setting them in this
+    // order works it out once instead of twice.
+    state.softWrap = softWrap
+    state.tabSize = settings.tabSize
     with(density) {
         state.updateMetrics(
             lineHeight = lineHeight.sp.toPx(),
@@ -150,7 +180,6 @@ fun EditorPane(
             cursorWidth = 2.dp.toPx(),
         )
     }
-    state.tabSize = settings.tabSize
     val handleRadiusPx = with(density) { 6.dp.toPx() }
     val handleTouchRadiusPx = with(density) { 24.dp.toPx() }
 
@@ -164,7 +193,10 @@ fun EditorPane(
     }
 
     var cursorVisible by remember { mutableStateOf(true) }
-    LaunchedEffect(state.cursorRow, state.cursorCol, state.session.version) {
+    // `state.revision`, not the session's version: the engine's counter is a
+    // plain field and composition cannot see it change, so keying on it never
+    // restarted the blink after an edit that left the caret where it was.
+    LaunchedEffect(state.cursorRow, state.cursorCol, state.revision) {
         cursorVisible = true
         while (true) {
             delay(CURSOR_BLINK_MILLIS)
@@ -218,8 +250,10 @@ fun EditorPane(
                         // Where in the thumb the finger landed, so the page
                         // does not jump under it on the first pixel of movement.
                         val height = size.height.toFloat()
-                        val visible =
-                            (height / (state.lineCount * state.lineHeightPx)).coerceIn(0f, 1f)
+                        val visible = (
+                            height /
+                                (state.displayMap.displayRowCount * state.lineHeightPx)
+                            ).coerceIn(0f, 1f)
                         val thumbHeight = (height * visible).coerceAtLeast(trackWidth * 2f)
                         val travel = (height - thumbHeight).coerceAtLeast(1f)
                         val thumbTop = (state.scrollY / state.maxScrollY) * travel
@@ -319,34 +353,129 @@ fun EditorPane(
                 }
         ) {
             state.updateViewport(size.width, size.height)
+            val map = state.displayMap
+            val window = state.displayWindow
             val lineHeight = state.lineHeightPx
             val gutterWidth = state.gutterWidthPx
-            val firstRow = (state.scrollY / lineHeight).toInt().coerceAtLeast(0)
-            val lastRow = min(
-                firstRow + ceil(size.height / lineHeight).toInt() + 1,
-                state.lineCount,
+            // A wrapped pane has nothing to scroll sideways; reading it here
+            // rather than clamping the state keeps the draw pass out of
+            // snapshot writes.
+            val scrollX = state.effectiveScrollX
+
+            // Everything below counts in *display* rows. The map turns them
+            // back into buffer rows and the segment of the row on show.
+            val firstDisplay = (state.scrollY / lineHeight).toInt().coerceAtLeast(0)
+            // Resolving the top row first is what makes the height below it
+            // honest: the map measures the block it lands in, and only then
+            // does `displayRowCount` know how far the screen reaches.
+            val firstBufferRow = map.bufferRowOf(firstDisplay)
+            val lastDisplay = max(
+                firstDisplay,
+                min(
+                    firstDisplay + ceil(size.height / lineHeight).toInt() + 1,
+                    map.displayRowCount,
+                ),
             )
-            val lines = state.linesWindow(firstRow, lastRow)
-            val textLeft = gutterWidth + state.textPaddingPx - state.scrollX
+            val lastBufferRow = map.bufferRowOf((lastDisplay - 1).coerceAtLeast(firstDisplay))
+            val lines = state.linesWindow(firstBufferRow, lastBufferRow + 1)
+            val spans = state.spansWindow()
+            map.fillWindow(window, firstDisplay, lastDisplay, firstBufferRow, lines)
+            val textLeft = gutterWidth + state.textPaddingPx - scrollX
+
+            fun lineAt(row: Int): String = lines.getOrElse(row - firstBufferRow) { "" }
+
+            /** The text this display row shows — the whole row when it fits. */
+            fun textOf(i: Int): String {
+                val line = lineAt(window.bufferRow(i))
+                return state.segmentText(
+                    line,
+                    window.startCol(i),
+                    min(window.endCol(i), line.length),
+                )
+            }
+
+            fun layoutOf(i: Int): TextLayoutResult {
+                val row = window.bufferRow(i)
+                return layoutCache.layoutFor(
+                    textOf(i),
+                    spansIn(
+                        spans.getOrElse(row - firstBufferRow) { emptyList() },
+                        window.startCol(i),
+                        window.endCol(i),
+                    ),
+                )
+            }
+
+            /** Left edge of this display row's text, continuation indent included. */
+            fun leftOf(i: Int): Float = textLeft + window.indentColumns(i) * state.charWidthPx
+
+            fun topOf(i: Int): Float = (firstDisplay + i) * lineHeight - state.scrollY
+
+            /**
+             * Paint UTF-16 range [from, to) of one buffer row, across however
+             * many display rows it is spread over. [includeNewline] adds the
+             * half-character tail that shows a whole row is selected.
+             */
+            fun paintSpan(
+                row: Int,
+                from: Int,
+                to: Int,
+                color: Color,
+                includeNewline: Boolean,
+                minWidth: Float,
+            ) {
+                var i = window.firstIndexOf(row)
+                if (i < 0) return
+                val line = lineAt(row)
+                while (i < window.size && window.bufferRow(i) == row) {
+                    val segmentStart = window.startCol(i)
+                    val segmentEnd = min(window.endCol(i), line.length)
+                    // Only the segment that ends the row carries the newline.
+                    val tail = includeNewline && segmentEnd >= line.length
+                    val overlaps = from <= segmentEnd && to >= segmentStart
+                    val left = max(from, segmentStart)
+                    val right = max(left, min(to, segmentEnd))
+                    // A range that collapses to nothing here is still drawn
+                    // where [minWidth] says so — a search hit of zero width
+                    // has to be visible somewhere.
+                    if (overlaps && (right > left || tail || minWidth > 0f)) {
+                        val layout = layoutOf(i)
+                        val x0 = leftOf(i) + layout.getHorizontalPosition(left - segmentStart, true)
+                        var x1 =
+                            leftOf(i) + layout.getHorizontalPosition(right - segmentStart, true)
+                        if (tail) x1 += state.charWidthPx / 2f
+                        drawRect(
+                            color = color,
+                            topLeft = Offset(x0, topOf(i)),
+                            size = Size((x1 - x0).coerceAtLeast(minWidth), lineHeight),
+                        )
+                    }
+                    i++
+                }
+            }
 
             // Current-line highlight, under everything else. It is the *one*
             // cursor's line: with a column of carets there is no single active
-            // line, and striping half the screen would only be noise.
-            val cursorTop = state.cursorRow * lineHeight - state.scrollY
+            // line, and striping half the screen would only be noise. Every
+            // display row of a wrapped line is highlighted, the way Zed treats
+            // a wrapped line as one line.
             val selection = state.selectionRange()
             val extras = state.extraCarets
-            if (selection == null && extras.isEmpty() &&
-                cursorTop + lineHeight > 0 && cursorTop < size.height
-            ) {
-                // Across the gutter as well: Zed's `current_line_highlight`
-                // defaults to "all" (assets/settings/default.json:314), and a
-                // highlight that stops at the gutter draws a seam down the
-                // page that Zed does not have.
-                drawRect(
-                    color = theme.color("editor.active_line.background"),
-                    topLeft = Offset(0f, cursorTop),
-                    size = Size(size.width, lineHeight),
-                )
+            if (selection == null && extras.isEmpty()) {
+                for (i in 0 until window.size) {
+                    if (window.bufferRow(i) != state.cursorRow) continue
+                    val top = topOf(i)
+                    if (top + lineHeight <= 0f || top >= size.height) continue
+                    // Across the gutter as well: Zed's `current_line_highlight`
+                    // defaults to "all" (assets/settings/default.json:314), and a
+                    // highlight that stops at the gutter draws a seam down the
+                    // page that Zed does not have.
+                    drawRect(
+                        color = theme.color("editor.active_line.background"),
+                        topLeft = Offset(0f, top),
+                        size = Size(size.width, lineHeight),
+                    )
+                }
             }
 
             // Indent guides. Zed draws them by default
@@ -360,7 +489,9 @@ fun EditorPane(
             // Per row rather than per block: a block-aware guide needs the tree
             // the outline work will bring, and the per-row form is right for
             // every case except a blank line inside a block, where Zed carries
-            // the guide through and we do not.
+            // the guide through and we do not. A wrapped row keeps its guides on
+            // every segment, which is what makes the continuation legible as
+            // part of the same block.
             if (state.tabSize > 0) {
                 val guide = theme.color("editor.indent_guide")
                 val activeGuide = theme.color("editor.indent_guide_active")
@@ -368,10 +499,9 @@ fun EditorPane(
                 val step = state.charWidthPx * state.tabSize
                 val activeLevel = indentLevels(state.line(state.cursorRow), state.tabSize)
                 clipRect(left = gutterWidth) {
-                    for (row in firstRow until lastRow) {
-                        val text = lines.getOrElse(row - firstRow) { "" }
-                        val levels = indentLevels(text, state.tabSize)
-                        val top = row * lineHeight - state.scrollY
+                    for (i in 0 until window.size) {
+                        val levels = indentLevels(lineAt(window.bufferRow(i)), state.tabSize)
+                        val top = topOf(i)
                         for (level in 0 until levels) {
                             val x = textLeft + level * step
                             if (x < gutterWidth || x > size.width) continue
@@ -385,7 +515,6 @@ fun EditorPane(
                 }
             }
 
-            val spansWindow = state.spansWindow()
             clipRect(left = gutterWidth) {
                 // Search hits, under everything else: Zed paints them as a
                 // background wash with the current one picked out
@@ -393,13 +522,16 @@ fun EditorPane(
                 if (state.searchMatches.isNotEmpty()) {
                     val match = theme.color("search.match_background")
                     val active = theme.color("search.active_match_background")
+                    val windowFirst = window.firstBufferRow()
+                    val windowLast = window.lastBufferRow()
                     state.searchMatches.forEachIndexed { index, range ->
-                        for (row in max(range.startRow, firstRow)..min(range.endRow, lastRow - 1)) {
-                            val line = lines[row - firstRow]
-                            val layout = layoutCache.layoutFor(
-                                line,
-                                spansWindow.getOrElse(row - firstRow) { emptyList() },
-                            )
+                        if (range.endRow < windowFirst || range.startRow > windowLast) {
+                            return@forEachIndexed
+                        }
+                        val color = if (index == state.activeMatch) active else match
+                        val rows = max(range.startRow, windowFirst)..min(range.endRow, windowLast)
+                        for (row in rows) {
+                            val line = lineAt(row)
                             val from = if (row == range.startRow) {
                                 range.startCol.coerceAtMost(line.length)
                             } else {
@@ -410,52 +542,44 @@ fun EditorPane(
                             } else {
                                 line.length
                             }
-                            val left = textLeft + layout.getHorizontalPosition(from, true)
-                            val right = textLeft + layout.getHorizontalPosition(to, true)
-                            drawRect(
-                                color = if (index == state.activeMatch) active else match,
-                                topLeft = Offset(left, row * lineHeight - state.scrollY),
-                                size = Size((right - left).coerceAtLeast(1f), lineHeight),
-                            )
+                            paintSpan(row, from, to, color, includeNewline = false, minWidth = 1f)
                         }
                     }
                 }
+
                 fun paintSelection(startRow: Int, startCol: Int, endRow: Int, endCol: Int) {
-                    for (row in max(startRow, firstRow)..min(endRow, lastRow - 1)) {
-                        val line = lines[row - firstRow]
-                        val layout = layoutCache.layoutFor(
-                            line,
-                            spansWindow.getOrElse(row - firstRow) { emptyList() },
-                        )
+                    val windowFirst = window.firstBufferRow()
+                    val windowLast = window.lastBufferRow()
+                    if (endRow < windowFirst || startRow > windowLast) return
+                    for (row in max(startRow, windowFirst)..min(endRow, windowLast)) {
+                        val line = lineAt(row)
                         val from = if (row == startRow) startCol.coerceAtMost(line.length) else 0
-                        val left = textLeft + layout.getHorizontalPosition(from, true)
-                        val right = if (row == endRow) {
-                            textLeft + layout.getHorizontalPosition(
-                                endCol.coerceAtMost(line.length),
-                                true,
-                            )
-                        } else {
-                            // Full-line rows: include a half-char for the newline.
-                            textLeft + layout.getHorizontalPosition(line.length, true) +
-                                state.charWidthPx / 2f
-                        }
-                        drawRect(
-                            color = theme.selection,
-                            topLeft = Offset(left, row * lineHeight - state.scrollY),
-                            size = Size((right - left).coerceAtLeast(0f), lineHeight),
+                        val to =
+                            if (row == endRow) endCol.coerceAtMost(line.length) else line.length
+                        paintSpan(
+                            row,
+                            from,
+                            to,
+                            theme.selection,
+                            includeNewline = row < endRow,
+                            minWidth = 0f,
                         )
                     }
                 }
 
                 fun paintCaret(row: Int, col: Int) {
-                    if (row !in firstRow until lastRow) return
-                    val line = lines[row - firstRow]
-                    val layout = layoutCache.layoutFor(line, state.spansFor(row))
-                    val caretX = textLeft + layout.getHorizontalPosition(col.coerceAtMost(line.length), true)
+                    if (row < window.firstBufferRow() || row > window.lastBufferRow()) return
+                    val line = lineAt(row)
+                    val at = col.coerceAtMost(line.length)
+                    val i = window.indexOf(row, at)
+                    if (i < 0) return
+                    val layout = layoutOf(i)
+                    val caretX =
+                        leftOf(i) + layout.getHorizontalPosition(at - window.startCol(i), true)
                     if (caretX < gutterWidth - 1f) return
                     drawRect(
                         color = theme.cursor,
-                        topLeft = Offset(caretX, row * lineHeight - state.scrollY),
+                        topLeft = Offset(caretX, topOf(i)),
                         // Zed's `px(2.)` is 2 *density-independent* pixels;
                         // 2f here is 2 physical ones, a hairline on a phone.
                         size = Size(state.cursorWidthPx, lineHeight),
@@ -478,14 +602,19 @@ fun EditorPane(
                 }
 
                 // Buffer text.
-                lines.forEachIndexed { index, line ->
-                    val layout =
-                        layoutCache.layoutFor(line, spansWindow.getOrElse(index) { emptyList() })
-                    state.noteContentWidth(layout.size.width.toFloat())
-                    val top = (firstRow + index) * lineHeight - state.scrollY
+                for (i in 0 until window.size) {
+                    val layout = layoutOf(i)
+                    // Only an unwrapped pane has a horizontal extent to track;
+                    // a wrapped one never overflows and noting a width here
+                    // would leave a stale extent behind when wrapping is
+                    // turned off again.
+                    if (!state.softWrap.wraps) state.noteContentWidth(layout.size.width.toFloat())
                     drawText(
                         textLayoutResult = layout,
-                        topLeft = Offset(textLeft, top + (lineHeight - layout.size.height) / 2f),
+                        topLeft = Offset(
+                            leftOf(i),
+                            topOf(i) + (lineHeight - layout.size.height) / 2f,
+                        ),
                     )
                 }
 
@@ -506,7 +635,7 @@ fun EditorPane(
                 }
             }
 
-            // Gutter: background, divider, right-aligned line numbers.
+            // Gutter: background, right-aligned line numbers.
             drawRect(
                 color = theme.color("editor.gutter.background"),
                 topLeft = Offset.Zero,
@@ -517,15 +646,18 @@ fun EditorPane(
             // as a pane border where there is no pane.
             val lineNumber = theme.color("editor.line_number")
             val activeLineNumber = theme.color("editor.active_line_number")
-            for (row in firstRow until lastRow) {
+            for (i in 0 until window.size) {
+                // A wrapped row is numbered once, on the segment it starts on —
+                // the number belongs to the file's row, not the screen's.
+                if (!window.isFirstSegment(i)) continue
+                val row = window.bufferRow(i)
                 val layout = layoutCache.layoutFor((row + 1).toString())
-                val top = row * lineHeight - state.scrollY
                 drawText(
                     textLayoutResult = layout,
                     color = if (row == state.cursorRow) activeLineNumber else lineNumber,
                     topLeft = Offset(
                         gutterWidth - state.gutterPaddingPx - layout.size.width,
-                        top + (lineHeight - layout.size.height) / 2f,
+                        topOf(i) + (lineHeight - layout.size.height) / 2f,
                     ),
                 )
             }
@@ -543,7 +675,8 @@ fun EditorPane(
                     topLeft = Offset(trackLeft, 0f),
                     size = Size(trackWidth, size.height),
                 )
-                val visible = (size.height / (state.lineCount * lineHeight)).coerceIn(0f, 1f)
+                val visible =
+                    (size.height / (map.displayRowCount * lineHeight)).coerceIn(0f, 1f)
                 val thumbHeight = (size.height * visible).coerceAtLeast(trackWidth * 2f)
                 val thumbTop = (state.scrollY / maxScroll) * (size.height - thumbHeight)
                 drawRect(
@@ -557,7 +690,6 @@ fun EditorPane(
                     size = Size(1f, thumbHeight),
                 )
             }
-
         }
 
         EditorActionRow(
@@ -656,6 +788,10 @@ private fun ActionKey(label: String, onClick: () -> Unit) {
 /**
  * Pane-local baseline positions of the selection start/end (where the drag
  * handles hang), or null without a selection.
+ *
+ * A handle hangs off the *display* row its end sits on, and off that row's
+ * own left edge — a selection ending inside a wrapped line's third segment
+ * gets its handle under that segment, not under the line's first.
  */
 private fun selectionHandles(
     state: EditorState,
@@ -664,10 +800,20 @@ private fun selectionHandles(
     val range = state.selectionRange() ?: return null
     fun at(row: Int, col: Int): Offset {
         val line = state.line(row)
-        val layout = layoutCache.layoutFor(line, state.spansFor(row))
-        val x = state.gutterWidthPx + state.textPaddingPx - state.scrollX +
-            layout.getHorizontalPosition(col.coerceAtMost(line.length), true)
-        return Offset(x, (row + 1) * state.lineHeightPx - state.scrollY)
+        val at = col.coerceAtMost(line.length)
+        val wrap = state.displayMap.wrapOf(line)
+        val segment = wrap.segmentOf(at)
+        val start = wrap.startOf(segment)
+        val end = wrap.endOf(segment, line.length)
+        val layout = layoutCache.layoutFor(
+            state.segmentText(line, start, end),
+            spansIn(state.spansFor(row), start, if (wrap.wraps) end else Int.MAX_VALUE),
+        )
+        val indentPx = if (segment > 0) wrap.indentColumns * state.charWidthPx else 0f
+        val x = state.gutterWidthPx + state.textPaddingPx - state.effectiveScrollX + indentPx +
+            layout.getHorizontalPosition(at - start, true)
+        val display = state.displayRowOf(row, at)
+        return Offset(x, (display + 1) * state.lineHeightPx - state.scrollY)
     }
     return at(range.startRow, range.startCol) to at(range.endRow, range.endCol)
 }
@@ -717,9 +863,10 @@ internal class EditorActions(
         val range = state.selectionRange() ?: return
         val topLeftLocal = Offset(
             state.gutterWidthPx,
-            range.startRow * state.lineHeightPx - state.scrollY,
+            state.displayRowOf(range.startRow, range.startCol) * state.lineHeightPx - state.scrollY,
         )
-        val bottomLocal = (range.endRow + 1) * state.lineHeightPx - state.scrollY
+        val bottomLocal =
+            (state.displayRowOf(range.endRow, range.endCol) + 1) * state.lineHeightPx - state.scrollY
         val topLeft = coords.localToRoot(topLeftLocal)
         val bottomRight = coords.localToRoot(
             Offset(coords.size.width.toFloat(), bottomLocal),

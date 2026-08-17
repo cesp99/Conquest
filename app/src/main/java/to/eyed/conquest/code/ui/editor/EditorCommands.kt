@@ -892,8 +892,13 @@ fun EditorState.movePage(down: Boolean, extend: Boolean = false) {
     val rows = (viewportRows() - 1).coerceAtLeast(1)
     val delta = if (down) rows else -rows
     moveCarets(extend) { caret ->
-        val row = (caret.headRow + delta).coerceIn(0, (lineCount - 1).coerceAtLeast(0))
-        row to caret.headCol.coerceAtMost(line(row).length)
+        // A screenful of *display* rows, which with soft wrap on is far fewer
+        // file rows: paging by file rows would jump clean past everything the
+        // page just showed.
+        pointAtDisplayRow(
+            displayRowOf(caret.headRow, caret.headCol) + delta,
+            columnWithinSegment(caret.headRow, caret.headCol),
+        )
     }
 }
 

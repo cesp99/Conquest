@@ -226,8 +226,29 @@ class EditorState private constructor(
     private var requestedFirst = 0
     private var requestedLast = 0
 
+    /**
+     * What is on screen, as opposed to what is in the file. Every place that
+     * used to multiply a row by the line height goes through it — see
+     * [DisplayMap], which also explains what it costs.
+     *
+     * It is handed the *cached* line count rather than the buffer's, so a
+     * query never crosses the bridge, and a reader that serves the window
+     * already fetched for drawing wherever it covers the rows asked for.
+     */
+    internal val displayMap = DisplayMap({ lineCount }, ::textOfRows)
+
+    /** Refilled by the draw pass every frame; see [DisplayWindow]. */
+    internal val displayWindow = DisplayWindow()
+
     private companion object {
         const val WINDOW_PADDING = 32
+
+        /**
+         * Narrowest pane we will still wrap in. A pane thinner than this is
+         * a layout accident (a pane mid-animation, a hinge fold), and wrapping
+         * every character onto its own row would be worse than overflowing.
+         */
+        const val MIN_WRAP_COLUMNS = 8
 
         /** Rows of the file read to decide whether it indents with tabs. */
         const val INDENT_SAMPLE_ROWS = 200
@@ -266,11 +287,57 @@ class EditorState private constructor(
         charWidthPx = charWidth
         gutterPaddingPx = gutterPadding
         textPaddingPx = textPadding
+        syncDisplayMap()
     }
 
     fun updateViewport(width: Float, height: Float) {
         viewportWidth = width
         viewportHeight = height
+        syncDisplayMap()
+    }
+
+    /**
+     * Zed's `soft_wrap`. A plain field pushed in from composition like
+     * [tabSize]: it changes when the user changes a setting, never on the
+     * keystroke path, and the draw pass reads it through the composition that
+     * set it.
+     */
+    var softWrap: SoftWrapMode = SoftWrapMode.None
+        set(value) {
+            if (field == value) return
+            field = value
+            syncDisplayMap()
+        }
+
+    /**
+     * Horizontal scroll as the renderer should use it: a wrapped pane has
+     * nothing to scroll sideways, and a stale [scrollX] left over from before
+     * wrapping was turned on would shift every row off its gutter.
+     *
+     * Read rather than clamped, because the only place that would notice is
+     * the draw pass and the draw pass must not write snapshot state.
+     */
+    internal val effectiveScrollX: Float get() = if (softWrap.wraps) 0f else scrollX
+
+    /**
+     * Tell the display map how wide a row may be, in characters.
+     *
+     * The text area is what is left of the pane once the gutter, the text's
+     * own left padding and the scrollbar's track are taken off — which is
+     * what `soft_wrap: "editor_width"` means. Called from both the metrics
+     * and the viewport update because either can change it; the map itself
+     * ignores a width it already has, so the per-frame call costs a compare.
+     */
+    private fun syncDisplayMap() {
+        val columns = if (!softWrap.wraps || charWidthPx <= 0f || viewportWidth <= 0f) {
+            0
+        } else {
+            val track = charWidthPx.coerceIn(10f, 24f)
+            ((viewportWidth - gutterWidthPx - textPaddingPx - track) / charWidthPx)
+                .toInt()
+                .coerceAtLeast(MIN_WRAP_COLUMNS)
+        }
+        displayMap.configure(columns, tabSize)
     }
 
     /**
@@ -346,9 +413,45 @@ class EditorState private constructor(
     /** Rows [firstRow, lastRow) straight from the buffer, past the window. */
     internal fun linesOf(firstRow: Int, lastRow: Int): String = buffer.lines(firstRow, lastRow)
 
-    /** Call after anything that may change the buffer contents. */
+    /**
+     * Text of buffer rows [first, last) for the display map.
+     *
+     * Served from the window already fetched for drawing wherever it covers
+     * them: measuring a block of a wrapped file must not turn into a bridge
+     * call on every frame, and the block the viewport sits in is the one the
+     * window is holding.
+     */
+    private fun textOfRows(first: Int, last: Int): List<String> {
+        val from = first.coerceIn(0, lineCount)
+        val to = last.coerceIn(from, lineCount)
+        if (to == from) return emptyList()
+        if (buffer.version == cachedVersion && from >= cachedFirst && to <= cachedLast) {
+            return cachedLines.subList(from - cachedFirst, to - cachedFirst)
+        }
+        return buffer.lines(from, to).split('\n')
+    }
+
+    /**
+     * Call after anything that may change the buffer contents from outside an
+     * edit this class made — a reload, a history step. Everything the display
+     * map measured is suspect.
+     */
     fun refreshLineCount() {
         lineCount = buffer.lineCount
+        displayMap.invalidateAll()
+        bumpRevision()
+    }
+
+    /**
+     * The same, for an edit whose reach is known: only the rows it rewrote
+     * lose their measured wrapping, so typing in a 100k-line file re-measures
+     * one block rather than the file. Everything after goes too when the row
+     * count changed, because every row after an inserted or deleted line has
+     * moved to a different index.
+     */
+    private fun refreshLineCount(fromRow: Int, toRow: Int) {
+        lineCount = buffer.lineCount
+        displayMap.invalidate(fromRow - 1, toRow + 1)
         bumpRevision()
     }
 
@@ -396,9 +499,9 @@ class EditorState private constructor(
      * Consume a vertical scrollable delta (positive = finger moving down,
      * which scrolls the content up). Returns the consumed amount.
      */
-    /** The largest [scrollY] the content allows. */
+    /** The largest [scrollY] the content allows — in display rows, not file rows. */
     internal val maxScrollY: Float
-        get() = (lineCount * lineHeightPx - viewportHeight).coerceAtLeast(0f)
+        get() = (displayMap.displayRowCount * lineHeightPx - viewportHeight).coerceAtLeast(0f)
 
     /** Put the viewport at [y], clamped — what dragging the scrollbar does. */
     internal fun scrollToY(y: Float) {
@@ -415,6 +518,9 @@ class EditorState private constructor(
 
     /** Horizontal counterpart of [applyScrollDeltaY]. */
     fun applyScrollDeltaX(delta: Float): Float {
+        // Nothing overflows a wrapped pane, so nothing is consumed and the
+        // gesture goes back to whatever is behind the editor.
+        if (softWrap.wraps) return 0f
         val contentAreaWidth = (viewportWidth - gutterWidthPx).coerceAtLeast(0f)
         val maxX = (contentWidthPx + textPaddingPx + charWidthPx - contentAreaWidth)
             .coerceAtLeast(0f)
@@ -424,12 +530,41 @@ class EditorState private constructor(
         return consumed
     }
 
-    /** (row, UTF-16 col) at a pane-local pixel position. */
+    /**
+     * (row, UTF-16 col) at a pane-local pixel position.
+     *
+     * The vertical hit lands on a *display* row, so with wrapping on the tap
+     * is resolved against the segment under the finger — its own text, its
+     * own left edge — and the column is clamped to that segment. A tap past
+     * the end of a wrapped segment therefore lands at the segment's end
+     * rather than at the end of the whole row.
+     */
     fun positionAt(point: Offset, layoutForLine: (String) -> TextLayoutResult): Pair<Int, Int> {
-        val row = ((point.y + scrollY) / lineHeightPx).toInt().coerceIn(0, lineCount - 1)
-        val xInText = point.x - gutterWidthPx - textPaddingPx + scrollX
-        val layout = layoutForLine(line(row))
-        return row to layout.getOffsetForPosition(Offset(xInText.coerceAtLeast(0f), 0f))
+        val display = ((point.y + scrollY) / lineHeightPx).toInt().coerceAtLeast(0)
+        val row = displayMap.bufferRowOf(display)
+        val text = line(row)
+        val wrap = displayMap.wrapOf(text)
+        val segment = (display - displayMap.displayRowOf(row))
+            .coerceIn(0, wrap.segmentCount - 1)
+        val start = wrap.startOf(segment)
+        val end = wrap.endOf(segment, text.length)
+        val indentPx = if (segment > 0) wrap.indentColumns * charWidthPx else 0f
+        val xInText = point.x - gutterWidthPx - textPaddingPx - indentPx + effectiveScrollX
+        val layout = layoutForLine(segmentText(text, start, end))
+        val col = start + layout.getOffsetForPosition(Offset(xInText.coerceAtLeast(0f), 0f))
+        return row to col.coerceIn(start, end)
+    }
+
+    /**
+     * One segment's text. An unwrapped row hands back the row itself rather
+     * than a copy of it, which keeps the layout cache's key — and therefore
+     * every measurement it holds — exactly what it was before wrapping
+     * existed.
+     */
+    internal fun segmentText(text: String, start: Int, end: Int): String {
+        if (start <= 0 && end >= text.length) return text
+        val from = start.coerceIn(0, text.length)
+        return text.substring(from, end.coerceIn(from, text.length))
     }
 
     /**
@@ -780,6 +915,13 @@ class EditorState private constructor(
      * keystroke path.
      */
     var tabSize: Int = 4
+        set(value) {
+            if (field == value) return
+            field = value
+            // A tab is this many columns wide to the wrapper as well, so
+            // every break in the file has just moved.
+            syncDisplayMap()
+        }
 
     /**
      * Whether this file indents with tabs, asked once of the file itself.
@@ -910,6 +1052,18 @@ class EditorState private constructor(
      */
     private fun runEdits(edits: List<CaretEdit>): List<CaretEdit> {
         if (edits.isEmpty()) return emptyList()
+        // How far the batch can reach, for the display map. Every range in it
+        // was derived from a caret, and the furthest an operation ever goes
+        // past one is the newline on either side — deleting a line takes the
+        // break in front of it, moving one takes the row beyond it — which is
+        // the ±1 [refreshLineCount] adds. Measured before the edits run,
+        // while the carets still name the rows the offsets came from.
+        var touchedFrom = Int.MAX_VALUE
+        var touchedTo = 0
+        for (caret in caretsInOrder()) {
+            if (caret.startRow < touchedFrom) touchedFrom = caret.startRow
+            if (caret.endRow > touchedTo) touchedTo = caret.endRow
+        }
         val ordered = edits.sortedBy { it.start }
         // Two carets that reached the same bytes would corrupt each other's
         // ranges; the earlier edit wins and the later one is dropped.
@@ -935,7 +1089,7 @@ class EditorState private constructor(
                 (refused ?: ArrayList<CaretEdit>(1).also { refused = it }).add(edit)
             }
         }
-        refreshLineCount()
+        refreshLineCount(touchedFrom, touchedTo)
         val rejected = refused ?: return kept
         return kept.filterNot { edit -> rejected.any { it === edit } }
     }
@@ -1025,7 +1179,7 @@ class EditorState private constructor(
             cursorRow = row
             cursorCol = selUtf16.coerceIn(0, newLine.length)
         }
-        refreshLineCount()
+        refreshLineCount(row, row)
         ensureCursorVisible()
         return structural
     }
@@ -1246,7 +1400,7 @@ class EditorState private constructor(
         val previousLine = line(cursorRow - 1)
         val lineStart = lineStartOffset(cursorRow)
         buffer.edit(lineStart - 1, lineStart, "")
-        refreshLineCount()
+        refreshLineCount(cursorRow - 1, cursorRow)
         cursorRow -= 1
         cursorCol = previousLine.length
         ensureCursorVisible()
@@ -1312,15 +1466,66 @@ class EditorState private constructor(
     }
 
     private fun movedVertically(caret: Caret, delta: Int, extend: Boolean): Caret {
-        val row = (caret.headRow + delta).coerceIn(0, lineCount - 1)
-        val col = caret.headCol.coerceAtMost(line(row).length)
+        if (displayMap.isIdentity) {
+            val row = (caret.headRow + delta).coerceIn(0, lineCount - 1)
+            val col = caret.headCol.coerceAtMost(line(row).length)
+            return if (extend) Caret(caret.anchorRow, caret.anchorCol, row, col) else Caret(row, col)
+        }
+        // With wrapping on, up and down move by a row of the *screen*: one
+        // press on a paragraph that wraps into six should step down one of
+        // them, not skip the whole paragraph. Zed's MoveUp/MoveDown walk
+        // display rows for the same reason.
+        val display = displayRowOf(caret.headRow, caret.headCol) + delta
+        val (row, col) = pointAtDisplayRow(
+            display,
+            columnWithinSegment(caret.headRow, caret.headCol),
+        )
         return if (extend) Caret(caret.anchorRow, caret.anchorCol, row, col) else Caret(row, col)
     }
 
-    /** Scroll just enough to keep the cursor's line inside the viewport. */
+    /**
+     * The display row that draws a caret position.
+     *
+     * Column zero needs no text at all, and asking for a row's text is a
+     * bridge call whenever the edit that moved the caret has just invalidated
+     * the line window — which is exactly when this is called.
+     */
+    internal fun displayRowOf(row: Int, col: Int): Int = when {
+        displayMap.isIdentity -> row.coerceIn(0, lineCount - 1)
+        col <= 0 -> displayMap.displayRowOf(row)
+        else -> displayMap.displayRowOf(row, col, line(row))
+    }
+
+    /** How far into its own display row a caret sits, in UTF-16 units. */
+    internal fun columnWithinSegment(row: Int, col: Int): Int {
+        if (displayMap.isIdentity) return col
+        val wrap = displayMap.wrapOf(line(row))
+        return col - wrap.startOf(wrap.segmentOf(col))
+    }
+
+    /**
+     * The (row, UTF-16 col) [offset] units into display row [display]'s
+     * segment, clamped to that segment.
+     */
+    internal fun pointAtDisplayRow(display: Int, offset: Int): Pair<Int, Int> {
+        // Clamped by the map, not against `displayRowCount`: that count is an
+        // estimate until the block is measured, and clamping to it would
+        // answer for a row short of the one asked about.
+        val at = display.coerceAtLeast(0)
+        val row = displayMap.bufferRowOf(at)
+        val text = line(row)
+        if (displayMap.isIdentity) return row to offset.coerceIn(0, text.length)
+        val wrap = displayMap.wrapOf(text)
+        val segment = (at - displayMap.displayRowOf(row)).coerceIn(0, wrap.segmentCount - 1)
+        val start = wrap.startOf(segment)
+        val end = wrap.endOf(segment, text.length)
+        return row to (start + offset).coerceIn(start, end)
+    }
+
+    /** Scroll just enough to keep the cursor's display row inside the viewport. */
     fun ensureCursorVisible() {
         if (viewportHeight <= 0f) return
-        val top = cursorRow * lineHeightPx
+        val top = displayRowOf(cursorRow, cursorCol) * lineHeightPx
         val bottom = top + lineHeightPx
         if (top < scrollY) {
             scrollY = top
