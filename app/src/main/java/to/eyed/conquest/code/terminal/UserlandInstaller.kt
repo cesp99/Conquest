@@ -9,6 +9,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Owns the userland install, outside the composition.
@@ -37,6 +38,15 @@ object UserlandInstaller {
         state = Userland.backend.state(context.applicationContext)
     }
 
+    /**
+     * Install the userland, then call [onInstalled] **on the main thread**.
+     *
+     * That guarantee is the whole signature: the caller re-enters the shell so
+     * the session lands in Debian rather than the fallback it started in, and
+     * constructing a `TerminalSession` binds a `Handler` to the calling
+     * thread's looper — on this scope's IO thread that is a crash, and it
+     * fired the moment a fresh emulator ran the install from the banner.
+     */
     fun install(context: Context, onInstalled: () -> Unit) {
         if (job?.isActive == true) return
         val app = context.applicationContext
@@ -53,7 +63,7 @@ object UserlandInstaller {
             result.fold(
                 onSuccess = {
                     state = UserlandState.Ready
-                    onInstalled()
+                    withContext(Dispatchers.Main) { onInstalled() }
                 },
                 onFailure = { error ->
                     state = if (error is InstallCancelledMarker) {
