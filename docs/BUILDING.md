@@ -146,6 +146,29 @@ ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358 \
 
 Supported ABIs: `arm64-v8a` (all real devices) and `x86_64` (emulator).
 
+## A foldable emulator
+
+This is a foldable-first IDE, and most of the bugs worth finding have only
+ever appeared on a device: a handler on the wrong thread, a display id, a
+fold that recreated the activity. A phone-shaped emulator finds none of
+them, so there is a script for one that has a hinge:
+
+```sh
+tools/fold-emulator.sh          # create it if needed, then boot
+adb -s emulator-5554 install -r \
+  app/build/outputs/apk/full/debug/app-full-x86_64-debug.apk
+```
+
+It is `x86_64`, so install the `x86_64` APK rather than the arm64 one. The
+whole stack runs there, Debian under proot included. Folding and unfolding
+are commands rather than gestures:
+
+```sh
+adb -s emulator-5554 shell cmd device_state state 0   # closed
+adb -s emulator-5554 shell cmd device_state state 3   # opened
+adb -s emulator-5554 exec-out screencap -p > shot.png
+```
+
 To try a release build locally, sign it with the debug key — an unsigned
 APK cannot be installed:
 
