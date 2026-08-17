@@ -56,6 +56,8 @@ editor.
 | `Ctrl` `P` | Find a file by name (fuzzy) |
 | `Ctrl` `F` | Find in the open file |
 | `Ctrl` `Shift` `F` | Search every file in the project |
+| `Ctrl` `G` | Go to a line (and column) |
+| `Ctrl` `Shift` `V` | Show/hide the Markdown preview |
 | `Ctrl` `Shift` `T` | Reopen the tab you closed last |
 | `Ctrl` `Shift` `E` | Reveal the open file in the project panel |
 | `Ctrl` `Shift` `G` | Clone a git repository into a new project |
@@ -92,6 +94,66 @@ file with more matches than the engine will hand back at once.
 A regular expression that does not compile yet — `[`, halfway through
 typing — outlines the field rather than clearing the file's highlights and
 claiming there are no results.
+
+## Go to line
+
+`Ctrl` `G` opens a small panel over the top of the editor. Type `42` for a
+line, or `42:8` for a line and a column — a comma works as well as the colon,
+because a soft keyboard hides the colon behind a modifier and the digit row
+already has the comma.
+
+The caret moves **as you type**, so you can watch the file scroll past and
+stop where you meant to. A number past the end of the file lands on the last
+line rather than being refused.
+
+| Shortcut | Action |
+|---|---|
+| `Enter`, or `↵` | Keep the caret where it landed |
+| `Esc`, or `✕` | Put the caret, the selection and the view back where they were |
+
+Cancelling really does put everything back: the selection you had, every extra
+cursor, and the exact scroll position — not just the line number.
+
+`Ctrl` `G` is deliberately not offered while a terminal has the keyboard, where
+it is BEL and readline's abort.
+
+## Markdown preview
+
+`Ctrl` `Shift` `V` renders the open `.md` file — Zed's `markdown::OpenPreview`.
+On a wide screen it docks beside the editor and its left edge drags to resize;
+on a phone it takes the work area, the way project search and the terminal do.
+`✕` in its title bar closes it, which is the route for a finger.
+
+It follows the buffer: type in the editor and the rendering catches up, without
+either pane's scrolling moving the other. The preview keeps its own place on
+the page while you edit.
+
+| Shortcut | Action |
+|---|---|
+| `PageUp` / `PageDown` | A screenful |
+| `↑` / `↓` | A few lines |
+| `Ctrl` `Home` / `Ctrl` `End` | Top / bottom |
+| `Esc`, or `✕` | Close it |
+
+The scrolling keys apply once the preview has the focus — click or tap it
+first; that is deliberate, so opening the preview never takes the keyboard away
+from the file you are writing.
+
+What it renders is what a README uses: headings, **bold**, *italic*,
+`code`, ~~strikethrough~~, links (inline, reference and bare), nested and
+ordered lists, task lists, block quotes and GitHub's `> [!NOTE]` alerts,
+tables, horizontal rules and fenced code blocks — **coloured by the same
+tree-sitter grammars that colour the editor**, so a Rust fence in a README
+looks like Rust.
+
+Two deliberate limits. **Images are named, not drawn**: an image shows as
+`[image: alt text]`, because drawing it would mean fetching it, and this editor
+does not make network requests you did not ask for. And there is **no WebView**
+behind any of this — it is drawn in Compose with the colours of your Zed theme,
+so it changes when the theme does.
+
+A link to `https://…` opens in your browser. A link to another file in the
+project opens that file in a tab.
 
 ## Search all files
 
@@ -253,6 +315,10 @@ and htop need them. The workspace keeps only these:
 | `Ctrl` `Shift` `G` | Clone a repository (`full` edition) |
 | `Ctrl` `Shift` `P` | Open the command palette |
 
+`Ctrl` `Shift` `V` is paste here and nothing else — the Markdown preview does
+not take it from a shell — and `Ctrl` `G` stays BEL. Both are reachable from
+the `☰` menu, which is the route out of a focused terminal.
+
 `Ctrl` `Shift` `P` means the command palette here as everywhere else,
 which is why *find file* is the one command with no shifted twin: from a
 shell it is `Ctrl` `Shift` `P` and then "file". `F1` is not taken, because
@@ -277,6 +343,9 @@ edition the shell runs inside Debian once you install it — see
   bar between the editor and the terminal drags to resize the dock.
 - In project search: the wheel scrolls the results, a row lights up under
   the pointer, and the panel's left edge drags to make it wider.
+- In the Markdown preview: links show a hand cursor and light up under the
+  pointer, the wheel scrolls the page, and the panel's left edge drags to
+  make it wider.
 
 ## Touch
 
@@ -296,6 +365,13 @@ tap a file's row to fold its matches, and tap `⋯` for the include and
 exclude fields. On a phone the panel takes the whole work area, so opening
 a match hands the screen back to the editor — what you typed is kept, and
 `☰` → **Search all files…** brings it back.
+
+The Markdown preview is a touch surface too: `✕` in its title bar closes it —
+the one control it needs a finger to reach, since on a phone it covers the
+editor there is no `Ctrl` `Shift` `V` to press into. Tap a link to follow it,
+drag to scroll, and drag the dock's left edge on a wide screen. Go to line is
+the same: the panel's `↵` confirms and `✕` cancels, both reachable while the
+soft keyboard is up.
 
 The status bar carries a **Save** action while the current
 file has unsaved changes, `☰ files` toggles the project panel, `▤` toggles the project

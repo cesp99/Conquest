@@ -376,6 +376,52 @@ fun isProjectSearch(event: KeyEvent): Boolean {
     return ProjectSearchChord.matches(event.nativeKeyEvent)
 }
 
+/**
+ * Go to line — Zed's `go_to_line::Toggle` on `ctrl-g`
+ * (assets/keymaps/default-linux.json:622), and the reason cloning had to take
+ * the shifted twin.
+ *
+ * A surface rather than a [WorkspaceCommand], for the same reason project
+ * search is one: what it puts on screen takes the keyboard, moves the caret as
+ * you type, answers Escape itself and has to put the caret back if you cancel.
+ * The workspace's whole job is to show it.
+ *
+ * Never matched while a shell has the keyboard: `Ctrl+G` is BEL on a terminal
+ * and readline's abort, and no editor command is worth taking those. The ☰
+ * menu carries it for a finger and for a focused terminal.
+ */
+val GoToLineChord = Chord(AndroidKeyEvent.KEYCODE_G, "G", shift = false)
+
+/** True when this event should open go-to-line. */
+fun isGoToLine(event: KeyEvent, focus: Focus = Focus.Workspace): Boolean {
+    if (focus != Focus.Workspace) return false
+    if (event.type != KeyEventType.KeyDown) return false
+    if (event.nativeKeyEvent.isAltPressed) return false
+    return GoToLineChord.matches(event.nativeKeyEvent)
+}
+
+/**
+ * Show or hide the Markdown preview — Zed's `markdown::OpenPreview` on
+ * `ctrl-shift-v` (default-linux.json:607). Zed's other binding for it,
+ * `ctrl-k v` for the side-by-side form, is a two-key sequence this table
+ * cannot express; which side the preview lands on is decided by the width of
+ * the screen instead.
+ *
+ * It costs paste its shifted twin *inside the editor* — `handleEditorKey`
+ * pastes on `Ctrl+V` with or without Shift — which is the same trade Zed
+ * itself makes, and `Ctrl+V` is untouched. In a terminal `Ctrl+Shift+V` is
+ * paste and nothing else may have it, so this is workspace-only.
+ */
+val MarkdownPreviewChord = Chord(AndroidKeyEvent.KEYCODE_V, "V", shift = true)
+
+/** True when this event should toggle the Markdown preview. */
+fun isMarkdownPreview(event: KeyEvent, focus: Focus = Focus.Workspace): Boolean {
+    if (focus != Focus.Workspace) return false
+    if (event.type != KeyEventType.KeyDown) return false
+    if (event.nativeKeyEvent.isAltPressed) return false
+    return MarkdownPreviewChord.matches(event.nativeKeyEvent)
+}
+
 /** The command a key event maps to, or null to let it through. */
 fun workspaceCommandFor(event: KeyEvent, focus: Focus = Focus.Workspace): WorkspaceCommand? {
     if (event.type != KeyEventType.KeyDown || !event.isCtrlPressed) return null
