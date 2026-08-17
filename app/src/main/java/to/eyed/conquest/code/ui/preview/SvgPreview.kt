@@ -90,7 +90,6 @@ private val Inset = 24.dp
 fun SvgPreview(
     editor: EditorState,
     path: String,
-    isDock: Boolean,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {

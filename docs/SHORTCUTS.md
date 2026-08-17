@@ -51,7 +51,7 @@ editor.
 | `Ctrl` `PageDown` / `PageUp` | Next / previous tab |
 | `Ctrl` `1`…`8` | Jump to tab by position |
 | `Ctrl` `9` | Jump to the last tab |
-| `Ctrl` `B` | Show/hide the project panel |
+| `Ctrl` `B` | Show/hide the left dock |
 | `Ctrl` `O` | Open the project picker (switch, create, import, export) |
 | `Ctrl` `P` | Find a file by name (fuzzy) |
 | `Ctrl` `F` | Find in the open file |
@@ -437,6 +437,8 @@ edition the shell runs inside Debian once you install it — see
 - Click a tab to switch to it, its `✕` to close it, and its unsaved-changes
   dot to save — the dot is a save button, which matters because the soft
   keyboard covers the status bar while you type.
+- In the status bar: the panel buttons sit with their docks — the left dock's
+  at the left end, the right dock's and the terminal's at the right.
 - In the terminal: the wheel scrolls the scrollback, drag selects, and the
   bar between the editor and the terminal drags to resize the dock.
 - In project search: the wheel scrolls the results, a row lights up under
@@ -475,10 +477,11 @@ wide screen. Go to line is
 the same: the panel's `↵` confirms and `✕` cancels, both reachable while the
 soft keyboard is up.
 
-The status bar carries a **Save** action while the current
-file has unsaved changes, `☰ files` toggles the project panel, `▤` toggles the project
-panel and `⌕` opens the file finder, and `❯_` opens the terminal. Project,
-file and settings commands live in the `☰` menu in the title bar, and
+The status bar carries one button per panel, each on the side its dock is on:
+the file tree, the git panel, project search and the preview, plus the terminal
+at the right end. A button lights while its panel is showing, and pressing it
+again closes that dock. Project, file and settings commands live in the `☰`
+menu in the title bar, and
 **Command palette…** at the top of that menu reaches everything else —
 it is the touch route to any command that has no button of its own. The
 project picker's own footer carries **New**, **Clone…** and **Import

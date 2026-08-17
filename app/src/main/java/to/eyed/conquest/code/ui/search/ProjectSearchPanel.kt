@@ -73,13 +73,6 @@ import to.eyed.conquest.code.ui.theme.BufferFontFamily
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import to.eyed.conquest.code.ui.workspace.EntryIconMark
 
-/**
- * Zed's `git_panel.default_width` (assets/settings/default.json:997) — its one
- * dock that shows code rather than names, and the width at which a result line
- * is still worth reading.
- */
-private val DockWidth = 360.dp
-private val DockMinWidth = 260.dp
 
 /** The bar is the buffer search bar's twin, so the numbers are its numbers. */
 private val BarHeight = 36.dp
@@ -95,8 +88,6 @@ private val RowMinHeight = 40.dp
 /** Room for four digits of the buffer font, right-aligned like the gutter. */
 private val LineNumberWidth = 40.dp
 
-/** The dock's grip, the same 6dp the terminal dock's is. */
-private val HandleWidth = 6.dp
 
 /**
  * How long the query rests before a search starts.
@@ -186,8 +177,6 @@ private data class SearchProgress(
 @Composable
 fun ProjectSearchPanel(
     project: ProjectSession,
-    /** Wide screens dock it beside the editor and let a mouse drag it wider. */
-    isDock: Boolean,
     /**
      * Bumped by the workspace whenever Ctrl+Shift+F is pressed, so pressing it
      * with the panel already open puts the caret back in the query rather than
@@ -444,22 +433,6 @@ fun ProjectSearchPanel(
  * The dock's left edge: the border between it and the editor, and the grip
  * that drags it wider. The terminal dock's handle, turned ninety degrees.
  */
-@Composable
-private fun ResizeHandle(onDrag: (Dp) -> Unit) {
-    val theme = LocalZedTheme.current
-    Box(
-        modifier = Modifier
-            .width(HandleWidth)
-            .fillMaxHeight()
-            .pointerHoverIcon(PointerIcon.Crosshair)
-            .pointerInput(Unit) {
-                detectHorizontalDragGestures { _, delta -> onDrag(delta.toDp()) }
-            },
-        contentAlignment = Alignment.Center,
-    ) {
-        VerticalDivider(color = theme.color("border"))
-    }
-}
 
 @Composable
 private fun QueryBar(

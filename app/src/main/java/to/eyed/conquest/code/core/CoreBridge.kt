@@ -250,6 +250,18 @@ object CoreBridge {
     external fun gitCommit(projectId: Long, message: String): String?
 
     /**
+     * A page of commit history, newest first, as JSON — `{"commits":[…]}` or
+     * `{"error":…}`. **Blocking** — it runs git.
+     */
+    external fun gitLog(projectId: Long, limit: Long, skip: Long): String
+
+    /**
+     * One commit in full: its fields, its whole message and the paths it
+     * touched. **Blocking** — it runs git.
+     */
+    external fun gitCommitDetails(projectId: Long, sha: String): String
+
+    /**
      * Who commits are recorded as, as JSON `{"name":…,"email":…}`. Both empty
      * when git has none — a fresh Debian guesses `root@localhost.(none)` from
      * the hostname, refuses to use it, and every commit fails until somebody

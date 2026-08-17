@@ -213,8 +213,6 @@ internal fun cappedSource(
  *
  * @param path the file's project-relative path — the header's title, and what
  *   a relative link is resolved against.
- * @param isDock true beside the editor on a wide screen, false when the
- *   preview has the whole work area.
  * @param onOpenPath asked to open a project-relative path when a relative link
  *   is followed. Null leaves such links inert.
  */
@@ -222,7 +220,6 @@ internal fun cappedSource(
 fun MarkdownPreview(
     editor: EditorState,
     path: String,
-    isDock: Boolean,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
     onOpenPath: ((String) -> Unit)? = null,

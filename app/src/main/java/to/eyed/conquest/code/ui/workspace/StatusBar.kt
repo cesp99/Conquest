@@ -55,7 +55,6 @@ fun StatusBar(
     /** Panels docked left, in the order they appear in the enum. */
     leftPanels: List<PanelButton> = emptyList(),
     rightPanels: List<PanelButton> = emptyList(),
-    onFindFile: (() -> Unit)? = null,
     isTerminalOpen: Boolean = false,
     onToggleTerminal: (() -> Unit)? = null,
 ) {
@@ -74,13 +73,6 @@ fun StatusBar(
     ) {
         for (button in leftPanels) {
             PanelStatusButton(button)
-        }
-        if (onFindFile != null) {
-            StatusIconAction(
-                icon = R.drawable.ic_ui_magnifying_glass,
-                label = "Find a file",
-                onClick = onFindFile,
-            )
         }
 
         Spacer(modifier = Modifier.weight(1f))

@@ -44,6 +44,42 @@ class GitSession(private val project: ProjectSession) {
         CoreBridge.gitStage(project.id, JSONArray(paths).toString())
 
     /**
+     * A page of history, newest first. Empty for a repository with no commits.
+     *
+     * **Blocking** — call it from [kotlinx.coroutines.Dispatchers.IO].
+     */
+    fun log(limit: Int = 100, skip: Int = 0): CommitPage {
+        val root = JSONObject(CoreBridge.gitLog(project.id, limit.toLong(), skip.toLong()))
+        if (!root.isNull("error")) return CommitPage(error = root.getString("error"))
+        val array = root.optJSONArray("commits") ?: JSONArray()
+        return CommitPage(
+            commits = List(array.length()) { index -> Commit.parse(array.getJSONObject(index)) },
+        )
+    }
+
+    /** One commit in full. Null when git could not read it. **Blocking**. */
+    fun commitDetails(sha: String): CommitDetails? {
+        val root = JSONObject(CoreBridge.gitCommitDetails(project.id, sha))
+        if (!root.isNull("error")) return null
+        val files = root.optJSONArray("files") ?: JSONArray()
+        return CommitDetails(
+            commit = Commit.parse(root),
+            message = root.optString("message"),
+            files = List(files.length()) { index ->
+                val file = files.getJSONObject(index)
+                CommitFile(
+                    status = file.optString("status").firstOrNull() ?: '?',
+                    path = file.optString("path"),
+                    // `optString` on a JSON null hands back the *string*
+                    // "null", which is how every renamed-from field in the
+                    // history read `null → .gitignore`.
+                    original = if (file.isNull("original")) null else file.getString("original"),
+                )
+            },
+        )
+    }
+
+    /**
      * Who commits will be recorded as, or nulls when git has none.
      *
      * **Blocking** — call it from [kotlinx.coroutines.Dispatchers.IO].
@@ -225,6 +261,55 @@ data class GitPanelState(
 data class GitIdentity(val name: String, val email: String) {
     val isComplete: Boolean get() = name.isNotBlank() && email.isNotBlank()
 }
+
+/** One commit, as the History tab draws it. */
+data class Commit(
+    val sha: String,
+    /** More than one means a merge. */
+    val parents: List<String>,
+    val author: String,
+    val authorEmail: String,
+    /** Seconds since the Unix epoch. */
+    val authorTime: Long,
+    val subject: String,
+    /** `HEAD -> main`, `origin/main`, `tag: v1` — git's own `%D`, split. */
+    val refs: List<String>,
+) {
+    val shortSha: String get() = sha.take(7)
+    val isMerge: Boolean get() = parents.size > 1
+
+    internal companion object {
+        fun parse(json: JSONObject): Commit {
+            val parents = json.optJSONArray("parents") ?: JSONArray()
+            val refs = json.optJSONArray("refs") ?: JSONArray()
+            return Commit(
+                sha = json.optString("sha"),
+                parents = List(parents.length()) { parents.getString(it) },
+                author = json.optString("author"),
+                authorEmail = json.optString("author_email"),
+                authorTime = json.optLong("author_time"),
+                subject = json.optString("subject"),
+                refs = List(refs.length()) { refs.getString(it) },
+            )
+        }
+    }
+}
+
+/** A page of history, or why there is none. */
+data class CommitPage(
+    val commits: List<Commit> = emptyList(),
+    val error: String? = null,
+)
+
+/** A path a commit touched. */
+data class CommitFile(val status: Char, val path: String, val original: String?)
+
+/** One commit in full: the row's fields, the whole message, and its files. */
+data class CommitDetails(
+    val commit: Commit,
+    val message: String,
+    val files: List<CommitFile>,
+)
 
 /** What happened to a run of rows, as the gutter paints it. */
 enum class GitHunkKind { Added, Modified, Deleted }

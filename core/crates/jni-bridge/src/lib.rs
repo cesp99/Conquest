@@ -635,6 +635,44 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitCommit(
     command_result(&env, engine().git_commit(project_id as u64, &message))
 }
 
+/// A page of commit history, newest first, as a JSON array of
+/// `{sha, parents, author, author_email, author_time, subject, refs}`.
+/// `[]` for a repository with no commits; the error text when git failed.
+/// **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitLog(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    limit: jlong,
+    skip: jlong,
+) -> jstring {
+    let json = match engine().git_log(project_id as u64, limit as u32, skip.max(0) as u32) {
+        Ok(commits) => serde_json::json!({ "commits": commits }).to_string(),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    };
+    to_jstring(&env, json)
+}
+
+/// One commit in full: the fields above plus `message` and `files`, each
+/// `{status, path, original}`. `{"error":…}` when git could not read it.
+/// **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitCommitDetails(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    sha: JString,
+) -> jstring {
+    let sha = get_string(&mut env, &sha);
+    let json = match engine().git_commit_details(project_id as u64, &sha) {
+        Ok(details) => serde_json::to_string(&details)
+            .unwrap_or_else(|_| "{\"error\":\"could not encode that commit\"}".to_owned()),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    };
+    to_jstring(&env, json)
+}
+
 /// Who commits are recorded as, as JSON `{"name":…,"email":…}` — both empty
 /// when git has none, which is a fresh Debian's state and the reason every
 /// commit in one fails. `{}` when there is no repository. **Blocking**.

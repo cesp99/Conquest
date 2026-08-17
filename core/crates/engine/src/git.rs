@@ -1071,14 +1071,14 @@ fn parse_run(output: &[u8]) -> Result<GitRun, String> {
 /// Where a command is going to run: the guest, the project, and the repository
 /// around it. Resolved once per command, and every failure here is a sentence
 /// the panel shows rather than a log line.
-struct Repo {
-    userland: Arc<Userland>,
-    project_root: PathBuf,
-    repo_root: PathBuf,
+pub(crate) struct Repo {
+    pub(crate) userland: Arc<Userland>,
+    pub(crate) project_root: PathBuf,
+    pub(crate) repo_root: PathBuf,
 }
 
 impl crate::Engine {
-    fn repo_for(&self, id: ProjectId) -> Result<Repo, String> {
+    pub(crate) fn repo_for(&self, id: ProjectId) -> Result<Repo, String> {
         let project = self
             .projects
             .lock()

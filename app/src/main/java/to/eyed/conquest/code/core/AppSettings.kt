@@ -68,9 +68,13 @@ data class AppSettings(
     /** How gitignored entries appear in the project tree. */
     val gitignoredFiles: GitignoredFiles = GitignoredFiles.Dimmed,
 ) {
-    /** Where [panel] sits, falling back to the shipped default. */
-    fun panel(panel: to.eyed.conquest.code.ui.workspace.WorkspacePanel): PanelPlacement =
-        panels[panel.settingsKey] ?: DEFAULT_PANELS.getValue(panel.settingsKey)
+    /**
+     * Where the panel keyed [settingsKey] sits, falling back to the shipped
+     * default. Keyed by string rather than by the UI's enum: settings are the
+     * lower layer and cannot see it.
+     */
+    fun panel(settingsKey: String): PanelPlacement =
+        panels[settingsKey] ?: DEFAULT_PANELS.getValue(settingsKey)
 
     companion object {
         /** Keys as the engine names them, for [CoreBridge.setSetting]. */

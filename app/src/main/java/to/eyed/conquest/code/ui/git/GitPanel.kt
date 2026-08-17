@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -35,6 +36,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import to.eyed.conquest.code.core.Commit
+import to.eyed.conquest.code.core.CommitDetails
+import to.eyed.conquest.code.core.CommitPage
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -98,7 +102,6 @@ val isGitPanelSupported: Boolean
 /** Zed's `git_panel.default_width` (assets/settings/default.json:997). */
 /** What the workspace budgets for this dock when it decides on a layout. */
 internal val GitPanelDockWidth = 360.dp
-private val DockMinWidth = 260.dp
 
 /** The project search panel's bar, because this is its twin. */
 private val BarHeight = 36.dp
@@ -112,8 +115,6 @@ private val FieldRadius = 6.dp
  */
 private val RowMinHeight = 40.dp
 
-/** The dock's grip, the same 6dp the terminal dock's is. */
-private val HandleWidth = 6.dp
 
 /** The engine debounces git by 400 ms; polling faster only costs JNI calls. */
 private const val POLL_MS = 250L
@@ -149,8 +150,6 @@ private val CommitBoxHeight = 76.dp
 @Composable
 fun GitPanel(
     project: ProjectSession,
-    /** Wide screens dock it beside the editor and let a mouse drag it wider. */
-    isDock: Boolean,
     /**
      * Bumped by the workspace whenever the panel's chord is pressed, so pressing
      * it again puts the keyboard back on the file list rather than doing nothing.
@@ -184,6 +183,11 @@ fun GitPanel(
      * setting and not a dialog: it is the answer to the error immediately
      * above it, and it goes away as soon as it is answered.
      */
+    /** Zed's two tabs: what has changed, and what has been committed. */
+    var tab by remember(project) { mutableStateOf(GitPanelTab.Changes) }
+    var history by remember(project) { mutableStateOf<CommitPage?>(null) }
+    /** The commit whose detail is expanded, by sha. */
+    var openCommit by remember(project) { mutableStateOf<CommitDetails?>(null) }
     var identityWanted by remember(project) { mutableStateOf(false) }
     var identityName by remember(project) { mutableStateOf(TextFieldValue()) }
     var identityEmail by remember(project) { mutableStateOf(TextFieldValue()) }
@@ -210,6 +214,14 @@ fun GitPanel(
             }
             delay(POLL_MS)
         }
+    }
+
+    // Loaded when the History tab is opened, and again whenever the
+    // repository's own counter moves — a commit made in this panel has to
+    // appear at the top of it without asking the user to come back.
+    LaunchedEffect(session, tab, state) {
+        if (tab != GitPanelTab.History) return@LaunchedEffect
+        history = withContext(Dispatchers.IO) { session.log() }
     }
 
     val rows = remember(state) { gitPanelRows(state) }
@@ -410,7 +422,35 @@ fun GitPanel(
         ) {
             HeaderBar(state = state, busy = busy, onClose = onDismiss)
             HorizontalDivider(color = theme.color("border.variant"))
+            TabBar(
+                tab = tab,
+                changeCount = state.entries.size,
+                onTab = {
+                    tab = it
+                    openCommit = null
+                },
+            )
+            HorizontalDivider(color = theme.color("border.variant"))
 
+            if (tab == GitPanelTab.History) {
+                HistoryList(
+                    page = history,
+                    open = openCommit,
+                    onOpen = { commit ->
+                        if (openCommit?.commit?.sha == commit.sha) {
+                            openCommit = null
+                        } else {
+                            scope.launch {
+                                openCommit = withContext(Dispatchers.IO) {
+                                    session.commitDetails(commit.sha)
+                                }
+                            }
+                        }
+                    },
+                    onOpenFile = onOpenFile,
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                )
+            } else
             Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
                 if (rows.isEmpty()) {
                     EmptyMessage(state)
@@ -484,6 +524,7 @@ fun GitPanel(
                 )
             }
 
+            if (tab == GitPanelTab.Changes) {
             HorizontalDivider(color = theme.color("border"))
             CommitBox(
                 message = message,
@@ -496,6 +537,7 @@ fun GitPanel(
                 busy = busy,
                 onCommit = ::commit,
             )
+            }
         }
     }
 
@@ -516,22 +558,6 @@ fun GitPanel(
  * The dock's left edge: the border between it and the editor, and the grip that
  * drags it wider. The project search panel's handle, unchanged.
  */
-@Composable
-private fun ResizeHandle(onDrag: (Dp) -> Unit) {
-    val theme = LocalZedTheme.current
-    Box(
-        modifier = Modifier
-            .width(HandleWidth)
-            .fillMaxHeight()
-            .pointerHoverIcon(PointerIcon.Crosshair)
-            .pointerInput(Unit) {
-                detectHorizontalDragGestures { _, delta -> onDrag(delta.toDp()) }
-            },
-        contentAlignment = Alignment.Center,
-    ) {
-        VerticalDivider(color = theme.color("border"))
-    }
-}
 
 /** Branch, drift, and the close button. */
 @Composable
@@ -1247,4 +1273,265 @@ private fun PanelAction(label: String, enabled: Boolean, onClick: () -> Unit) {
             .pointerHoverIcon(PointerIcon.Hand)
             .padding(horizontal = 10.dp, vertical = 8.dp),
     )
+}
+
+/** Zed's two tabs (`git_panel.rs:507`). */
+enum class GitPanelTab { Changes, History }
+
+/**
+ * The tab strip — Zed's, at Zed's proportions: two halves, the inactive one
+ * dimmed and set back, the active one carrying the count
+ * (`git_panel.rs:6257-6325`).
+ */
+@Composable
+private fun TabBar(tab: GitPanelTab, changeCount: Int, onTab: (GitPanelTab) -> Unit) {
+    val theme = LocalZedTheme.current
+    Row(modifier = Modifier.fillMaxWidth().height(TabHeight)) {
+        for (candidate in GitPanelTab.entries) {
+            val active = candidate == tab
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .background(
+                        if (active) {
+                            theme.color("panel.background")
+                        } else {
+                            theme.color("editor.background")
+                        }
+                    )
+                    .clickable(onClickLabel = "Show ${candidate.name}") { onTab(candidate) }
+                    .pointerHoverIcon(PointerIcon.Hand),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = candidate.name,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (active) theme.color("text") else theme.color("text.muted"),
+                )
+                if (candidate == GitPanelTab.Changes && changeCount > 0) {
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "($changeCount)",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = theme.color("text.muted"),
+                    )
+                }
+            }
+            if (candidate == GitPanelTab.Changes) {
+                VerticalDivider(color = theme.color("border.variant"))
+            }
+        }
+    }
+}
+
+private val TabHeight = 36.dp
+
+/**
+ * What has been committed — Zed's History tab.
+ *
+ * A row is the subject, then who and when and which commit, which is what
+ * Zed's own rows carry. Tapping one expands what it touched underneath it
+ * rather than opening a view of its own: a phone has one work area, and the
+ * question "what was in that commit" is usually answered by a glance at the
+ * file list.
+ */
+@Composable
+private fun HistoryList(
+    page: CommitPage?,
+    open: CommitDetails?,
+    onOpen: (Commit) -> Unit,
+    onOpenFile: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val theme = LocalZedTheme.current
+    val now = remember(page) { System.currentTimeMillis() / 1000L }
+    when {
+        page == null -> Box(modifier = modifier, contentAlignment = Alignment.Center) {
+            Text(
+                text = "Reading history…",
+                style = MaterialTheme.typography.bodyMedium,
+                color = theme.color("text.muted"),
+            )
+        }
+        page.error != null -> Box(modifier = modifier, contentAlignment = Alignment.Center) {
+            Text(
+                text = page.error,
+                style = MaterialTheme.typography.bodyMedium,
+                color = theme.color("error"),
+                modifier = Modifier.padding(24.dp),
+            )
+        }
+        page.commits.isEmpty() -> Box(modifier = modifier, contentAlignment = Alignment.Center) {
+            Text(
+                text = "Nothing has been committed yet",
+                style = MaterialTheme.typography.bodyMedium,
+                color = theme.color("text.muted"),
+                modifier = Modifier.padding(24.dp),
+            )
+        }
+        else -> LazyColumn(modifier = modifier) {
+            items(page.commits, key = { it.sha }) { commit ->
+                CommitRow(
+                    commit = commit,
+                    now = now,
+                    isOpen = open?.commit?.sha == commit.sha,
+                    onClick = { onOpen(commit) },
+                )
+                if (open?.commit?.sha == commit.sha) {
+                    CommitDetail(details = open, onOpenFile = onOpenFile)
+                }
+                HorizontalDivider(color = theme.color("border.variant"))
+            }
+        }
+    }
+}
+
+@Composable
+private fun CommitRow(commit: Commit, now: Long, isOpen: Boolean, onClick: () -> Unit) {
+    val theme = LocalZedTheme.current
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(
+                if (isOpen) theme.color("element.selected", theme.color("border.variant")) else Color.Transparent
+            )
+            .clickable(onClickLabel = "Show what this commit changed", onClick = onClick)
+            .pointerHoverIcon(PointerIcon.Hand)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Text(
+            text = commit.subject.ifBlank { "(no message)" },
+            style = MaterialTheme.typography.bodyMedium,
+            color = theme.color("text"),
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = commit.author.ifBlank { "Unknown" },
+                style = MaterialTheme.typography.labelMedium,
+                color = theme.color("text.muted"),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            Dot(theme)
+            Text(
+                text = relativeTime(commit.authorTime, now),
+                style = MaterialTheme.typography.labelMedium,
+                color = theme.color("text.muted"),
+                maxLines = 1,
+            )
+            Dot(theme)
+            Text(
+                text = commit.shortSha,
+                style = MaterialTheme.typography.labelMedium,
+                color = theme.color("text.muted"),
+                maxLines = 1,
+            )
+            if (commit.isMerge) {
+                Dot(theme)
+                Text(
+                    text = "merge",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = theme.color("text.muted"),
+                )
+            }
+        }
+        if (commit.refs.isNotEmpty()) {
+            // Where the branches and tags are, which is the one thing a list
+            // of subjects cannot tell you.
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                for (name in commit.refs.take(3)) {
+                    Text(
+                        text = name.removePrefix("HEAD -> "),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = theme.color("text.accent", theme.color("text")),
+                        modifier = Modifier
+                            .background(
+                                theme.color("element.background", theme.color("border.variant")),
+                                RoundedCornerShape(3.dp),
+                            )
+                            .padding(horizontal = 5.dp, vertical = 1.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun Dot(theme: to.eyed.conquest.code.ui.theme.ZedTheme) {
+    Text(
+        text = "•",
+        style = MaterialTheme.typography.labelMedium,
+        color = theme.color("text.muted"),
+        modifier = Modifier.padding(horizontal = 5.dp),
+    )
+}
+
+/** What one commit said and touched. */
+@Composable
+private fun CommitDetail(details: CommitDetails, onOpenFile: (String) -> Unit) {
+    val theme = LocalZedTheme.current
+    val colours = remember(theme) {
+        GitStatusColours.from(theme, theme.color("text"), theme.color("text.muted"))
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(theme.color("editor.background"))
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        val body = details.message.substringAfter('\n', "").trim()
+        if (body.isNotEmpty()) {
+            Text(
+                text = body,
+                style = MaterialTheme.typography.bodySmall,
+                color = theme.color("text.muted"),
+            )
+        }
+        Text(
+            text = "${details.commit.authorEmail} · ${details.files.size} " +
+                if (details.files.size == 1) "file" else "files",
+            style = MaterialTheme.typography.labelSmall,
+            color = theme.color("text.muted"),
+        )
+        for (file in details.files) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClickLabel = "Open ${file.path}") { onOpenFile(file.path) }
+                    .pointerHoverIcon(PointerIcon.Hand)
+                    .padding(vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = file.status.toString(),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = colours.colorFor(statusOf(file.status)),
+                    modifier = Modifier.width(16.dp),
+                )
+                Text(
+                    text = file.original?.let { "${it} → ${file.path}" } ?: file.path,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = theme.color("text"),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+/** git's letter, in the vocabulary the panel paints with. */
+private fun statusOf(letter: Char): to.eyed.conquest.code.ui.workspace.GitFileStatus = when (letter) {
+    'A' -> to.eyed.conquest.code.ui.workspace.GitFileStatus.Added
+    'D' -> to.eyed.conquest.code.ui.workspace.GitFileStatus.Deleted
+    'R', 'C' -> to.eyed.conquest.code.ui.workspace.GitFileStatus.Renamed
+    else -> to.eyed.conquest.code.ui.workspace.GitFileStatus.Modified
 }

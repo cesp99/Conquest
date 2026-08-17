@@ -143,7 +143,7 @@ fun SettingsScreen(
                             label = panel.title,
                             detail = if (panel == WorkspacePanel.Project) "Which side it docks on" else null,
                             options = DockSide.entries.map { it to it.label },
-                            selected = settings.panel(panel).dock,
+                            selected = settings.panel(panel.settingsKey).dock,
                             onSelect = {
                                 onSet(AppSettings.keyForDock(panel.settingsKey), "\"${it.key}\"")
                             },

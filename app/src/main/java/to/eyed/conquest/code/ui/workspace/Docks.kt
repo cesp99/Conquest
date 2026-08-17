@@ -31,9 +31,9 @@ enum class WorkspacePanel(
     Preview("preview", "Preview", R.drawable.ic_ui_eye);
 
     /** Which side this panel is docked on right now. */
-    fun sideIn(settings: AppSettings): DockSide = settings.panel(this).dock
+    fun sideIn(settings: AppSettings): DockSide = settings.panel(settingsKey).dock
 
-    fun widthIn(settings: AppSettings): Dp = settings.panel(this).defaultWidth.dp
+    fun widthIn(settings: AppSettings): Dp = settings.panel(settingsKey).defaultWidth.dp
 }
 
 /**
@@ -82,6 +82,21 @@ class DockLayout {
     fun isOpen(panel: WorkspacePanel, settings: AppSettings): Boolean =
         active(panel.sideIn(settings)) == panel
 
+    /**
+     * Bring [panel]'s dock to the front when the screen cannot show both.
+     *
+     * A dock that is open but *not drawn* — the loser of a tight screen — has
+     * a button that says "open" and nothing on screen. Pressing it has to show
+     * it, not close it, which is what [toggle] did: it saw the panel as active
+     * and shut it, so the first press did nothing visible and the second one
+     * finally worked.
+     */
+    fun raise(panel: WorkspacePanel, settings: AppSettings) {
+        val side = panel.sideIn(settings)
+        if (active(side) != panel) return
+        lastOpened = side
+    }
+
     private fun show(side: DockSide, panel: WorkspacePanel?) {
         if (side == DockSide.Left) left = panel else right = panel
     }
@@ -122,16 +137,17 @@ class DockLayout {
     fun reconcile(settings: AppSettings) {
         val movedFromLeft = left?.takeIf { it.sideIn(settings) != DockSide.Left }
         val movedFromRight = right?.takeIf { it.sideIn(settings) != DockSide.Right }
-        if (movedFromLeft != null) {
-            left = null
-            right = movedFromLeft
-            rightWidth = movedFromLeft.widthIn(settings)
-        }
-        if (movedFromRight != null) {
-            right = null
-            left = movedFromRight
-            leftWidth = movedFromRight.widthIn(settings)
-        }
+        if (movedFromLeft == null && movedFromRight == null) return
+        // Both sides are decided before either is written: swapping the two
+        // panels at once — one hand-edit of settings.json does it — used to
+        // drop whichever moved first, because the second assignment
+        // overwrote it.
+        val nextLeft = movedFromRight ?: left.takeIf { movedFromLeft == null }
+        val nextRight = movedFromLeft ?: right.takeIf { movedFromRight == null }
+        left = nextLeft
+        right = nextRight
+        if (movedFromRight != null) leftWidth = movedFromRight.widthIn(settings)
+        if (movedFromLeft != null) rightWidth = movedFromLeft.widthIn(settings)
     }
 }
 

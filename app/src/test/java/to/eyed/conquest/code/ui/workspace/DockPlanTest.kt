@@ -117,4 +117,62 @@ class DockPlanTest {
         val full = plan(window = 411, right = 360)
         assert(full.draws(DockSide.Right) && !full.draws(DockSide.Left))
     }
+
+    // ---- what the layout state does, as opposed to what it measures -------
+
+    private val settings = to.eyed.conquest.code.core.AppSettings()
+
+    /**
+     * Moving *both* panels across at once — one hand-edit of settings.json
+     * does it — used to drop whichever moved first, because the second
+     * assignment overwrote the first.
+     */
+    @Test
+    fun swappingBothPanelsAtOnceKeepsBoth() {
+        val docks = DockLayout()
+        docks.open(WorkspacePanel.Project, settings)
+        docks.open(WorkspacePanel.Git, settings)
+        assertEquals(WorkspacePanel.Project, docks.left)
+        assertEquals(WorkspacePanel.Git, docks.right)
+
+        val swapped = settings.copy(
+            panels = mapOf(
+                "project_panel" to to.eyed.conquest.code.core.PanelPlacement(DockSide.Right, 240f),
+                "git_panel" to to.eyed.conquest.code.core.PanelPlacement(DockSide.Left, 360f),
+            )
+        )
+        docks.reconcile(swapped)
+        assertEquals(WorkspacePanel.Git, docks.left)
+        assertEquals(WorkspacePanel.Project, docks.right)
+    }
+
+    /**
+     * A dock that is open but not drawn — the loser of a tight screen — is
+     * *raised* by its button, not closed. Toggling it was a silent no-op
+     * followed by a second press that finally worked.
+     */
+    @Test
+    fun raisingAWaitingDockDoesNotCloseIt() {
+        val docks = DockLayout()
+        docks.open(WorkspacePanel.Project, settings)
+        docks.open(WorkspacePanel.Git, settings)
+        assertEquals(DockSide.Right, docks.lastOpened)
+
+        docks.raise(WorkspacePanel.Project, settings)
+        assertEquals(DockSide.Left, docks.lastOpened)
+        // Still open, both of them.
+        assertEquals(WorkspacePanel.Project, docks.left)
+        assertEquals(WorkspacePanel.Git, docks.right)
+    }
+
+    /** One panel per dock: opening a second on the same side replaces it. */
+    @Test
+    fun aSecondPanelOnTheSameSideTakesTheDock() {
+        val docks = DockLayout()
+        docks.open(WorkspacePanel.Git, settings)
+        docks.open(WorkspacePanel.Search, settings)
+        assertEquals(WorkspacePanel.Search, docks.right)
+        // And the other side is untouched by any of it.
+        assertNull(docks.left)
+    }
 }

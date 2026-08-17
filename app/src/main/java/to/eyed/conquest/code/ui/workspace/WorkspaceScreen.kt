@@ -214,7 +214,15 @@ fun WorkspaceScreen(
      * whatever opens a file *from* a dock — which has to hand the area back
      * when it is true, and must not when the editor is right there next to it.
      */
-    var dockTookWorkArea by remember { mutableStateOf(false) }
+    var dockTookWorkArea by remember { mutableStateOf<DockSide?>(null) }
+    /**
+     * Which docks the last layout actually drew.
+     *
+     * Open and drawn are not the same thing — a screen that cannot hold both
+     * docks draws one and leaves the other waiting — and the buttons have to
+     * know the difference, or the one for a waiting panel closes it invisibly.
+     */
+    var drawnDocks by remember { mutableStateOf(emptySet<DockSide>()) }
     var settingsValid by remember { mutableStateOf(true) }
     /** What the engine refused, if it refused the last write. */
     var settingsRefusal by remember { mutableStateOf<String?>(null) }
@@ -448,11 +456,6 @@ fun WorkspaceScreen(
         }
     }
 
-    val onOpenEntry: (ProjectEntry) -> Unit = { entry ->
-        project?.let { openFile(it, entry.path) }
-    }
-
-    // Wide layouts can hide the panel (Ctrl+B); compact ones use the drawer.
     var isWide by remember { mutableStateOf(false) }
     // A wide screen opens with its sidebar up, which is what it did before
     // docks existed and what Zed does. A compact one does not: there, a dock
@@ -484,7 +487,21 @@ fun WorkspaceScreen(
      * `terminalFocused` still says the shell has the keys. Returns whether the
      * panel is now open.
      */
+    /** Whether [panel] is not just open but on screen. See [drawnDocks]. */
+    fun panelIsDrawn(panel: WorkspacePanel): Boolean =
+        docks.isOpen(panel, settings) && panel.sideIn(settings) in drawnDocks
+
     fun togglePanel(panel: WorkspacePanel): Boolean {
+        // A panel that is open but *not drawn* — the loser when two docks will
+        // not both fit — is raised rather than toggled. Its button says open
+        // and the screen says otherwise; the press has to resolve that in
+        // favour of showing it, not of closing something invisible.
+        if (docks.isOpen(panel, settings) && !panelIsDrawn(panel)) {
+            docks.raise(panel, settings)
+            terminalFocused = false
+            rootFocus.requestFocus()
+            return true
+        }
         val opened = docks.toggle(panel, settings)
         terminalFocused = false
         rootFocus.requestFocus()
@@ -505,10 +522,11 @@ fun WorkspaceScreen(
             ?: return false
         // A panel with nothing to show would open onto its empty state and
         // take the screen with it.
+        // A tree with no project is an empty panel over the work area with no
+        // button to dismiss it.
         val usable = when (panel) {
             WorkspacePanel.Preview -> canPreviewActiveFile()
-            WorkspacePanel.Search, WorkspacePanel.Git -> project != null
-            WorkspacePanel.Project -> true
+            else -> project != null
         }
         if (!usable) return false
         return togglePanel(panel)
@@ -557,8 +575,8 @@ fun WorkspaceScreen(
             WorkspaceCommand.NextTab -> files.selectRelative(1)
             WorkspaceCommand.PreviousTab -> files.selectRelative(-1)
             WorkspaceCommand.ToggleProjectPanel -> togglePanel(WorkspacePanel.Project)
-            WorkspaceCommand.ToggleLeftDock -> toggleDock(DockSide.Left)
-            WorkspaceCommand.ToggleRightDock -> toggleDock(DockSide.Right)
+            WorkspaceCommand.ToggleLeftDock -> if (!toggleDock(DockSide.Left)) return false
+            WorkspaceCommand.ToggleRightDock -> if (!toggleDock(DockSide.Right)) return false
             WorkspaceCommand.OpenProjects -> {
                 refreshProjects()
                 transferError = null
@@ -638,11 +656,11 @@ fun WorkspaceScreen(
     fun openMatch(path: String, match: ProjectSearchMatch) {
         val open = project ?: return
         openFile(open, path) { file -> file.editor?.revealProjectSearchMatch(match) }
-        if (dockTookWorkArea) {
+        if (dockTookWorkArea != null) {
             // A compact screen gave the panel the whole work area, so opening a
             // file has to hand it back — and hand the keyboard back with it, or
             // the keymap dies the way it did when Stop-all closed the dock.
-            docks.closeDock(docks.lastOpened)
+            dockTookWorkArea?.let(docks::closeDock)
             terminalFocused = false
             rootFocus.requestFocus()
         }
@@ -659,12 +677,21 @@ fun WorkspaceScreen(
     fun openFromDock(path: String) {
         val open = project ?: return
         openFile(open, path)
-        if (dockTookWorkArea) {
-            docks.closeDock(docks.lastOpened)
+        // The dock that *has* the work area, which is not always the one
+        // opened most recently — a panel can be left holding the screen after
+        // the newer one is dismissed.
+        dockTookWorkArea?.let { side ->
+            docks.closeDock(side)
             terminalFocused = false
             rootFocus.requestFocus()
         }
     }
+
+    // A tap in the tree is a dock opening a file, and on a compact screen the
+    // dock *is* the work area — so it hands the area back, exactly as a search
+    // hit does. Without this the file opened behind the tree and nothing
+    // looked like it had happened.
+    val onOpenEntry: (ProjectEntry) -> Unit = { entry -> openFromDock(entry.path) }
 
     fun openProjectSearch(): Boolean {
         if (project == null) return false
@@ -846,7 +873,8 @@ fun WorkspaceScreen(
                 minDock = DockMinWidth,
                 canSplit = isWide,
             )
-            dockTookWorkArea = plan.fullScreen != null
+            dockTookWorkArea = plan.fullScreen
+            drawnDocks = DockSide.entries.filter { plan.draws(it) }.toSet()
             val terminalIsFullScreen = !isWide && terminals.isOpen && plan.fullScreen == null
             Box(modifier = Modifier.weight(1f)) {
                 val fullScreen = plan.fullScreen
@@ -1005,7 +1033,7 @@ fun WorkspaceScreen(
                 .map { panel ->
                     PanelButton(
                         panel = panel,
-                        isOpen = docks.isOpen(panel, settings),
+                        isOpen = panelIsDrawn(panel),
                         onClick = {
                             when (panel) {
                                 WorkspacePanel.Search -> if (docks.isOpen(panel, settings)) {
@@ -1029,11 +1057,6 @@ fun WorkspaceScreen(
                 hasFile = active?.editor != null,
                 leftPanels = panelButtons.filter { it.panel.sideIn(settings) == DockSide.Left },
                 rightPanels = panelButtons.filter { it.panel.sideIn(settings) == DockSide.Right },
-                onFindFile = if (project != null) {
-                    { runCommand(WorkspaceCommand.FindFile) }
-                } else {
-                    null
-                },
                 isTerminalOpen = terminals.isOpen,
                 onToggleTerminal = if (project != null) {
                     { runCommand(WorkspaceCommand.ToggleTerminal) }
@@ -1399,7 +1422,6 @@ private fun DockPanel(
         )
         WorkspacePanel.Search -> ProjectSearchPanel(
             project = project ?: return,
-            isDock = true,
             focusToken = searchFocus,
             onOpenMatch = onOpenMatch,
             onDismiss = onDismiss,
@@ -1407,13 +1429,11 @@ private fun DockPanel(
         WorkspacePanel.Preview -> PreviewPanel(
             editor = file?.editor ?: return,
             path = file.path,
-            isDock = true,
             onDismiss = onDismiss,
             onOpenPath = onOpenPath,
         )
         WorkspacePanel.Git -> GitPanel(
             project = project ?: return,
-            isDock = true,
             focusToken = gitFocus,
             onOpenFile = onOpenPath,
             onDismiss = onDismiss,
@@ -1433,7 +1453,6 @@ private fun DockPanel(
 private fun PreviewPanel(
     editor: EditorState,
     path: String,
-    isDock: Boolean,
     onDismiss: () -> Unit,
     onOpenPath: (String) -> Unit,
 ) {
@@ -1441,13 +1460,11 @@ private fun PreviewPanel(
         PreviewKind.Svg -> SvgPreview(
             editor = editor,
             path = path,
-            isDock = isDock,
             onDismiss = onDismiss,
         )
         else -> MarkdownPreview(
             editor = editor,
             path = path,
-            isDock = isDock,
             onDismiss = onDismiss,
             onOpenPath = onOpenPath,
         )
