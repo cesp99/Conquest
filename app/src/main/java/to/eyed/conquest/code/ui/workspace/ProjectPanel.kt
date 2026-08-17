@@ -249,9 +249,10 @@ fun ProjectPanel(
         val colours = remember(theme, onSurface, onSurfaceVariant) {
             GitStatusColours.from(theme, onSurface, onSurfaceVariant)
         }
-        val icons = remember(theme, onSurfaceVariant) {
-            EntryIconColours.from(theme, onSurfaceVariant)
-        }
+        // One tint for every icon: Zed's file icons are monochrome and it is
+        // the row's *name* that carries git status. `icon.muted` is what its
+        // project panel asks for.
+        val iconColour = theme.color("icon.muted", onSurfaceVariant)
         // `ghost_element.*`, not `element.*`: a project-panel row is a
         // borderless `ListItem`, and Zed paints those from the ghost ramp
         // (list_item.rs:323-329). The `element.*` ramp belongs to things that
@@ -631,7 +632,7 @@ fun ProjectPanel(
         ProjectRootRow(
             name = project.rootName,
             rowColours = rowColours,
-            iconColour = icons.colorFor(EntryIcon.Folder),
+            iconColour = iconColour,
             onClick = { reshape { tree.collapseAll() } },
             onContextMenu = { at -> menu = PanelMenu(null, at) },
             menu = {
@@ -674,7 +675,7 @@ fun ProjectPanel(
                             depth = row.depth + 1,
                             status = row.status,
                             colours = colours,
-                            icons = icons,
+                            iconColour = iconColour,
                             rowColours = rowColours,
                             isExpanded = tree.isExpanded(row.entry.path),
                             isOpen = row.entry.path == openedPath,
@@ -853,7 +854,12 @@ private fun ProjectRootRow(
                 modifier = Modifier.width(EntryIconWidth),
                 contentAlignment = Alignment.CenterStart,
             ) {
-                EntryIconMark(icon = EntryIcon.Folder, color = iconColour)
+                EntryIconMark(
+                    name = name,
+                    isDir = true,
+                    isExpanded = true,
+                    color = iconColour,
+                )
             }
             Text(
                 text = name,
@@ -881,7 +887,7 @@ private fun ProjectRow(
     depth: Int,
     status: GitFileStatus,
     colours: GitStatusColours,
-    icons: EntryIconColours,
+    iconColour: Color,
     rowColours: RowColours,
     isExpanded: Boolean,
     isOpen: Boolean,
@@ -901,7 +907,6 @@ private fun ProjectRow(
     // Colours were resolved once for the whole panel, so this is a `when` over
     // an enum — no theme lookup and no allocation per row, per frame.
     val color = colours.colorFor(status, entry.isIgnored, dimIgnored)
-    val icon = remember(entry.name, entry.isDir) { entryIconFor(entry.name, entry.isDir) }
     val interaction = remember { MutableInteractionSource() }
     val hovered by interaction.collectIsHoveredAsState()
     val isPressed by interaction.collectIsPressedAsState()
@@ -962,8 +967,10 @@ private fun ProjectRow(
                 contentAlignment = Alignment.CenterStart,
             ) {
                 EntryIconMark(
-                    icon = icon,
-                    color = icons.colorFor(icon).copy(alpha = if (isCut) CUT_ALPHA else 1f),
+                    name = entry.name,
+                    isDir = entry.isDir,
+                    isExpanded = isExpanded,
+                    color = iconColour.copy(alpha = if (isCut) CUT_ALPHA else 1f),
                 )
             }
             Text(
