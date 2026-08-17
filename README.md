@@ -62,6 +62,13 @@ Samsung DeX.
 | Tabs, save & external change detection | ✅ dirty dots, atomic save, live reload |
 | Projects: create, switch, import & export | ✅ app-private storage, SAF folder import/export |
 | Fuzzy file finder | ✅ Ctrl+P, match highlighting |
+| Command palette | ✅ Ctrl+Shift+P, every command with its chord, Zed's action names |
+| Find in file | ✅ Ctrl+F, case/word/regex, every match highlighted |
+| Search across the project | ✅ engine-side, cancellable, gitignore-aware |
+| Multiple cursors & line operations | ✅ Ctrl+D, cursors above/below, move/duplicate/delete line, toggle comment |
+| Autoclose, auto-indent, indent guides | ✅ from the language's own brackets |
+| Project panel as a file manager | ✅ new/rename/delete/duplicate, context menu, full keyboard |
+| Themes | ✅ eleven of Zed's own, with a live-preview picker |
 | Settings | ✅ JSONC file that keeps your comments, settings screen |
 | Integrated terminal | ✅ shells in the project directory, tabs, theme colours, keyboard/mouse/touch |
 | Terminal sessions survive backgrounding | ✅ foreground service, notification with **Stop all**, survives a swipe from Recents |

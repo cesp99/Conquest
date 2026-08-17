@@ -100,6 +100,23 @@ private const val CURSOR_BLINK_MILLIS = 530L
  * cursors and selections with drag handles + floating toolbar,
  * soft-keyboard editing (editorTextInput) and hardware keys.
  */
+/**
+ * How many indent levels [text] is indented past, counting a tab as a whole
+ * level and spaces in [tabSize]s. A line that is only whitespace has none: a
+ * guide drawn on a blank line would be a guide pointing at nothing.
+ */
+private fun indentLevels(text: String, tabSize: Int): Int {
+    var columns = 0
+    for (char in text) {
+        when (char) {
+            '\t' -> columns += tabSize
+            ' ' -> columns++
+            else -> return columns / tabSize
+        }
+    }
+    return 0
+}
+
 @Composable
 fun EditorPane(
     state: EditorState,
@@ -293,6 +310,42 @@ fun EditorPane(
                     topLeft = Offset(0f, cursorTop),
                     size = Size(size.width, lineHeight),
                 )
+            }
+
+            // Indent guides. Zed draws them by default
+            // (`indent_guides.enabled: true`, assets/settings/default.json:706)
+            // and they are most of what makes deep code readable at a phone's
+            // font size. One line per level the row is indented past, in
+            // `editor.indent_guide`, with the level the cursor sits at drawn in
+            // `editor.indent_guide_active` — the theme leaves both keys out and
+            // ZedTheme derives them.
+            //
+            // Per row rather than per block: a block-aware guide needs the tree
+            // the outline work will bring, and the per-row form is right for
+            // every case except a blank line inside a block, where Zed carries
+            // the guide through and we do not.
+            if (state.tabSize > 0) {
+                val guide = theme.color("editor.indent_guide")
+                val activeGuide = theme.color("editor.indent_guide_active")
+                val guideWidth = state.cursorWidthPx / 2f
+                val step = state.charWidthPx * state.tabSize
+                val activeLevel = indentLevels(state.line(state.cursorRow), state.tabSize)
+                clipRect(left = gutterWidth) {
+                    for (row in firstRow until lastRow) {
+                        val text = lines.getOrElse(row - firstRow) { "" }
+                        val levels = indentLevels(text, state.tabSize)
+                        val top = row * lineHeight - state.scrollY
+                        for (level in 0 until levels) {
+                            val x = textLeft + level * step
+                            if (x < gutterWidth || x > size.width) continue
+                            drawRect(
+                                color = if (level == activeLevel - 1) activeGuide else guide,
+                                topLeft = Offset(x, top),
+                                size = Size(guideWidth, lineHeight),
+                            )
+                        }
+                    }
+                }
             }
 
             val spansWindow = state.spansWindow()
