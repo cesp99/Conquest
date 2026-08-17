@@ -189,6 +189,8 @@ fun WorkspaceScreen(
      * than leaving a rendered README beside a Rust file.
      */
     var previewOpen by remember { mutableStateOf(false) }
+    /** Ctrl+G. A surface rather than a command: it answers for itself. */
+    var goToLineOpen by remember { mutableStateOf(false) }
     /** Ctrl+Shift+F. The token is bumped to pull focus back to its query. */
     var projectSearchOpen by remember { mutableStateOf(false) }
     var projectSearchFocus by remember { mutableIntStateOf(0) }
@@ -321,6 +323,12 @@ fun WorkspaceScreen(
     // remove it and the engine went on running a git that was no longer there.
     LaunchedEffect(UserlandInstaller.state) {
         withContext(Dispatchers.IO) { syncUserlandWithEngine(context) }
+    }
+
+    // The panel moves the caret of the buffer it was opened on; if that tab
+    // closes underneath it there is nothing left for it to move.
+    LaunchedEffect(files.active) {
+        if (files.active?.editor == null) goToLineOpen = false
     }
 
     LaunchedEffect(Unit) {
@@ -607,6 +615,11 @@ fun WorkspaceScreen(
                 if (isPreview(event, focus)) {
                     return@onPreviewKeyEvent runCommand(WorkspaceCommand.TogglePreview)
                 }
+                if (isGoToLine(event, focus)) {
+                    if (files.active?.editor == null) return@onPreviewKeyEvent false
+                    goToLineOpen = true
+                    return@onPreviewKeyEvent true
+                }
                 tabIndexFor(event, files.tabs.size, focus)?.let { index ->
                     files.select(index)
                     return@onPreviewKeyEvent true
@@ -637,7 +650,17 @@ fun WorkspaceScreen(
                 MenuAction("Find file…", shortcutLabel(WorkspaceCommand.FindFile), enabled = project != null) {
                     runCommand(WorkspaceCommand.FindFile)
                 },
-                MenuAction("Save", shortcutLabel(WorkspaceCommand.Save), enabled = active != null) {
+                MenuAction("Go to line…", GoToLineChord.label, enabled = active?.editor != null) {
+                    goToLineOpen = true
+                },
+                MenuAction(
+                    "Toggle preview",
+                    PreviewChord.label,
+                    enabled = canPreviewActiveFile(),
+                ) {
+                    runCommand(WorkspaceCommand.TogglePreview)
+                },
+                MenuAction("Save", shortcutLabel(WorkspaceCommand.Save), enabled = active?.session != null) {
                     active?.let { save(it) }
                 },
                 MenuAction("Save all", null, enabled = files.tabs.any { it.isDirty }) {
@@ -840,6 +863,22 @@ fun WorkspaceScreen(
                             onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
                         )
                     }
+                }
+                // Over the editor, at the top, where Zed's own sits — and only
+                // while the editor is the thing on screen: it moves the caret
+                // as you type, which is pointless behind a full-screen panel.
+                val goToLineEditor = active?.editor
+                if (goToLineOpen && goToLineEditor != null &&
+                    !searchIsFullScreen && !previewIsFullScreen && !dockIsFullScreen
+                ) {
+                    GoToLine(
+                        editor = goToLineEditor,
+                        onDismiss = {
+                            goToLineOpen = false
+                            rootFocus.requestFocus()
+                        },
+                        modifier = Modifier.align(Alignment.TopCenter),
+                    )
                 }
             }
             if (terminals.isOpen && !dockIsFullScreen && !searchIsFullScreen) {
