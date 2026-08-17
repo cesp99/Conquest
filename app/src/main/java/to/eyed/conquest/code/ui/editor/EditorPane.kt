@@ -85,6 +85,7 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlinx.coroutines.delay
 import to.eyed.conquest.code.ui.theme.LocalAppSettings
+import to.eyed.conquest.code.ui.theme.BufferFontFamily
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import to.eyed.conquest.code.ui.theme.ZedTheme
 
@@ -109,7 +110,7 @@ fun EditorPane(
     val settings = LocalAppSettings.current
     val fontSize = settings.bufferFontSize.sp
     val textStyle = TextStyle(
-        fontFamily = FontFamily.Monospace,
+        fontFamily = BufferFontFamily,
         fontSize = fontSize,
         color = theme.color("editor.foreground"),
     )
@@ -117,9 +118,11 @@ fun EditorPane(
     val measurer = rememberTextMeasurer()
     val layoutCache =
         remember(measurer, textStyle, theme) { TextLayoutCache(measurer, textStyle, theme) }
-    // Line height follows the font so changing the size doesn't cramp or
-    // scatter the lines.
-    val lineHeight = settings.bufferFontSize * 1.45f
+    // Zed's `buffer_line_height: "comfortable"`, which is φ — 1.618, not a
+    // round number someone liked the look of (theme_settings/src/settings.rs:390).
+    // Following the font size is what keeps the lines from cramping when it
+    // changes.
+    val lineHeight = settings.bufferFontSize * 1.618034f
 
     with(density) {
         state.updateMetrics(
@@ -127,6 +130,7 @@ fun EditorPane(
             charWidth = layoutCache.layoutFor("M").size.width.toFloat(),
             gutterPadding = 10.dp.toPx(),
             textPadding = 8.dp.toPx(),
+            cursorWidth = 2.dp.toPx(),
         )
     }
     state.tabSize = settings.tabSize
@@ -280,13 +284,15 @@ fun EditorPane(
             if (selection == null && extras.isEmpty() &&
                 cursorTop + lineHeight > 0 && cursorTop < size.height
             ) {
-                clipRect(left = gutterWidth) {
-                    drawRect(
-                        color = theme.color("editor.active_line.background"),
-                        topLeft = Offset(gutterWidth, cursorTop),
-                        size = Size(size.width - gutterWidth, lineHeight),
-                    )
-                }
+                // Across the gutter as well: Zed's `current_line_highlight`
+                // defaults to "all" (assets/settings/default.json:314), and a
+                // highlight that stops at the gutter draws a seam down the
+                // page that Zed does not have.
+                drawRect(
+                    color = theme.color("editor.active_line.background"),
+                    topLeft = Offset(0f, cursorTop),
+                    size = Size(size.width, lineHeight),
+                )
             }
 
             val spansWindow = state.spansWindow()
@@ -327,7 +333,9 @@ fun EditorPane(
                     drawRect(
                         color = theme.cursor,
                         topLeft = Offset(caretX, row * lineHeight - state.scrollY),
-                        size = Size(2f, lineHeight),
+                        // Zed's `px(2.)` is 2 *density-independent* pixels;
+                        // 2f here is 2 physical ones, a hairline on a phone.
+                        size = Size(state.cursorWidthPx, lineHeight),
                     )
                 }
 
@@ -381,11 +389,9 @@ fun EditorPane(
                 topLeft = Offset.Zero,
                 size = Size(gutterWidth, size.height),
             )
-            drawLine(
-                color = theme.color("border.variant"),
-                start = Offset(gutterWidth, 0f),
-                end = Offset(gutterWidth, size.height),
-            )
+            // No divider between gutter and text: Zed draws none
+            // (crates/editor/src/element.rs:4905), and the line we drew read
+            // as a pane border where there is no pane.
             val lineNumber = theme.color("editor.line_number")
             val activeLineNumber = theme.color("editor.active_line_number")
             for (row in firstRow until lastRow) {

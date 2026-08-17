@@ -210,12 +210,37 @@ class EditorState private constructor(
 
         /** Rows of the file read to decide whether it indents with tabs. */
         const val INDENT_SAMPLE_ROWS = 200
+
+        /** Zed's `gutter.min_line_number_digits`. */
+        const val MIN_GUTTER_DIGITS = 4
+
+        /** Zed's gutter margins: 3 character widths left, 4 right. */
+        const val GUTTER_PADDING_CHARS = 7
     }
 
+    /**
+     * Zed's rule, not a dp guess: `max(digits, 4)` characters wide, with the
+     * padding measured in character widths too — three before the number and
+     * four after (crates/editor/src/editor.rs:11712-11770, and the `min 4`
+     * comes from `gutter.min_line_number_digits` in default.json:697). Padding
+     * in dp would drift away from the numbers as the buffer font changed.
+     */
     val gutterWidthPx: Float
-        get() = lineCount.toString().length.coerceAtLeast(2) * charWidthPx + 2 * gutterPaddingPx
+        get() = (lineCount.toString().length.coerceAtLeast(MIN_GUTTER_DIGITS) +
+            GUTTER_PADDING_CHARS) * charWidthPx
 
-    fun updateMetrics(lineHeight: Float, charWidth: Float, gutterPadding: Float, textPadding: Float) {
+    /** Zed's `px(2.)` for the cursor, in device pixels. Set from composition. */
+    var cursorWidthPx: Float = 2f
+        private set
+
+    fun updateMetrics(
+        lineHeight: Float,
+        charWidth: Float,
+        gutterPadding: Float,
+        textPadding: Float,
+        cursorWidth: Float = cursorWidthPx,
+    ) {
+        cursorWidthPx = cursorWidth
         lineHeightPx = lineHeight
         charWidthPx = charWidth
         gutterPaddingPx = gutterPadding
