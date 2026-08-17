@@ -6,15 +6,14 @@
 //! is the one `apt` put in the rootfs, and the only way to reach it is through
 //! proot (agent-docs/research/proot-spike.md, "Open items", item 4).
 //!
-//! Three things shape this module.
+//! Getting *into* the guest is not this module's job — `guest.rs` owns the
+//! proot command line, and git's own share of it is the argv below and two
+//! environment variables. What is worth knowing here is that guest.rs binds
+//! every host path onto the identical guest path, so the `-C` going in and the
+//! paths coming back are the same strings on both sides of the boundary, with
+//! nothing to translate.
 //!
-//! **Identity binds.** proot is told `-b <dir>:<dir>`, mapping a host path onto
-//! the *same* guest path, rather than the terminal's `-b <projects>:/projects`.
-//! The terminal remaps because a human wants a short prompt; the engine must
-//! not, because every path that crosses this boundary — the `-C` argument going
-//! in, the paths coming back — would otherwise need translating in both
-//! directions, and one forgotten translation is a whole class of bug. With an
-//! identity bind there is nothing to translate.
+//! Two more things shape this module.
 //!
 //! **Nothing waits on git.** A status run is a process spawn inside an
 //! emulated filesystem: tens of milliseconds at best, seconds on a cold cache.
@@ -30,13 +29,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::guest::{self, GuestCommand, Userland};
 use crate::project::ProjectId;
 
 /// How long to wait after a worktree change before asking git. A save, a
@@ -48,13 +46,6 @@ const DEBOUNCE: Duration = Duration::from_millis(400);
 /// Generous on purpose: the first proot spawn after boot pays for page cache
 /// misses across the whole rootfs.
 const RUN_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// How often the supervising thread checks on a running git.
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
-
-/// How long proot gets to take its tracees down after SIGQUIT, before we
-/// resort to SIGKILL. The same grace the Kotlin side gives it.
-const QUIT_GRACE: Duration = Duration::from_secs(3);
 
 /// How many times one refresh may immediately re-run because the worktree
 /// moved again while it was running. See [`run_until_settled`].
@@ -79,23 +70,6 @@ pub enum GitStatus {
     Ignored,
 }
 
-/// Where the guest lives. The engine never guesses any of this: Kotlin knows
-/// the flavour, the install state and the paths, and hands them over through
-/// [`Engine::set_userland`].
-#[derive(Debug)]
-pub(crate) struct Userland {
-    /// The proot executable, in `nativeLibraryDir`.
-    proot: PathBuf,
-    /// The unpacked Debian rootfs.
-    rootfs: PathBuf,
-    /// `PROOT_TMP_DIR`; proot's compiled-in default points into Termux's
-    /// private storage, which we cannot write.
-    tmp_dir: PathBuf,
-    /// The projects directory, bound onto itself so that every project inside
-    /// it is visible at its real path.
-    projects_dir: PathBuf,
-}
-
 /// Cached status for one project.
 #[derive(Default)]
 struct ProjectGit {
@@ -114,33 +88,10 @@ struct ProjectGit {
 
 #[derive(Default)]
 pub(crate) struct GitStatuses {
-    userland: Mutex<Option<Arc<Userland>>>,
     projects: Mutex<HashMap<ProjectId, Arc<Mutex<ProjectGit>>>>,
 }
 
 impl crate::Engine {
-    /// Tell the engine where proot and the Debian rootfs are.
-    ///
-    /// Called once from the platform layer, in the `full` flavour, once the
-    /// userland reports itself installed. The `play` flavour never calls it,
-    /// and everything below simply stays quiet.
-    pub fn set_userland(&self, proot: &Path, rootfs: &Path, tmp_dir: &Path, projects_dir: &Path) {
-        let userland = Userland {
-            proot: proot.to_path_buf(),
-            rootfs: rootfs.to_path_buf(),
-            tmp_dir: tmp_dir.to_path_buf(),
-            projects_dir: projects_dir.to_path_buf(),
-        };
-        log::info!("userland configured: {userland:?}");
-        *self.git.userland.lock().unwrap() = Some(Arc::new(userland));
-    }
-
-    /// Forget the userland — after the user removes the rootfs, say. Status
-    /// then degrades to empty, exactly as in a build that never had one.
-    pub fn clear_userland(&self) {
-        *self.git.userland.lock().unwrap() = None;
-    }
-
     /// Generation counter for a project's git status. Bumped when the statuses
     /// change; 0 until the first run produces something. Poll it the way the
     /// panel already polls `project_version`.
@@ -172,7 +123,7 @@ impl crate::Engine {
             self.git.projects.lock().unwrap().remove(&id);
             return;
         };
-        let Some(userland) = self.git.userland.lock().unwrap().clone() else {
+        let Some(userland) = self.userland() else {
             return;
         };
 
@@ -279,12 +230,7 @@ fn status_for(
     let repo_root = repo_root_of(root)?;
     let prefix = relative_prefix(&repo_root, root)?;
 
-    if !userland.proot.is_file() {
-        log::debug!("project {id}: no proot at {}", userland.proot.display());
-        return None;
-    }
-    if !userland.rootfs.is_dir() {
-        log::debug!("project {id}: no rootfs at {}", userland.rootfs.display());
+    if !userland.is_installed() {
         return None;
     }
 
@@ -343,179 +289,22 @@ fn git_argv(project: &Path) -> Vec<OsString> {
 }
 
 /// Run git inside the guest and return its stdout.
+///
+/// The proot half of this — the flags, the binds, the guest environment, the
+/// deadline and the pipe draining — belongs to [`guest::capture`]. What is
+/// git's own is the argv, a bind for a repository that lives outside the
+/// projects directory, and these two variables.
 fn capture(userland: &Userland, repo_root: &Path, project: &Path) -> Option<Vec<u8>> {
-    let mut command = Command::new(&userland.proot);
-    command
-        // The guest must believe it is root. Besides matching how the rootfs
-        // was unpacked, proot's fake_id0 also reports files as owned by root,
-        // which is what keeps git's "dubious ownership" check quiet.
-        .arg("-0")
-        // Don't leave a guest process behind if we have to kill proot on
-        // timeout; Android's phantom-process killer counts them against us.
-        .arg("--kill-on-exit")
-        // The rootfs was unpacked with this on, and dpkg keeps using it, so
-        // the guest's own files are only presented correctly with it on here
-        // too. Nothing here creates a link, so it costs a translation and
-        // nothing else.
-        .arg("--link2symlink")
-        // Debian's git is happy on any kernel, but the guest asking uname is
-        // one less thing to differ from the terminal's environment.
-        .args(["-k", "6.2.1"])
-        .arg("-r")
-        .arg(&userland.rootfs)
-        // The same three the terminal binds; without /proc, git's own
-        // sub-processes misbehave in ways that are tedious to diagnose.
-        .args(["-b", "/dev", "-b", "/proc", "-b", "/sys"]);
-
-    for dir in bind_dirs(userland, repo_root) {
-        command.arg("-b").arg(identity_bind(&dir));
-    }
-
-    command
-        // `/` always exists inside the guest; the `-C` in [`git_argv`] is what
-        // actually puts git in the project.
-        .args(["-w", "/"])
-        .args(git_argv(project));
-
-    command
-        .env("PROOT_TMP_DIR", &userland.tmp_dir)
-        // The child inherits *our* environment, in which PATH points at
-        // /system/bin — a directory that does not exist inside the fake root,
-        // which is why the spike saw "command not found" for everything. Give
-        // the guest a guest PATH.
-        .env(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        )
-        .env("HOME", "/root")
-        .env("LANG", "C.UTF-8")
-        // Porcelain is not localised, but git's *errors* are, and we log them.
-        .env("LC_ALL", "C")
+    let command = GuestCommand::new("git status", git_argv(project))
+        .bind(repo_root)
+        // `--no-optional-locks` in its environment form, which git(1) gives as
+        // equivalent; unlike the flag it is inherited, so a git that runs
+        // another git still writes no lock.
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            log::debug!("git status could not start: {err}");
-            return None;
-        }
-    };
-
-    // DEADLOCK, and why this is not a `try_wait` loop over a piped child.
-    //
-    // A pipe holds 64 KiB. `git status` on a repository with a few thousand
-    // changed files writes more than that, then blocks in `write(2)` until
-    // somebody reads. A supervisor that polls `try_wait` and only reads after
-    // the child exits waits for a child that is waiting for the supervisor:
-    // neither moves, and the run "times out" on a git that was working
-    // perfectly. So both pipes are drained *concurrently*, by a thread each,
-    // for the entire lifetime of the child. The main thread here does nothing
-    // but watch the clock, which is the one job it can do without blocking on
-    // a pipe.
-    //
-    // (`Command::output()` gets this right too — it polls both pipes — but it
-    // consumes the child, leaving nothing to `kill()` when the timeout fires.)
-    let mut stdout = child.stdout.take()?;
-    let mut stderr = child.stderr.take()?;
-    let out_reader = thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stdout.read_to_end(&mut buffer);
-        buffer
-    });
-    let err_reader = thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stderr.read_to_end(&mut buffer);
-        buffer
-    });
-
-    let deadline = Instant::now() + RUN_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {}
-            Err(err) => {
-                log::debug!("git status could not be waited on: {err}");
-                break None;
-            }
-        }
-        if Instant::now() >= deadline {
-            log::debug!("git status timed out after {RUN_TIMEOUT:?}; killing it");
-            terminate(&mut child);
-            break None;
-        }
-        thread::sleep(POLL_INTERVAL);
-    };
-
-    // Joining is safe now: the readers finish as soon as the pipes close,
-    // which killing the child guarantees.
-    let out = out_reader.join().unwrap_or_default();
-    let err = err_reader.join().unwrap_or_default();
-
-    let status = status?;
-    if !status.success() {
-        // The overwhelmingly common cause is "git is not installed in the
-        // guest", which is a perfectly ordinary state for a fresh Debian.
-        log::debug!(
-            "git status exited with {status}: {}",
-            String::from_utf8_lossy(&err).trim()
-        );
-        return None;
-    }
-    Some(out)
-}
-
-/// The directories proot must be able to see, deduplicated.
-///
-/// The projects directory covers the normal case in one bind. The repository
-/// root is added only when it sits outside it — an imported project whose
-/// enclosing repository lives elsewhere — because a bind of a path already
-/// inside another bind is just noise.
-fn bind_dirs(userland: &Userland, repo_root: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![userland.projects_dir.clone()];
-    if !repo_root.starts_with(&userland.projects_dir) {
-        dirs.push(repo_root.to_path_buf());
-    }
-    dirs
-}
-
-/// Stop a wedged proot without orphaning what it is tracing.
-///
-/// `Child::kill` is SIGKILL, and proot never sees it: it dies where it stands
-/// and its tracees — a git that has stopped answering, and whatever it forked —
-/// keep running, counting against Android's cap on background child processes
-/// with nothing left holding a handle to them. proot does act on SIGQUIT, and
-/// takes its tracees down with it, so ask that way first and give it a moment.
-/// This is the lesson `GitClone.terminate` already learned on the Kotlin side.
-///
-/// SIGKILL stays as the last resort, for a proot that ignores even this.
-fn terminate(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        // Safety: `child` is alive here — nothing has reaped it, since the only
-        // waits on it are this function's own — so the pid cannot have been
-        // recycled onto some other process.
-        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGQUIT) };
-        let deadline = Instant::now() + QUIT_GRACE;
-        while Instant::now() < deadline {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => thread::sleep(POLL_INTERVAL),
-                Err(_) => break,
-            }
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-/// `-b <path>:<path>`: the host path mounted at the identical guest path.
-fn identity_bind(path: &Path) -> String {
-    let path = path.to_string_lossy();
-    format!("{path}:{path}")
+        // There is nobody on this end to answer a credential prompt, and a git
+        // waiting for one would sit there until the deadline killed it.
+        .env("GIT_TERMINAL_PROMPT", "0");
+    guest::capture(userland, &command, RUN_TIMEOUT)
 }
 
 /// The enclosing repository's root, or `None` if there isn't one.
@@ -735,6 +524,7 @@ fn summary(tier: u8, from: GitStatus) -> GitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     /// Build porcelain output the way git does: NUL after every record.
     fn porcelain(records: &[&str]) -> Vec<u8> {
@@ -958,6 +748,34 @@ mod tests {
         assert_eq!(rolled.len(), 2);
     }
 
+    /// git's own half of the command line, spelled out. guest.rs pins the
+    /// proot half the same way, and between them the whole thing is covered —
+    /// which matters more now that the two halves are written in different
+    /// files, because a flag lost in either is invisible until a phone shows
+    /// an uncoloured panel.
+    #[test]
+    fn the_git_argv_is_exactly_this() {
+        let argv: Vec<String> = git_argv(Path::new("/files/projects/thing"))
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            vec![
+                "git",
+                "-C",
+                "/files/projects/thing",
+                "-c",
+                "safe.directory=*",
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=normal",
+            ]
+        );
+    }
+
     #[test]
     fn prefixes_come_from_the_repository_layout() {
         assert_eq!(
@@ -971,35 +789,6 @@ mod tests {
         assert_eq!(
             relative_prefix(Path::new("/p/repo"), Path::new("/elsewhere")),
             None
-        );
-    }
-
-    #[test]
-    fn binds_are_identities_and_deduplicated() {
-        let userland = Userland {
-            proot: PathBuf::from("/lib/libproot_exec.so"),
-            rootfs: PathBuf::from("/files/debian"),
-            tmp_dir: PathBuf::from("/cache"),
-            projects_dir: PathBuf::from("/files/projects"),
-        };
-        // The host path is mounted at the identical guest path: nothing to
-        // translate in either direction.
-        assert_eq!(
-            identity_bind(Path::new("/files/projects")),
-            "/files/projects:/files/projects"
-        );
-        // A repository inside the projects directory needs no bind of its own.
-        assert_eq!(
-            bind_dirs(&userland, Path::new("/files/projects/thing")),
-            vec![PathBuf::from("/files/projects")]
-        );
-        // One outside does.
-        assert_eq!(
-            bind_dirs(&userland, Path::new("/elsewhere/repo")),
-            vec![
-                PathBuf::from("/files/projects"),
-                PathBuf::from("/elsewhere/repo"),
-            ]
         );
     }
 

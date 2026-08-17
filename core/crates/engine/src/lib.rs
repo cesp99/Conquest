@@ -18,7 +18,9 @@
 //! Git status is not computed here: it comes from the `git` binary inside the
 //! Debian userland, reached through proot (`git.rs`), cached behind a
 //! generation counter of the same shape, and silently empty in builds that
-//! have no userland.
+//! have no userland. Reaching *into* that userland at all is `guest.rs`, which
+//! owns the proot command line for everything the engine runs there — git
+//! today, language servers next.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -32,6 +34,7 @@ mod config;
 mod file;
 mod find;
 mod git;
+mod guest;
 mod highlight;
 mod highlight_worker;
 mod platform;
@@ -83,10 +86,14 @@ pub struct Engine {
     /// Started when a buffer first gets a language. Reparsing happens here,
     /// never on the caller's thread — see highlight_worker.rs.
     highlight_worker: OnceLock<highlight_worker::HighlightWorker>,
-    /// Cached `git status` per project, plus where the userland that can run
-    /// git lives. Empty and quiet until the platform layer configures one —
-    /// see git.rs.
+    /// Cached `git status` per project. Empty and quiet until there is a
+    /// userland to run git in — see git.rs.
     git: git::GitStatuses,
+    /// Where proot and the Debian rootfs are. It sits here rather than on one
+    /// feature's state because it belongs to no feature: git status runs
+    /// through it today and language servers will, and there is only ever one
+    /// guest — see guest.rs.
+    userland: Mutex<Option<Arc<guest::Userland>>>,
 }
 
 pub(crate) struct BufferState {
