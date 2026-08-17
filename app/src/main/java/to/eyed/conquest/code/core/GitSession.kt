@@ -51,9 +51,15 @@ class GitSession(private val project: ProjectSession) {
      * **Destructive.** Throw away every uncommitted change to those paths.
      *
      * A path the last commit has goes back to what the commit holds. A path it
-     * does not — untracked, or newly staged — has nowhere to go back to, so it
-     * is moved to the app's trash instead of being deleted; [GitChange.inHead]
-     * is which of the two will happen, and the confirmation should say so.
+     * does not — untracked, newly staged, or the new name of a rename — has
+     * nowhere to go back to, so it is moved to the app's trash instead of being
+     * deleted; [GitChange.inHead] is which of the two will happen, and the
+     * confirmation should say so. A rename is both at once: [GitChange.original]
+     * comes back from the commit and the new name goes to the trash.
+     *
+     * A row the engine cannot explain — a conflict above all, where discarding
+     * would keep one side of a merge and say nothing — comes back as a refusal
+     * with the reason in it, and nothing is touched.
      *
      * **Ask the user first, naming the files.** Nothing below here asks.
      * **Blocking**.
@@ -94,21 +100,42 @@ data class GitBranch(
  * what git means and what a single rolled-up status cannot say.
  */
 data class GitChange(
-    /** Project-relative, '/'-separated — [ProjectEntry.path]'s spelling. */
+    /**
+     * Project-relative, '/'-separated — [ProjectEntry.path]'s spelling.
+     *
+     * Ends in '/' when git collapsed a whole new directory into one record,
+     * which is what it does with every file in a directory it has never seen.
+     * That row is a folder, and [isDirectory] is how the panel knows.
+     */
     val path: String,
     val staged: GitFileStatus?,
     val unstaged: GitFileStatus?,
     /** A merge conflict: in neither section, and nothing to stage until it is resolved. */
     val conflicted: Boolean,
     /**
-     * The last commit has a version of this path. False for an untracked or
-     * newly staged file, which discarding therefore *trashes* rather than
-     * restores — the difference the confirmation has to state.
+     * The last commit has a version of **this path**. False for an untracked or
+     * newly staged file, and false for the destination of a rename, whose old
+     * name is the one the commit holds — discarding those *trashes* rather than
+     * restores, which is the difference the confirmation has to state.
      */
     val inHead: Boolean,
+    /**
+     * What the last commit calls this file, when it has been renamed or copied.
+     * Discarding a rename cannot be done without it: the old name is restored
+     * and the new one goes to the trash.
+     */
+    val original: String? = null,
 ) {
-    val name: String get() = path.substringAfterLast('/')
-    val directory: String get() = path.substringBeforeLast('/', "")
+    /** One record for a whole new directory — `?? newdir/`. */
+    val isDirectory: Boolean get() = path.endsWith('/')
+
+    /**
+     * The row's label. Keeps the trailing slash for a directory: "src" and
+     * "src/" are two different promises when the next tap discards one of them.
+     */
+    val name: String get() = path.trimEnd('/').substringAfterLast('/') + if (isDirectory) "/" else ""
+
+    val directory: String get() = path.trimEnd('/').substringBeforeLast('/', "")
 }
 
 /** A snapshot of everything the git panel draws. */
@@ -153,6 +180,7 @@ data class GitPanelState(
                         unstaged = status(entry, "unstaged"),
                         conflicted = entry.optBoolean("conflicted"),
                         inHead = entry.optBoolean("in_head"),
+                        original = if (entry.isNull("original")) null else entry.getString("original"),
                     )
                 },
             )
@@ -233,7 +261,8 @@ object GitDiff {
     fun hunksVersion(bufferId: Long): Long = CoreBridge.gitHunksVersion(bufferId)
 
     /**
-     * The hunks, ascending by row. Reads a cache — safe on the main thread,
+     * The hunks, ascending by row. Reads a cache — it takes the engine's buffer
+     * locks briefly and never runs git, so it is safe on the main thread,
      * though there is no reason to call it unless [hunksVersion] has moved.
      */
     fun hunks(bufferId: Long): List<GitHunk> {

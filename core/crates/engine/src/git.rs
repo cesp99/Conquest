@@ -89,7 +89,16 @@ pub enum GitStatus {
 pub(crate) struct FileChange {
     /// Repository-relative while parsing; project-relative once
     /// [`parse_porcelain`] has re-based it.
+    ///
+    /// A record for an untracked *directory* keeps its trailing `/` — that is
+    /// how `--untracked-files=normal` collapses a whole new directory into one
+    /// line, and dropping the slash would turn it into a file that is not there.
     pub path: String,
+    /// Where an `R` or `C` record's file came from: porcelain's *second*
+    /// record, the one git writes immediately after. `None` for everything
+    /// else — and for a rename whose source lies outside the project, which
+    /// this cannot name and therefore cannot act on.
+    pub original: Option<String>,
     /// The index against HEAD.
     pub x: u8,
     /// The worktree against the index.
@@ -131,13 +140,16 @@ impl FileChange {
         Some(letter(self.y))
     }
 
-    /// Whether the last commit has a version of this path to restore.
+    /// Whether the last commit has a version of **this** path to restore.
     ///
-    /// `A` is "added to the index", `?` is "git has never seen it": in both
-    /// cases HEAD holds nothing, so discarding cannot mean `git restore` and
-    /// means the trash instead — see [`crate::Engine::git_discard`].
+    /// `A` is "added to the index", `?` is "git has never seen it", and the
+    /// destination of an `R` or a `C` is a name HEAD has never held either —
+    /// the *source* is the one it knows. In all three cases HEAD holds nothing
+    /// under this path, and `git restore --source=HEAD` on it does not refuse:
+    /// it removes the path from the index and the worktree and exits 0. So
+    /// discarding cannot mean `git restore` here — see [`discard_steps`].
     fn in_head(&self) -> bool {
-        self.x != b'A' && self.x != b'?'
+        !matches!(self.x, b'A' | b'?' | b'R' | b'C')
     }
 }
 
@@ -187,14 +199,23 @@ pub struct GitChanges {
 pub struct ChangedFile {
     /// Project-relative, `/`-separated — the same spelling `TreeEntry::path`
     /// uses, so the panel can open it through the project it already holds.
+    ///
+    /// Ends in `/` when git collapsed a whole new directory into one record.
+    /// The panel has to be able to say so: the row is a folder, and discarding
+    /// it trashes everything under it.
     pub path: String,
+    /// What this file was called in the last commit, when it has been renamed
+    /// or copied. The panel names both halves, and discarding is the one
+    /// operation that needs the old name to do anything at all.
+    pub original: Option<String>,
     /// What is staged for the next commit; `None` when nothing of this file is.
     pub staged: Option<GitStatus>,
     /// What is changed and not staged.
     pub unstaged: Option<GitStatus>,
     pub conflicted: bool,
-    /// HEAD has a version of this path — so discarding restores it rather than
-    /// throwing it away. See [`crate::Engine::git_discard`].
+    /// HEAD has a version of **this path** — so discarding restores it rather
+    /// than throwing it away. False for the destination of a rename, whose old
+    /// name is the one HEAD holds. See [`discard_steps`].
     pub in_head: bool,
 }
 
@@ -248,6 +269,17 @@ pub(crate) fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many ancestor walks [`repo_root_of`] has done **on this thread**.
+    ///
+    /// Test-only, and it exists because "this call is cheap enough for the main
+    /// thread" is a claim about a syscall count that no other assertion can
+    /// see. Per-thread so that the suite's own parallelism, and the diff
+    /// worker's legitimate walks, cannot be mistaken for the caller's.
+    pub(crate) static REPO_ROOT_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl crate::Engine {
     /// Generation counter for a project's git status. Bumped when the statuses
     /// change; 0 until the first run produces something. Poll it the way the
@@ -289,6 +321,7 @@ impl crate::Engine {
                 .iter()
                 .map(|change| ChangedFile {
                     path: change.path.clone(),
+                    original: change.original.clone(),
                     staged: change.staged(),
                     unstaged: change.unstaged(),
                     conflicted: change.is_conflicted(),
@@ -560,7 +593,14 @@ pub(crate) fn git_command(label: &str, repo_root: &Path, argv: Vec<OsString>) ->
 /// `.git` is a directory in a normal clone and a *file* in a worktree or
 /// submodule, so this only asks whether the name exists. A few `stat` calls,
 /// no subprocess: this is what makes "not a repository" free.
+///
+/// Free is not free enough to do per poll, though — a file deep in a tree is a
+/// `stat` per level, and a file in *no* repository walks to the filesystem
+/// root. Every caller here either runs on a worker thread or remembers the
+/// answer, which is what [`REPO_ROOT_WALKS`] exists to hold callers to.
 pub(crate) fn repo_root_of(project: &Path) -> Option<PathBuf> {
+    #[cfg(test)]
+    REPO_ROOT_WALKS.with(|walks| walks.set(walks.get() + 1));
     let mut dir = Some(project);
     while let Some(candidate) = dir {
         if candidate.join(".git").exists() {
@@ -610,6 +650,16 @@ fn rebase(mut changes: Vec<FileChange>, strip_prefix: &str) -> Vec<FileChange> {
     changes.retain(|change| change.path.starts_with(strip_prefix));
     for change in &mut changes {
         change.path = change.path[strip_prefix.len()..].to_owned();
+        // A rename *into* the project from outside it keeps its status row and
+        // loses its source: the source is not a path this project can name, so
+        // there is nothing here that could restore it. `None` is what
+        // [`discard_steps`] refuses on, which is the right answer for a file
+        // whose other half we cannot reach.
+        change.original = change
+            .original
+            .as_ref()
+            .filter(|original| original.starts_with(strip_prefix))
+            .map(|original| original[strip_prefix.len()..].to_owned());
     }
     changes
 }
@@ -671,13 +721,24 @@ pub(crate) fn parse_changes(output: &[u8]) -> Vec<FileChange> {
         // rename whose destination was then deleted, and those classify as
         // Deleted. Deciding from the status desynchronises the whole parse and
         // invents a path — covered by the RD/CD tests below.
+        let mut original = None;
         if x == b'R' || x == b'C' {
-            // Skip the source path. It is *not* reported as deleted: the file
-            // moved, and painting its old location would be showing the user
-            // something that no longer exists.
+            // The source path. It is *not* reported as a change of its own —
+            // the file moved, and painting its old location would be showing
+            // the user something that no longer exists — but it is kept,
+            // because it is the only name HEAD knows this file by and
+            // discarding a rename is impossible without it.
+            original = records
+                .get(index)
+                .map(|record| String::from_utf8_lossy(record).into_owned());
             index += 1;
         }
-        out.push(FileChange { path, x, y });
+        out.push(FileChange {
+            path,
+            original,
+            x,
+            y,
+        });
     }
     out
 }
@@ -1034,7 +1095,7 @@ impl crate::Engine {
         let repo = self.repo_for(id)?;
         let paths = checked_paths(paths)?;
         let mut args: Vec<OsString> = ["add", "-A", "--"].iter().map(OsString::from).collect();
-        args.extend(paths);
+        args.extend(paths.iter().map(OsString::from));
         let run = run_git(
             &repo.userland,
             &repo.repo_root,
@@ -1064,7 +1125,7 @@ impl crate::Engine {
             .iter()
             .map(OsString::from)
             .collect();
-        args.extend(paths.clone());
+        args.extend(paths.iter().map(OsString::from));
         let run = run_git(
             &repo.userland,
             &repo.repo_root,
@@ -1080,7 +1141,7 @@ impl crate::Engine {
             .iter()
             .map(OsString::from)
             .collect();
-        args.extend(paths);
+        args.extend(paths.iter().map(OsString::from));
         let fallback = run_git(
             &repo.userland,
             &repo.repo_root,
@@ -1104,11 +1165,18 @@ impl crate::Engine {
     ///
     /// * A path HEAD knows is *restored* to what HEAD has, index and worktree
     ///   together. What is lost is uncommitted, and nothing else.
-    /// * A path HEAD has never seen — untracked, or staged-new — cannot be
-    ///   restored from anywhere, so it goes to the app's trash instead of being
-    ///   unlinked. `git clean` would delete it outright; Zed's own panel trashes
-    ///   untracked files for the same reason (`TrashUntrackedFiles`), and here
-    ///   it is the difference between a mistake and a loss.
+    /// * A path HEAD has never seen — untracked, staged-new, or the
+    ///   destination of a rename — cannot be restored from anywhere, so it goes
+    ///   to the app's trash instead of being unlinked. `git clean` would delete
+    ///   it outright; Zed's own panel trashes untracked files for the same
+    ///   reason (`TrashUntrackedFiles`), and here it is the difference between
+    ///   a mistake and a loss.
+    ///
+    /// Which of the two a row gets is [`discard_steps`]'s decision, taken from
+    /// the status letters, and a row it cannot explain — a conflict, a rename
+    /// with no source, a path no status run has seen — refuses the whole list
+    /// before anything runs. That is not caution for its own sake: `git restore
+    /// --source=HEAD` deletes a path HEAD does not hold rather than refusing it.
     ///
     /// The caller is expected to have confirmed with the user first, naming the
     /// files. Nothing in this function asks.
@@ -1117,25 +1185,47 @@ impl crate::Engine {
         let checked = checked_paths(paths)?;
         let known = self.changed_files(id);
 
-        // A path we have no status for is treated as tracked: `git restore`
-        // will refuse a path HEAD does not have, and refusing is the safe way
-        // to be wrong here — the other way round trashes a file on a guess.
-        let (tracked, new): (Vec<OsString>, Vec<OsString>) =
-            checked.into_iter().partition(|path| {
-                known
-                    .iter()
-                    .find(|change| OsStr::new(&change.path) == path.as_os_str())
-                    .is_none_or(FileChange::in_head)
-            });
+        // The whole plan first, and every path in it checked again: a rename's
+        // source came from git rather than from the UI, and "git said it" is
+        // not a reason to hand a path to a command that deletes things.
+        let mut plan: Vec<Discard> = Vec::new();
+        for path in &checked {
+            let change = known
+                .iter()
+                .find(|change| change.path.trim_end_matches('/') == path);
+            for step in discard_steps(path, change)? {
+                plan.push(match step {
+                    Discard::Restore(path) => Discard::Restore(checked_path(&path)?),
+                    Discard::Trash(path) => Discard::Trash(checked_path(&path)?),
+                    Discard::Forget(path) => Discard::Forget(checked_path(&path)?),
+                });
+            }
+        }
+        let restore: Vec<&String> = plan
+            .iter()
+            .filter_map(|step| match step {
+                Discard::Restore(path) => Some(path),
+                _ => None,
+            })
+            .collect();
 
         let mut failures = Vec::new();
-        if !tracked.is_empty() {
-            let mut args: Vec<OsString> =
-                ["restore", "--source=HEAD", "--staged", "--worktree", "--"]
-                    .iter()
-                    .map(OsString::from)
-                    .collect();
-            args.extend(tracked);
+        if !restore.is_empty() {
+            let mut args: Vec<OsString> = [
+                "restore",
+                "--source=HEAD",
+                "--staged",
+                "--worktree",
+                // A dirty submodule is ` M sub`, indistinguishable from a file
+                // here, and `submodule.recurse` in the user's config would turn
+                // restoring its gitlink into restoring its whole worktree.
+                "--no-recurse-submodules",
+                "--",
+            ]
+            .iter()
+            .map(OsString::from)
+            .collect();
+            args.extend(restore.iter().map(OsString::from));
             let run = run_git(
                 &repo.userland,
                 &repo.repo_root,
@@ -1146,22 +1236,35 @@ impl crate::Engine {
                 failures.push(run.message());
             }
         }
-        for path in new {
-            // Joined onto the project root rather than passed to git: this half
-            // never enters the guest, and the trash is the engine's own.
-            let absolute = repo.project_root.join(Path::new(&path));
-            if let Err(err) = trash::delete_with_info(&absolute) {
-                failures.push(format!("{}: {err}", absolute.display()));
-                continue;
-            }
+        for step in &plan {
+            let path = match step {
+                Discard::Restore(_) => continue,
+                Discard::Trash(path) => {
+                    // Joined onto the project root rather than passed to git:
+                    // this half never enters the guest, and the trash is the
+                    // engine's own.
+                    let absolute = repo.project_root.join(Path::new(path));
+                    if let Err(err) = trash::delete_with_info(&absolute) {
+                        failures.push(format!("{}: {err}", absolute.display()));
+                    }
+                    path
+                }
+                // Nothing on disk to move — see [`Discard::Forget`]. The index
+                // entry below is the whole of it, and the old code's `continue`
+                // after a failed trash skipped exactly that, leaving the row in
+                // the panel forever with an errno beside it.
+                Discard::Forget(path) => path,
+            };
             // A staged-new file also has an index entry, which trashing the
             // file does not remove; without this the panel would keep showing
-            // it as staged for a file that is no longer there.
-            let mut args: Vec<OsString> = ["rm", "--cached", "--quiet", "--ignore-unmatch", "--"]
-                .iter()
-                .map(OsString::from)
-                .collect();
-            args.push(path);
+            // it as staged for a file that is no longer there. `-r` because one
+            // record can be a whole untracked directory.
+            let mut args: Vec<OsString> =
+                ["rm", "--cached", "--quiet", "--ignore-unmatch", "-r", "--"]
+                    .iter()
+                    .map(OsString::from)
+                    .collect();
+            args.push(OsString::from(&path));
             let _ = run_git(
                 &repo.userland,
                 &repo.repo_root,
@@ -1220,22 +1323,115 @@ impl crate::Engine {
 /// relative, no `..`, no empty component, no NUL. A path that breaks them is an
 /// error rather than a silent skip, because a discard that quietly did nothing
 /// to one of three files is worse than one that did nothing at all.
-fn checked_paths(paths: &[String]) -> Result<Vec<OsString>, String> {
+fn checked_paths(paths: &[String]) -> Result<Vec<String>, String> {
     if paths.is_empty() {
         return Err("No files given".to_owned());
     }
-    let mut out = Vec::with_capacity(paths.len());
-    for path in paths {
-        let bad = path.is_empty()
-            || path.starts_with('/')
-            || path.contains('\0')
-            || path.split('/').any(|part| part.is_empty() || part == "..");
-        if bad {
-            return Err(format!("{path:?} is not a path inside the project"));
-        }
-        out.push(OsString::from(path));
+    paths.iter().map(String::as_str).map(checked_path).collect()
+}
+
+/// One path, checked. Also the gate every path *we* produce goes through —
+/// a rename's source comes from git rather than from the UI, and "git said it"
+/// is not a reason to hand it to a command that deletes things.
+fn checked_path(path: &str) -> Result<String, String> {
+    // One trailing slash is git's own spelling for an untracked directory
+    // (`?? newdir/`), which is a row the panel draws and a path the user can
+    // stage or discard like any other. Trimming it here rather than rejecting
+    // it is the difference between "Stage all" working and the whole list
+    // being refused because one record names a folder.
+    let trimmed = path.strip_suffix('/').unwrap_or(path);
+    let bad = trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.contains('\0')
+        || trimmed
+            .split('/')
+            .any(|part| part.is_empty() || part == "..");
+    if bad {
+        return Err(format!("{path:?} is not a path inside the project"));
     }
-    Ok(out)
+    Ok(trimmed.to_owned())
+}
+
+/// One thing discarding does to one path.
+///
+/// The plan is built in full before any of it runs, because a plan that cannot
+/// be built must not run the half of itself that it could.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Discard {
+    /// HEAD holds this path: `git restore --source=HEAD`, index and worktree.
+    Restore(String),
+    /// HEAD has never held it, so there is nothing to restore it *from*: the
+    /// app's trash, and then whatever index entry it left behind.
+    Trash(String),
+    /// HEAD has never held it and the worktree no longer has it either — `AD`,
+    /// staged and then deleted. The index entry is the whole of what is left,
+    /// and there is nothing to trash: saying "no such file" here would be
+    /// reporting the very state the user asked us to clean up.
+    Forget(String),
+}
+
+/// What discarding one row actually means, decided from the status letters
+/// rather than guessed at the git command line.
+///
+/// The rule that shapes all of it: **`git restore --source=HEAD` on a path
+/// HEAD does not have is not refused.** It removes the path from the index and
+/// the worktree and exits 0, so anything the user typed into a file git has
+/// never hashed is gone with no copy anywhere. Every case below therefore has
+/// to know whether HEAD holds the name before that command can see it.
+///
+/// A submodule is the one row this cannot tell apart: porcelain v1 spells a
+/// dirty submodule ` M sub`, exactly like a file, and the restore below touches
+/// only the gitlink in the index — which is why the argv says
+/// `--no-recurse-submodules` rather than trusting the user's `submodule.recurse`.
+pub(crate) fn discard_steps(
+    path: &str,
+    known: Option<&FileChange>,
+) -> Result<Vec<Discard>, String> {
+    let Some(change) = known else {
+        // The panel discards rows it was given by the last status run, so this
+        // is a path we have no letters for — and without letters there is no
+        // way to tell a restore from a delete. Refusing is the only safe
+        // answer: the old code assumed `git restore` would refuse for us.
+        return Err(format!(
+            "Conquest has no git status for {path:?}. Let the panel refresh and try again."
+        ));
+    };
+    if change.is_conflicted() || change.x == b'U' || change.y == b'U' {
+        // `git restore --source=HEAD` on an unmerged path *succeeds*: it takes
+        // "ours", marks the path resolved and staged, and leaves `MERGE_HEAD`
+        // set, so the panel goes quiet and the next commit drops the incoming
+        // side without ever saying so. There is no version of that which is
+        // what the user meant by "discard".
+        return Err(format!(
+            "{path} has a merge conflict. Resolve it in the editor and stage the result — \
+             discarding it would keep one side of the merge and say nothing."
+        ));
+    }
+    // `Y` of `D` is git saying the worktree has already lost the file.
+    let away = if change.y == b'D' {
+        Discard::Forget(change.path.clone())
+    } else {
+        Discard::Trash(change.path.clone())
+    };
+    match change.x {
+        // A rename is two paths and both have to move. The old name is what
+        // HEAD holds, so it is restored; the new name is one HEAD has never
+        // seen — whatever the user has typed into it since is unhashed and
+        // unrecoverable — so it goes to the trash, never under `git restore`.
+        b'R' => {
+            let Some(original) = &change.original else {
+                return Err(format!(
+                    "Conquest cannot tell where {path} was renamed from, so it will not \
+                     discard it. Use the terminal."
+                ));
+            };
+            Ok(vec![Discard::Restore(original.clone()), away])
+        }
+        // A copy leaves its source alone: only the copy is new, and only the
+        // copy goes.
+        b'C' | b'A' | b'?' => Ok(vec![away]),
+        _ => Ok(vec![Discard::Restore(change.path.clone())]),
+    }
 }
 
 #[cfg(test)]
@@ -1326,6 +1522,128 @@ mod tests {
             statuses(&["RM moved.rs", "original.rs"]),
             vec![("moved.rs".to_owned(), GitStatus::Renamed)]
         );
+    }
+
+    /// The source record is consumed, and *kept*: it is the only name HEAD
+    /// knows the file by, and without it discarding a rename cannot be done at
+    /// all — see [`discard_steps`].
+    #[test]
+    fn a_rename_keeps_the_name_head_knows_it_by() {
+        let changes = parse_changes(&porcelain(&["RM renamed.txt", "a.txt", " M after.rs"]));
+        assert_eq!(changes[0].path, "renamed.txt");
+        assert_eq!(changes[0].original.as_deref(), Some("a.txt"));
+        // And the new name is *not* in HEAD, whatever the letters look like.
+        assert!(!changes[0].in_head());
+
+        assert_eq!(changes[1].path, "after.rs");
+        assert_eq!(changes[1].original, None);
+        assert!(changes[1].in_head());
+
+        // A rename out of a subdirectory the project does not contain has no
+        // source this project can name.
+        let outside = rebase(
+            parse_changes(&porcelain(&["R  app/moved.rs", "lib/old.rs"])),
+            "app/",
+        );
+        assert_eq!(outside[0].path, "moved.rs");
+        assert_eq!(outside[0].original, None);
+    }
+
+    /// The plan behind the most dangerous button in the app.
+    #[test]
+    fn discarding_a_rename_restores_the_old_name_and_never_restores_the_new_one() {
+        let changes = parse_changes(&porcelain(&["RM renamed.txt", "a.txt"]));
+        // `git restore --source=HEAD -- renamed.txt` would *delete* it — HEAD
+        // has no such path — and exit 0. So: a.txt comes back from HEAD, and
+        // renamed.txt, whose content git has never hashed, goes to the trash.
+        assert_eq!(
+            discard_steps("renamed.txt", changes.first()).unwrap(),
+            vec![
+                Discard::Restore("a.txt".to_owned()),
+                Discard::Trash("renamed.txt".to_owned()),
+            ]
+        );
+        assert!(
+            !discard_steps("renamed.txt", changes.first())
+                .unwrap()
+                .contains(&Discard::Restore("renamed.txt".to_owned()))
+        );
+
+        // A copy's source was not touched, so only the copy goes.
+        let copied = parse_changes(&porcelain(&["C  copy.rs", "source.rs"]));
+        assert_eq!(
+            discard_steps("copy.rs", copied.first()).unwrap(),
+            vec![Discard::Trash("copy.rs".to_owned())]
+        );
+
+        // A rename whose source we could not read is refused rather than
+        // half-done.
+        let sourceless = FileChange {
+            path: "renamed.txt".to_owned(),
+            original: None,
+            x: b'R',
+            y: b'M',
+        };
+        assert!(discard_steps("renamed.txt", Some(&sourceless)).is_err());
+    }
+
+    #[test]
+    fn discarding_decides_restore_or_trash_from_the_letters() {
+        let changes = parse_changes(&porcelain(&[
+            " M tracked.rs",
+            "M  staged.rs",
+            " D deleted.rs",
+            "A  new.rs",
+            "AD staged-then-deleted.rs",
+            "?? untracked.rs",
+            "?? newdir/",
+        ]));
+        let steps = |path: &str| {
+            discard_steps(path, changes.iter().find(|change| change.path == path)).unwrap()
+        };
+        for path in ["tracked.rs", "staged.rs", "deleted.rs"] {
+            assert_eq!(steps(path), vec![Discard::Restore(path.to_owned())]);
+        }
+        for path in ["new.rs", "untracked.rs", "newdir/"] {
+            assert_eq!(steps(path), vec![Discard::Trash(path.to_owned())]);
+        }
+        // `AD`: staged, then deleted from the worktree. There is nothing to
+        // trash and the index entry is the whole of what discarding it means,
+        // so "no such file" is not a failure to report — it is the state the
+        // user asked us to clear.
+        assert_eq!(
+            steps("staged-then-deleted.rs"),
+            vec![Discard::Forget("staged-then-deleted.rs".to_owned())]
+        );
+        // The same for a rename whose destination has since been deleted.
+        let renamed_away = parse_changes(&porcelain(&["RD gone.rs", "was.rs"]));
+        assert_eq!(
+            discard_steps("gone.rs", renamed_away.first()).unwrap(),
+            vec![
+                Discard::Restore("was.rs".to_owned()),
+                Discard::Forget("gone.rs".to_owned()),
+            ]
+        );
+    }
+
+    /// Discard is the one command that must not guess. A conflict resolved by
+    /// `git restore --source=HEAD` keeps "ours", stages it, and leaves
+    /// `MERGE_HEAD` set — the panel then shows a clean tree and the next commit
+    /// drops the incoming side without a word.
+    #[test]
+    fn discarding_refuses_a_conflict_and_anything_it_has_no_status_for() {
+        for code in ["DD", "AU", "UD", "UA", "DU", "AA", "UU"] {
+            let changes = parse_changes(&porcelain(&[&format!("{code} conflict.rs")]));
+            let refusal = discard_steps("conflict.rs", changes.first()).unwrap_err();
+            assert!(
+                refusal.contains("merge conflict"),
+                "{code} should be refused by name, got {refusal:?}"
+            );
+        }
+        // No status at all: without the letters there is no way to tell a
+        // restore from a delete, and the old code called that "tracked".
+        let refusal = discard_steps("mystery.rs", None).unwrap_err();
+        assert!(refusal.contains("no git status"), "got {refusal:?}");
     }
 
     #[test]
@@ -1644,11 +1962,32 @@ mod tests {
 
         assert_eq!(
             checked_paths(&["src/main.rs".to_owned(), "a b/-weird.rs".to_owned()]).unwrap(),
-            vec![
-                OsString::from("src/main.rs"),
-                OsString::from("a b/-weird.rs"),
-            ]
+            vec!["src/main.rs".to_owned(), "a b/-weird.rs".to_owned()]
         );
+    }
+
+    /// `--untracked-files=normal` collapses a whole new directory into one
+    /// record with a trailing slash, and that record is a row the panel draws.
+    /// Refusing it refused every list it appeared in — which is to say "Stage
+    /// all" stopped working the moment anyone made a directory.
+    #[test]
+    fn an_untracked_directory_is_a_path_like_any_other() {
+        assert_eq!(
+            checked_paths(&["newdir/".to_owned()]).unwrap(),
+            vec!["newdir".to_owned()]
+        );
+        assert_eq!(
+            checked_paths(&["src/feature/".to_owned(), "src/main.rs".to_owned()]).unwrap(),
+            vec!["src/feature".to_owned(), "src/main.rs".to_owned()]
+        );
+        // The slash is *one* trailing slash and nothing else: everything the
+        // rule above refuses stays refused.
+        for bad in ["/", "//", "src//", "src/../"] {
+            assert!(
+                checked_paths(&[bad.to_owned()]).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
     }
 
     #[test]
@@ -2220,6 +2559,236 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         }
         panic!("git status never reported {path}");
+    }
+
+    /// Is there a git to test against at all?
+    fn has_git() -> bool {
+        if Command::new("git").arg("--version").output().is_ok() {
+            return true;
+        }
+        eprintln!("skipping: no git on PATH");
+        false
+    }
+
+    /// A real repository with a real git, and an engine pointed at both.
+    ///
+    /// The tests below are about what git *does* rather than about what we
+    /// think it does — every one of them exists because a plausible reading of
+    /// git-restore(1) turned out to be wrong on a file somebody cared about.
+    #[cfg(unix)]
+    fn live_repo(dir: &Path) -> (crate::Engine, PathBuf) {
+        let projects = dir.join("projects");
+        let repo = projects.join("thing");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(
+            host_git(&repo, &["init", "--quiet", "-b", "main"])
+                .status
+                .success()
+        );
+        let engine = crate::Engine::new();
+        engine.set_userland(&fake_guest(dir), dir, dir, &projects);
+        (engine, repo)
+    }
+
+    /// `git status --porcelain`, straight from the host's git.
+    #[cfg(unix)]
+    fn plain_status(repo: &Path) -> String {
+        let out = host_git(repo, &["status", "--porcelain"]);
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Discarding a rename used to delete the file and lose everything typed
+    /// into it since: `git restore --source=HEAD -- <new name>` does not refuse
+    /// a path HEAD has never held, it removes it from the index and the
+    /// worktree and exits 0.
+    #[test]
+    #[cfg(unix)]
+    fn discarding_a_rename_brings_the_old_name_back_instead_of_deleting_the_file() {
+        if !has_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, repo) = live_repo(dir.path());
+        std::fs::write(repo.join("a.txt"), "original\n").unwrap();
+        assert!(host_git(&repo, &["add", "a.txt"]).status.success());
+        assert!(
+            host_git(&repo, &["commit", "--quiet", "-m", "first"])
+                .status
+                .success()
+        );
+        assert!(
+            host_git(&repo, &["mv", "a.txt", "renamed.txt"])
+                .status
+                .success()
+        );
+        std::fs::write(repo.join("renamed.txt"), "original\nprecious new work\n").unwrap();
+
+        let id = engine.open_project(&repo);
+        let change = await_change(&engine, id, "renamed.txt");
+        // What the panel is told, which is what its dialog has to say.
+        assert_eq!(change.original.as_deref(), Some("a.txt"));
+        assert!(!change.in_head);
+
+        engine.git_discard(id, &["renamed.txt".to_owned()]).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+            "original\n",
+            "the name HEAD holds has to come back"
+        );
+        assert!(
+            !repo.join("renamed.txt").exists(),
+            "the new name goes — to the trash, not with `git restore`"
+        );
+        // And the index goes with it: the old code left `D a.txt` staged, a
+        // deletion the user never asked for.
+        assert_eq!(plain_status(&repo), "");
+    }
+
+    /// A conflict is a decision, and `git restore --source=HEAD` makes it
+    /// silently: it keeps "ours", stages the path, leaves `MERGE_HEAD` set and
+    /// exits 0, so the panel goes quiet while the merge is still half-done.
+    #[test]
+    #[cfg(unix)]
+    fn discarding_a_conflict_is_refused_and_leaves_the_merge_alone() {
+        if !has_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, repo) = live_repo(dir.path());
+        std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+        assert!(host_git(&repo, &["add", "f.txt"]).status.success());
+        assert!(
+            host_git(&repo, &["commit", "--quiet", "-m", "base"])
+                .status
+                .success()
+        );
+        assert!(
+            host_git(&repo, &["checkout", "--quiet", "-b", "other"])
+                .status
+                .success()
+        );
+        std::fs::write(repo.join("f.txt"), "theirs\n").unwrap();
+        assert!(
+            host_git(&repo, &["commit", "--quiet", "-am", "theirs"])
+                .status
+                .success()
+        );
+        assert!(
+            host_git(&repo, &["checkout", "--quiet", "main"])
+                .status
+                .success()
+        );
+        std::fs::write(repo.join("f.txt"), "ours\n").unwrap();
+        assert!(
+            host_git(&repo, &["commit", "--quiet", "-am", "ours"])
+                .status
+                .success()
+        );
+        assert!(
+            !host_git(&repo, &["merge", "other"]).status.success(),
+            "the merge is supposed to conflict"
+        );
+
+        let id = engine.open_project(&repo);
+        let change = await_change(&engine, id, "f.txt");
+        assert!(change.conflicted);
+
+        let refused = engine.git_discard(id, &["f.txt".to_owned()]).unwrap_err();
+        assert!(
+            refused.contains("merge conflict"),
+            "expected a refusal naming the conflict, got {refused:?}"
+        );
+        let content = std::fs::read_to_string(repo.join("f.txt")).unwrap();
+        assert!(
+            content.contains("<<<<<<<") && content.contains("theirs"),
+            "the incoming side must still be in the file, got {content:?}"
+        );
+        assert!(
+            repo.join(".git/MERGE_HEAD").exists(),
+            "the merge is still in progress and must stay that way"
+        );
+    }
+
+    /// `--untracked-files=normal` collapses a new directory into one record
+    /// with a trailing slash. Refusing that path refused every list it was in,
+    /// so "Stage all" stopped working the moment anyone started new work.
+    #[test]
+    #[cfg(unix)]
+    fn a_whole_untracked_directory_can_be_staged_and_discarded() {
+        if !has_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, repo) = live_repo(dir.path());
+        std::fs::write(repo.join("README"), "one\n").unwrap();
+        assert!(host_git(&repo, &["add", "README"]).status.success());
+        assert!(
+            host_git(&repo, &["commit", "--quiet", "-m", "first"])
+                .status
+                .success()
+        );
+        std::fs::create_dir_all(repo.join("src/feature")).unwrap();
+        std::fs::write(repo.join("src/feature/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(repo.join("src/feature/b.rs"), "fn b() {}\n").unwrap();
+        std::fs::create_dir_all(repo.join("scratch")).unwrap();
+        std::fs::write(repo.join("scratch/notes.md"), "notes\n").unwrap();
+
+        let id = engine.open_project(&repo);
+        // One record, one row, and the row's path is a directory's.
+        let change = await_change(&engine, id, "src/");
+        assert_eq!(change.unstaged, Some(GitStatus::Untracked));
+
+        // "Stage all" hands the section's paths over as one list, so a single
+        // unstageable row used to refuse every other row with it.
+        engine
+            .git_stage(id, &["src/".to_owned(), "scratch/".to_owned()])
+            .unwrap();
+        let staged = plain_status(&repo);
+        assert!(
+            staged.contains("A  src/feature/a.rs") && staged.contains("A  scratch/notes.md"),
+            "expected both directories staged, got {staged:?}"
+        );
+
+        // And the destructive half: a directory HEAD has never seen goes to the
+        // trash whole, rather than under a `git restore` that would delete it.
+        engine.git_unstage(id, &["scratch/".to_owned()]).unwrap();
+        let scratch = await_change(&engine, id, "scratch/");
+        assert!(!scratch.in_head);
+        engine.git_discard(id, &["scratch/".to_owned()]).unwrap();
+        assert!(!repo.join("scratch").exists());
+    }
+
+    /// `AD` — staged, then deleted from the worktree. There is nothing to
+    /// trash, and the index entry is the whole of what discarding it means.
+    #[test]
+    #[cfg(unix)]
+    fn discarding_a_staged_file_already_gone_from_disk_clears_its_index_entry() {
+        if !has_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, repo) = live_repo(dir.path());
+        std::fs::write(repo.join("README"), "one\n").unwrap();
+        assert!(host_git(&repo, &["add", "README"]).status.success());
+        assert!(
+            host_git(&repo, &["commit", "--quiet", "-m", "first"])
+                .status
+                .success()
+        );
+        std::fs::write(repo.join("new.rs"), "fn main() {}\n").unwrap();
+        assert!(host_git(&repo, &["add", "new.rs"]).status.success());
+        std::fs::remove_file(repo.join("new.rs")).unwrap();
+
+        let id = engine.open_project(&repo);
+        let change = await_change(&engine, id, "new.rs");
+        assert!(!change.in_head);
+
+        // The old code reported the trash's `No such file or directory` and
+        // skipped the `git rm --cached` that was the point, so the row stayed
+        // in the panel forever.
+        engine.git_discard(id, &["new.rs".to_owned()]).unwrap();
+        assert_eq!(plain_status(&repo), "");
     }
 
     #[test]

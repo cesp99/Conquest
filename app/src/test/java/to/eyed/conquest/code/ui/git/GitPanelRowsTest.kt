@@ -1,6 +1,7 @@
 package to.eyed.conquest.code.ui.git
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import to.eyed.conquest.code.core.GitChange
@@ -20,7 +21,8 @@ class GitPanelRowsTest {
         unstaged: GitFileStatus? = null,
         conflicted: Boolean = false,
         inHead: Boolean = true,
-    ) = GitChange(path, staged, unstaged, conflicted, inHead)
+        original: String? = null,
+    ) = GitChange(path, staged, unstaged, conflicted, inHead, original)
 
     private fun state(vararg changes: GitChange) =
         GitPanelState(scanned = true, hasRepo = true, entries = changes.toList())
@@ -86,5 +88,73 @@ class GitPanelRowsTest {
     fun aCleanProjectHasNoRows() {
         assertTrue(gitPanelRows(state()).isEmpty())
         assertTrue(gitPanelRows(GitPanelState()).isEmpty())
+    }
+
+    /**
+     * Discard is offered from the ⋯ menu, from a right-click, from a long-press
+     * and from `Delete`; a guard on one of them is a guard on none. All four go
+     * through this, because the confirmation a conflict must never reach is the
+     * one that promises "back to what the last commit holds" — and `git restore`
+     * on an unmerged path keeps "ours", stages it, exits 0 and leaves the merge
+     * half-done with nothing on screen to say so.
+     */
+    @Test
+    fun aConflictIsRefusedBeforeTheConfirmationRatherThanDiscarded() {
+        val conflict = change("f.txt", conflicted = true, inHead = true)
+        val refusal = discardRefusal(conflict)
+        assertTrue(refusal != null && "merge conflict" in refusal)
+
+        // Everything else still gets the dialog.
+        assertNull(discardRefusal(change("a.rs", unstaged = GitFileStatus.Modified)))
+        assertNull(discardRefusal(change("new.rs", unstaged = GitFileStatus.Untracked, inHead = false)))
+        assertNull(
+            discardRefusal(
+                change("renamed.txt", staged = GitFileStatus.Renamed, inHead = false, original = "a.txt")
+            )
+        )
+    }
+
+    /** What the item promises has to be what happens to *that* row. */
+    @Test
+    fun theDiscardItemIsNamedForWhatItDoesToThisRow() {
+        assertEquals("Discard changes…", discardLabel(change("a.rs", unstaged = GitFileStatus.Modified)))
+        assertEquals(
+            "Move to the trash…",
+            discardLabel(change("new.rs", unstaged = GitFileStatus.Untracked, inHead = false)),
+        )
+        assertEquals(
+            "Move the folder to the trash…",
+            discardLabel(change("src/", unstaged = GitFileStatus.Untracked, inHead = false)),
+        )
+        // A rename is a restore *and* a trash, and "discard changes" is neither.
+        assertEquals(
+            "Undo the rename…",
+            discardLabel(
+                change("renamed.txt", staged = GitFileStatus.Renamed, inHead = false, original = "a.txt")
+            ),
+        )
+    }
+
+    /**
+     * The panel is removed from the composition by Escape, and on a compact
+     * screen by opening a file. A commit message that lives only in that
+     * composition is a message the user types twice.
+     */
+    @Test
+    fun aTypedCommitMessageSurvivesThePanelClosing() {
+        val project = 7L
+        assertEquals("", CommitDrafts.of(project))
+        CommitDrafts.put(project, "Fix the parser\n\nIt was reading the source record")
+        assertEquals("Fix the parser\n\nIt was reading the source record", CommitDrafts.of(project))
+
+        // Another project's draft is its own.
+        assertEquals("", CommitDrafts.of(8L))
+
+        // Cleared on a commit that landed, and by emptying the box.
+        CommitDrafts.clear(project)
+        assertEquals("", CommitDrafts.of(project))
+        CommitDrafts.put(project, "typed")
+        CommitDrafts.put(project, "")
+        assertEquals("", CommitDrafts.of(project))
     }
 }

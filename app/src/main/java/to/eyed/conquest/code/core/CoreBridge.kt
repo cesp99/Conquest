@@ -228,9 +228,13 @@ object CoreBridge {
      * **Destructive.** Throws away every uncommitted change to those paths.
      *
      * A path the last commit has is restored to what the commit holds — index
-     * and worktree both. A path it does not have (untracked, or staged-new)
-     * cannot be restored from anywhere, so it is moved to the app's trash
-     * rather than deleted: a mistake here must not be a loss.
+     * and worktree both. A path it does not have (untracked, staged-new, or the
+     * new name of a rename) cannot be restored from anywhere, so it is moved to
+     * the app's trash rather than deleted: a mistake here must not be a loss.
+     *
+     * A row the engine cannot explain is *refused*, with the reason as the
+     * return value and nothing touched — a conflict above all, where the
+     * obvious git command keeps one side of the merge and reports success.
      *
      * **Confirm with the user first, naming the files.** Nothing below this
      * call asks anything. **Blocking**.
@@ -262,8 +266,9 @@ object CoreBridge {
      * buffer moves. A deletion occupies no rows — first and end row are equal,
      * and mark the boundary the rows were removed from.
      *
-     * Reads a cache: never blocks, never null. Empty for a buffer with no file,
-     * one outside a repository, and one that matches the commit.
+     * Reads a cache: takes the engine's buffer locks briefly, never runs git
+     * and never blocks on one that is running; never null. Empty for a buffer
+     * with no file, one outside a repository, and one that matches the commit.
      */
     external fun gitHunks(bufferId: Long): IntArray
 

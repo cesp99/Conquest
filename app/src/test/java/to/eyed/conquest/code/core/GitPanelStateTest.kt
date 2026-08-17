@@ -109,9 +109,60 @@ class GitPanelStateTest {
         val nested = GitChange("src/deep/main.rs", null, GitFileStatus.Modified, false, true)
         assertEquals("main.rs", nested.name)
         assertEquals("src/deep", nested.directory)
+        assertFalse(nested.isDirectory)
 
         val root = GitChange("README", null, GitFileStatus.Modified, false, true)
         assertEquals("README", root.name)
         assertEquals("", root.directory)
+    }
+
+    /**
+     * `--untracked-files=normal` collapses a whole new directory into one
+     * record with a trailing slash — the state right after starting new work.
+     * Split like a file it has no name at all, and the row draws blank.
+     */
+    @Test
+    fun anUntrackedDirectoryIsOneRowWithAName() {
+        val state = GitPanelState.parse(
+            """{"scanned":true,"has_repo":true,"branch":null,"entries":[
+                 {"path":"src/feature/","staged":null,"unstaged":"untracked",
+                  "conflicted":false,"in_head":false,"original":null}]}"""
+        )
+        val folder = state.unstaged.single()
+        assertTrue(folder.isDirectory)
+        // The slash stays in the label: "feature" and "feature/" are not the
+        // same promise when the next tap discards one of them.
+        assertEquals("feature/", folder.name)
+        assertEquals("src", folder.directory)
+
+        val top = GitChange("newdir/", null, GitFileStatus.Untracked, false, false)
+        assertEquals("newdir/", top.name)
+        assertEquals("", top.directory)
+    }
+
+    /**
+     * A rename carries the name the last commit knows it by. Discarding one
+     * cannot be done without it — the old name is restored and the new one, a
+     * path HEAD has never held, goes to the trash.
+     */
+    @Test
+    fun aRenameCarriesTheNameTheCommitKnows() {
+        val state = GitPanelState.parse(
+            """{"scanned":true,"has_repo":true,"branch":null,"entries":[
+                 {"path":"renamed.txt","staged":"renamed","unstaged":"modified",
+                  "conflicted":false,"in_head":false,"original":"a.txt"}]}"""
+        )
+        val renamed = state.staged.single()
+        assertEquals("a.txt", renamed.original)
+        // The new name is *not* in the commit, whatever git's letters look like.
+        assertFalse(renamed.inHead)
+
+        // And an ordinary row has no original at all, absent or null.
+        val plain = GitPanelState.parse(
+            """{"scanned":true,"has_repo":true,"entries":[
+                 {"path":"a.rs","staged":null,"unstaged":"modified",
+                  "conflicted":false,"in_head":true}]}"""
+        )
+        assertNull(plain.unstaged.single().original)
     }
 }

@@ -57,6 +57,7 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -135,9 +136,10 @@ private val CommitBoxHeight = 76.dp
  * editor's worth of surface for a wave that is building three other things.
  *
  * Two of the actions here destroy work, so both are guarded. Discard confirms,
- * names the file, and says which of its two meanings applies — restore, or
- * trash — and it cannot be reached in one tap from anywhere. Commit refuses an
- * empty message rather than making an empty commit.
+ * names the file, and says which of its meanings applies — restore, trash, or a
+ * rename undone — and it cannot be reached in one tap from anywhere. A row it
+ * cannot state a promise for, a conflict above all, it refuses instead. Commit
+ * refuses an empty message rather than making an empty commit.
  */
 @Composable
 fun GitPanel(
@@ -158,7 +160,16 @@ fun GitPanel(
     val session = remember(project) { GitSession(project) }
 
     var state by remember(project) { mutableStateOf(GitPanelState()) }
-    var message by remember(project) { mutableStateOf(TextFieldValue()) }
+    // Seeded from, and written back to, the draft the panel was closed with:
+    // Escape and — on a phone — opening a file both take the panel out of the
+    // composition, and a commit message is the one thing here nobody wants to
+    // type twice. Cleared on a commit that succeeded, and nowhere else.
+    var message by remember(project) {
+        val draft = CommitDrafts.of(project.id)
+        // Caret at the end of what was already typed, which is where the user
+        // left it and where they expect to carry on.
+        mutableStateOf(TextFieldValue(draft, TextRange(draft.length)))
+    }
     var selected by remember(project) { mutableIntStateOf(-1) }
     var busy by remember(project) { mutableStateOf(false) }
     var error by remember(project) { mutableStateOf<String?>(null) }
@@ -203,7 +214,13 @@ fun GitPanel(
      * field does it here and not from an IO dispatcher.
      */
     fun perform(action: suspend () -> String?, onSuccess: () -> Unit = {}) {
-        if (busy) return
+        // One at a time, and *said* rather than swallowed: a `git add` inside
+        // proot is easily a second, and a Ctrl+Enter that vanished into it
+        // looks exactly like a keybinding that does not work.
+        if (busy) {
+            error = "Still running the last git command…"
+            return
+        }
         busy = true
         error = null
         scope.launch {
@@ -242,7 +259,27 @@ fun GitPanel(
         }
         // The message is cleared only on success: one the user would have to
         // retype because git refused the commit is the wrong thing to lose.
-        perform({ session.commit(text) }) { message = TextFieldValue() }
+        perform({ session.commit(text) }) {
+            message = TextFieldValue()
+            CommitDrafts.clear(project.id)
+        }
+    }
+
+    /**
+     * Discard, from every route to it — the menu, the row, and Delete.
+     *
+     * A conflict never reaches the dialog. `git restore --source=HEAD` on an
+     * unmerged path does not refuse: it keeps "ours", stages it, and leaves the
+     * merge half-done with nothing on screen to say so. The engine refuses it
+     * too; this is the half that can explain *why* without a round trip.
+     */
+    fun requestDiscard(change: GitChange) {
+        val refusal = discardRefusal(change)
+        if (refusal != null) {
+            error = refusal
+            return
+        }
+        confirming = change
     }
 
     /** Walk the file rows, stepping over the section headers between them. */
@@ -306,7 +343,7 @@ fun GitPanel(
                     // also binds with `skip_prompt: false`. Ours has no version
                     // that skips the prompt.
                     Key.Delete, Key.Backspace -> {
-                        selectedChange?.let { confirming = it }
+                        selectedChange?.let(::requestDiscard)
                         true
                     }
                     else -> false
@@ -364,7 +401,7 @@ fun GitPanel(
                                 },
                                 onDiscard = {
                                     selected = index
-                                    confirming = row.change
+                                    requestDiscard(row.change)
                                 },
                             )
                         }
@@ -387,7 +424,10 @@ fun GitPanel(
             HorizontalDivider(color = theme.color("border"))
             CommitBox(
                 message = message,
-                onMessage = { message = it },
+                onMessage = {
+                    message = it
+                    CommitDrafts.put(project.id, it.text)
+                },
                 onFocusChanged = { messageFocused = it },
                 stagedCount = state.staged.size,
                 busy = busy,
@@ -613,9 +653,11 @@ private fun ChangeRow(
                     ContextMenuItem("Stage", shortcut = "Space", enabled = enabled, onClick = onToggleStaged)
                 },
                 // Named for what it will actually do to *this* file, and it
-                // opens the confirmation rather than doing it.
+                // opens the confirmation rather than doing it. A conflicted row
+                // keeps the item and gets the reason it cannot: an item that
+                // silently vanishes teaches nothing.
                 ContextMenuItem(
-                    label = if (change.inHead) "Discard changes…" else "Move to the trash…",
+                    label = discardLabel(change),
                     shortcut = "Delete",
                     enabled = enabled,
                     onClick = onDiscard,
@@ -807,21 +849,26 @@ private fun Glyph(glyph: String, description: String, onClick: () -> Unit) {
 }
 
 /**
- * The confirmation. It names the file, and it says which of discard's two
- * meanings this one is — because "restored to the last commit" and "moved to
- * the trash" are not the same promise, and only one of them is reversible with
- * a `git` command.
+ * The confirmation. It names the file, and it says which of discard's three
+ * meanings this one is — restored from the last commit, moved to the trash, or
+ * a rename undone, which is both at once. They are not the same promise, and
+ * only the first is reversible with a `git` command.
+ *
+ * A conflicted row never gets here: [discardRefusal] turns it back at the door,
+ * because there is no wording that would make "keep ours and say nothing" the
+ * thing the user meant.
  */
 @Composable
 private fun DiscardDialog(change: GitChange, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    val renamedFrom = change.original
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
             Text(
-                if (change.inHead) {
-                    "Discard changes to ${change.name}?"
-                } else {
-                    "Move ${change.name} to the trash?"
+                when {
+                    renamedFrom != null -> "Undo the rename of ${change.name}?"
+                    change.inHead -> "Discard changes to ${change.name}?"
+                    else -> "Move ${change.name} to the trash?"
                 }
             )
         },
@@ -830,14 +877,28 @@ private fun DiscardDialog(change: GitChange, onDismiss: () -> Unit, onConfirm: (
                 buildString {
                     append(change.path)
                     append("\n\n")
-                    if (change.inHead) {
-                        append(
+                    when {
+                        // Both halves, named, because the destructive half is
+                        // the one the old name does not cover: the last commit
+                        // has never held this file under its new name, so what
+                        // has been typed into it since is not in git anywhere.
+                        renamedFrom != null -> append(
+                            "$renamedFrom comes back as the last commit holds it, and " +
+                                "${change.name} goes to the app's trash — the commit has " +
+                                "never seen it under that name, so git has no copy of " +
+                                "anything you have written in it."
+                        )
+                        change.inHead -> append(
                             "The file goes back to what the last commit holds. " +
                                 "Everything you have changed in it since then is gone, " +
                                 "and git has no copy of it."
                         )
-                    } else {
-                        append(
+                        change.isDirectory -> append(
+                            "The last commit has never seen this folder, so there is " +
+                                "nothing to restore it from. It goes to the app's trash " +
+                                "with everything in it, rather than being deleted."
+                        )
+                        else -> append(
                             "The last commit has never seen this file, so there is " +
                                 "nothing to restore it from. It goes to the app's " +
                                 "trash rather than being deleted."
@@ -852,11 +913,67 @@ private fun DiscardDialog(change: GitChange, onDismiss: () -> Unit, onConfirm: (
         },
         confirmButton = {
             TextButton(onClick = onConfirm) {
-                Text(if (change.inHead) "Discard" else "Move to the trash")
+                Text(
+                    when {
+                        renamedFrom != null -> "Undo the rename"
+                        change.inHead -> "Discard"
+                        else -> "Move to the trash"
+                    }
+                )
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
+}
+
+/**
+ * Why discarding this row cannot be offered, or null when it can.
+ *
+ * One conflict, one sentence, every route to discard. `git restore
+ * --source=HEAD` on an unmerged path is not refused by git: it keeps "ours",
+ * marks the path resolved and staged, exits 0 and leaves `MERGE_HEAD` set — so
+ * the panel would go quiet, the section would empty, and the next commit would
+ * drop the incoming side of the merge with nothing ever said about it.
+ */
+internal fun discardRefusal(change: GitChange): String? = when {
+    change.conflicted ->
+        "${change.name} has a merge conflict. Resolve it in the editor and stage the " +
+            "result — discarding it would keep one side of the merge and say nothing."
+    else -> null
+}
+
+/** What the discard item says it will do to *this* row. */
+internal fun discardLabel(change: GitChange): String = when {
+    // A rename is both halves at once, and "discard changes" describes neither.
+    change.original != null -> "Undo the rename…"
+    change.inHead -> "Discard changes…"
+    change.isDirectory -> "Move the folder to the trash…"
+    else -> "Move to the trash…"
+}
+
+/**
+ * Commit messages typed but not yet committed, one per project.
+ *
+ * The panel is a composable that gets *removed*: Escape closes it, and on a
+ * compact screen opening a file takes the work area away from it. So its own
+ * composition cannot be where a half-written commit message lives — that is the
+ * one thing here nobody will retype. Kept beside the panel rather than hoisted
+ * into the workspace because nothing else reads it, and touched only from the
+ * main thread, like the composition that owns it.
+ */
+internal object CommitDrafts {
+    private val drafts = mutableMapOf<Long, String>()
+
+    fun of(project: Long): String = drafts[project] ?: ""
+
+    fun put(project: Long, message: String) {
+        if (message.isEmpty()) drafts.remove(project) else drafts[project] = message
+    }
+
+    /** After a commit that landed: that message has done its job. */
+    fun clear(project: Long) {
+        drafts.remove(project)
+    }
 }
 
 /** Which section a row belongs to. */

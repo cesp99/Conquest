@@ -104,6 +104,17 @@ pub struct BlameEntry {
 /// Per-buffer diff state.
 #[derive(Default)]
 struct BufferDiff {
+    /// Whether the file is inside a repository at all, and the git generation
+    /// that was decided at.
+    ///
+    /// Answering it is an ancestor walk of `Path::exists` — one `stat` per
+    /// directory up to the filesystem root — and the gutter polls this module
+    /// from the main thread, once per open buffer, four times a second. So it
+    /// is asked once per buffer per git generation and remembered, on the same
+    /// staleness rule the base text below already follows: a `git init` moves
+    /// the generation, and nothing else can make a file join a repository.
+    in_repo: Option<bool>,
+    in_repo_generation: u64,
     /// The file's content at HEAD. `Some("")` for a file HEAD has never seen,
     /// which is a base of no lines and therefore a wholly added file; `None`
     /// until we have managed to ask, and after an ask that failed.
@@ -137,7 +148,8 @@ impl crate::Engine {
         self.with_diff(id, |diff| diff.version).unwrap_or(0)
     }
 
-    /// The hunks, ascending by row. Reads a cache and returns at once; empty
+    /// The hunks, ascending by row. Reads a cache: it takes the buffer locks
+    /// briefly, never runs git and never waits for one that is running. Empty
     /// for a buffer with no file, a file in no repository, and a file that
     /// matches HEAD.
     pub fn git_hunks(&self, id: BufferId) -> Vec<Hunk> {
@@ -178,6 +190,16 @@ impl crate::Engine {
             .clone();
         {
             let mut diff = cache.lock().unwrap();
+            if diff.in_repo.is_none() || diff.in_repo_generation != generation {
+                diff.in_repo = Some(
+                    path.parent()
+                        .is_some_and(|dir| git::repo_root_of(dir).is_some()),
+                );
+                diff.in_repo_generation = generation;
+            }
+            if diff.in_repo != Some(true) {
+                return;
+            }
             let base_is_current = diff.base_fetched && diff.base_generation == generation;
             let hunks_are_current = diff.diffed && diff.diffed_version == version;
             if diff.running || (base_is_current && hunks_are_current) {
@@ -198,12 +220,15 @@ impl crate::Engine {
         }
     }
 
-    /// The file behind a buffer and the buffer's version, or `None` when there
-    /// is nothing to diff — a scratch buffer, or a file outside any repository.
+    /// The file behind a buffer and the buffer's version, or `None` for a
+    /// scratch buffer, which has no file to diff against anything.
+    ///
+    /// Whether the file is in a repository is *not* asked here: that costs a
+    /// walk of the filesystem, and this runs on the caller's thread on every
+    /// poll. [`Engine::refresh_hunks`] asks it once and remembers.
     fn diff_target(&self, id: BufferId) -> Option<(PathBuf, u64)> {
         let version = self.version(id).ok()?;
         let path = self.buffer_path(id)?;
-        git::repo_root_of(path.parent()?)?;
         Some((path, version))
     }
 
@@ -658,5 +683,41 @@ mod tests {
         let id = engine.create_buffer("a\nb\n");
         assert_eq!(engine.git_hunks_version(id), 0);
         assert!(engine.git_hunks(id).is_empty());
+    }
+
+    /// Both entry points are documented as cache reads the gutter may poll from
+    /// the main thread. Asking "is this file in a repository?" is an ancestor
+    /// walk of `stat`s, and doing it per call made that documentation false —
+    /// fifteen open tabs at 250 ms is hundreds of syscalls a second on the UI
+    /// thread. It is asked once per buffer per git generation instead.
+    #[test]
+    fn polling_the_gutter_does_not_walk_the_filesystem_every_time() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "a\nb\n").unwrap();
+
+        let engine = crate::Engine::new();
+        // A userland it can never reach: the diff thread is spawned and fails,
+        // which is beside the point — what is measured is the caller's thread.
+        engine.set_userland(
+            &dir.path().join("no-such-proot"),
+            dir.path(),
+            dir.path(),
+            dir.path(),
+        );
+        let id = engine.open_file(&file).unwrap();
+
+        let walked = || git::REPO_ROOT_WALKS.with(std::cell::Cell::get);
+        let before = walked();
+        for _ in 0..20 {
+            engine.git_hunks_version(id);
+            engine.git_hunks(id);
+        }
+        let walks = walked() - before;
+        assert!(
+            walks <= 1,
+            "40 polls should walk the tree once, not {walks} times"
+        );
     }
 }
