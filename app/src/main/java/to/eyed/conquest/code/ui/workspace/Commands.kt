@@ -32,6 +32,8 @@ data class CommandContext(
     val terminalCount: Int,
     /** Whether this build has a Linux userland to run git in. */
     val canClone: Boolean,
+    /** Whether the open file is one the preview can draw — Markdown or SVG. */
+    val canPreview: Boolean = false,
 )
 
 /** A command as the palette shows it. */

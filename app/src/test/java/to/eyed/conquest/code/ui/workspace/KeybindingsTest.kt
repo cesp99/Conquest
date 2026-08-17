@@ -31,7 +31,7 @@ class KeybindingsTest {
     @Test
     fun `no workspace surface takes a chord the editor or the panel needs`() {
         val surfaces = mapOf(
-            "Markdown preview" to MarkdownPreviewChord,
+            "Preview" to PreviewChord,
             "go to line" to GoToLineChord,
             "project search" to ProjectSearchChord,
             "command palette" to CommandPaletteChord,

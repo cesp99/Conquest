@@ -105,6 +105,15 @@ enum class WorkspaceCommand(
     /** Find within the open file — Zed's buffer search. */
     FindInFile("buffer_search::Deploy", isAvailable = { it.hasActiveFile }),
 
+    /**
+     * Show or hide the preview of the open file.
+     *
+     * One command for both previews, as Zed has one button for both: which of
+     * them appears is a property of the file, not a choice the user makes.
+     * Unavailable — greyed, not hidden — on a file with neither.
+     */
+    TogglePreview("conquest::TogglePreview", isAvailable = { it.canPreview }),
+
     /** Open the settings screen. */
     OpenSettings("conquest::OpenSettings"),
 
@@ -401,7 +410,7 @@ fun isGoToLine(event: KeyEvent, focus: Focus = Focus.Workspace): Boolean {
 }
 
 /**
- * Show or hide the Markdown preview.
+ * Show or hide the preview of the open file.
  *
  * Zed puts this on `ctrl-shift-v` (default-linux.json:607) and this table may
  * not: the convention above is that editor-local clipboard chords never appear
@@ -412,19 +421,20 @@ fun isGoToLine(event: KeyEvent, focus: Focus = Focus.Workspace): Boolean {
  * that it had. Zed's other binding, `ctrl-k v`, is a two-key sequence this
  * table cannot express yet.
  *
- * So `Ctrl+Shift+M`, which nothing in this app or in a shell claims, and which
- * says Markdown. Which side the preview lands on is decided by the width of
- * the screen rather than by a second chord. Workspace-only: in a terminal
- * `Ctrl+Shift+M` is free but the preview needs a file open, not a shell.
+ * So `Ctrl+Shift+M`, which nothing in this app or in a shell claims. Which side
+ * the preview lands on is decided by the width of the screen rather than by a
+ * second chord, and *which* preview by the file that is open — Markdown or
+ * SVG, the same two Zed's own eye button offers. Workspace-only: in a terminal
+ * `Ctrl+Shift+M` is free but a preview needs a file open, not a shell.
  */
-val MarkdownPreviewChord = Chord(AndroidKeyEvent.KEYCODE_M, "M", shift = true)
+val PreviewChord = Chord(AndroidKeyEvent.KEYCODE_M, "M", shift = true)
 
-/** True when this event should toggle the Markdown preview. */
-fun isMarkdownPreview(event: KeyEvent, focus: Focus = Focus.Workspace): Boolean {
+/** True when this event should show or hide the preview. */
+fun isPreview(event: KeyEvent, focus: Focus = Focus.Workspace): Boolean {
     if (focus != Focus.Workspace) return false
     if (event.type != KeyEventType.KeyDown) return false
     if (event.nativeKeyEvent.isAltPressed) return false
-    return MarkdownPreviewChord.matches(event.nativeKeyEvent)
+    return PreviewChord.matches(event.nativeKeyEvent)
 }
 
 /** The command a key event maps to, or null to let it through. */

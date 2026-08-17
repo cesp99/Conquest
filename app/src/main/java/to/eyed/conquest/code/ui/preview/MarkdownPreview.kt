@@ -91,7 +91,7 @@ import to.eyed.conquest.code.ui.theme.UiFontFamily
 import to.eyed.conquest.code.ui.theme.ZedTheme
 
 /** Zed's git panel width, which is what the search dock already uses. */
-private val DockWidth = 400.dp
+internal val PreviewDockWidth = 400.dp
 private val DockMinWidth = 280.dp
 
 /**
@@ -125,12 +125,12 @@ private val ControlSize = 26.dp
  * types a word. The delay is inside the effect, so each keystroke cancels the
  * previous one before it starts and only the last one lands.
  *
- * This is the debounce, not the latency: [VERSION_POLL_MS] is a key of the
+ * This is the debounce, not the latency: [PREVIEW_VERSION_POLL_MS] is a key of the
  * same effect and typing moves the engine's version too, so the tick after the
  * last keystroke restarts the wait once more. What a typist actually sees is
  * up to this plus that.
  */
-private const val REPARSE_DEBOUNCE_MS = 180L
+internal const val PREVIEW_REPARSE_DEBOUNCE_MS = 180L
 
 /**
  * How often the engine's buffer version is re-read.
@@ -142,10 +142,7 @@ private const val REPARSE_DEBOUNCE_MS = 180L
  * about that is visible to composition. One long read every quarter second is
  * what keeps the preview honest about that case.
  */
-private const val VERSION_POLL_MS = 250L
-
-/** Files the preview will render. Anything else gets the empty state. */
-private val MARKDOWN_SUFFIXES = listOf(".md", ".markdown", ".mdown", ".mkd")
+internal const val PREVIEW_VERSION_POLL_MS = 250L
 
 /**
  * The most text the preview will take.
@@ -236,17 +233,17 @@ fun MarkdownPreview(
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     val focus = remember { FocusRequester() }
-    var dockWidth by remember { mutableStateOf(DockWidth) }
+    var dockWidth by remember { mutableStateOf(PreviewDockWidth) }
 
-    val isMarkdown = MARKDOWN_SUFFIXES.any { path.endsWith(it, ignoreCase = true) }
+    val isMarkdown = PreviewKind.of(path) == PreviewKind.Markdown
 
     // Two things move the text and only one of them is visible to composition.
-    // See VERSION_POLL_MS.
+    // See PREVIEW_VERSION_POLL_MS.
     var engineVersion by remember(editor) { mutableLongStateOf(-1L) }
     LaunchedEffect(editor) {
         while (true) {
             engineVersion = editor.session.version
-            delay(VERSION_POLL_MS)
+            delay(PREVIEW_VERSION_POLL_MS)
         }
     }
 
@@ -256,7 +253,7 @@ fun MarkdownPreview(
             document = PreviewDocument.EMPTY
             return@LaunchedEffect
         }
-        delay(REPARSE_DEBOUNCE_MS)
+        delay(PREVIEW_REPARSE_DEBOUNCE_MS)
         // All of it off the main thread: reading past the drawn window is a
         // JNI call that takes the engine's buffer mutex, and highlighting a
         // fence is a tree-sitter parse behind that same mutex.
@@ -312,7 +309,7 @@ fun MarkdownPreview(
             }
         ) {
             if (isDock) {
-                ResizeHandle { delta -> dockWidth = clampDockWidth(dockWidth - delta, available) }
+                PreviewResizeHandle { delta -> dockWidth = clampDockWidth(dockWidth - delta, available) }
             }
             Column(
                 modifier = Modifier
@@ -432,7 +429,7 @@ private fun Notice(text: String, style: PreviewStyle) {
  * the whole work area and there is no editor to press Ctrl+Shift+V into.
  */
 @Composable
-private fun PreviewHeader(path: String, onDismiss: () -> Unit) {
+internal fun PreviewHeader(path: String, onDismiss: () -> Unit) {
     val theme = LocalZedTheme.current
     Row(
         modifier = Modifier
@@ -471,7 +468,7 @@ private fun PreviewHeader(path: String, onDismiss: () -> Unit) {
 
 /** The dock's left edge: the border, and the grip that drags it wider. */
 @Composable
-private fun ResizeHandle(onDrag: (Dp) -> Unit) {
+internal fun PreviewResizeHandle(onDrag: (Dp) -> Unit) {
     val theme = LocalZedTheme.current
     Box(
         modifier = Modifier

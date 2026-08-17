@@ -57,7 +57,7 @@ editor.
 | `Ctrl` `F` | Find in the open file |
 | `Ctrl` `Shift` `F` | Search every file in the project |
 | `Ctrl` `G` | Go to a line (and column) |
-| `Ctrl` `Shift` `M` | Show/hide the Markdown preview |
+| `Ctrl` `Shift` `M` | Show/hide the preview of the open file |
 | `Ctrl` `Shift` `T` | Reopen the tab you closed last |
 | `Ctrl` `Shift` `E` | Reveal the open file in the project panel |
 | `Ctrl` `Shift` `G` | Clone a git repository into a new project |
@@ -117,12 +117,15 @@ cursor, and the exact scroll position — not just the line number.
 `Ctrl` `G` is deliberately not offered while a terminal has the keyboard, where
 it is BEL and readline's abort.
 
-## Markdown preview
+## Preview
 
-`Ctrl` `Shift` `M` renders the open `.md` file — Zed's `markdown::OpenPreview`,
-which Zed itself puts on `Ctrl` `Shift` `V`. That chord is paste in the editor,
-paste in the project panel and paste in the terminal, and a workspace command
-may not take a clipboard chord from any of them.
+`Ctrl` `Shift` `M` previews the open file — a `.md` rendered, or a `.svg`
+drawn. Zed offers exactly these two, from one 👁 button in its toolbar
+(`quick_action_bar/preview.rs`), and so does this: the eye appears at the right
+of the toolbar whenever the open file has a preview, and nothing appears when
+it does not. Zed's own chord is `Ctrl` `Shift` `V`, which here is paste in the
+editor, paste in the project panel and paste in the terminal — a workspace
+command may not take a clipboard chord from any of them.
 On a wide screen it docks beside the editor and its left edge drags to resize;
 on a phone it takes the work area, the way project search and the terminal do.
 `✕` in its title bar closes it, which is the route for a finger.
@@ -130,6 +133,17 @@ on a phone it takes the work area, the way project search and the terminal do.
 It follows the buffer: type in the editor and the rendering catches up, without
 either pane's scrolling moving the other. The preview keeps its own place on
 the page while you edit.
+
+An SVG is text first — Zed keeps it out of its image viewer by name and opens
+it in the editor, because whoever opens an icon file is usually editing it — so
+the drawing is a preview like the Markdown one. Pinch or `Ctrl` `+` / `Ctrl` `-`
+to zoom, drag to pan, double tap or `Ctrl` `0` to put it back. Gradients,
+filters, masks and text are named under the drawing rather than drawn wrong.
+
+A picture that is *only* a picture — `.png`, `.jpg`, `.webp` and the rest —
+opens as one instead, with no buffer behind it: nothing to save, nothing to be
+dirty, and `Ctrl` `S` and `Ctrl` `F` are refused on it rather than doing
+nothing quietly.
 
 | Shortcut | Action |
 |---|---|
@@ -319,7 +333,7 @@ and htop need them. The workspace keeps only these:
 | `Ctrl` `Shift` `P` | Open the command palette |
 
 `Ctrl` `Shift` `V` is paste here and nothing else — and everywhere else, which
-is why the Markdown preview is on `Ctrl` `Shift` `M` — and `Ctrl` `G` stays
+is why the preview is on `Ctrl` `Shift` `M` — and `Ctrl` `G` stays
 BEL. Both are reachable from the `☰` menu, which is the route out of a focused
 terminal.
 
@@ -347,9 +361,11 @@ edition the shell runs inside Debian once you install it — see
   bar between the editor and the terminal drags to resize the dock.
 - In project search: the wheel scrolls the results, a row lights up under
   the pointer, and the panel's left edge drags to make it wider.
+- In the toolbar: the 👁 button shows a hand cursor and opens the preview of
+  the file that is open — the same button for Markdown and for SVG, as in Zed.
 - In the Markdown preview: links show a hand cursor and light up under the
   pointer, the wheel scrolls the page, and the panel's left edge drags to
-  make it wider.
+  make it wider. In the SVG preview the wheel zooms and a drag pans.
 
 ## Touch
 
@@ -370,10 +386,12 @@ exclude fields. On a phone the panel takes the whole work area, so opening
 a match hands the screen back to the editor — what you typed is kept, and
 `☰` → **Search all files…** brings it back.
 
-The Markdown preview is a touch surface too: `✕` in its title bar closes it —
-the one control it needs a finger to reach, since on a phone it covers the
-editor there is no `Ctrl` `Shift` `M` to press into. Tap a link to follow it,
-drag to scroll, and drag the dock's left edge on a wide screen. Go to line is
+The preview is a touch surface too. The 👁 in the toolbar opens it, and `✕` in
+its title bar closes it — the control it needs a finger to reach, since on a
+phone it covers the editor and there is no `Ctrl` `Shift` `M` to press into.
+In Markdown, tap a link to follow it and drag to scroll; in SVG, pinch to zoom,
+drag to pan and double tap to put both back. The dock's left edge drags on a
+wide screen. Go to line is
 the same: the panel's `↵` confirms and `✕` cancels, both reachable while the
 soft keyboard is up.
 

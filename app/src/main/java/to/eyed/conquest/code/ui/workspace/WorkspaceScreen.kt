@@ -72,6 +72,10 @@ import to.eyed.conquest.code.ui.editor.EditorPane
 import to.eyed.conquest.code.ui.editor.EditorState
 import to.eyed.conquest.code.ui.media.MediaKind
 import to.eyed.conquest.code.ui.media.MediaPane
+import to.eyed.conquest.code.ui.preview.MarkdownPreview
+import to.eyed.conquest.code.ui.preview.PreviewDockWidth
+import to.eyed.conquest.code.ui.preview.PreviewKind
+import to.eyed.conquest.code.ui.preview.SvgPreview
 import to.eyed.conquest.code.ui.terminal.TerminalDock
 
 /**
@@ -179,6 +183,12 @@ fun WorkspaceScreen(
     var settingsOpen by remember { mutableStateOf(false) }
     var themeSelectorOpen by remember { mutableStateOf(false) }
     var searchBarOpen by remember { mutableStateOf(false) }
+    /**
+     * Whether the preview is showing. What it previews is decided by whatever
+     * file is active, so switching tabs switches the preview with them rather
+     * than leaving a rendered README beside a Rust file.
+     */
+    var previewOpen by remember { mutableStateOf(false) }
     /** Ctrl+Shift+F. The token is bumped to pull focus back to its query. */
     var projectSearchOpen by remember { mutableStateOf(false) }
     var projectSearchFocus by remember { mutableIntStateOf(0) }
@@ -424,6 +434,12 @@ fun WorkspaceScreen(
     var isWide by remember { mutableStateOf(false) }
 
 
+    /** Whether the open tab is text the preview can draw. */
+    fun canPreviewActiveFile(): Boolean {
+        val open = files.active ?: return false
+        return open.editor != null && PreviewKind.of(open.path) != null
+    }
+
     fun runCommand(command: WorkspaceCommand): Boolean {
         val active = files.active
         when (command) {
@@ -488,6 +504,11 @@ fun WorkspaceScreen(
                 finderOpen = true
             }
             WorkspaceCommand.SelectTheme -> themeSelectorOpen = true
+            WorkspaceCommand.TogglePreview -> {
+                if (!canPreviewActiveFile()) return false
+                previewOpen = !previewOpen
+                if (!previewOpen) rootFocus.requestFocus()
+            }
             WorkspaceCommand.FindInFile -> {
                 if (files.active?.editor == null) return false
                 searchBarOpen = true
@@ -583,6 +604,9 @@ fun WorkspaceScreen(
                     return@onPreviewKeyEvent true
                 }
                 if (isProjectSearch(event)) return@onPreviewKeyEvent openProjectSearch()
+                if (isPreview(event, focus)) {
+                    return@onPreviewKeyEvent runCommand(WorkspaceCommand.TogglePreview)
+                }
                 tabIndexFor(event, files.tabs.size, focus)?.let { index ->
                     files.select(index)
                     return@onPreviewKeyEvent true
@@ -676,7 +700,16 @@ fun WorkspaceScreen(
             val searchIsFullScreen = projectSearchOpen && project != null &&
                 (!isWide || editorWidthWithDock < MinEditorWidth)
             searchTakesWorkArea = searchIsFullScreen
-            val dockIsFullScreen = !isWide && terminals.isOpen && !searchIsFullScreen
+            // The preview needs a buffer to follow, so a media tab has none —
+            // a picture *is* the preview.
+            val previewEditor = active?.editor
+            val editorWidthWithPreview = windowWidth -
+                (if (panelVisible) ProjectPanelWidth else 0.dp) - PreviewDockWidth
+            val previewShows = previewOpen && previewEditor != null && !searchIsFullScreen
+            val previewIsFullScreen = previewShows &&
+                (!isWide || editorWidthWithPreview < MinEditorWidth)
+            val dockIsFullScreen = !isWide && terminals.isOpen &&
+                !searchIsFullScreen && !previewIsFullScreen
             Box(modifier = Modifier.weight(1f)) {
                 if (searchIsFullScreen) {
                     ProjectSearchPanel(
@@ -688,6 +721,17 @@ fun WorkspaceScreen(
                             projectSearchOpen = false
                             rootFocus.requestFocus()
                         },
+                    )
+                } else if (previewIsFullScreen) {
+                    PreviewPanel(
+                        editor = previewEditor!!,
+                        path = active!!.path,
+                        isDock = false,
+                        onDismiss = {
+                            previewOpen = false
+                            rootFocus.requestFocus()
+                        },
+                        onOpenPath = { path -> project?.let { openFile(it, path) } },
                     )
                 } else if (dockIsFullScreen) {
                     TerminalDock(
@@ -729,8 +773,22 @@ fun WorkspaceScreen(
                                 searchBarOpen = false
                                 rootFocus.requestFocus()
                             },
+                            isPreviewOpen = previewOpen,
+                            onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
                             modifier = Modifier.weight(1f),
                         )
+                        if (previewShows) {
+                            PreviewPanel(
+                                editor = previewEditor!!,
+                                path = active!!.path,
+                                isDock = true,
+                                onDismiss = {
+                                    previewOpen = false
+                                    rootFocus.requestFocus()
+                                },
+                                onOpenPath = { path -> project?.let { openFile(it, path) } },
+                            )
+                        }
                         // The panel draws its own left edge, which is also the
                         // handle that drags it wider, so no divider here.
                         if (projectSearchOpen && project != null) {
@@ -778,6 +836,8 @@ fun WorkspaceScreen(
                                 searchBarOpen = false
                                 rootFocus.requestFocus()
                             },
+                            isPreviewOpen = previewOpen,
+                            onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
                         )
                     }
                 }
@@ -887,6 +947,7 @@ fun WorkspaceScreen(
                 tabCount = files.tabs.size,
                 terminalCount = terminals.sessions.size,
                 canClone = GitClone.isSupported,
+                canPreview = canPreviewActiveFile(),
             ),
             onRun = { runCommand(it) },
             onDismiss = {
@@ -1000,12 +1061,27 @@ private fun EditorArea(
     onReopen: () -> Unit,
     searchOpen: Boolean,
     onSearchDismissed: () -> Unit,
+    isPreviewOpen: Boolean,
+    onTogglePreview: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val active = files.active
     Column(modifier = modifier.fillMaxSize()) {
         if (files.tabs.isNotEmpty()) {
             EditorTabs(files, onSave = onSave, onReopen = onReopen)
+            DockDivider()
+        }
+        // Zed's toolbar, which for now is only its quick action bar: shown
+        // when the open file has a preview, and absent otherwise rather than
+        // sitting there empty. A picture is not previewable — it *is* the
+        // preview — so a media tab never gets one.
+        val previewKind = active?.editor?.let { PreviewKind.of(active.path) }
+        if (previewKind != null) {
+            EditorToolbar(
+                kind = previewKind,
+                isPreviewOpen = isPreviewOpen,
+                onTogglePreview = onTogglePreview,
+            )
             DockDivider()
         }
         // Find-in-file is a text question; a picture has nothing to search.
@@ -1077,6 +1153,39 @@ private fun EditorArea(
  * recompose it. Measured on the emulator: install Debian, open the menu, and
  * the entry is missing.
  */
+/**
+ * Whichever preview the open file has — Zed shows one button and one panel,
+ * and which of the two it is follows the file rather than a second command.
+ *
+ * A file with no preview keeps the panel and gets its empty state, rather than
+ * having the panel vanish under it: switching to a `.rs` for one lookup and
+ * back should not cost the reader their preview.
+ */
+@Composable
+private fun PreviewPanel(
+    editor: EditorState,
+    path: String,
+    isDock: Boolean,
+    onDismiss: () -> Unit,
+    onOpenPath: (String) -> Unit,
+) {
+    when (PreviewKind.of(path)) {
+        PreviewKind.Svg -> SvgPreview(
+            editor = editor,
+            path = path,
+            isDock = isDock,
+            onDismiss = onDismiss,
+        )
+        else -> MarkdownPreview(
+            editor = editor,
+            path = path,
+            isDock = isDock,
+            onDismiss = onDismiss,
+            onOpenPath = onOpenPath,
+        )
+    }
+}
+
 @Composable
 private fun userlandActions(
     context: android.content.Context,
