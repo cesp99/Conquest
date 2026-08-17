@@ -31,6 +31,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -175,6 +179,14 @@ fun GitPanel(
     var busy by remember(project) { mutableStateOf(false) }
     var error by remember(project) { mutableStateOf<String?>(null) }
     var confirming by remember(project) { mutableStateOf<GitChange?>(null) }
+    /**
+     * The identity form, shown when git refuses to commit without one. Not a
+     * setting and not a dialog: it is the answer to the error immediately
+     * above it, and it goes away as soon as it is answered.
+     */
+    var identityWanted by remember(project) { mutableStateOf(false) }
+    var identityName by remember(project) { mutableStateOf(TextFieldValue()) }
+    var identityEmail by remember(project) { mutableStateOf(TextFieldValue()) }
     var dockWidth by remember { mutableStateOf(GitPanelDockWidth) }
     var messageFocused by remember { mutableStateOf(false) }
 
@@ -214,7 +226,11 @@ fun GitPanel(
      * [onSuccess] runs back on the main thread, so a command that clears a
      * field does it here and not from an IO dispatcher.
      */
-    fun perform(action: suspend () -> String?, onSuccess: () -> Unit = {}) {
+    fun perform(
+        action: suspend () -> String?,
+        onFailure: (String) -> Unit = {},
+        onSuccess: () -> Unit = {},
+    ) {
         // One at a time, and *said* rather than swallowed: a `git add` inside
         // proot is easily a second, and a Ctrl+Enter that vanished into it
         // looks exactly like a keybinding that does not work.
@@ -227,8 +243,13 @@ fun GitPanel(
         scope.launch {
             val failure = withContext(Dispatchers.IO) { action() }
             error = failure
-            if (failure == null) onSuccess()
+            // Cleared *before* the callbacks: one of them runs the next
+            // command — saving an identity commits straight afterwards — and
+            // with the flag still set that command refused itself with "still
+            // running the last git command", which is this function's own
+            // guard talking about a command that had finished.
             busy = false
+            if (failure == null) onSuccess() else onFailure(failure)
             // The list still shows what git said *before* the command: the
             // engine invalidates its cache and re-runs `git status` behind a
             // debounce, so the row moves a fraction of a second later, when the
@@ -260,9 +281,41 @@ fun GitPanel(
         }
         // The message is cleared only on success: one the user would have to
         // retype because git refused the commit is the wrong thing to lose.
-        perform({ session.commit(text) }) {
+        perform(
+            action = { session.commit(text) },
+            onFailure = { failure ->
+                // A fresh Debian has no git identity, guesses one from the
+                // hostname and refuses to use it. Every commit in a new
+                // userland hits this, and the error alone leaves the user to
+                // work out that the fix is two `git config` commands in a
+                // shell. Offer the form instead — and prefill it, in case git
+                // has half of it already.
+                if (needsIdentity(failure)) {
+                    identityWanted = true
+                    scope.launch {
+                        val known = withContext(Dispatchers.IO) { session.identity() }
+                        if (known != null) {
+                            if (identityName.text.isEmpty() && known.name.isNotBlank()) {
+                                identityName = TextFieldValue(known.name)
+                            }
+                            if (identityEmail.text.isEmpty() && known.email.isNotBlank()) {
+                                identityEmail = TextFieldValue(known.email)
+                            }
+                        }
+                    }
+                }
+            },
+        ) {
             message = TextFieldValue()
             CommitDrafts.clear(project.id)
+        }
+    }
+
+    /** Save the identity, then commit — which is what the user asked for. */
+    fun saveIdentity() {
+        perform({ session.setIdentity(identityName.text, identityEmail.text) }) {
+            identityWanted = false
+            commit()
         }
     }
 
@@ -419,6 +472,19 @@ fun GitPanel(
                     maxLines = 3,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                )
+            }
+
+            if (identityWanted) {
+                HorizontalDivider(color = theme.color("border.variant"))
+                IdentityForm(
+                    name = identityName,
+                    email = identityEmail,
+                    onName = { identityName = it },
+                    onEmail = { identityEmail = it },
+                    busy = busy,
+                    onSave = ::saveIdentity,
+                    onDismiss = { identityWanted = false },
                 )
             }
 
@@ -1065,4 +1131,124 @@ private fun GitFileStatus?.forColours(): PanelStatus = when (this) {
     GitFileStatus.Untracked -> PanelStatus.Untracked
     GitFileStatus.Ignored -> PanelStatus.Ignored
     null -> PanelStatus.None
+}
+
+/**
+ * git's own complaint, recognised.
+ *
+ * Matched on the phrases rather than on an exit code because git says this
+ * three different ways depending on version and on whether it found half an
+ * identity: "unable to auto-detect email address", "Please tell me who you
+ * are", and "empty ident name". All three mean the same thing and have the
+ * same fix.
+ */
+internal fun needsIdentity(failure: String): Boolean {
+    val text = failure.lowercase()
+    return "unable to auto-detect email address" in text ||
+        "please tell me who you are" in text ||
+        "empty ident name" in text ||
+        "no name was given" in text
+}
+
+/**
+ * Who commits are by, asked at the moment git refuses to guess.
+ *
+ * It writes `user.name` and `user.email` into the *guest's* global config, so
+ * it is answered once per userland rather than once per clone — and then it
+ * runs the commit that was refused, because that is what the user pressed.
+ */
+@Composable
+private fun IdentityForm(
+    name: TextFieldValue,
+    email: TextFieldValue,
+    onName: (TextFieldValue) -> Unit,
+    onEmail: (TextFieldValue) -> Unit,
+    busy: Boolean,
+    onSave: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val theme = LocalZedTheme.current
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            text = "git records who made each commit, and has nobody to record.",
+            style = MaterialTheme.typography.labelMedium,
+            color = theme.color("text.muted"),
+        )
+        IdentityField(value = name, onValue = onName, placeholder = "Your name")
+        IdentityField(
+            value = email,
+            onValue = onEmail,
+            placeholder = "you@example.com",
+            keyboard = KeyboardType.Email,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            PanelAction("Not now", enabled = !busy, onClick = onDismiss)
+            Spacer(modifier = Modifier.width(8.dp))
+            PanelAction(
+                "Save and commit",
+                enabled = !busy && name.text.isNotBlank() && email.text.isNotBlank(),
+                onClick = onSave,
+            )
+        }
+    }
+}
+
+@Composable
+private fun IdentityField(
+    value: TextFieldValue,
+    onValue: (TextFieldValue) -> Unit,
+    placeholder: String,
+    keyboard: KeyboardType = KeyboardType.Text,
+) {
+    val theme = LocalZedTheme.current
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(4.dp))
+            .background(theme.color("editor.background"))
+            .border(1.dp, theme.color("border.variant"), RoundedCornerShape(4.dp))
+            .padding(horizontal = 8.dp, vertical = 8.dp),
+    ) {
+        if (value.text.isEmpty()) {
+            Text(
+                text = placeholder,
+                style = MaterialTheme.typography.bodyMedium,
+                color = theme.color("text.placeholder", theme.color("text.muted")),
+            )
+        }
+        BasicTextField(
+            value = value,
+            onValueChange = onValue,
+            singleLine = true,
+            textStyle = MaterialTheme.typography.bodyMedium.copy(color = theme.color("text")),
+            cursorBrush = SolidColor(theme.color("editor.foreground")),
+            keyboardOptions = KeyboardOptions(keyboardType = keyboard, imeAction = ImeAction.Next),
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+/** A text button in the panel's own idiom. */
+@Composable
+private fun PanelAction(label: String, enabled: Boolean, onClick: () -> Unit) {
+    val theme = LocalZedTheme.current
+    Text(
+        text = label,
+        style = MaterialTheme.typography.labelLarge,
+        color = if (enabled) theme.color("text.accent", MaterialTheme.colorScheme.primary) else theme.color("text.disabled", theme.color("text.muted")),
+        modifier = Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .then(if (enabled) Modifier.clickable(onClick = onClick) else Modifier)
+            .pointerHoverIcon(PointerIcon.Hand)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+    )
 }

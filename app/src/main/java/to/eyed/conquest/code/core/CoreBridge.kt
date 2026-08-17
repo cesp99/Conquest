@@ -250,6 +250,20 @@ object CoreBridge {
     external fun gitCommit(projectId: Long, message: String): String?
 
     /**
+     * Who commits are recorded as, as JSON `{"name":…,"email":…}`. Both empty
+     * when git has none — a fresh Debian guesses `root@localhost.(none)` from
+     * the hostname, refuses to use it, and every commit fails until somebody
+     * says who they are. **Blocking** — it runs git.
+     */
+    external fun gitIdentity(projectId: Long): String
+
+    /**
+     * Set that identity globally inside the guest. Null when it worked, and
+     * the reason when it did not. **Blocking**.
+     */
+    external fun gitSetIdentity(projectId: Long, name: String, email: String): String?
+
+    /**
      * Generation counter for a buffer's diff hunks; 0 while there is nothing to
      * show. Poll it exactly like [gitStatusVersion] — polling is what schedules
      * the diff, and it never waits for one.

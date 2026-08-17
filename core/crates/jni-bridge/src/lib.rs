@@ -635,6 +635,40 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitCommit(
     command_result(&env, engine().git_commit(project_id as u64, &message))
 }
 
+/// Who commits are recorded as, as JSON `{"name":…,"email":…}` — both empty
+/// when git has none, which is a fresh Debian's state and the reason every
+/// commit in one fails. `{}` when there is no repository. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitIdentity(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    let json = match engine().git_identity(project_id as u64) {
+        Ok((name, email)) => serde_json::json!({ "name": name, "email": email }).to_string(),
+        Err(_) => "{}".to_owned(),
+    };
+    to_jstring(&env, json)
+}
+
+/// Set that identity in the guest's global git config. Null when it worked and
+/// the reason when it did not, like the other write commands. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitSetIdentity(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    name: JString,
+    email: JString,
+) -> jstring {
+    let name = get_string(&mut env, &name);
+    let email = get_string(&mut env, &email);
+    command_result(
+        &env,
+        engine().git_set_identity(project_id as u64, &name, &email),
+    )
+}
+
 /// Generation counter for a buffer's diff hunks; 0 until there is something to
 /// show. Poll it exactly like `gitStatusVersion` — polling schedules the work
 /// and never waits for it.

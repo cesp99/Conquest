@@ -43,6 +43,23 @@ class GitSession(private val project: ProjectSession) {
     fun stage(paths: List<String>): String? =
         CoreBridge.gitStage(project.id, JSONArray(paths).toString())
 
+    /**
+     * Who commits will be recorded as, or nulls when git has none.
+     *
+     * **Blocking** — call it from [kotlinx.coroutines.Dispatchers.IO].
+     */
+    fun identity(): GitIdentity? {
+        val root = JSONObject(CoreBridge.gitIdentity(project.id))
+        val name = root.optString("name")
+        val email = root.optString("email")
+        if (!root.has("name")) return null
+        return GitIdentity(name, email)
+    }
+
+    /** Record that identity in the guest. Null when it worked. **Blocking**. */
+    fun setIdentity(name: String, email: String): String? =
+        CoreBridge.gitSetIdentity(project.id, name, email)
+
     /** Take those paths back out of the index. **Blocking**. */
     fun unstage(paths: List<String>): String? =
         CoreBridge.gitUnstage(project.id, JSONArray(paths).toString())
@@ -196,6 +213,17 @@ data class GitPanelState(
         private fun status(entry: JSONObject, key: String): GitFileStatus? =
             if (entry.isNull(key)) null else GitFileStatus.parse(entry.getString(key))
     }
+}
+
+/**
+ * The name and email commits are recorded under.
+ *
+ * Empty strings mean git has none — not that it has an empty one. A fresh
+ * Debian guesses `root@localhost.(none)` from its hostname, then refuses to
+ * commit with it, which is the one wall every new userland hits.
+ */
+data class GitIdentity(val name: String, val email: String) {
+    val isComplete: Boolean get() = name.isNotBlank() && email.isNotBlank()
 }
 
 /** What happened to a run of rows, as the gutter paints it. */

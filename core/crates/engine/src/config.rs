@@ -59,6 +59,20 @@ pub enum SoftWrap {
     EditorWidth,
 }
 
+/// Which side of the workspace a panel lives on — Zed's `dock`, minus
+/// `bottom`, which here belongs to the terminal alone.
+///
+/// The defaults are *this app's*, not Zed's current ones: Zed moved its
+/// project panel to the right, and a phone-shaped editor reads better with the
+/// tree where every file manager on the platform puts it. Both are one line in
+/// settings.json, which is the point of the setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DockSide {
+    Left,
+    Right,
+}
+
 /// Zed's `git.inline_blame`. An object with one field rather than a bare
 /// bool, because that is the shape Zed's settings file has and someone
 /// pasting a line out of their Zed config should find it works.
@@ -81,10 +95,45 @@ pub struct GitSettings {
     pub inline_blame: InlineBlameSettings,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProjectPanelSettings {
     pub gitignored_files: GitignoredFiles,
+    /// Zed's `project_panel.dock`.
+    pub dock: DockSide,
+    /// Zed's `project_panel.default_width`, in dp rather than px — this is
+    /// Android, where a number of pixels is not a size.
+    pub default_width: f32,
+}
+
+impl Default for ProjectPanelSettings {
+    fn default() -> Self {
+        Self {
+            gitignored_files: GitignoredFiles::default(),
+            dock: DockSide::Left,
+            default_width: 240.0,
+        }
+    }
+}
+
+/// A panel that has nothing to configure but where it sits and how wide it is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PanelSettings {
+    pub dock: DockSide,
+    pub default_width: f32,
+}
+
+impl PanelSettings {
+    const fn new(dock: DockSide, default_width: f32) -> Self {
+        Self { dock, default_width }
+    }
+}
+
+impl Default for PanelSettings {
+    fn default() -> Self {
+        Self::new(DockSide::Right, 360.0)
+    }
 }
 
 /// Everything the app can be configured with. Every field here is wired to
@@ -101,6 +150,13 @@ pub struct Settings {
     pub soft_wrap: SoftWrap,
     pub git: GitSettings,
     pub project_panel: ProjectPanelSettings,
+    /// The git panel — Zed's `git_panel.dock` and `default_width`.
+    pub git_panel: PanelSettings,
+    /// Search across the project. Zed has no dock for this (it is a pane item
+    /// there); here it is a panel like the others and says so.
+    pub project_search: PanelSettings,
+    /// The Markdown and SVG preview, likewise.
+    pub preview: PanelSettings,
 }
 
 impl Default for Settings {
@@ -112,6 +168,9 @@ impl Default for Settings {
             soft_wrap: SoftWrap::default(),
             git: GitSettings::default(),
             project_panel: ProjectPanelSettings::default(),
+            git_panel: PanelSettings::new(DockSide::Right, 360.0),
+            project_search: PanelSettings::new(DockSide::Right, 360.0),
+            preview: PanelSettings::new(DockSide::Right, 400.0),
         }
     }
 }
@@ -124,6 +183,17 @@ impl Settings {
     fn sanitized(mut self) -> Self {
         self.buffer_font_size = self.buffer_font_size.clamp(6.0, 48.0);
         self.tab_size = self.tab_size.clamp(1, 16);
+        // A panel 4dp wide is a panel nobody can grab the edge of, and one
+        // wider than a tablet leaves no editor at all. The UI clamps against
+        // the *window* as well; this is the hand-edited-file guard.
+        self.project_panel.default_width = self.project_panel.default_width.clamp(120.0, 900.0);
+        for panel in [
+            &mut self.git_panel,
+            &mut self.project_search,
+            &mut self.preview,
+        ] {
+            panel.default_width = panel.default_width.clamp(120.0, 900.0);
+        }
         self
     }
 }
@@ -157,9 +227,30 @@ const DEFAULT_FILE: &str = r#"// Conquest Code settings.
     "inline_blame": { "enabled": true }
   },
 
+  // Which side each panel docks on, and how wide it opens. "left" or
+  // "right"; the terminal has the bottom to itself. Two panels on the same
+  // side take turns — opening one closes the other — and the two sides are
+  // independent, so a tree on the left and git on the right stay up together.
   "project_panel": {
     // Gitignored files in the tree: "show", "dimmed" or "hide".
-    "gitignored_files": "dimmed"
+    "gitignored_files": "dimmed",
+    "dock": "left",
+    "default_width": 240
+  },
+
+  "git_panel": {
+    "dock": "right",
+    "default_width": 360
+  },
+
+  "project_search": {
+    "dock": "right",
+    "default_width": 360
+  },
+
+  "preview": {
+    "dock": "right",
+    "default_width": 400
   }
 }
 "#;
@@ -343,6 +434,42 @@ mod tests {
         let parsed: Settings =
             settings_json::parse_json_with_comments(DEFAULT_FILE).unwrap();
         assert_eq!(parsed, Settings::default());
+    }
+
+    /// Where a panel sits is a setting, and the file that documents it has to
+    /// parse as what it documents — see the test above.
+    #[test]
+    fn a_panel_can_be_moved_to_the_other_side() {
+        with_settings_dir(|engine, _dir| {
+            engine.settings_text();
+            assert_eq!(engine.settings().project_panel.dock, DockSide::Left);
+            let updated = engine
+                .set_setting(&["project_panel", "dock"], json!("right"))
+                .unwrap();
+            assert_eq!(updated.project_panel.dock, DockSide::Right);
+            // The git panel is on the right by default and stays where it is.
+            assert_eq!(updated.git_panel.dock, DockSide::Right);
+            // A side that is not a side is refused rather than resetting the
+            // whole file to defaults.
+            assert!(
+                engine
+                    .set_setting(&["project_panel", "dock"], json!("bottom"))
+                    .is_err()
+            );
+            assert_eq!(engine.settings().project_panel.dock, DockSide::Right);
+        });
+    }
+
+    /// A hand-edited width that would leave no editor, or no grabbable edge.
+    #[test]
+    fn a_panel_width_out_of_range_is_clamped() {
+        with_settings_dir(|engine, _dir| {
+            engine.settings_text();
+            let updated = engine
+                .set_setting(&["git_panel", "default_width"], json!(5000))
+                .unwrap();
+            assert_eq!(updated.git_panel.default_width, 900.0);
+        });
     }
 
     #[test]

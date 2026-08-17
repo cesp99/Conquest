@@ -122,6 +122,12 @@ out of a focused terminal.
 | `Ctrl` `Enter` | Commit what is staged, from anywhere in the panel |
 | `Esc`, or `✕` | Close the panel |
 
+The first commit in a fresh userland fails: git guesses an identity from the
+hostname (`root@localhost.(none)`), refuses to use it, and says so. The panel
+answers that with a name and email field rather than an error — what you type
+goes into the userland's global git config, so it is asked once per userland
+and not once per clone, and the commit you pressed runs straight after.
+
 On a wide screen it docks beside the editor; on a phone it takes the work area.
 The dock shows one panel at a time — git, project search or the preview — which
 is a dock's rule in Zed too, and is what stops three of them sharing a phone

@@ -1344,6 +1344,80 @@ impl crate::Engine {
             Err(run.message())
         }
     }
+
+    /// The identity commits will be recorded under, as git resolves it here.
+    ///
+    /// Empty strings for "git has none", which is the state a fresh Debian is
+    /// in: it guesses `root@localhost.(none)` from the hostname, refuses to
+    /// use it, and every commit fails until somebody says who they are.
+    ///
+    /// **Blocking**: it runs git.
+    pub fn git_identity(&self, id: ProjectId) -> Result<(String, String), String> {
+        let repo = self.repo_for(id)?;
+        let read = |key: &str| -> String {
+            let args = [OsString::from("config"), OsString::from("--get"), OsString::from(key)];
+            run_git(
+                &repo.userland,
+                &repo.repo_root,
+                "git config",
+                git_argv(&repo.project_root, &args),
+            )
+            .ok()
+            // `--get` exits 1 with no output when the key is unset, which is
+            // an answer rather than a failure.
+            .filter(|run| run.status == 0)
+            .map(|run| run.output.trim().to_owned())
+            .unwrap_or_default()
+        };
+        Ok((read("user.name"), read("user.email")))
+    }
+
+    /// Record who commits are by, in the guest's global config.
+    ///
+    /// Global rather than per-repository because the alternative is answering
+    /// this question once per clone, and the userland is one machine with one
+    /// person at it. `HOME` inside the guest is `/root`, so this lands in the
+    /// rootfs and survives everything but removing the userland.
+    ///
+    /// **Blocking**: it runs git.
+    pub fn git_set_identity(&self, id: ProjectId, name: &str, email: &str) -> Result<(), String> {
+        let name = name.trim();
+        let email = email.trim();
+        if name.is_empty() || email.is_empty() {
+            return Err("Both a name and an email are needed".to_owned());
+        }
+        // Not a validation of what an email *is* — that argument has no end —
+        // but of what git will accept: it refuses a value with a newline in
+        // it, and a leading dash would be read as an option by anything that
+        // later passes this through a shell.
+        for value in [name, email] {
+            if value.contains('\n') || value.contains('\r') || value.starts_with('-') {
+                return Err("A name or email cannot start with '-' or contain a line break".to_owned());
+            }
+        }
+        if !email.contains('@') {
+            return Err("That does not look like an email address".to_owned());
+        }
+        let repo = self.repo_for(id)?;
+        for (key, value) in [("user.name", name), ("user.email", email)] {
+            let args = [
+                OsString::from("config"),
+                OsString::from("--global"),
+                OsString::from(key),
+                OsString::from(value),
+            ];
+            let run = run_git(
+                &repo.userland,
+                &repo.repo_root,
+                "git config",
+                git_argv(&repo.project_root, &args),
+            )?;
+            if run.status != 0 {
+                return Err(run.message());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Turn caller-supplied project-relative paths into arguments, or refuse.
