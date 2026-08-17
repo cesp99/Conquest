@@ -2,7 +2,6 @@ package to.eyed.conquest.code.ui.theme
 
 import androidx.compose.material3.Typography
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 
@@ -26,7 +25,7 @@ import androidx.compose.ui.unit.sp
 private const val PHI = 1.618034f
 
 private fun ui(sizeSp: Float, weight: FontWeight = FontWeight.Normal) = TextStyle(
-    fontFamily = FontFamily.Default,
+    fontFamily = UiFontFamily,
     fontWeight = weight,
     fontSize = sizeSp.sp,
     lineHeight = (sizeSp * PHI).sp,
