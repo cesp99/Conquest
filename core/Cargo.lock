@@ -1680,6 +1680,7 @@ checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
 name = "engine"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "clock",
  "fs",
@@ -1691,6 +1692,7 @@ dependencies = [
  "log",
  "parking_lot",
  "path",
+ "regex",
  "rope",
  "serde",
  "serde_json",
@@ -1702,6 +1704,7 @@ dependencies = [
  "text",
  "trash",
  "tree-sitter",
+ "util",
  "worktree",
 ]
 

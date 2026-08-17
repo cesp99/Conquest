@@ -226,6 +226,7 @@ impl crate::Engine {
 
     /// Stop scanning a project and forget its mirrored state.
     pub fn close_project(&self, id: ProjectId) -> bool {
+        self.searches.cancel_project(id);
         let existed = self.projects.lock().unwrap().remove(&id).is_some();
         if existed {
             self.runtime().spawn(move |cx| {

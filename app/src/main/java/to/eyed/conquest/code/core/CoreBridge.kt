@@ -287,4 +287,64 @@ object CoreBridge {
      * new version, or -1. **Blocking** — call it off the main thread.
      */
     external fun reloadBuffer(bufferId: Long): Long
+
+    // -----------------------------------------------------------------------
+    // Search. Both searches take the same options object, as JSON, so one
+    // search bar can drive either without reshaping its state:
+    //
+    //     {"query": "needle", "regex": false, "case_sensitive": false,
+    //      "whole_word": false, "include_ignored": false,
+    //      "include_globs": [], "exclude_globs": []}
+    //
+    // Every field may be omitted; the last three are project-search only.
+    // [SearchQuery] builds it — nothing should be spelling this out by hand.
+    //
+    // Buffer search answers on the calling thread: it is one pass over a rope,
+    // which is what lets the search bar re-run it on every keystroke. Project
+    // search cannot answer at all — it reads thousands of files — so it runs
+    // on an engine thread and publishes a counter to poll, exactly like
+    // [gitStatusVersion].
+    // -----------------------------------------------------------------------
+
+    /**
+     * Why [queryJson] will not compile, or null if it will. Ask this to
+     * explain a half-typed regex instead of silently showing no results.
+     */
+    external fun searchQueryError(queryJson: String): String?
+
+    /**
+     * Every match in a buffer, flattened: element 0 is how many matches the
+     * buffer holds in all, and the rest are groups of four — byte start, byte
+     * end, row, byte column. When the total exceeds the groups present,
+     * [limit] bit and the UI can still say "3 of 12 000".
+     *
+     * Null for an unknown buffer or a query that doesn't compile; ask
+     * [searchQueryError] which. Wrapped by [BufferSearch].
+     */
+    external fun bufferSearch(bufferId: Long, queryJson: String, limit: Long): LongArray?
+
+    /**
+     * Starts searching a project. Returns a search id to poll with, or -1 if
+     * the project is unknown or the query doesn't compile. Returns at once.
+     *
+     * Starting a search cancels whatever was already running for that project,
+     * so there is only ever one live id per project.
+     */
+    external fun projectSearchStart(projectId: Long, queryJson: String): Long
+
+    /**
+     * Generation counter for a search; 0 before the first results and for an
+     * id the engine has forgotten. Poll it exactly like [projectVersion].
+     */
+    external fun projectSearchVersion(searchId: Long): Long
+
+    /**
+     * Everything a search has found from [fromFile] onwards, as JSON — see
+     * [ProjectSearchResults] for the shape. Results only grow, so a caller
+     * holding `n` files passes `n` and gets what it is missing. Never null.
+     */
+    external fun projectSearchResults(searchId: Long, fromFile: Long): String
+
+    /** Stops a search and forgets it. False if the id is already gone. */
+    external fun projectSearchCancel(searchId: Long): Boolean
 }

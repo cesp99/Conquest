@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+aho-corasick.workspace = true
 anyhow.workspace = true
 clock.workspace = true
 fs.workspace = true
@@ -16,6 +17,7 @@ libc.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 path.workspace = true
+regex.workspace = true
 rope.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,6 +30,9 @@ text.workspace = true
 # `fs`'s `trash` dependency at this same crate.
 trash = { path = "../trash-android" }
 tree-sitter.workspace = true
+# For `paths::PathMatcher`, so include/exclude globs behave exactly as they do
+# in Zed. Already in the tree as a dependency of `worktree`.
+util.workspace = true
 worktree.workspace = true
 
 [dev-dependencies]

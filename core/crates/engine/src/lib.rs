@@ -15,6 +15,11 @@
 //! headless `Platform` (`platform.rs`) that cannot draw; see `project.rs` for
 //! how its state reaches the UI without blocking anything.
 //!
+//! Search comes in two shapes for the same reason Zed's does: over one open
+//! buffer it is a synchronous scan fast enough to run on every keystroke of
+//! the query (`search.rs`), and over a whole worktree it is background work
+//! published behind a generation counter (`project_search.rs`).
+//!
 //! Git status is not computed here: it comes from the `git` binary inside the
 //! Debian userland, reached through proot (`git.rs`), cached behind a
 //! generation counter of the same shape, and silently empty in builds that
@@ -39,13 +44,17 @@ mod highlight;
 mod highlight_worker;
 mod platform;
 mod project;
+mod project_search;
 mod runtime;
+mod search;
 
 pub use config::{GitignoredFiles, ProjectPanelSettings, Settings, ThemeMode};
 pub use find::FileMatch;
 pub use git::GitStatus;
 pub use highlight::{HighlightSpan, STYLE_NAMES, language_for_path};
 pub use project::{ProjectId, TreeEntry};
+pub use project_search::{FileMatches, LineMatch, SearchId, SearchResults, SearchState};
+pub use search::{BufferMatch, BufferSearch, SearchOptions};
 
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -94,6 +103,9 @@ pub struct Engine {
     /// through it today and language servers will, and there is only ever one
     /// guest — see guest.rs.
     userland: Mutex<Option<Arc<guest::Userland>>>,
+    /// The project search running for each project, at most one apiece — see
+    /// project_search.rs.
+    searches: project_search::ProjectSearches,
 }
 
 pub(crate) struct BufferState {
@@ -398,6 +410,10 @@ pub enum EngineError {
     },
     /// The operation needs a file behind the buffer, and there isn't one.
     NoFile(BufferId),
+    UnknownProject(ProjectId),
+    /// A search query that does not compile; carries the regex engine's
+    /// complaint, which is worth showing the user verbatim.
+    InvalidQuery(String),
     /// The engine was never told where settings live (see `initialize`).
     NoSettingsFile,
     /// Settings text that doesn't parse; carries the parser's complaint.
@@ -416,6 +432,8 @@ impl std::fmt::Display for EngineError {
                 write!(f, "invalid range {start}..{end}")
             }
             EngineError::NoFile(id) => write!(f, "buffer {id} is not backed by a file"),
+            EngineError::UnknownProject(id) => write!(f, "unknown project {id}"),
+            EngineError::InvalidQuery(message) => write!(f, "invalid search query: {message}"),
             EngineError::NoSettingsFile => write!(f, "no settings directory configured"),
             EngineError::InvalidSettings(message) => write!(f, "invalid settings: {message}"),
             EngineError::Io { path, message } => write!(f, "{path}: {message}"),

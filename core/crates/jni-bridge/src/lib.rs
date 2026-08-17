@@ -14,7 +14,7 @@
 
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
-use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jintArray, jlong, jstring};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jintArray, jlong, jlongArray, jstring};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -797,6 +797,168 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_reloadBuffer(
             log::warn!("reloadBuffer failed: {err}");
             -1
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Search. Both searches take the same options object, as JSON, so one search
+// bar can drive either without reshaping its state:
+//
+//     {"query": "needle", "regex": false, "case_sensitive": false,
+//      "whole_word": false, "include_ignored": false,
+//      "include_globs": [], "exclude_globs": []}
+//
+// Every field may be omitted. The last three are project-search only.
+//
+// Buffer search answers on the calling thread because it is a single pass over
+// a rope — milliseconds on a 100k-line file, which is what lets the search bar
+// re-run it on every keystroke of the query. Project search cannot answer at
+// all: it reads thousands of files, so it runs on a thread of its own and
+// publishes a generation counter to poll, the same shape as `gitStatusVersion`.
+// ---------------------------------------------------------------------------
+
+/// Why a query will not compile, or null if it will. The search bar calls this
+/// to explain a half-typed regex rather than silently showing nothing.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_searchQueryError(
+    mut env: JNIEnv,
+    _class: JClass,
+    query_json: JString,
+) -> jstring {
+    let query_json = get_string(&mut env, &query_json);
+    match serde_json::from_str(&query_json) {
+        Ok(options) => match engine().search_query_error(&options) {
+            Some(error) => to_jstring(&env, error),
+            None => std::ptr::null_mut(),
+        },
+        Err(err) => to_jstring(&env, err.to_string()),
+    }
+}
+
+/// Every match in a buffer, as longs: element 0 is the total number of matches
+/// in the buffer, and the rest are groups of four — byte start, byte end, row,
+/// byte column. The total can exceed the groups present, which is how the
+/// caller knows `limit` bit; the group layout is a primitive array copy rather
+/// than JSON because this runs on the keystroke path.
+///
+/// Null for an unknown buffer or a query that does not compile — ask
+/// `searchQueryError` which it was.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferSearch(
+    mut env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+    query_json: JString,
+    limit: jlong,
+) -> jlongArray {
+    let query_json = get_string(&mut env, &query_json);
+    let options = match serde_json::from_str(&query_json) {
+        Ok(options) => options,
+        Err(err) => {
+            log::warn!("bufferSearch: {query_json:?} is not a query: {err}");
+            return std::ptr::null_mut();
+        }
+    };
+    let limit = limit.clamp(0, MAX_BUFFER_MATCHES) as usize;
+    let found = match engine().search_buffer(buffer_id as u64, &options, limit) {
+        Ok(found) => found,
+        Err(err) => {
+            log::warn!("bufferSearch failed: {err}");
+            return std::ptr::null_mut();
+        }
+    };
+
+    let mut flat = Vec::with_capacity(1 + found.matches.len() * 4);
+    flat.push(found.total as jlong);
+    for found in &found.matches {
+        flat.push(found.start as jlong);
+        flat.push(found.end as jlong);
+        flat.push(found.row as jlong);
+        flat.push(found.column as jlong);
+    }
+    let array = env
+        .new_long_array(flat.len() as i32)
+        .expect("failed to allocate search array");
+    env.set_long_array_region(&array, 0, &flat)
+        .expect("failed to fill search array");
+    array.into_raw()
+}
+
+/// The most matches `bufferSearch` will hand back at once. Ten thousand is
+/// Zed's own cap, and 320 KB of longs is already more than any UI will draw.
+const MAX_BUFFER_MATCHES: jlong = 10_000;
+
+/// Start searching a project. Returns a search id to poll with, or -1 if the
+/// project is unknown or the query does not compile. Returns at once: the
+/// search runs on a thread of its own.
+///
+/// Starting a search cancels whatever was already running for that project.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectSearchStart(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    query_json: JString,
+) -> jlong {
+    let query_json = get_string(&mut env, &query_json);
+    let options = match serde_json::from_str(&query_json) {
+        Ok(options) => options,
+        Err(err) => {
+            log::warn!("projectSearchStart: {query_json:?} is not a query: {err}");
+            return -1;
+        }
+    };
+    match engine().start_project_search(project_id as u64, &options) {
+        Ok(id) => id as jlong,
+        Err(err) => {
+            log::warn!("projectSearchStart failed: {err}");
+            -1
+        }
+    }
+}
+
+/// Generation counter for a search, bumped whenever there is something new to
+/// read; 0 before the first results and for a forgotten id. Poll it exactly
+/// like `projectVersion`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectSearchVersion(
+    _env: JNIEnv,
+    _class: JClass,
+    search_id: jlong,
+) -> jlong {
+    engine().project_search_version(search_id as u64) as jlong
+}
+
+/// Everything a search has found from `from_file` onwards, as JSON. Results
+/// only grow, so a caller holding `n` files passes `n` and gets the rest.
+/// Never null: a forgotten id reports itself cancelled with nothing in it.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectSearchResults(
+    env: JNIEnv,
+    _class: JClass,
+    search_id: jlong,
+    from_file: jlong,
+) -> jstring {
+    let from_file = from_file.max(0) as usize;
+    let results = engine().project_search_results(search_id as u64, from_file);
+    let json = serde_json::to_string(&results).unwrap_or_else(|err| {
+        log::warn!("projectSearchResults failed to serialize: {err}");
+        "{}".to_owned()
+    });
+    to_jstring(&env, json)
+}
+
+/// Stop a search and forget it. False if the engine no longer knows the id.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_projectSearchCancel(
+    _env: JNIEnv,
+    _class: JClass,
+    search_id: jlong,
+) -> jboolean {
+    if engine().cancel_project_search(search_id as u64) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
     }
 }
 
