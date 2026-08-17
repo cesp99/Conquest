@@ -220,9 +220,13 @@ private val BINDINGS: List<Binding> = listOf(
     // Ctrl+F is free in the editor — it moves nothing there — and this is
     // where every editor puts find. In a terminal it is readline's "forward
     // one character", so the bar is not offered while a shell has the keys.
+    //
+    // The one command whose shifted twin is *not* itself: Ctrl+Shift+F opens
+    // project search ([ProjectSearchChord]), which is why this one is pinned
+    // to unshifted rather than matching either way like its neighbours.
     Binding(
         WorkspaceCommand.FindInFile,
-        Chord(AndroidKeyEvent.KEYCODE_F, "F", shift = null),
+        Chord(AndroidKeyEvent.KEYCODE_F, "F", shift = false),
         InWorkspace,
     ),
     Binding(
@@ -346,6 +350,30 @@ fun isCommandPalette(event: KeyEvent, focus: Focus = Focus.Workspace): Boolean {
     if (event.nativeKeyEvent.isAltPressed) return false
     if (CommandPaletteChord.matches(event.nativeKeyEvent)) return true
     return focus == Focus.Workspace && CommandPaletteFunctionKey.matches(event.nativeKeyEvent)
+}
+
+/**
+ * The chord that opens project search — Zed's own `ctrl-shift-f`
+ * (assets/keymaps/default-linux.json:682).
+ *
+ * Not a [WorkspaceCommand], for the reason the palette is not one either: what
+ * it opens is a *surface* rather than an action. The panel takes the keyboard,
+ * keeps the caret in its own query field, answers Escape itself and holds a
+ * live search that has to be cancelled when it goes; the workspace's whole job
+ * is to put it on screen.
+ *
+ * Matched in the workspace's preview pass, so it fires wherever focus sits —
+ * except inside a focused terminal, which receives key events before Compose
+ * does and dispatches only [workspaceCommandFor]. The ☰ menu carries the panel
+ * for everyone else: a finger, and a shell that has the keyboard.
+ */
+val ProjectSearchChord = Chord(AndroidKeyEvent.KEYCODE_F, "F", shift = true)
+
+/** True when this event should open project search. */
+fun isProjectSearch(event: KeyEvent): Boolean {
+    if (event.type != KeyEventType.KeyDown) return false
+    if (event.nativeKeyEvent.isAltPressed) return false
+    return ProjectSearchChord.matches(event.nativeKeyEvent)
 }
 
 /** The command a key event maps to, or null to let it through. */

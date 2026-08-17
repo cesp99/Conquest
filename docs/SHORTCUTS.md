@@ -55,6 +55,7 @@ editor.
 | `Ctrl` `O` | Open the project picker (switch, create, import, export) |
 | `Ctrl` `P` | Find a file by name (fuzzy) |
 | `Ctrl` `F` | Find in the open file |
+| `Ctrl` `Shift` `F` | Search every file in the project |
 | `Ctrl` `Shift` `T` | Reopen the tab you closed last |
 | `Ctrl` `Shift` `E` | Reveal the open file in the project panel |
 | `Ctrl` `Shift` `G` | Clone a git repository into a new project |
@@ -91,6 +92,47 @@ file with more matches than the engine will hand back at once.
 A regular expression that does not compile yet — `[`, halfway through
 typing — outlines the field rather than clearing the file's highlights and
 claiming there are no results.
+
+## Search all files
+
+`Ctrl` `Shift` `F` opens project search. On a wide screen it docks beside
+the editor and its left edge drags to resize; on a phone it takes the work
+area, the way the terminal does. **Search all files…** in the `☰` menu
+opens it too — which is the route from a terminal, where the shell keeps
+`Ctrl` `Shift` `F` for itself.
+
+Results arrive while the search runs: files appear as they are found, and
+the line under the query says how far the walk has got — `12 results in 3
+files · searched 480 of 1200` — with a progress bar that leaves when the
+search finishes. A project still being scanned says so and waits, rather
+than answering "no results" over half a repository.
+
+| Shortcut | Action |
+|---|---|
+| `↑` `↓` | Move through files and matches |
+| `PageUp` / `PageDown` | Move ten rows |
+| `Enter` | Open the selected match, or fold the selected file |
+| `Esc` | Close the panel and stop the search |
+| `Aa` `ab` `.*` | Match case / whole word / regular expression |
+| `⋯` | Show the include and exclude patterns |
+| `⊘` | Also search files git ignores |
+
+The query keeps the caret while the arrows walk the results, so you can
+keep typing without clicking back into the field. Clicking or tapping a
+match opens the file with the cursor on the hit; clicking a file's row
+folds its matches away.
+
+Include and exclude take comma-separated globs — `src/**/*.rs`,
+`vendor/*, *.lock` — and a pattern that isn't a valid glob outlines both
+fields rather than searching the whole project instead.
+
+Files the search cannot read honestly are counted but skipped: anything
+over 4 MiB, anything holding a NUL byte, and anything that is not UTF-8.
+The result count is what the engine found, so a search that hit its own
+limit says `limit reached` rather than quietly showing you less.
+
+Replacing across files is deliberately not here. It rewrites files you
+have not opened, and it will arrive with its own confirmation.
 
 ## Editor
 
@@ -215,6 +257,8 @@ edition the shell runs inside Debian once you install it — see
   keyboard covers the status bar while you type.
 - In the terminal: the wheel scrolls the scrollback, drag selects, and the
   bar between the editor and the terminal drags to resize the dock.
+- In project search: the wheel scrolls the results, a row lights up under
+  the pointer, and the panel's left edge drags to make it wider.
 
 ## Touch
 
@@ -228,6 +272,12 @@ cursor above or below, select the next occurrence, move a line up or down,
 duplicate, delete and join lines, and toggle the comment. It appears with
 the keyboard and goes away with it, so a paired keyboard or DeX never
 sees it.
+
+Project search is a touch surface too: tap a match to open the file at it,
+tap a file's row to fold its matches, and tap `⋯` for the include and
+exclude fields. On a phone the panel takes the whole work area, so opening
+a match hands the screen back to the editor — what you typed is kept, and
+`☰` → **Search all files…** brings it back.
 
 The status bar carries a **Save** action while the current
 file has unsaved changes, `☰ files` toggles the project panel, `▤` toggles the project
