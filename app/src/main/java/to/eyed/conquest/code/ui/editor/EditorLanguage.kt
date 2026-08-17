@@ -21,12 +21,19 @@ internal data class BracketPair(
  * auto-close, and the characters an opener may be closed in front of.
  *
  * **This table is a stopgap and should not grow.** The engine already carries
- * every value in it — `line_comments`, `brackets` and `autoclose_before` in
- * the vendored `grammars/src/<language>/config.toml` files that
- * `engine::highlight` loads to build its registry — so the right home is a
- * JNI accessor that hands the buffer's language config to the UI, and this
- * object then becomes a deletion rather than a rewrite. The values below are
- * copied from those configs verbatim for exactly that reason.
+ * every value in it — `line_comments`, `brackets`, `autoclose_before` and
+ * `hard_tabs` in the vendored `grammars/src/<language>/config.toml` files
+ * that `engine::highlight` loads to build its registry — so the right home
+ * is a JNI accessor that hands the buffer's language config to the UI, and
+ * this object then becomes a deletion rather than a rewrite. The values
+ * below are read off those configs for exactly that reason.
+ *
+ * One thing in them is *not* copied, and cannot be from here: every quote
+ * pair carries `not_in = ["string", "comment"]`, which asks where the caret
+ * is in the syntax tree. The bridge hands out highlight style ids, not
+ * scopes, and they trail the text by a parse — so a quote typed inside a
+ * comment still auto-closes here where Zed leaves it alone. That wants the
+ * same JNI accessor, and is the reason this file is a stopgap.
  *
  * Keys are grammar names as `BufferSession.language` reports them, which is
  * the engine's registry name: a `.js` file parses with the `tsx` grammar and
@@ -50,10 +57,26 @@ internal object EditorLanguage {
      * Characters an opener is allowed to auto-close in front of, on top of
      * whitespace and the end of the line. Closing `(` when a word follows
      * would push the closer into the middle of that word.
+     *
+     * These differ per language and the differences are not cosmetic: a
+     * shell script that closed `(` in front of `;` or `=` would be closing
+     * it in the middle of an assignment.
      */
     fun autocloseBefore(language: String?): String = when (language) {
+        "bash" -> "}])"
+        "json", "jsonc", "yaml" -> ",]}"
+        "jsdoc" -> "]}"
+        "gomod", "gowork" -> ")"
         else -> ";:.,=}])>"
     }
+
+    /**
+     * Whether one indent level is a tab, for a language that says so —
+     * `hard_tabs` in the config. Go is the only one of ours that does.
+     * Otherwise the file's own indentation decides; see
+     * [EditorState.indentUnit].
+     */
+    fun hardTabs(language: String?): Boolean = language == "go"
 
     /**
      * The token that, at the end of a line, opens an indented block in a
@@ -71,10 +94,13 @@ internal object EditorLanguage {
      *
      * Rust is the one language that has to differ: `'` starts a lifetime far
      * more often than a character literal, so Zed's Rust config has no `'`
-     * pair at all and neither do we.
+     * pair at all and neither do we. JSON is the other: its only string
+     * delimiter is `"`, and closing a `'` into a `.json` file would be
+     * closing it into invalid JSON.
      */
     fun pairs(language: String?): List<BracketPair> = when (language) {
         "rust" -> RustPairs
+        "json", "jsonc" -> JsonPairs
         "python", "bash", "yaml", "gitcommit" -> ScriptPairs
         else -> DefaultPairs
     }
@@ -90,6 +116,8 @@ internal object EditorLanguage {
         BracketPair("'", "'"),
         BracketPair("`", "`"),
     )
+
+    private val JsonPairs = Brackets + BracketPair("\"", "\"")
 
     private val ScriptPairs = Brackets + listOf(
         BracketPair("\"", "\""),

@@ -223,15 +223,18 @@ private class EditorInputConnection(
         prepareForEdit()
         val selStart = Selection.getSelectionStart(shadow)
         if (beforeLength > 0 && selStart == 0 && Selection.getSelectionEnd(shadow) == 0) {
-            // Backspace at column 0: join with the previous line. The
-            // shadow can't express this — go straight to the engine and
-            // force a fresh connection for the joined line. (Any
-            // beforeLength beyond the newline itself is dropped; IMEs ask
-            // for 1 here in practice.)
+            // Backspace at column 0 joins with the previous line, which the
+            // one-line shadow can't express. Hand it to the same command the
+            // hardware key uses rather than to the join primitive: the
+            // primitive moves one caret, and with a column of them the rest
+            // would be left naming rows that had shifted up under them.
+            // (Any beforeLength beyond the newline itself is dropped; IMEs
+            // ask for 1 here in practice.)
             closed = true
-            state.joinWithPreviousLine()
-            view.context.getSystemService(InputMethodManager::class.java)
-                ?.restartInput(view)
+            // backspace() reports the cursor change, which is what restarts
+            // this connection on the joined line — the same route a hardware
+            // backspace at column 0 already depends on.
+            state.backspace()
             return true
         }
         return super.deleteSurroundingText(beforeLength, afterLength).also { maybeSync() }

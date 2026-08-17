@@ -9,7 +9,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.text.TextLayoutResult
 import to.eyed.conquest.code.core.BufferSession
-import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.core.Utf8Diff
 
 /** One highlighted range on one row; columns are UTF-16 offsets. */
@@ -60,7 +59,23 @@ internal val CaretOrder = compareBy<Caret>({ it.startRow }, { it.startCol })
  * layout works in). Conversion to engine byte offsets happens at edit time,
  * not here.
  */
-class EditorState(val session: BufferSession) {
+class EditorState private constructor(
+    private val buffer: EditorBuffer,
+    private val boundSession: BufferSession?,
+) {
+    constructor(session: BufferSession) : this(SessionBuffer(session), session)
+
+    /** An editor over a buffer that is not an engine one — see [EditorBuffer]. */
+    internal constructor(buffer: EditorBuffer) : this(buffer, null)
+
+    /**
+     * The engine buffer behind this pane, for the workspace (saving, closing,
+     * dirty state). Every editor the app builds has one; only the host-side
+     * tests of the caret machinery do not.
+     */
+    val session: BufferSession
+        get() = requireNotNull(boundSession) { "this editor has no engine buffer" }
+
     var scrollY by mutableFloatStateOf(0f)
         private set
     var scrollX by mutableFloatStateOf(0f)
@@ -150,14 +165,14 @@ class EditorState(val session: BufferSession) {
 
     /** True if the engine has newer spans than the ones last drawn. */
     fun refreshHighlightVersion(): Boolean {
-        val version = session.highlightVersion
+        val version = buffer.highlightVersion
         if (version == highlightVersion) return false
         highlightVersion = version
         return true
     }
 
     /** Not snapshot state: refreshed from the engine in [refreshLineCount]. */
-    var lineCount: Int = session.lineCount
+    var lineCount: Int = buffer.lineCount
         private set
 
     // Pixel metrics, set from composition (density-dependent).
@@ -192,6 +207,9 @@ class EditorState(val session: BufferSession) {
 
     private companion object {
         const val WINDOW_PADDING = 32
+
+        /** Rows of the file read to decide whether it indents with tabs. */
+        const val INDENT_SAMPLE_ROWS = 200
     }
 
     val gutterWidthPx: Float
@@ -214,7 +232,7 @@ class EditorState(val session: BufferSession) {
      * when the window or the buffer version changed.
      */
     fun linesWindow(first: Int, last: Int): List<String> {
-        val version = session.version
+        val version = buffer.version
         val miss = version != cachedVersion ||
             highlightVersion != cachedHighlightVersion ||
             first < cachedFirst ||
@@ -223,16 +241,9 @@ class EditorState(val session: BufferSession) {
             val paddedFirst = (first - WINDOW_PADDING).coerceAtLeast(0)
             val paddedLast = (last + WINDOW_PADDING).coerceAtMost(lineCount)
             if (paddedLast > paddedFirst) {
-                cachedLines = CoreBridge
-                    .bufferLines(session.id, paddedFirst.toLong(), paddedLast.toLong())
-                    .orEmpty()
-                    .split('\n')
+                cachedLines = buffer.lines(paddedFirst, paddedLast).split('\n')
                 cachedSpans = groupSpans(
-                    CoreBridge.bufferHighlights(
-                        session.id,
-                        paddedFirst.toLong(),
-                        paddedLast.toLong(),
-                    ),
+                    buffer.highlights(paddedFirst, paddedLast),
                     paddedFirst,
                     cachedLines.size,
                 )
@@ -258,7 +269,7 @@ class EditorState(val session: BufferSession) {
         cachedSpans.subList(requestedFirst - cachedFirst, requestedLast - cachedFirst)
 
     fun spansFor(row: Int): List<HighlightSpan> =
-        if (row in cachedFirst until cachedLast && cachedVersion == session.version) {
+        if (row in cachedFirst until cachedLast && cachedVersion == buffer.version) {
             cachedSpans.getOrElse(row - cachedFirst) { emptyList() }
         } else {
             emptyList()
@@ -280,15 +291,18 @@ class EditorState(val session: BufferSession) {
     }
 
     fun line(row: Int): String =
-        if (row in cachedFirst until cachedLast && cachedVersion == session.version) {
+        if (row in cachedFirst until cachedLast && cachedVersion == buffer.version) {
             cachedLines[row - cachedFirst]
         } else {
-            CoreBridge.bufferLines(session.id, row.toLong(), row.toLong() + 1).orEmpty()
+            buffer.lines(row, row + 1)
         }
+
+    /** Rows [firstRow, lastRow) straight from the buffer, past the window. */
+    internal fun linesOf(firstRow: Int, lastRow: Int): String = buffer.lines(firstRow, lastRow)
 
     /** Call after anything that may change the buffer contents. */
     fun refreshLineCount() {
-        lineCount = session.lineCount
+        lineCount = buffer.lineCount
     }
 
     /** Track line widths seen during drawing to bound horizontal scroll. */
@@ -406,6 +420,33 @@ class EditorState(val session: BufferSession) {
         if (notify) onCursorChangedExternally?.invoke()
     }
 
+    /**
+     * Move the primary caret and leave the others where they are.
+     *
+     * Everything that moves the primary on its own goes through here rather
+     * than writing the four fields, because a primary that lands *on* an
+     * extra caret is two carets in one place, and two carets in one place
+     * apply everything typed from then on twice. With extras in play the
+     * move goes through [setCarets], which is where coincident carets merge;
+     * with none there is nothing to collide with, and the fields are written
+     * directly so an ordinary tap or IME selection report costs what it did.
+     */
+    private fun setPrimaryCaret(moved: Caret, notify: Boolean = true) {
+        if (extraCarets.isEmpty()) {
+            cursorRow = moved.headRow
+            cursorCol = moved.headCol
+            if (!moved.isEmpty) {
+                selectionAnchorRow = moved.anchorRow
+                selectionAnchorCol = moved.anchorCol
+            }
+            ensureCursorVisible()
+            if (notify) onCursorChangedExternally?.invoke()
+            return
+        }
+        val primary = primaryCaret()
+        setCarets(caretsInOrder().map { if (it == primary) moved else it }, moved, notify)
+    }
+
     /** Drop every caret but the primary. Returns false if there was none. */
     fun dropExtraCarets(): Boolean {
         if (extraCarets.isEmpty()) return false
@@ -463,6 +504,25 @@ class EditorState(val session: BufferSession) {
     }
 
     /**
+     * Collapse every caret's selection to its head — what a copy leaves
+     * behind. [clearSelection] only ever reaches the primary, so after a
+     * multi-caret copy the other selections would stay highlighted with
+     * nothing selecting them.
+     */
+    fun collapseSelections() {
+        if (extraCarets.isEmpty()) {
+            clearSelection()
+            return
+        }
+        val primary = primaryCaret()
+        var head: Caret? = null
+        val carets = caretsInOrder().map { caret ->
+            Caret(caret.headRow, caret.headCol).also { if (caret == primary) head = it }
+        }
+        setCarets(carets, head ?: carets.last())
+    }
+
+    /**
      * Move one selection endpoint during a drag: the cursor end follows the
      * pointer while the anchor stays. If [movingStart] the drag started on
      * the start handle, so anchor and cursor are swapped as needed.
@@ -474,29 +534,21 @@ class EditorState(val session: BufferSession) {
     ) {
         val range = selectionRange() ?: return
         val (row, col) = positionAt(point, layoutForLine)
-        if (movingStart) {
-            selectionAnchorRow = range.endRow
-            selectionAnchorCol = range.endCol
+        val anchor = if (movingStart) {
+            range.endRow to range.endCol
         } else {
-            selectionAnchorRow = range.startRow
-            selectionAnchorCol = range.startCol
+            range.startRow to range.startCol
         }
-        cursorRow = row
-        cursorCol = col
-        onCursorChangedExternally?.invoke()
+        setPrimaryCaret(Caret(anchor.first, anchor.second, row, col))
     }
 
     /** Extend (or start) a selection from the current cursor to [point]. */
     fun extendSelectionTo(point: Offset, layoutForLine: (String) -> TextLayoutResult) {
         endCommandRun()
-        if (selectionAnchorRow < 0) {
-            selectionAnchorRow = cursorRow
-            selectionAnchorCol = cursorCol
-        }
+        val anchorRow = if (selectionAnchorRow < 0) cursorRow else selectionAnchorRow
+        val anchorCol = if (selectionAnchorRow < 0) cursorCol else selectionAnchorCol
         val (row, col) = positionAt(point, layoutForLine)
-        cursorRow = row
-        cursorCol = col
-        onCursorChangedExternally?.invoke()
+        setPrimaryCaret(Caret(anchorRow, anchorCol, row, col))
     }
 
     /** Select the word (or symbol run) at a pane-local pixel position. */
@@ -549,10 +601,7 @@ class EditorState(val session: BufferSession) {
         textOf(SelectionRange(caret.startRow, caret.startCol, caret.endRow, caret.endCol))
 
     private fun textOf(range: SelectionRange): String {
-        val lines = CoreBridge
-            .bufferLines(session.id, range.startRow.toLong(), range.endRow.toLong() + 1)
-            .orEmpty()
-            .split('\n')
+        val lines = buffer.lines(range.startRow, range.endRow + 1).split('\n')
         if (lines.isEmpty()) return ""
         if (!range.isMultiLine) {
             val line = lines[0]
@@ -611,7 +660,7 @@ class EditorState(val session: BufferSession) {
      * language when it is opened and never changes it, and the commands that
      * need it — comment toggling, bracket pairs — ask on every keystroke.
      */
-    val language: String? by lazy { session.language }
+    val language: String? by lazy { buffer.language }
 
     /**
      * Width of one indent level, in spaces, from the `tab_size` setting. A
@@ -622,10 +671,48 @@ class EditorState(val session: BufferSession) {
      */
     var tabSize: Int = 4
 
+    /**
+     * Whether this file indents with tabs, asked once of the file itself.
+     *
+     * The row an operation happens on is not evidence enough on its own: at
+     * column zero its indent is empty, and a tab-indented file would then
+     * get spaces for every top-level block it opens — mixed indentation, one
+     * level down. So the sample is the head of the file, and only when it
+     * has nothing to say does the language answer (Zed's Go config sets
+     * `hard_tabs`; nothing else we carry does).
+     *
+     * Computed once: a file does not change how it is indented, and this is
+     * on the Enter and Tab path.
+     */
+    private val usesHardTabs: Boolean by lazy {
+        var tabs = 0
+        var spaces = 0
+        for (text in buffer.lines(0, minOf(lineCount, INDENT_SAMPLE_ROWS)).split('\n')) {
+            when {
+                text.startsWith('\t') -> tabs++
+                // Two, because one leading space is as likely to be the
+                // continuation of a block comment as an indent level.
+                text.startsWith("  ") -> spaces++
+            }
+        }
+        if (tabs == 0 && spaces == 0) EditorLanguage.hardTabs(language) else tabs > spaces
+    }
+
+    /**
+     * One indent level's worth of text. [lineIndent] is the indent of the
+     * row being worked on, which wins where it exists so that a line already
+     * indented one way keeps going that way; the file decides the rest.
+     */
+    internal fun indentUnit(lineIndent: String = ""): String = when {
+        lineIndent.startsWith('\t') -> "\t"
+        lineIndent.isNotEmpty() -> " ".repeat(tabSize)
+        usesHardTabs -> "\t"
+        else -> " ".repeat(tabSize)
+    }
+
     fun currentLine(): String = line(cursorRow)
 
-    fun lineStartOffset(row: Int): Long =
-        CoreBridge.pointToOffset(session.id, row.toLong(), 0)
+    fun lineStartOffset(row: Int): Long = buffer.rowStart(row)
 
     /**
      * One caret's share of a multi-caret edit. Offsets are absolute engine
@@ -719,9 +806,10 @@ class EditorState(val session: BufferSession) {
         val kept = ArrayList<CaretEdit>(ordered.size)
         for (edit in ordered) {
             val last = kept.lastOrNull()
-            if (last != null && edit.start < last.end) continue
+            if (last != null && collides(last, edit)) continue
             kept.add(edit)
         }
+        var refused: MutableList<CaretEdit>? = null
         for (i in kept.indices.reversed()) {
             val edit = kept[i]
             // A caret with nothing to do still travels with the batch so it
@@ -729,15 +817,29 @@ class EditorState(val session: BufferSession) {
             // engine: an empty edit would bump the version and litter the
             // undo history for no change at all.
             if (edit.start == edit.end && edit.replacement.isEmpty()) continue
-            session.editBytes(edit.start, edit.end, edit.replacement)
+            if (!buffer.edit(edit.start, edit.end, edit.replacement)) {
+                // The engine refused this range, so the buffer is exactly as
+                // it was. Letting the edit stay in the batch would count its
+                // length against every caret after it and put all of them at
+                // offsets the buffer never had.
+                (refused ?: ArrayList<CaretEdit>(1).also { refused = it }).add(edit)
+            }
         }
         refreshLineCount()
-        return kept
+        val rejected = refused ?: return kept
+        return kept.filterNot { edit -> rejected.any { it === edit } }
     }
+
+    /** Whether [edit] reaches bytes [last] has already claimed. */
+    private fun collides(last: CaretEdit, edit: CaretEdit): Boolean =
+        edit.start < last.end ||
+            // Two zero-width inserts at one offset are two carets standing in
+            // one place: run both and the text goes in twice.
+            (edit.start == last.end && edit.start == edit.end && last.start == last.end)
 
     /** (row, UTF-16 col) of a global byte offset, clipped to the buffer. */
     private fun pointAt(offset: Long, columnGoal: Int?): Pair<Int, Int> {
-        val packed = CoreBridge.offsetToPoint(session.id, offset.coerceAtLeast(0))
+        val packed = buffer.pointOf(offset.coerceAtLeast(0))
         if (packed < 0) return cursorRow.coerceIn(0, lineCount - 1) to 0
         val row = (packed ushr 32).toInt().coerceIn(0, lineCount - 1)
         val text = line(row)
@@ -762,9 +864,11 @@ class EditorState(val session: BufferSession) {
     fun applyLineDiff(row: Int, newLine: String, selUtf16: Int): Boolean {
         val oldLine = line(row)
         if (oldLine == newLine) {
-            cursorRow = row
-            cursorCol = selUtf16.coerceIn(0, newLine.length)
-            ensureCursorVisible()
+            // Only the caret moved (a tap on the IME's cursor control, a
+            // composing region set). It still goes through the one door: on
+            // a soft keyboard this is the way the primary reaches the column
+            // an extra caret is already standing in.
+            setPrimaryCaret(Caret(row, selUtf16.coerceIn(0, newLine.length)), notify = false)
             return false
         }
         // A soft keyboard commits characters through this path rather than as
@@ -796,13 +900,13 @@ class EditorState(val session: BufferSession) {
         val edit = Utf8Diff.diff(oldLine.encodeToByteArray(), newLine.encodeToByteArray())
         val lineStart = lineStartOffset(row)
         if (edit != null) {
-            session.editBytes(lineStart + edit.start, lineStart + edit.end, edit.replacement)
+            buffer.edit(lineStart + edit.start, lineStart + edit.end, edit.replacement)
         }
         val structural = '\n' in newLine
         if (structural) {
             val cursorOffset = lineStart +
                 utf8Length(newLine, selUtf16.coerceIn(0, newLine.length))
-            val packed = CoreBridge.offsetToPoint(session.id, cursorOffset)
+            val packed = buffer.pointOf(cursorOffset)
             val newRow = (packed ushr 32).toInt()
             val byteCol = (packed and 0xFFFFFFFFL).toInt()
             cursorRow = newRow
@@ -865,17 +969,23 @@ class EditorState(val session: BufferSession) {
     /**
      * The multi-caret form of [applyLineDiff]. The IME only ever sees the
      * primary caret's line, so its change is re-expressed relative to that
-     * caret — "three bytes were replaced ending where the caret was" — and
-     * then repeated at every other caret. A caret whose line is too short
-     * for the range is left alone rather than clipped into an edit that
-     * would eat the wrong characters.
+     * caret — "one character either side of where the caret was" — and then
+     * repeated at every other caret. A caret whose line is too short for the
+     * range is left alone rather than clipped into an edit that would eat
+     * the wrong characters.
+     *
+     * The range is counted in *code points*, not in the bytes the diff comes
+     * in. The other carets sit on other text: replaying "two bytes back from
+     * here" on a line whose character before the caret happens to be one
+     * byte wide deletes two characters where the user asked for one, and a
+     * range that lands mid-character is one the engine refuses outright.
      */
     private fun spreadLineDiff(row: Int, oldLine: String, newLine: String, selUtf16: Int): Boolean {
         val edit = Utf8Diff.diff(oldLine.encodeToByteArray(), newLine.encodeToByteArray())
             ?: return false
-        val caretByte = utf8Length(oldLine, cursorCol.coerceIn(0, oldLine.length))
-        val before = caretByte - edit.start
-        val after = edit.end - caretByte
+        val caretCol = cursorCol.coerceIn(0, oldLine.length)
+        val before = codePointsBetween(oldLine, utf16Col(oldLine, edit.start), caretCol)
+        val after = codePointsBetween(oldLine, caretCol, utf16Col(oldLine, edit.end))
         val head = (utf8Length(newLine, selUtf16.coerceIn(0, newLine.length)) - edit.start)
             .coerceAtLeast(0)
         val primary = primaryCaret()
@@ -883,15 +993,18 @@ class EditorState(val session: BufferSession) {
         for (caret in caretsInOrder()) {
             val isPrimary = caret == primary
             val text = if (isPrimary) oldLine else line(caret.headRow)
-            val at = utf8Length(text, caret.headCol.coerceIn(0, text.length))
+            val col = caret.headCol.coerceIn(0, text.length)
             val lineStart = lineStartOffset(caret.headRow)
+            val from = codePointOffset(text, col, -before)
+            val to = codePointOffset(text, col, after)
             edits.add(
-                if (at - before < 0 || at + after > utf8Length(text)) {
-                    CaretEdit(lineStart + at, lineStart + at, "", isPrimary = isPrimary)
+                if (from == null || to == null) {
+                    val at = lineStart + utf8Length(text, col)
+                    CaretEdit(at, at, "", isPrimary = isPrimary)
                 } else {
                     CaretEdit(
-                        start = lineStart + at - before,
-                        end = lineStart + at - before + before + after,
+                        start = lineStart + utf8Length(text, from),
+                        end = lineStart + utf8Length(text, to),
                         replacement = edit.replacement,
                         head = head,
                         isPrimary = isPrimary,
@@ -939,11 +1052,11 @@ class EditorState(val session: BufferSession) {
      * before the caret, joining lines at column 0.
      */
     fun backspace() {
-        if (deleteSelection()) {
-            onCursorChangedExternally?.invoke()
-            return
-        }
         if (extraCarets.isEmpty()) {
+            if (deleteSelection()) {
+                onCursorChangedExternally?.invoke()
+                return
+            }
             val text = currentLine()
             val col = cursorCol.coerceAtMost(text.length)
             val pair = enclosingPairAt(text, col)
@@ -964,10 +1077,17 @@ class EditorState(val session: BufferSession) {
         for (caret in caretsInOrder()) {
             val text = line(caret.headRow)
             val col = caret.headCol.coerceAtMost(text.length)
-            val pair = enclosingPairAt(text, col)
+            val pair = if (caret.isEmpty) enclosingPairAt(text, col) else null
             val start: Long
             val end: Long
-            if (pair != null) {
+            if (!caret.isEmpty) {
+                // Every caret answers for itself: the ones with a selection
+                // lose it, the bare ones lose what is behind them, and it is
+                // one press either way. Deleting only the selections would
+                // leave the bare carets watching.
+                start = byteOffsetOf(caret.startRow, caret.startCol)
+                end = byteOffsetOf(caret.endRow, caret.endCol)
+            } else if (pair != null) {
                 start = byteOffsetOf(caret.headRow, col - pair.open.length)
                 end = byteOffsetOf(caret.headRow, col + pair.close.length)
             } else if (col > 0) {
@@ -988,20 +1108,34 @@ class EditorState(val session: BufferSession) {
         applyCaretEdits(edits)
     }
 
-    /** The pair [col] sits between, with nothing in it — `(|)`, `"|"`. */
+    /**
+     * The pair [col] sits between, with nothing in it — `(|)`, `"|"`.
+     *
+     * Only pairs we would have closed ourselves count: Rust's `<`/`>` never
+     * auto-closes, so the `>` in `Vec<|>` is one the user typed and deleting
+     * it with the `<` would be deleting something they did not ask about.
+     */
     private fun enclosingPairAt(text: String, col: Int): BracketPair? =
         EditorLanguage.pairs(language).firstOrNull { pair ->
-            col >= pair.open.length &&
+            pair.autoClose &&
+                col >= pair.open.length &&
                 text.startsWith(pair.open, col - pair.open.length) &&
                 text.startsWith(pair.close, col)
         }
 
-    /** Remove the newline before the cursor's line. No-op on row 0. */
-    fun joinWithPreviousLine(): Boolean {
+    /**
+     * Remove the newline before the cursor's line. No-op on row 0.
+     *
+     * Private on purpose: it moves the primary caret and nothing else, so
+     * reaching it from outside — the IME's backspace at column zero used
+     * to — leaves every other caret naming a row that has moved under it.
+     * [backspace] is the door.
+     */
+    private fun joinWithPreviousLine(): Boolean {
         if (cursorRow == 0) return false
         val previousLine = line(cursorRow - 1)
         val lineStart = lineStartOffset(cursorRow)
-        session.editBytes(lineStart - 1, lineStart, "")
+        buffer.edit(lineStart - 1, lineStart, "")
         refreshLineCount()
         cursorRow -= 1
         cursorCol = previousLine.length
@@ -1010,11 +1144,11 @@ class EditorState(val session: BufferSession) {
     }
 
     fun undo() {
-        if (session.undo()) afterHistoryChange()
+        if (buffer.undo()) afterHistoryChange()
     }
 
     fun redo() {
-        if (session.redo()) afterHistoryChange()
+        if (buffer.redo()) afterHistoryChange()
     }
 
     // ---- Motion ----------------------------------------------------------
@@ -1144,6 +1278,28 @@ class EditorState(val session: BufferSession) {
         return i
     }
 }
+
+/**
+ * The UTF-16 offset [count] code points from [col], or null if that runs off
+ * either end of [text]. Negative counts move backwards.
+ *
+ * Null rather than a clamp: a count that does not fit means the line is not
+ * long enough for the operation being replayed on it, and clipping it into
+ * range would silently eat characters nobody pointed at.
+ */
+internal fun codePointOffset(text: String, col: Int, count: Int): Int? {
+    if (col < 0 || col > text.length) return null
+    if (count >= 0) {
+        if (text.codePointCount(col, text.length) < count) return null
+    } else if (text.codePointCount(0, col) < -count) {
+        return null
+    }
+    return text.offsetByCodePoints(col, count)
+}
+
+/** Code points from [from] to [to], negative when [to] is the earlier one. */
+internal fun codePointsBetween(text: String, from: Int, to: Int): Int =
+    if (from <= to) text.codePointCount(from, to) else -text.codePointCount(to, from)
 
 /**
  * The half-open UTF-16 range of the run of same-class characters around

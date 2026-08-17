@@ -1,7 +1,5 @@
 package to.eyed.conquest.code.ui.editor
 
-import to.eyed.conquest.code.core.CoreBridge
-
 /**
  * The editing commands that go beyond moving one cursor around: multiple
  * cursors, the line operations, comment toggling, auto-closing pairs and
@@ -111,7 +109,7 @@ internal fun EditorState.selectAllOccurrences(): Boolean {
     val query = textIn(seed)
     if (query.isEmpty()) return false
     val matches = ArrayList<Caret>()
-    forEachOccurrence(query, selectNextWordwise, 0) { row, col, _ ->
+    forEachOccurrence(query, selectNextWordwise, 0, revisitFirstRow = false) { row, col, _ ->
         matches.add(Caret(row, col, row, col + query.length))
         matches.size < SELECT_ALL_MATCHES_LIMIT
     }
@@ -130,7 +128,7 @@ private fun EditorState.nextOccurrence(
     taken: List<Caret>,
 ): Caret? {
     var found: Caret? = null
-    forEachOccurrence(query, wordwise, fromRow) { row, col, wrapped ->
+    forEachOccurrence(query, wordwise, fromRow, revisitFirstRow = true) { row, col, wrapped ->
         // The starting row is walked twice — once for what follows the
         // caret, and again at the end of the wrap for what precedes it.
         if (!wrapped && row == fromRow && col < fromCol) return@forEachOccurrence true
@@ -149,6 +147,11 @@ private fun EditorState.nextOccurrence(
  * of the buffer, stopping when [action] answers false. Its third argument is
  * true once the walk has wrapped.
  *
+ * [revisitFirstRow] makes the walk end on [fromRow] a second time, which is
+ * what "the next occurrence after the cursor" needs — the matches earlier on
+ * the starting row come last. A walk that wants every match once, and
+ * starts at row 0, must not: it would count that row's matches twice.
+ *
  * Reads the buffer in chunks straight from the bridge rather than through
  * the pane's line window, so searching never evicts the lines being drawn.
  * The right home for this is a search API on the engine — Zed runs an
@@ -156,23 +159,22 @@ private fun EditorState.nextOccurrence(
  * have, and Ctrl+D is a keypress somebody made, not a keystroke on the
  * typing path.
  */
-private fun EditorState.forEachOccurrence(
+internal fun EditorState.forEachOccurrence(
     query: String,
     wordwise: Boolean,
     fromRow: Int,
+    revisitFirstRow: Boolean,
     action: (row: Int, col: Int, wrapped: Boolean) -> Boolean,
 ) {
     var row = fromRow.coerceIn(0, lineCount - 1)
+    val rowsToVisit = if (revisitFirstRow) lineCount + 1 else lineCount
     var visited = 0
     var wrapped = false
-    while (visited <= lineCount) {
+    while (visited < rowsToVisit) {
         val end = (row + SEARCH_CHUNK_ROWS).coerceAtMost(lineCount)
-        val chunk = CoreBridge
-            .bufferLines(session.id, row.toLong(), end.toLong())
-            .orEmpty()
-            .split('\n')
+        val chunk = linesOf(row, end).split('\n')
         for ((index, text) in chunk.withIndex()) {
-            if (visited > lineCount) return
+            if (visited >= rowsToVisit) return
             val at = row + index
             var found = text.indexOf(query)
             while (found >= 0) {
@@ -231,8 +233,7 @@ private fun EditorState.rowGroups(): List<Pair<IntRange, MutableList<Caret>>> {
 private fun EditorState.lineEndOffset(row: Int): Long =
     lineStartOffset(row) + utf8Length(line(row))
 
-private fun EditorState.linesOf(rows: IntRange): String =
-    CoreBridge.bufferLines(session.id, rows.first.toLong(), rows.last.toLong() + 1).orEmpty()
+private fun EditorState.linesOf(rows: IntRange): String = linesOf(rows.first, rows.last + 1)
 
 /**
  * Zed's `MoveLineUp` / `MoveLineDown`: swap each group of rows with the row
@@ -367,11 +368,25 @@ internal fun EditorState.deleteLines() {
  */
 internal fun EditorState.joinLines() {
     val primary = primaryCaret()
-    val edits = rowGroups().mapNotNull { (rows, group) ->
+    val edits = rowGroups().map { (rows, group) ->
         // A group that covers a single row still means "and the next one",
         // or the command would do nothing for a bare caret.
         val last = if (rows.last == rows.first) rows.first + 1 else rows.last
-        if (last > lineCount - 1) return@mapNotNull null
+        if (last > lineCount - 1) {
+            // Nothing follows the last row of the buffer, so this group has
+            // nothing to pull up. Its caret still travels with the batch:
+            // the new caret set is built from these edits, and dropping the
+            // edit would drop the caret with it.
+            val at = lineEndOffset(rows.first)
+            return@map EditorState.CaretEdit(
+                start = at,
+                end = at,
+                replacement = "",
+                head = 0,
+                columnGoal = group.first().headCol,
+                isPrimary = group.any { it == primary },
+            )
+        }
         val joined = StringBuilder()
         var tail = line(rows.first)
         var seam = 0
@@ -589,7 +604,7 @@ private fun closesWellHere(
  * closer pushed down below it.
  *
  * The indent width is the `tab_size` setting; whether it is tabs or spaces
- * is read off the row being split, because the settings file has no
+ * is [EditorState.indentUnit]'s question, because the settings file has no
  * hard-tabs key yet and the file in front of you is better evidence than a
  * default would be.
  */
@@ -600,12 +615,16 @@ internal fun EditorState.insertNewline() {
         val indentEnd = text.indexOfFirst { it != ' ' && it != '\t' }
             .let { if (it < 0) text.length else it }
         val indent = text.take(minOf(indentEnd, caret.startCol))
-        val unit = if (indent.startsWith('\t')) "\t" else " ".repeat(tabSize)
+        val unit = indentUnit(indent)
 
         val before = text.take(caret.startCol).trimEnd()
+        // A quote is not a block opener. It ends a string as often as it
+        // starts one, and Zed's configs say as much: every quote pair in
+        // them is `newline = false` where the brackets are `newline = true`.
+        // Without this, `x = "hello"` + Enter indents.
         val opener = before.lastOrNull()
             ?.let { EditorLanguage.opener(language, it.toString()) }
-            ?.takeIf { it.autoClose }
+            ?.takeIf { it.autoClose && !it.isQuote }
         val after = line(caret.endRow).drop(caret.endCol).trimStart()
         val opensBlock = opener != null ||
             EditorLanguage.blockOpener(language)?.let(before::endsWith) == true

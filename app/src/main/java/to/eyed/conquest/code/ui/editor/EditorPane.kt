@@ -238,6 +238,10 @@ fun EditorPane(
                 .pointerInput(state) {
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = true)
+                        // Only the primary selection has handles drawn, so
+                        // only it may be dragged: hit-testing handles nobody
+                        // can see drags the primary into another caret.
+                        if (state.extraCarets.isNotEmpty()) return@awaitEachGesture
                         val handles = selectionHandles(state, layoutCache) ?: return@awaitEachGesture
                         val distStart = (down.position - handles.first).getDistance()
                         val distEnd = (down.position - handles.second).getDistance()
@@ -461,7 +465,7 @@ private fun EditorActionRow(
             onActed()
         }
         ActionKey("esc", act { state.cancel() })
-        ActionKey("tab", act { state.insertAtCursor(" ".repeat(state.tabSize)) })
+        ActionKey("tab", act { state.insertAtCursor(state.indentUnit()) })
         ActionKey("undo", act { state.undo() })
         ActionKey("redo", act { state.redo() })
         ActionKey("＋cur↑", act { state.addCaretVertically(-1) })
@@ -524,7 +528,7 @@ internal class EditorActions(
         val text = state.selectionText()
         if (text.isEmpty()) return false
         clipboard.setText(AnnotatedString(text))
-        state.clearSelection()
+        state.collapseSelections()
         hideToolbar()
         return true
     }
@@ -662,7 +666,7 @@ private fun handleEditorKey(
         // Spaces, not a tab character: mixed indentation is a bug factory,
         // and the width is the user's to choose.
         Key.Tab -> {
-            state.insertAtCursor(" ".repeat(state.tabSize))
+            state.insertAtCursor(state.indentUnit())
             true
         }
         Key.DirectionLeft -> {
