@@ -10,6 +10,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.text.TextLayoutResult
 import to.eyed.conquest.code.core.BufferSession
 import to.eyed.conquest.code.core.Utf8Diff
+import kotlin.math.ceil
+import kotlin.math.min
 
 /** One highlighted range on one row; columns are UTF-16 offsets. */
 data class HighlightSpan(val start: Int, val end: Int, val style: Int)
@@ -258,6 +260,14 @@ class EditorState private constructor(
 
         /** Zed's gutter margins: 3 character widths left, 4 right. */
         const val GUTTER_PADDING_CHARS = 7
+
+        /**
+         * How many times [ensureCursorVisible] will re-measure before it
+         * settles for what it has. Two is the most a jump has ever needed;
+         * the bound is there so a pathological file cannot turn a caret move
+         * into a walk of the document.
+         */
+        const val MAX_SETTLE_TURNS = 4
     }
 
     /**
@@ -337,7 +347,23 @@ class EditorState private constructor(
                 .toInt()
                 .coerceAtLeast(MIN_WRAP_COLUMNS)
         }
+        // Called from every frame's `updateViewport`, so nothing below may
+        // run for a width the map already has.
+        if (columns == displayMap.wrapColumns && tabSize == displayMap.tabSize) return
+        // A new width throws away every measurement, so the display row
+        // [scrollY] names now means a different row of the file — and left
+        // alone it can sit past the whole document, which draws an empty
+        // window and therefore an empty pane. Re-anchor on the buffer row
+        // that was at the top: a fold, a rotation, a DeX resize or a font
+        // change should keep the reader where they were reading.
+        val topRow = if (scrollY > 0f && lineHeightPx > 0f) {
+            displayMap.bufferRowOf((scrollY / lineHeightPx).toInt())
+        } else {
+            -1
+        }
         displayMap.configure(columns, tabSize)
+        if (topRow >= 0) scrollY = displayMap.displayRowOf(topRow) * lineHeightPx
+        scrollY = scrollY.coerceIn(0f, maxScrollY)
     }
 
     /**
@@ -345,33 +371,39 @@ class EditorState private constructor(
      * when the window or the buffer version changed.
      */
     fun linesWindow(first: Int, last: Int): List<String> {
-        val version = buffer.version
-        val miss = version != cachedVersion ||
+        val miss = buffer.version != cachedVersion ||
             highlightVersion != cachedHighlightVersion ||
             first < cachedFirst ||
             last > cachedLast
-        if (miss) {
-            val paddedFirst = (first - WINDOW_PADDING).coerceAtLeast(0)
-            val paddedLast = (last + WINDOW_PADDING).coerceAtMost(lineCount)
-            if (paddedLast > paddedFirst) {
-                cachedLines = buffer.lines(paddedFirst, paddedLast).split('\n')
-                cachedSpans = groupSpans(
-                    buffer.highlights(paddedFirst, paddedLast),
-                    paddedFirst,
-                    cachedLines.size,
-                )
-            } else {
-                cachedLines = emptyList()
-                cachedSpans = emptyList()
-            }
-            cachedFirst = paddedFirst
-            cachedLast = paddedFirst + cachedLines.size
-            cachedVersion = version
-            cachedHighlightVersion = highlightVersion
-        }
+        if (miss) fetchWindow(first, last)
         requestedFirst = first.coerceIn(cachedFirst, cachedLast)
         requestedLast = last.coerceIn(requestedFirst, cachedLast)
         return cachedLines.subList(requestedFirst - cachedFirst, requestedLast - cachedFirst)
+    }
+
+    /** Read rows [first, last) — padded — into the window cache. */
+    private fun fetchWindow(first: Int, last: Int) {
+        val paddedFirst = (first - WINDOW_PADDING).coerceAtLeast(0)
+        val paddedLast = (last + WINDOW_PADDING).coerceAtMost(lineCount)
+        if (paddedLast > paddedFirst) {
+            cachedLines = buffer.lines(paddedFirst, paddedLast).split('\n')
+            cachedSpans = groupSpans(
+                buffer.highlights(paddedFirst, paddedLast),
+                paddedFirst,
+                cachedLines.size,
+            )
+        } else {
+            cachedLines = emptyList()
+            cachedSpans = emptyList()
+        }
+        cachedFirst = paddedFirst
+        cachedLast = paddedFirst + cachedLines.size
+        cachedVersion = buffer.version
+        cachedHighlightVersion = highlightVersion
+        // The window moved under whoever asked last; keep the spans they are
+        // about to read inside it.
+        requestedFirst = requestedFirst.coerceIn(cachedFirst, cachedLast)
+        requestedLast = requestedLast.coerceIn(requestedFirst, cachedLast)
     }
 
     /**
@@ -427,6 +459,19 @@ class EditorState private constructor(
         if (to == from) return emptyList()
         if (buffer.version == cachedVersion && from >= cachedFirst && to <= cachedLast) {
             return cachedLines.subList(from - cachedFirst, to - cachedFirst)
+        }
+        // An edit drops the window, and the block the map has to re-measure
+        // afterwards is the one the caret is in — the very rows the draw pass
+        // is about to ask for again. Reading them as a window rather than as
+        // a bare block turns two bridge round trips per keystroke into one.
+        // A block nowhere near the window is a jump or a drag into a far part
+        // of the file: that one is read on its own, so a query into a
+        // 100k-line file still costs a block and not a window around it.
+        if (from < cachedLast && to > cachedFirst) {
+            fetchWindow(from, to)
+            if (from >= cachedFirst && to <= cachedLast) {
+                return cachedLines.subList(from - cachedFirst, to - cachedFirst)
+            }
         }
         return buffer.lines(from, to).split('\n')
     }
@@ -506,6 +551,30 @@ class EditorState private constructor(
     /** Put the viewport at [y], clamped — what dragging the scrollbar does. */
     internal fun scrollToY(y: Float) {
         scrollY = y.coerceIn(0f, maxScrollY)
+    }
+
+    /**
+     * The first display row the draw pass paints.
+     *
+     * Clamped inside the document, not merely at zero: [scrollY] can name a
+     * row past the end — a wrap width thrown away between the scroll and the
+     * frame, a document that shrank — and a first row past the end leaves the
+     * window empty, which is a pane with nothing in it at all. The clamp only
+     * bites in that case, because an honest [scrollY] is at most [maxScrollY].
+     */
+    internal fun firstDisplayRow(): Int {
+        val last = (displayMap.displayRowCount - 1).coerceAtLeast(0)
+        return (scrollY / lineHeightPx).toInt().coerceIn(0, last)
+    }
+
+    /**
+     * One past the last display row the draw pass paints, given [first] from
+     * [firstDisplayRow]. Always at least one row: something is always on
+     * screen while there is a document to draw.
+     */
+    internal fun lastDisplayRow(first: Int): Int {
+        val fits = ceil(viewportHeight / lineHeightPx).toInt() + 1
+        return min(first + fits, displayMap.displayRowCount).coerceAtLeast(first + 1)
     }
 
     fun applyScrollDeltaY(delta: Float): Float {
@@ -1493,7 +1562,10 @@ class EditorState private constructor(
     internal fun displayRowOf(row: Int, col: Int): Int = when {
         displayMap.isIdentity -> row.coerceIn(0, lineCount - 1)
         col <= 0 -> displayMap.displayRowOf(row)
-        else -> displayMap.displayRowOf(row, col, line(row))
+        // The row's start first, then its text: measuring the row's block
+        // refills the line window the edit just dropped, so the text below is
+        // served from that read instead of a second one.
+        else -> displayMap.displayRowOf(row) + displayMap.wrapOf(line(row)).segmentOf(col)
     }
 
     /** How far into its own display row a caret sits, in UTF-16 units. */
@@ -1522,16 +1594,39 @@ class EditorState private constructor(
         return row to (start + offset).coerceIn(start, end)
     }
 
-    /** Scroll just enough to keep the cursor's display row inside the viewport. */
+    /**
+     * Scroll just enough to keep the cursor's display row inside the
+     * viewport.
+     *
+     * Settled against what the next draw will measure rather than against
+     * what happens to be measured now. A caret that jumps — a search hit, a
+     * goto-line — is placed against blocks estimated at one display row per
+     * file row, and the first thing the draw pass does is measure the block
+     * the top of the viewport lands in, which makes it taller and pushes the
+     * caret's display row down with it. Measuring here first is what stops
+     * the pane scrolling to a row the caret is no longer on. Each turn
+     * measures at least one more block and the caret's row only ever moves
+     * down, so this settles in a turn or two.
+     */
     fun ensureCursorVisible() {
         if (viewportHeight <= 0f) return
-        val top = displayRowOf(cursorRow, cursorCol) * lineHeightPx
-        val bottom = top + lineHeightPx
-        if (top < scrollY) {
-            scrollY = top
-        } else if (bottom > scrollY + viewportHeight) {
-            scrollY = bottom - viewportHeight
+        var turns = 0
+        while (true) {
+            val display = displayRowOf(cursorRow, cursorCol)
+            val top = display * lineHeightPx
+            val bottom = top + lineHeightPx
+            if (top < scrollY) {
+                scrollY = top
+            } else if (bottom > scrollY + viewportHeight) {
+                scrollY = bottom - viewportHeight
+            }
+            if (displayMap.isIdentity) break
+            val first = (scrollY / lineHeightPx).toInt().coerceAtLeast(0)
+            displayMap.measureWindow(first, first + viewportRows() + 2)
+            if (displayRowOf(cursorRow, cursorCol) == display) break
+            if (++turns >= MAX_SETTLE_TURNS) break
         }
+        scrollY = scrollY.coerceIn(0f, maxScrollY)
     }
 
     private fun afterHistoryChange() {

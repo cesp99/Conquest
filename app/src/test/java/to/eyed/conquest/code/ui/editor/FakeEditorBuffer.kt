@@ -61,10 +61,19 @@ internal class FakeEditorBuffer(
     var rowsRead = 0
         private set
 
+    /**
+     * Times it was asked at all. Rows are the cheap part of a read; the round
+     * trip over JNI is the part a keystroke pays for, so the tests that count
+     * the cost of an edit count these.
+     */
+    var lineCalls = 0
+        private set
+
     override fun lines(firstRow: Int, lastRow: Int): String {
         val all = rows
         val first = firstRow.coerceIn(0, all.size)
         val last = lastRow.coerceIn(first, all.size)
+        lineCalls++
         rowsRead += last - first
         return all.subList(first, last).joinToString("\n")
     }

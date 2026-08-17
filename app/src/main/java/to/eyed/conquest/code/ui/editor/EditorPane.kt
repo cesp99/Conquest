@@ -80,7 +80,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
 import kotlinx.coroutines.delay
@@ -364,18 +363,12 @@ fun EditorPane(
 
             // Everything below counts in *display* rows. The map turns them
             // back into buffer rows and the segment of the row on show.
-            val firstDisplay = (state.scrollY / lineHeight).toInt().coerceAtLeast(0)
+            val firstDisplay = state.firstDisplayRow()
             // Resolving the top row first is what makes the height below it
             // honest: the map measures the block it lands in, and only then
             // does `displayRowCount` know how far the screen reaches.
             val firstBufferRow = map.bufferRowOf(firstDisplay)
-            val lastDisplay = max(
-                firstDisplay,
-                min(
-                    firstDisplay + ceil(size.height / lineHeight).toInt() + 1,
-                    map.displayRowCount,
-                ),
-            )
+            val lastDisplay = state.lastDisplayRow(firstDisplay)
             val lastBufferRow = map.bufferRowOf((lastDisplay - 1).coerceAtLeast(firstDisplay))
             val lines = state.linesWindow(firstBufferRow, lastBufferRow + 1)
             val spans = state.spansWindow()

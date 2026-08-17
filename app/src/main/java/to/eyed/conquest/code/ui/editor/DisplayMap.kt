@@ -367,7 +367,58 @@ internal class DisplayMap(
         this.wrapColumns = wrapColumns
         this.tabSize = tabSize
         rows = -1
+        forgetWraps()
         if (!isIdentity) ensureShape()
+    }
+
+    // ---- Remembered breaks -----------------------------------------------
+
+    /**
+     * The last few long rows' breaks, keyed by the text they were computed
+     * from.
+     *
+     * Wrapping a row costs a scan of the whole row, and one frame asks for
+     * the same row's breaks several times over: the draw pass for the
+     * segments on screen, the caret for the segment it sits in, the
+     * selection handles, `positionAt` for a tap, and an arrow key three more
+     * times. On an ordinary row that is a few hundred characters of
+     * arithmetic and not worth remembering; on the single 50k-character line
+     * a minified file is, it is the frame budget.
+     *
+     * Keyed by the text rather than by row number because a row's index
+     * moves under an edit while its breaks depend on nothing but its own
+     * text, this width and this tab size — so a stale entry cannot be
+     * wrong, only unused.
+     */
+    private val wrapKeys = arrayOfNulls<String>(WRAP_CACHE_SLOTS)
+    private val wrapValues = arrayOfNulls<WrappedLine>(WRAP_CACHE_SLOTS)
+    private var wrapNext = 0
+
+    /**
+     * Rows this map has scanned to find their breaks, for the tests that
+     * hold a frame to the rows on screen rather than the characters behind
+     * them.
+     */
+    internal var wrapScans = 0
+        private set
+
+    private fun forgetWraps() {
+        wrapKeys.fill(null)
+        wrapValues.fill(null)
+        wrapNext = 0
+    }
+
+    private fun rememberedWrap(text: String): WrappedLine? {
+        for (i in wrapKeys.indices) {
+            if (wrapKeys[i] == text) return wrapValues[i]
+        }
+        return null
+    }
+
+    private fun rememberWrap(text: String, wrapped: WrappedLine) {
+        wrapKeys[wrapNext] = text
+        wrapValues[wrapNext] = wrapped
+        wrapNext = (wrapNext + 1) % WRAP_CACHE_SLOTS
     }
 
     // ---- Block index -----------------------------------------------------
@@ -391,6 +442,20 @@ internal class DisplayMap(
          * than a tree over a hundred thousand rows.
          */
         const val BLOCK_ROWS = 64
+
+        /**
+         * Rows whose breaks are remembered at once. A screenful of wrapped
+         * rows is more than this, but the rows worth remembering are the
+         * long ones and there are never many of those on screen at a time.
+         */
+        const val WRAP_CACHE_SLOTS = 8
+
+        /**
+         * Shortest row worth remembering. A row that wraps into two or three
+         * is cheaper to scan again than to keep, and keeping it would evict
+         * the one row on screen whose scan actually costs something.
+         */
+        const val WRAP_CACHE_MIN_LENGTH = 1024
     }
 
     private fun rowsIn(block: Int): Int = min(BLOCK_ROWS, rows - block * BLOCK_ROWS)
@@ -475,8 +540,7 @@ internal class DisplayMap(
         var sum = 0
         for (i in 0 until count) {
             prefix[i] = sum
-            val text = texts.getOrElse(i) { "" }
-            sum += wrap(text, SoftWrap.indentColumns(text, tabSize))
+            sum += segmentCountOf(texts.getOrElse(i) { "" })
         }
         prefix[count] = sum
         measured[block] = prefix
@@ -484,8 +548,8 @@ internal class DisplayMap(
         return prefix
     }
 
-    private fun wrap(text: String, indentColumns: Int, breaks: MutableList<Int>? = null): Int =
-        SoftWrap.wrap(text, wrapColumns, tabSize, indentColumns, breaks)
+    private fun wrap(text: String, indentColumns: Int): Int =
+        SoftWrap.wrap(text, wrapColumns, tabSize, indentColumns)
 
     // ---- Invalidation ----------------------------------------------------
 
@@ -560,11 +624,26 @@ internal class DisplayMap(
         }
 
     /** How many display rows a row holding [text] takes at this width. */
-    fun segmentCountOf(text: String): Int =
-        if (isIdentity) 1 else wrap(text, SoftWrap.indentColumns(text, tabSize))
+    fun segmentCountOf(text: String): Int {
+        if (isIdentity) return 1
+        // A long row's breaks are worth keeping, and counting them is the
+        // same scan; a short one counts without allocating anything.
+        if (text.length >= WRAP_CACHE_MIN_LENGTH) return wrapOf(text).segmentCount
+        wrapScans++
+        return wrap(text, SoftWrap.indentColumns(text, tabSize))
+    }
 
     /** [text]'s segments; [WrappedLine.FITS] when it takes a single row. */
-    fun wrapOf(text: String): WrappedLine = SoftWrap.of(text, wrapColumns, tabSize)
+    fun wrapOf(text: String): WrappedLine {
+        if (isIdentity || text.isEmpty()) return WrappedLine.FITS
+        if (text.length >= WRAP_CACHE_MIN_LENGTH) {
+            rememberedWrap(text)?.let { return it }
+        }
+        wrapScans++
+        val wrapped = SoftWrap.of(text, wrapColumns, tabSize)
+        if (text.length >= WRAP_CACHE_MIN_LENGTH && wrapped.wraps) rememberWrap(text, wrapped)
+        return wrapped
+    }
 
     /** The display row buffer row [row] starts on. */
     fun displayRowOf(row: Int): Int {
@@ -573,12 +652,6 @@ internal class DisplayMap(
         val clamped = row.coerceIn(0, rows - 1)
         val block = clamped / BLOCK_ROWS
         return prefixOf(block) + blockPrefix(block)[clamped - block * BLOCK_ROWS]
-    }
-
-    /** The display row that draws (row, col) of a row holding [text]. */
-    fun displayRowOf(row: Int, col: Int, text: String): Int {
-        if (isIdentity || col <= 0) return displayRowOf(row)
-        return displayRowOf(row) + wrapOf(text).segmentOf(col)
     }
 
     /**
@@ -626,9 +699,10 @@ internal class DisplayMap(
      * of buffer rows from [firstBufferRow] on, which the caller has already
      * fetched in one read.
      *
-     * The breaks are recomputed here rather than cached per row: a few dozen
-     * rows of arithmetic a frame is cheaper than a cache that would have to
-     * be kept honest against every edit.
+     * Costs the display rows it fills, not the characters behind them: an
+     * ordinary row's breaks are a few dozen characters of arithmetic, a long
+     * row's come from [wrapOf]'s memory, and either way only the segments
+     * inside the window are looked at.
      */
     fun fillWindow(
         window: DisplayWindow,
@@ -652,27 +726,56 @@ internal class DisplayMap(
         ensureShape()
         var display = displayRowOf(firstBufferRow)
         var row = firstBufferRow
-        val breaks = ArrayList<Int>(4)
         while (display < last && row < rows) {
             val text = lines.getOrElse(row - firstBufferRow) { "" }
-            breaks.clear()
-            val indent = SoftWrap.indentColumns(text, tabSize)
-            val segments = wrap(text, indent, breaks)
-            val continuation = if (breaks.isEmpty()) 0 else indent.coerceIn(0, wrapColumns / 2)
-            for (segment in 0 until segments) {
-                if (display >= last) break
-                if (display >= first) {
-                    window.add(
-                        row = row,
-                        segment = segment,
-                        start = if (segment == 0) 0 else breaks[segment - 1],
-                        end = if (segment == breaks.size) Int.MAX_VALUE else breaks[segment],
-                        indent = if (segment == 0) 0 else continuation,
-                    )
-                }
-                display++
+            val wrapped = wrapOf(text)
+            val segments = wrapped.segmentCount
+            // Open at the segment the window starts on rather than walking
+            // the row from its first one: a window forty rows into the single
+            // long line a minified file is must cost forty rows of work, not
+            // the line's thousand.
+            var segment = (first - display).coerceAtLeast(0)
+            while (segment < segments && display + segment < last) {
+                window.add(
+                    row = row,
+                    segment = segment,
+                    start = wrapped.startOf(segment),
+                    end = if (segment == segments - 1) {
+                        Int.MAX_VALUE
+                    } else {
+                        wrapped.endOf(segment, text.length)
+                    },
+                    indent = if (segment == 0) 0 else wrapped.indentColumns,
+                )
+                segment++
             }
+            display += segments
             row++
+        }
+    }
+
+    /**
+     * Measure every block the display rows [first, last) fall in.
+     *
+     * Anything that decides *where* to scroll has to do this before it works
+     * out where the caret is drawn. The draw pass measures these blocks as it
+     * resolves the top of the viewport, measuring can only make a block
+     * taller, and a block that grows above the caret pushes the caret's own
+     * display row down — which is how a jump used to scroll to a row the
+     * caret was no longer on.
+     */
+    fun measureWindow(first: Int, last: Int) {
+        if (isIdentity) return
+        ensureShape()
+        var at = first.coerceAtLeast(0)
+        while (at < last && at < total) {
+            val block = blockAt(at)
+            blockPrefix(block)
+            val end = prefixOf(block) + blockValue[block]
+            // Measuring can only have made this block taller, so `end` is
+            // past `at`; the guard is for the empty-file shape, not for it.
+            if (end <= at) break
+            at = end
         }
     }
 }

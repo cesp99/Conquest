@@ -53,6 +53,29 @@ class SoftWrapEditorTest {
         for (row in 0 until lineCount) displayMap.displayRowOf(row)
     }
 
+    /**
+     * What the pane's draw pass asks of the map, without the pixels: resolve
+     * the top of the viewport, work out how far the screen reaches, read the
+     * rows and fill the window.
+     *
+     * Measuring a block is a side effect of drawing, and these tests are
+     * about what that side effect does to a decision taken before the frame,
+     * so they have to take the frame.
+     */
+    private fun EditorState.drawFrame(): DisplayWindow {
+        val first = firstDisplayRow()
+        val firstRow = displayMap.bufferRowOf(first)
+        val last = lastDisplayRow(first)
+        val lastRow = displayMap.bufferRowOf((last - 1).coerceAtLeast(first))
+        val lines = linesWindow(firstRow, lastRow + 1)
+        displayMap.fillWindow(displayWindow, first, last, firstRow, lines)
+        return displayWindow
+    }
+
+    /** A file of [rows] rows that each take exactly two display rows at ten columns. */
+    private fun twoRowLines(rows: Int): String =
+        List(rows) { "x".repeat(15) }.joinToString("\n")
+
     @Test
     fun thePaneWorksOutItsOwnWrapWidth() {
         assertEquals(20, editorOf("hello", columns = 20).displayMap.wrapColumns)
@@ -229,6 +252,133 @@ class SoftWrapEditorTest {
         // `refreshLineCount`, which the tests above exercise.
         state.undo()
         assertEquals(4, state.measureWholeFile().displayMap.displayRowCount)
+    }
+
+    @Test
+    fun aCaretJumpLandsWhereTheNextFrameDrawsIt() {
+        // 2000 rows of two display rows each, 40 rows of viewport, and a
+        // caret dropped into a block nobody has looked at — a search hit or a
+        // goto-line. Everything above it is still estimated at one display
+        // row per file row, which is half the truth, and the frame that
+        // follows measures exactly the block the estimate was wrong about.
+        val state = editorOf(twoRowLines(2000), columns = 10, viewportRows = 40)
+
+        state.caretAt(1024, 0)
+        val window = state.drawFrame()
+
+        val first = state.firstDisplayRow()
+        val last = state.lastDisplayRow(first)
+        assertTrue("nothing was drawn", window.size > 0)
+        assertTrue(
+            "caret display row ${state.displayRowOf(1024, 0)} outside [$first, $last)",
+            state.displayRowOf(1024, 0) in first until last,
+        )
+        assertTrue("the caret's row is not on screen", window.firstIndexOf(1024) >= 0)
+    }
+
+    @Test
+    fun scrollingToACaretNearTheEndOfALongFileStaysInsideTheDocument() {
+        // The same jump, to the last row: the reveal must not run off the
+        // bottom of what the document turns out to be either.
+        val state = editorOf(twoRowLines(2000), columns = 10, viewportRows = 40)
+
+        state.caretAt(1999, 0)
+        val window = state.drawFrame()
+
+        val first = state.firstDisplayRow()
+        assertTrue(state.scrollY <= state.maxScrollY)
+        assertTrue(
+            "caret display row ${state.displayRowOf(1999, 0)} outside the viewport",
+            state.displayRowOf(1999, 0) in first until state.lastDisplayRow(first),
+        )
+        assertTrue(window.firstIndexOf(1999) >= 0)
+    }
+
+    @Test
+    fun aWiderPaneStillHasSomethingToDraw() {
+        // A fold opening, a rotation, a DeX resize: the wrap width changes,
+        // every measurement goes with it, and the display row `scrollY` names
+        // is suddenly past the end of the document.
+        val state = editorOf(twoRowLines(400), columns = 10, viewportRows = 40)
+            .measureWholeFile()
+        assertEquals(800, state.displayMap.displayRowCount)
+        state.scrollToY(state.maxScrollY)
+        assertEquals(7600f, state.scrollY, 0.01f)
+
+        state.updateViewport(width = 40 * 10f + 120f, height = 400f)
+
+        assertEquals(40, state.displayMap.wrapColumns)
+        assertTrue(
+            "scrollY ${state.scrollY} past ${state.maxScrollY}",
+            state.scrollY <= state.maxScrollY,
+        )
+        val window = state.drawFrame()
+        assertTrue("nothing was drawn", window.size > 0)
+        assertTrue(
+            "the reader was thrown back to row ${window.firstBufferRow()}",
+            window.firstBufferRow() >= 350,
+        )
+    }
+
+    @Test
+    fun turningWrappingOffStillHasSomethingToDraw() {
+        val state = editorOf(twoRowLines(400), columns = 10, viewportRows = 40)
+            .measureWholeFile()
+        state.scrollToY(state.maxScrollY)
+
+        state.softWrap = SoftWrapMode.None
+
+        assertTrue(state.displayMap.isIdentity)
+        assertTrue(
+            "scrollY ${state.scrollY} past ${state.maxScrollY}",
+            state.scrollY <= state.maxScrollY,
+        )
+        val window = state.drawFrame()
+        assertTrue("nothing was drawn", window.size > 0)
+        assertTrue(window.firstBufferRow() >= 350)
+    }
+
+    @Test
+    fun aKeystrokeReadsTheRowsTheNextFrameDraws() {
+        val buffer = FakeEditorBuffer(
+            List(400) { "the quick brown fox jumps over it" }.joinToString("\n"),
+        )
+        val state = EditorState(buffer)
+        state.softWrap = SoftWrapMode.EditorWidth
+        state.updateMetrics(lineHeight = 10f, charWidth = 10f, gutterPadding = 0f, textPadding = 0f)
+        state.updateViewport(width = 220f, height = 400f)
+        state.caretAt(100, 5)
+        state.drawFrame()
+
+        val before = buffer.lineCalls
+        state.insertAtCursor("X")
+        val afterEdit = buffer.lineCalls
+        state.drawFrame()
+
+        assertEquals("the keystroke reads once", before + 1, afterEdit)
+        assertEquals("and the frame after it reads nothing", afterEdit, buffer.lineCalls)
+    }
+
+    @Test
+    fun aQueryFarFromTheWindowStillReadsOneBlock() {
+        // Reading the caret's block as a window is only right where the two
+        // overlap; a drag to the far end of a file must still cost a block,
+        // which is what makes a 100k-line file openable.
+        val buffer = FakeEditorBuffer(
+            List(2000) { "the quick brown fox jumps over it" }.joinToString("\n"),
+        )
+        val state = EditorState(buffer)
+        state.softWrap = SoftWrapMode.EditorWidth
+        state.updateMetrics(lineHeight = 10f, charWidth = 10f, gutterPadding = 0f, textPadding = 0f)
+        state.updateViewport(width = 220f, height = 400f)
+        state.drawFrame()
+
+        val calls = buffer.lineCalls
+        val rows = buffer.rowsRead
+        state.displayMap.bufferRowOf(3_000)
+
+        assertEquals("one read", calls + 1, buffer.lineCalls)
+        assertTrue("read ${buffer.rowsRead - rows} rows", buffer.rowsRead - rows <= 64)
     }
 
     @Test

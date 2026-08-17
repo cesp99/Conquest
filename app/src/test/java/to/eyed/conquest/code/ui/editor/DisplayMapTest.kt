@@ -1,6 +1,7 @@
 package to.eyed.conquest.code.ui.editor
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -220,6 +221,60 @@ class DisplayMapTest {
         assertEquals(1, window.bufferRow(0))
         assertEquals(2, window.segment(0))
         assertEquals(3, window.segment(1))
+    }
+
+    @Test
+    fun drawingIntoALongLineDoesNotScanItAgain() {
+        // A minified file: one line of 53,780 characters. Filling forty
+        // display rows six hundred rows into it must cost forty rows of
+        // work, not a scan of the line — sixty times a second, on a phone.
+        val line = "a1b2c3d4e5,".repeat(4_889) + "a"
+        val texts = mutableListOf(line, "after it")
+        val map = mapOver(Reader(texts), columns = 80)
+        val window = DisplayWindow()
+
+        map.fillWindow(window, 600, 640, 0, texts)
+        val scanned = map.wrapScans
+        assertTrue("the line was never scanned", scanned > 0)
+
+        map.fillWindow(window, 600, 640, 0, texts)
+        assertEquals(40, window.size)
+        assertEquals(0, window.bufferRow(0))
+        assertEquals(600, window.segment(0))
+        assertEquals("the window is the segments it was asked for", 639, window.segment(39))
+
+        map.fillWindow(window, 601, 641, 0, texts)
+        assertEquals("the frames after the first scan nothing", scanned, map.wrapScans)
+
+        // The caret, the handles and `positionAt` ask the same question the
+        // draw pass just answered, and get the same answer back.
+        assertSame(map.wrapOf(line), map.wrapOf(line))
+        assertEquals(scanned, map.wrapScans)
+    }
+
+    @Test
+    fun theSegmentsOfALongLineStillTileIt() {
+        // The window opens mid-line now instead of walking to it; the
+        // segments either side of the seam still have to add up to the row.
+        val line = "a1b2c3d4e5,".repeat(200)
+        val texts = mutableListOf(line)
+        val map = mapOver(Reader(texts), columns = 80)
+        val window = DisplayWindow()
+        val segments = map.segmentCountOf(line)
+
+        map.fillWindow(window, 0, segments, 0, texts)
+        val whole = (0 until window.size).joinToString("") {
+            line.substring(window.startCol(it), minOf(window.endCol(it), line.length))
+        }
+        assertEquals(line, whole)
+
+        // The same rows, asked for one window at a time.
+        for (start in 0 until segments) {
+            map.fillWindow(window, start, start + 1, 0, texts)
+            assertEquals(1, window.size)
+            assertEquals(start, window.segment(0))
+            assertEquals(0, window.bufferRow(0))
+        }
     }
 
     @Test
