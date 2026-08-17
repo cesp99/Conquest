@@ -61,12 +61,23 @@ import to.eyed.conquest.code.terminal.GitClone
 import to.eyed.conquest.code.terminal.TerminalSessions
 import to.eyed.conquest.code.terminal.Userland
 import to.eyed.conquest.code.terminal.UserlandState
+import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import to.eyed.conquest.code.ui.editor.EditorPane
 import to.eyed.conquest.code.ui.editor.EditorState
 import to.eyed.conquest.code.ui.terminal.TerminalDock
 
-private val WideLayoutMinWidth = 840.dp
-private val ProjectPanelWidth = 260.dp
+/**
+ * Where the project panel stops being a drawer and becomes Zed's sidebar.
+ *
+ * 840dp is Material's "expanded" breakpoint, and it was the wrong rule: the
+ * Fold's inner display is 674dp at its density, so the device this app is
+ * built for was getting the phone layout while unfolded. What actually
+ * matters is whether the editor is still usable beside a 240dp panel, and at
+ * 600dp it has 360dp — a phone's whole width — so that is the line.
+ */
+private val WideLayoutMinWidth = 600.dp
+// Zed's own default (assets/settings/default.json:816).
+private val ProjectPanelWidth = 240.dp
 
 /** Terminal dock: initial height, and how small or large a drag may make it. */
 private val TerminalDockHeight = 260.dp
@@ -82,6 +93,21 @@ private const val STARTUP_FILE = "src/main.rs"
  * keystroke push through the bridge.
  */
 private const val STATUS_POLL_MS = 250L
+
+/**
+ * The line between two docks.
+ *
+ * Material's dividers default to `outlineVariant`, which our theme maps to
+ * Zed's `border.variant` — and Zed reserves that for the quieter lines inside
+ * a panel (a toolbar's underline, a list separator). The edges *between* docks
+ * are `border` (crates/workspace/src/dock.rs:1203), and at One Dark's values
+ * the two differ enough to read as a different app.
+ */
+@Composable
+private fun DockDivider(vertical: Boolean = false) {
+    val color = LocalZedTheme.current.color("border")
+    if (vertical) VerticalDivider(color = color) else HorizontalDivider(color = color)
+}
 
 /**
  * Root of the IDE UI, in the spirit of Zed's workspace: a project panel, a tab
@@ -440,7 +466,7 @@ fun WorkspaceScreen(
                 isDirty = active?.isDirty == true,
                 menuGroups = menuGroups,
             )
-            HorizontalDivider()
+            DockDivider()
             // Compact screens have no room to split: the dock takes the whole
             // work area, as the settings screen and the drawer already do.
             val dockIsFullScreen = !isWide && terminals.isOpen
@@ -468,7 +494,7 @@ fun WorkspaceScreen(
                                 gitignoredFiles = settings.gitignoredFiles,
                             )
                             }
-                            VerticalDivider()
+                            DockDivider(vertical = true)
                         }
                         EditorArea(
                             files = files,
@@ -519,7 +545,7 @@ fun WorkspaceScreen(
                             }
                         }
                 ) {
-                    HorizontalDivider()
+                    DockDivider()
                 }
                 TerminalDock(
                     state = terminals,
@@ -530,7 +556,7 @@ fun WorkspaceScreen(
                     modifier = Modifier.height(dockHeight),
                 )
             }
-            HorizontalDivider()
+            DockDivider()
             StatusBar(
                 cursorRow = active?.editor?.cursorRow ?: 0,
                 cursorCol = active?.editor?.cursorCol ?: 0,

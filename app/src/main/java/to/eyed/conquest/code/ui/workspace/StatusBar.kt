@@ -44,9 +44,12 @@ fun StatusBar(
     Row(
         modifier = modifier
             .fillMaxWidth()
+            // 30 = a 22px default button plus 4px of padding on each side,
+            // which is how Zed's status bar gets its height rather than by
+            // declaring one (crates/workspace/src/status_bar.rs:153).
             .height(30.dp)
             .background(theme.color("status_bar.background"))
-            .padding(horizontal = 10.dp),
+            .padding(4.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {

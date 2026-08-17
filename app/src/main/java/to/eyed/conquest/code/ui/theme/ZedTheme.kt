@@ -23,9 +23,18 @@ class ZedTheme(
 ) {
     data class SyntaxStyle(val color: Color?, val italic: Boolean, val bold: Boolean)
 
-    /** Style-table lookup by Zed style key, e.g. `"editor.background"`. */
+    /**
+     * Style-table lookup by Zed style key, e.g. `"editor.background"`.
+     *
+     * A miss falls back to [DERIVED], then to magenta. The derivations are not
+     * invention: a dozen keys Zed's own themes never write — the indent
+     * guides, the minimap, `pane_group.border` — are filled by its Rust
+     * deserializer from `ThemeColors::dark()`, and a theme JSON that omits
+     * them is normal rather than broken. Without this table the first indent
+     * guide we draw is magenta.
+     */
     fun color(key: String, fallback: Color = Color.Magenta): Color =
-        colors[key] ?: fallback
+        colors[key] ?: DERIVED[key]?.let { colors[it] } ?: fallback
 
     /** Compose span styles indexed by engine style id. */
     private val spanStyles: List<SpanStyle?> = STYLE_NAMES.map { name ->
@@ -41,6 +50,38 @@ class ZedTheme(
     fun spanStyle(styleId: Int): SpanStyle? = spanStyles.getOrNull(styleId)
 
     companion object {
+        /**
+         * Keys Zed's themes leave out, and the key each one borrows from.
+         *
+         * Zed fills these in Rust from `ThemeColors::dark()`
+         * (crates/theme/src/default_colors.rs) rather than in the JSON, so
+         * even its own One Dark omits every one of them. The borrowings below
+         * follow those defaults' *relationships* — an indent guide is the
+         * quiet border, an active one the ordinary border — rather than
+         * hardcoding One Dark's hexes, so a user's own theme stays coherent.
+         */
+        private val DERIVED = mapOf(
+            "editor.indent_guide" to "border.variant",
+            "editor.indent_guide_active" to "border",
+            "panel.indent_guide" to "border.variant",
+            "panel.indent_guide_hover" to "border",
+            "panel.indent_guide_active" to "border.selected",
+            "pane_group.border" to "border",
+            "scrollbar.thumb.active_background" to "scrollbar.thumb.hover_background",
+            "minimap.thumb.background" to "scrollbar.thumb.background",
+            "minimap.thumb.hover_background" to "scrollbar.thumb.hover_background",
+            "minimap.thumb.active_background" to "scrollbar.thumb.hover_background",
+            "minimap.thumb.border" to "scrollbar.thumb.border",
+            "drop_target.border" to "border.selected",
+            "editor.document_highlight.bracket_background"
+                to "editor.document_highlight.read_background",
+            "editor.debugger_active_line.background" to "editor.highlighted_line.background",
+            "debugger.accent" to "text.accent",
+            "terminal.ansi.background" to "terminal.background",
+            "panel.overlay_background" to "elevated_surface.background",
+            "panel.overlay_hover" to "element.hover",
+        )
+
         /**
          * Mirrors `STYLE_NAMES` in `core/crates/engine/src/highlight.rs` —
          * the engine's highlight style ids index this list. Keep in sync.

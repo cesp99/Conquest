@@ -28,7 +28,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
-private val TitleBarHeight = 40.dp
+// Zed: max(1.75rem, 34px) — 34 at the default 16px rem
+// (crates/ui/src/utils/constants.rs:17-19).
+private val TitleBarHeight = 34.dp
 
 /** One entry in the menu: what it does, and the chord that also does it. */
 data class MenuAction(
@@ -65,7 +67,9 @@ fun TitleBar(
             .fillMaxWidth()
             .height(TitleBarHeight)
             .background(theme.color("title_bar.background", theme.color("tab_bar.background")))
-            .padding(horizontal = 8.dp),
+            // Left only, as Zed's `pl_2`: the right end is a button group
+            // that brings its own padding (title_bar/src/title_bar.rs:417).
+            .padding(start = 8.dp),
     ) {
         Box {
             Text(
