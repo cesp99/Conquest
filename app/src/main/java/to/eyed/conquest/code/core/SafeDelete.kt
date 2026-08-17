@@ -101,6 +101,24 @@ object SafeDelete {
         return parentPath == rootPath || parentPath.startsWith(rootPath + File.separator)
     }
 
+    /**
+     * Whether [dir] *itself* resolves to somewhere inside [root].
+     *
+     * [isInside] canonicalizes the parent and deliberately not the target, so
+     * that deleting or renaming a symlink acts on the link rather than on what
+     * it points at. A *destination* is the opposite question: writing into a
+     * link means writing wherever it points, so here the directory itself is
+     * resolved. A project holding `vendor -> /storage/emulated/0/Download` —
+     * one line in the terminal dock, and unremarkable in a Debian-shaped tree
+     * — otherwise lets New File and Paste land outside the project, where the
+     * panel then refuses to delete what it just created.
+     */
+    fun resolvesInside(root: File, dir: File): Boolean {
+        val rootPath = canonicalOrNull(root) ?: return false
+        val dirPath = canonicalOrNull(dir) ?: return false
+        return dirPath == rootPath || dirPath.startsWith(rootPath + File.separator)
+    }
+
     private fun canonicalOrNull(file: File): String? = try {
         file.canonicalPath
     } catch (e: IOException) {

@@ -110,6 +110,9 @@ object ProjectFiles {
     /** Create an empty file, or a directory, under [parent]. */
     fun create(root: File, parent: String, name: String, isDir: Boolean): FileOpResult {
         val parentDir = resolve(root, parent) ?: return notInProject(parent)
+        // The string cannot walk out with `..`, but a symlinked folder in the
+        // tree can: resolve the destination itself before creating anything.
+        if (!SafeDelete.resolvesInside(root, parentDir)) return notInProject(parent)
         val parts = name.trim().split('/').filter { it.isNotEmpty() }
         pathError(name, parentDir)?.let { return FileOpResult.Failed(it) }
         var dir = parentDir
@@ -123,6 +126,9 @@ object ProjectFiles {
                 }
             }
             val leaf = parts.last().trim()
+            // Re-checked after walking any intermediate components: one of
+            // them may itself be an existing link out of the project.
+            if (!SafeDelete.resolvesInside(root, dir)) return notInProject(rel)
             val target = File(dir, leaf)
             val created = if (isDir) target.mkdir() else target.createNewFile()
             if (!created) FileOpResult.Failed("Could not create $leaf")
@@ -238,6 +244,11 @@ object ProjectFiles {
     ): String? = when {
         !SafeDelete.isInside(root, source) -> "${source.name} is not in this project"
         !target.isDirectory -> "${target.name} is not a folder"
+        // `isDirectory` follows links, so a row the panel draws as a folder
+        // can be a link out of the project — and writing into it writes
+        // wherever it points.
+        !SafeDelete.resolvesInside(root, target) ->
+            "${target.name} leads outside this project"
         destDir == rel || destDir.startsWith("$rel/") ->
             "A folder cannot be pasted into itself"
         else -> null

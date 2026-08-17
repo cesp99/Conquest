@@ -218,14 +218,21 @@ fun TerminalDock(
 
     fun runAction(action: TerminalAction) {
         val terminal = view
+        // Read the active session *now*, never the `host` this composition
+        // captured. `AndroidView`'s factory runs once and keeps the first
+        // `onKey` it is given, so a closure over `host` is pinned to whichever
+        // session existed when the dock's view was created: open a second
+        // shell, press Ctrl+Shift+V, and the clipboard goes into the first
+        // one's pty — invisibly, and executed if it ends in a newline.
+        val active = state.active
         when (action) {
-            TerminalAction.Copy -> terminal?.let { host.copy(terminalSelection(it)) }
-            TerminalAction.Paste -> host.paste()
+            TerminalAction.Copy -> terminal?.let { active?.copy(terminalSelection(it)) }
+            TerminalAction.Paste -> active?.paste()
             TerminalAction.Clear -> terminal?.let(::clearTerminal)
             TerminalAction.ScrollToTop -> terminal?.let(::scrollTerminalToTop)
             TerminalAction.ScrollToBottom -> terminal?.let(::scrollTerminalToBottom)
-            TerminalAction.Rename -> renaming = host
-            TerminalAction.Restart -> host.restart()
+            TerminalAction.Rename -> renaming = active
+            TerminalAction.Restart -> active?.restart()
             TerminalAction.Close -> state.closeSession(state.activeIndex)
         }
     }

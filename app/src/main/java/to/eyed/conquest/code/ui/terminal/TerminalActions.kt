@@ -31,7 +31,11 @@ private const val CLEAR_SEQUENCE = "\u001b[H\u001b[2J\u001b[3J"
  * simply eat it.
  */
 fun clearTerminal(view: TerminalView) {
-    val emulator = view.mEmulator ?: return
+    // Not while `less` or `vi` owns the screen. `ESC[3J` clears the *main*
+    // buffer's transcript whichever buffer is active, so clearing from inside
+    // a pager throws away the build log you are about to return to, and the
+    // pager redraws as if nothing happened.
+    val emulator = scrollableEmulator(view) ?: return
     val bytes = CLEAR_SEQUENCE.toByteArray()
     emulator.append(bytes, bytes.size)
     view.onScreenUpdated()

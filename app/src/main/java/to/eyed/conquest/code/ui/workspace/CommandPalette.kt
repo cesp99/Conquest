@@ -88,6 +88,8 @@ fun CommandPalette(
     /** Runs the command; false when the workspace refused it after all. */
     onRun: (WorkspaceCommand) -> Boolean,
     onDismiss: () -> Unit,
+    /** Where the keyboard was when the palette opened; decides which chords it prints. */
+    keyboardFocus: Focus = Focus.Workspace,
     /** Pre-filled query, for a caller handing the palette a search. */
     initialQuery: String = "",
 ) {
@@ -110,7 +112,7 @@ fun CommandPalette(
     // people type it out of habit that swallowing it is kinder than matching
     // nothing. It is also the hook for handing off from the file finder.
     val text = query.text.removePrefix(">")
-    val entries = remember(workspace) { paletteEntries(workspace) }
+    val entries = remember(workspace, keyboardFocus) { paletteEntries(workspace, keyboardFocus) }
     val results = remember(entries, text, recent) { matchCommands(entries, text, recent) }
 
     LaunchedEffect(text) { selected = 0 }

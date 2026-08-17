@@ -52,15 +52,28 @@ data class CommandMatch(
     val score: Int,
 )
 
-/** Every command this build offers, judged against [context]. */
-fun paletteEntries(context: CommandContext): List<PaletteEntry> =
+/**
+ * Every command this build offers, judged against [context].
+ *
+ * [focus] is where the keyboard is, and it decides which chord each row
+ * prints. It is not cosmetic: the same command answers to different chords in
+ * the two focuses — Save is Ctrl+S in the workspace and Ctrl+Shift+S while a
+ * shell has the keyboard, because a terminal owns every plain Ctrl+letter. A
+ * palette opened from the terminal that printed the workspace chord would be
+ * teaching the user to press Ctrl+S at a shell, which is XOFF: output stops,
+ * and it looks exactly like a hang.
+ */
+fun paletteEntries(
+    context: CommandContext,
+    focus: Focus = Focus.Workspace,
+): List<PaletteEntry> =
     WorkspaceCommand.entries
         .filter { it.isOffered(context) }
         .map { command ->
             PaletteEntry(
                 command = command,
                 name = humanizeActionName(command.id),
-                shortcut = shortcutLabel(command),
+                shortcut = shortcutLabel(command, focus),
                 isEnabled = command.isAvailable(context),
             )
         }
@@ -110,9 +123,14 @@ fun matchCommands(
             .map { CommandMatch(it, emptyList(), 0) }
     }
 
-    // A query with an uppercase letter is case-sensitive, the convention the
-    // file finder already follows.
-    val smartCase = trimmed.any { it.isUpperCase() }
+    // Smart case — a query with an uppercase letter is case-sensitive — is the
+    // file finder's convention, and it is right there because paths carry
+    // uppercase. Command names do not: `humanizeActionName` lowercases every
+    // one, so a candidate can never contain an uppercase letter, and applying
+    // the rule here matches *nothing* the moment a soft keyboard capitalises
+    // the first letter. It applies only if there is something to match.
+    val smartCase = trimmed.any { it.isUpperCase() } &&
+        entries.any { entry -> entry.name.any(Char::isUpperCase) }
     return entries
         .mapNotNull { entry ->
             fuzzyMatch(entry.name, trimmed, smartCase)?.let { found ->
