@@ -79,7 +79,57 @@ class ProjectTreeState(
     var shape by mutableLongStateOf(0L)
         private set
 
+    /**
+     * The row the keyboard is on, as a project-relative path, or null when the
+     * panel has never been driven from the keyboard.
+     *
+     * Separate from the *open* file the panel highlights: they are usually the
+     * same row and occasionally not, exactly as in Zed, where moving the
+     * selection through the tree doesn't open anything until you ask.
+     */
+    var selected by mutableStateOf<String?>(null)
+        private set
+
+    /**
+     * A path [reveal] was asked for that isn't on screen yet.
+     *
+     * Revealing a file inside a directory the worktree hasn't scanned can't
+     * finish in one pass: the engine is asked to scan, and the row appears a
+     * snapshot or two later. The panel scrolls to it when it does, and clears
+     * this with [revealed].
+     */
+    var pendingReveal by mutableStateOf<String?>(null)
+        private set
+
     fun isExpanded(path: String): Boolean = expanded.contains(path)
+
+    /** The row the selection is on, if it is still in the tree. */
+    val selectedRow: ProjectTreeRow?
+        get() = selected?.let { path -> rows.firstOrNull { it.entry.path == path } }
+
+    fun select(path: String?) {
+        selected = path
+    }
+
+    /**
+     * Move the selection [delta] visible rows, without wrapping — the ends of
+     * a file tree are meaningful places to be, and Zed's panel stops there too.
+     * Selects the first (or last) row when nothing is selected yet.
+     */
+    fun moveSelection(delta: Int) {
+        if (rows.isEmpty()) return
+        val current = rows.indexOfFirst { it.entry.path == selected }
+        selected = when {
+            current < 0 -> if (delta > 0) rows.first().entry.path else rows.last().entry.path
+            else -> rows[(current + delta).coerceIn(0, rows.lastIndex)].entry.path
+        }
+    }
+
+    /** Jump the selection to the first or last visible row. */
+    fun selectEdge(last: Boolean) {
+        if (rows.isEmpty()) return
+        selected = if (last) rows.last().entry.path else rows.first().entry.path
+    }
 
     /**
      * Expand or collapse a directory. Expanding a directory the worktree
@@ -88,12 +138,94 @@ class ProjectTreeState(
      */
     fun toggle(entry: ProjectEntry) {
         if (!entry.isDir) return
+        if (isExpanded(entry.path)) collapse(entry.path) else expand(entry)
+    }
+
+    /** Expand a directory. Returns false if it was already open, or is a file. */
+    fun expand(entry: ProjectEntry): Boolean {
+        if (!entry.isDir || expanded.contains(entry.path)) return false
         shape += 1
-        if (expanded.remove(entry.path)) return
         expanded.add(entry.path)
         if (entry.isUnloaded || entry.isIgnored) {
             session.expand(entry.path)
         }
+        return true
+    }
+
+    /** Collapse a directory. Returns false if it wasn't open. */
+    fun collapse(path: String): Boolean {
+        if (!expanded.remove(path)) return false
+        shape += 1
+        return true
+    }
+
+    /** Collapse everything, back to the project's top level. */
+    fun collapseAll(): Boolean {
+        if (expanded.isEmpty()) return false
+        shape += 1
+        expanded.clear()
+        return true
+    }
+
+    /**
+     * Every directory "expand all" should open: the ones the worktree has
+     * already scanned, walked breadth-first so the shallow ones are taken
+     * first if [limit] runs out. **Blocking** — one engine read per directory,
+     * so callers run it off the main thread and hand the result to [expandAll].
+     *
+     * Directories the worktree deferred ([ProjectEntry.isUnloaded], and
+     * gitignored ones) are left closed rather than triggering a scan of
+     * everything: `node_modules` is exactly the thing "expand all" must not
+     * pull into memory, and it is one tap away for anyone who does want it.
+     */
+    fun expandableDirectories(limit: Int = MAX_EXPANDED): List<String> {
+        val found = mutableListOf<String>()
+        val queue = ArrayDeque<Pair<String, Int>>()
+        queue.add("" to 0)
+        while (queue.isNotEmpty() && found.size < limit) {
+            val (dir, depth) = queue.removeFirst()
+            if (depth > MAX_DEPTH) continue
+            for (entry in session.children(dir)) {
+                if (!entry.isDir || entry.isUnloaded || entry.isIgnored) continue
+                if (found.size >= limit) break
+                found += entry.path
+                queue.add(entry.path to depth + 1)
+            }
+        }
+        return found
+    }
+
+    /** Open [paths] — the result of [expandableDirectories]. */
+    fun expandAll(paths: List<String>) {
+        if (paths.isEmpty()) return
+        shape += 1
+        for (path in paths) if (!expanded.contains(path)) expanded.add(path)
+    }
+
+    /**
+     * Open everything above [path] and put the selection on it — "reveal the
+     * active file", and where the tree lands after a file operation.
+     *
+     * Ancestors are handed to the engine unconditionally: expanding a
+     * directory it has already scanned is a no-op there, and the alternative
+     * is looking each ancestor up first just to decide not to ask.
+     */
+    fun reveal(path: String) {
+        if (path.isEmpty()) return
+        shape += 1
+        var prefix = ""
+        for (part in path.split('/').dropLast(1)) {
+            prefix = if (prefix.isEmpty()) part else "$prefix/$part"
+            if (!expanded.contains(prefix)) expanded.add(prefix)
+            session.expand(prefix)
+        }
+        selected = path
+        pendingReveal = path
+    }
+
+    /** The panel has scrolled to [pendingReveal]; stop watching for it. */
+    fun revealed() {
+        pendingReveal = null
     }
 
     /** Walk the expanded directories, reading each one's children. Blocking. */
@@ -166,5 +298,13 @@ class ProjectTreeState(
 
     private companion object {
         const val MAX_DEPTH = 64
+
+        /**
+         * Ceiling on what one "expand all" will open. A project with more
+         * directories than this is one where expanding everything was never
+         * the useful answer, and the flattening cost is linear in what it
+         * opens.
+         */
+        const val MAX_EXPANDED = 2_000
     }
 }

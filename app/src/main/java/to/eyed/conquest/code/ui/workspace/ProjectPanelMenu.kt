@@ -1,0 +1,374 @@
+package to.eyed.conquest.code.ui.workspace
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.pointerHoverIcon
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.DpOffset
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import to.eyed.conquest.code.ui.theme.LocalZedTheme
+
+/** One line of the project panel's context menu. */
+sealed interface PanelMenuEntry {
+    /** A rule between groups; two in a row, or one at either end, collapse. */
+    data object Separator : PanelMenuEntry
+
+    data class Action(
+        val label: String,
+        /** Shown greyed on the right, as in the title bar's menu. */
+        val shortcut: String? = null,
+        val enabled: Boolean = true,
+        val onClick: () -> Unit,
+    ) : PanelMenuEntry
+}
+
+/**
+ * The context menu, in Zed's order: create, then move things about, then the
+ * destructive pair, then whole-tree commands.
+ *
+ * One menu serves all three ways in: right-click and long-press both open it
+ * at the pointer, the menu key and `Shift F10` open it on the selected row.
+ * That is deliberate — a menu that exists only under a right-click is missing
+ * on a phone, and one that exists only under a long-press is missing on DeX,
+ * where there is no touchscreen at all.
+ */
+@Composable
+fun ProjectContextMenu(
+    entries: List<PanelMenuEntry>,
+    offset: DpOffset,
+    onDismiss: () -> Unit,
+) {
+    DropdownMenu(
+        expanded = true,
+        onDismissRequest = onDismiss,
+        offset = offset,
+        modifier = Modifier.onPreviewKeyEvent { event ->
+            // Escape closes it. Arrows and Enter are Compose's own focus
+            // traversal, which the items are already wired for.
+            if (event.type == KeyEventType.KeyDown && event.key == Key.Escape) {
+                onDismiss()
+                true
+            } else {
+                false
+            }
+        },
+    ) {
+        for (entry in entries.withoutStraySeparators()) {
+            when (entry) {
+                is PanelMenuEntry.Separator ->
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
+                is PanelMenuEntry.Action -> {
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                text = entry.label,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = if (entry.enabled) {
+                                    MaterialTheme.colorScheme.onSurface
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                            )
+                        },
+                        trailingIcon = entry.shortcut?.let { shortcut ->
+                            {
+                                Text(
+                                    text = shortcut,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        },
+                        enabled = entry.enabled,
+                        onClick = {
+                            onDismiss()
+                            entry.onClick()
+                        },
+                        modifier = Modifier.pointerHoverIcon(PointerIcon.Hand),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Ask for a name — new file, new folder, rename.
+ *
+ * [selectionEnd] is how much of the name starts out selected: renaming
+ * `main.rs` selects `main`, because the extension is almost never the part
+ * being changed. Zed's inline rename does the same.
+ */
+@Composable
+fun EntryNameDialog(
+    title: String,
+    confirmLabel: String,
+    initial: String,
+    /** How much of [initial] starts out selected, counted from the front. */
+    selectionEnd: Int,
+    placeholder: String,
+    errorFor: (String) -> String?,
+    onConfirm: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var value by remember {
+        mutableStateOf(
+            TextFieldValue(initial, TextRange(0, selectionEnd))
+        )
+    }
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { focus.requestFocus() }
+
+    val error = value.text.takeIf { it.isNotBlank() }?.let(errorFor)
+    val canConfirm = value.text.isNotBlank() && error == null
+
+    PanelDialog(title = title, onDismiss = onDismiss) {
+        PanelTextField(
+            value = value,
+            onValueChange = { value = it },
+            placeholder = placeholder,
+            focusRequester = focus,
+            onSubmit = { if (canConfirm) onConfirm(value.text) },
+            onEscape = onDismiss,
+        )
+        if (error != null) PanelMessage(error, isError = true)
+        PanelActions {
+            PanelTextAction("Cancel", onClick = onDismiss)
+            PanelTextAction(confirmLabel, enabled = canConfirm) { onConfirm(value.text) }
+        }
+    }
+}
+
+/**
+ * Confirm a delete, naming what is about to go.
+ *
+ * It says "permanently" because on Android it is. Zed's own default is Trash,
+ * with Delete as the harder version behind a modifier, and the engine already
+ * carries an app-private trash (`core/crates/trash-android`) — but nothing in
+ * the bridge reaches it yet, so promising a trash here would be a lie.
+ */
+@Composable
+fun ConfirmDeleteDialog(
+    path: String,
+    isDir: Boolean,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    PanelDialog(title = "DELETE", onDismiss = onDismiss) {
+        Text(
+            text = if (isDir) {
+                "Permanently delete “$path” and everything in it? This cannot be undone."
+            } else {
+                "Permanently delete “$path”? This cannot be undone."
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.padding(horizontal = 20.dp),
+        )
+        PanelActions {
+            PanelTextAction("Cancel", onClick = onDismiss)
+            PanelTextAction("Delete", isDestructive = true, onClick = onConfirm)
+        }
+    }
+}
+
+/** An operation that didn't happen, and why. */
+@Composable
+fun PanelErrorDialog(message: String, onDismiss: () -> Unit) {
+    PanelDialog(title = "PROJECT", onDismiss = onDismiss) {
+        PanelMessage(message, isError = true)
+        PanelActions {
+            PanelTextAction("Close", onClick = onDismiss)
+        }
+    }
+}
+
+@Composable
+private fun PanelDialog(
+    title: String,
+    onDismiss: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val theme = LocalZedTheme.current
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = theme.color("elevated_surface.background", MaterialTheme.colorScheme.surface),
+            modifier = Modifier.widthIn(min = 320.dp, max = 520.dp),
+        ) {
+            Column(modifier = Modifier.padding(vertical = 16.dp)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = 20.dp),
+                )
+                Box(modifier = Modifier.padding(top = 16.dp)) {
+                    Column { content() }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * The dialog's text field: `Enter` confirms, `Esc` backs out, and the pointer
+ * becomes a caret over it rather than staying an arrow.
+ */
+@Composable
+private fun PanelTextField(
+    value: TextFieldValue,
+    onValueChange: (TextFieldValue) -> Unit,
+    placeholder: String,
+    focusRequester: FocusRequester,
+    onSubmit: () -> Unit,
+    onEscape: () -> Unit,
+) {
+    val theme = LocalZedTheme.current
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp)
+            .background(theme.color("editor.background"), RoundedCornerShape(6.dp))
+            .pointerHoverIcon(PointerIcon.Text)
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+    ) {
+        BasicTextField(
+            value = value,
+            onValueChange = onValueChange,
+            singleLine = true,
+            textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
+            cursorBrush = SolidColor(theme.color("editor.foreground")),
+            modifier = Modifier
+                .fillMaxWidth()
+                .focusRequester(focusRequester)
+                .onPreviewKeyEvent { event ->
+                    if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                    when (event.key) {
+                        Key.Enter, Key.NumPadEnter -> { onSubmit(); true }
+                        Key.Escape -> { onEscape(); true }
+                        else -> false
+                    }
+                },
+        )
+        if (value.text.isEmpty()) {
+            Text(
+                text = placeholder,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun PanelActions(content: @Composable () -> Unit) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(20.dp),
+        modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 20.dp),
+    ) {
+        Box(modifier = Modifier.weight(1f))
+        content()
+    }
+}
+
+@Composable
+private fun PanelMessage(text: String, isError: Boolean = false) {
+    val theme = LocalZedTheme.current
+    Text(
+        text = text,
+        style = MaterialTheme.typography.bodySmall,
+        color = if (isError) {
+            theme.color("error", MaterialTheme.colorScheme.error)
+        } else {
+            MaterialTheme.colorScheme.onSurfaceVariant
+        },
+        modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+    )
+}
+
+@Composable
+private fun PanelTextAction(
+    label: String,
+    enabled: Boolean = true,
+    isDestructive: Boolean = false,
+    onClick: () -> Unit,
+) {
+    val theme = LocalZedTheme.current
+    Text(
+        text = label,
+        style = MaterialTheme.typography.labelLarge,
+        color = when {
+            !enabled -> MaterialTheme.colorScheme.onSurfaceVariant
+            isDestructive -> theme.color("error", MaterialTheme.colorScheme.error)
+            else -> MaterialTheme.colorScheme.primary
+        },
+        modifier = Modifier
+            .then(
+                if (enabled) {
+                    Modifier.pointerHoverIcon(PointerIcon.Hand).clickable(onClick = onClick)
+                } else {
+                    Modifier
+                }
+            )
+            .padding(vertical = 4.dp),
+    )
+}
+
+/**
+ * Drop the separators that would render as a rule against nothing: the menu is
+ * built by appending groups that each may turn out to be empty.
+ */
+private fun List<PanelMenuEntry>.withoutStraySeparators(): List<PanelMenuEntry> {
+    val kept = mutableListOf<PanelMenuEntry>()
+    for (entry in this) {
+        if (entry is PanelMenuEntry.Separator &&
+            (kept.isEmpty() || kept.last() is PanelMenuEntry.Separator)
+        ) {
+            continue
+        }
+        kept += entry
+    }
+    if (kept.lastOrNull() is PanelMenuEntry.Separator) kept.removeAt(kept.lastIndex)
+    return kept
+}

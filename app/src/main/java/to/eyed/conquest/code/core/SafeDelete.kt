@@ -64,5 +64,48 @@ object SafeDelete {
         }
     }
 
+    /**
+     * Delete [target], but only once it is established that [target] really
+     * lives inside [root]. Returns false without touching anything otherwise.
+     *
+     * This is what the project panel deletes through. [deleteTree] already
+     * refuses to *descend* a link, which keeps a delete from spreading; this
+     * adds the other half, that the thing being deleted was reached from
+     * inside the project in the first place. A tree whose middle is a link —
+     * `project/vendor -> /` — would otherwise let a row the user sees in their
+     * project stand for a file nowhere near it.
+     */
+    fun deleteWithin(root: File, target: File): Boolean =
+        isInside(root, target) && deleteTree(target)
+
+    /**
+     * Is [target] a path inside [root], judged by the directory holding it?
+     *
+     * The parent chain is canonicalized, so a symlinked directory partway down
+     * cannot smuggle the target out of [root]. The target itself deliberately
+     * is not: a link is an entry of the project in its own right, and deleting
+     * or renaming one must act on the link, never on what it points at.
+     *
+     * Both sides are canonicalized, not just the parent: on Android `filesDir`
+     * is /data/user/0/<pkg>, itself a link to /data/data/<pkg>, so comparing
+     * one spelling against the other would say "outside" about every project
+     * we have. The engine resolves the worktree root once for the same reason.
+     *
+     * Also the guard the panel's rename, move and copy use — same property,
+     * same answer, one definition.
+     */
+    fun isInside(root: File, target: File): Boolean {
+        val parent = target.parentFile ?: return false
+        val rootPath = canonicalOrNull(root) ?: return false
+        val parentPath = canonicalOrNull(parent) ?: return false
+        return parentPath == rootPath || parentPath.startsWith(rootPath + File.separator)
+    }
+
+    private fun canonicalOrNull(file: File): String? = try {
+        file.canonicalPath
+    } catch (e: IOException) {
+        null
+    }
+
     private fun isSymlink(file: File): Boolean = Files.isSymbolicLink(file.toPath())
 }
