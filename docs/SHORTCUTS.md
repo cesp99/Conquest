@@ -8,6 +8,34 @@ also have a binding here.
 Bindings are hard-coded for now. A user-editable Zed-style keymap JSON is
 planned; see the roadmap.
 
+## Command palette
+
+You do not have to memorise the tables below. `Ctrl` `Shift` `P` (or `F1`, or
+**Command palette…** in the `☰` menu) opens the palette: every command in
+the workspace, searchable by name, with the chord that also runs it shown
+beside it.
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl` `Shift` `P` / `F1` | Open the command palette |
+| `↑` `↓`, `Ctrl` `P` / `Ctrl` `N`, `Tab` / `Shift` `Tab` | Move the selection |
+| `Enter` | Run the selected command |
+| `Esc`, or `Ctrl` `Shift` `P` again | Close it |
+
+Commands are named the way Zed names them — `terminal panel: toggle`,
+`pane: close active item` — so typing `term` finds everything the terminal
+can do. Matching is fuzzy and the matched letters are highlighted, exactly
+as in the file finder; typing an uppercase letter makes the search
+case-sensitive. The commands you ran most recently come first.
+
+A command that cannot run right now — saving with no file open, opening a
+terminal with no project — is listed greyed rather than hidden, so the
+palette is also the honest list of what exists. Commands this edition does
+not have at all (cloning, without a userland) are not listed.
+
+The palette is a touch surface as much as a keyboard one: tap a row to run
+it, and the list stays above the soft keyboard while you type.
+
 ## Workspace
 
 These work wherever focus is, including while you're typing in the
@@ -15,6 +43,7 @@ editor.
 
 | Shortcut | Action |
 |---|---|
+| `Ctrl` `Shift` `P` / `F1` | Open the command palette |
 | `Ctrl` `S` | Save the active file |
 | `Ctrl` `W` | Close the active tab |
 | `Ctrl` `Tab` | Next tab (wraps) |
@@ -73,8 +102,14 @@ and htop need them. The workspace keeps only these:
 | `Ctrl` `PageDown` / `PageUp` | Next / previous editor tab |
 | `Ctrl` `Shift` `W` | Close this terminal |
 | `Ctrl` `Shift` `V` | Paste (`Ctrl` `V` would be a control code) |
-| `Ctrl` `Shift` `S` / `P` / `O` / `B` / `,` | Save, find file, projects, project panel, settings |
+| `Ctrl` `Shift` `S` / `O` / `B` / `,` | Save, projects, project panel, settings |
 | `Ctrl` `Shift` `G` | Clone a repository (`full` edition) |
+| `Ctrl` `Shift` `P` | Open the command palette |
+
+`Ctrl` `Shift` `P` means the command palette here as everywhere else,
+which is why *find file* is the one command with no shifted twin: from a
+shell it is `Ctrl` `Shift` `P` and then "file". `F1` is not taken, because
+it belongs to whatever is running in the terminal.
 
 Sessions start in the project directory and keep running while the
 terminal is hidden. They close when you switch projects. In the `full`
@@ -101,7 +136,9 @@ drag the handles to adjust a selection, and use the floating toolbar for
 copy/paste. The status bar carries a **Save** action while the current
 file has unsaved changes, `☰ files` toggles the project panel, `▤` toggles the project
 panel and `⌕` opens the file finder, and `❯_` opens the terminal. Project,
-file and settings commands live in the `☰` menu in the title bar. The
+file and settings commands live in the `☰` menu in the title bar, and
+**Command palette…** at the top of that menu reaches everything else —
+it is the touch route to any command that has no button of its own. The
 project picker's own footer carries **New**, **Clone…** and **Import
 folder**; a clone in progress shows what git is doing and a **Cancel**
 that stops it and removes the half-cloned directory.
