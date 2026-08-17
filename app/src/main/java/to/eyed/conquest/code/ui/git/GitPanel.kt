@@ -92,7 +92,8 @@ val isGitPanelSupported: Boolean
     get() = Userland.backend.isSupported
 
 /** Zed's `git_panel.default_width` (assets/settings/default.json:997). */
-private val DockWidth = 360.dp
+/** What the workspace budgets for this dock when it decides on a layout. */
+internal val GitPanelDockWidth = 360.dp
 private val DockMinWidth = 260.dp
 
 /** The project search panel's bar, because this is its twin. */
@@ -174,7 +175,7 @@ fun GitPanel(
     var busy by remember(project) { mutableStateOf(false) }
     var error by remember(project) { mutableStateOf<String?>(null) }
     var confirming by remember(project) { mutableStateOf<GitChange?>(null) }
-    var dockWidth by remember { mutableStateOf(DockWidth) }
+    var dockWidth by remember { mutableStateOf(GitPanelDockWidth) }
     var messageFocused by remember { mutableStateOf(false) }
 
     val listState = rememberLazyListState()

@@ -60,7 +60,7 @@ editor.
 | `Ctrl` `Shift` `M` | Show/hide the preview of the open file |
 | `Ctrl` `Shift` `T` | Reopen the tab you closed last |
 | `Ctrl` `Shift` `E` | Reveal the open file in the project panel |
-| `Ctrl` `Shift` `G` | Clone a git repository into a new project |
+| `Ctrl` `Shift` `G` | Show/hide the git panel |
 | `Ctrl` `,` | Open settings |
 | — | Pick a theme (`theme selector: toggle` in the palette, or the ☰ menu) |
 | ``Ctrl` ` `` | Show/hide the terminal |
@@ -73,10 +73,34 @@ In the project picker's forms — new project, and clone — `Enter` confirms,
 `Tab` and `Shift` `Tab` move between fields, and `Esc` goes back to the
 project list.
 
-`Ctrl` `Shift` `G` exists only in the `full` edition. Cloning runs the git
-inside the Linux userland, so the edition that has no userland leaves the
-command and its menu entry out entirely rather than showing them greyed —
-see [USERLAND.md](USERLAND.md).
+**Clone** has no chord: `Ctrl` `Shift` `G` is the git panel in Zed and is the
+git panel here, and cloning is something one does once per repository. It is in
+the command palette, the `☰` menu and the project picker's own footer. It also
+exists only in the `full` edition — cloning runs the git inside the Linux
+userland, so the edition with no userland leaves the command and its menu entry
+out entirely rather than showing them greyed — see [USERLAND.md](USERLAND.md).
+
+## Git panel
+
+`Ctrl` `Shift` `G` shows the changes in the project — Zed's
+`git_panel::ToggleFocus`, on Zed's own chord. Press it again to put the
+keyboard back on the file list. The branch button at the left of the status bar
+is the same thing for a finger or a mouse, and `☰` → **Git panel** is the route
+out of a focused terminal.
+
+| Shortcut | Action |
+|---|---|
+| `↑` / `↓`, `PageUp` / `PageDown` | Move through the changed files |
+| `Space` | Stage or unstage the selected file |
+| `Enter` | Open it |
+| `Delete` / `Backspace` | Discard its changes, after a prompt that names it |
+| `Ctrl` `Enter` | Commit what is staged, from anywhere in the panel |
+| `Esc`, or `✕` | Close the panel |
+
+On a wide screen it docks beside the editor; on a phone it takes the work area.
+The dock shows one panel at a time — git, project search or the preview — which
+is a dock's rule in Zed too, and is what stops three of them sharing a phone
+screen and leaving the editor a character wide.
 
 ## Find in file
 
@@ -329,7 +353,7 @@ and htop need them. The workspace keeps only these:
 | `Ctrl` `Shift` `W` | Close this terminal |
 | `Ctrl` `Shift` `V` | Paste (`Ctrl` `V` would be a control code) |
 | `Ctrl` `Shift` `S` / `O` / `B` / `,` | Save, projects, project panel, settings |
-| `Ctrl` `Shift` `G` | Clone a repository (`full` edition) |
+| `Ctrl` `Shift` `G` | Show/hide the git panel |
 | `Ctrl` `Shift` `P` | Open the command palette |
 
 `Ctrl` `Shift` `V` is paste here and nothing else — and everywhere else, which

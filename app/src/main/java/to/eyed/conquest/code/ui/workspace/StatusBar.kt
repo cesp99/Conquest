@@ -1,6 +1,7 @@
 package to.eyed.conquest.code.ui.workspace
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
@@ -8,14 +9,18 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.unit.dp
+import to.eyed.conquest.code.R
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
 /**
@@ -39,6 +44,8 @@ fun StatusBar(
     onFindFile: (() -> Unit)? = null,
     isTerminalOpen: Boolean = false,
     onToggleTerminal: (() -> Unit)? = null,
+    isGitPanelOpen: Boolean = false,
+    onToggleGitPanel: (() -> Unit)? = null,
 ) {
     val theme = LocalZedTheme.current
     Row(
@@ -62,6 +69,17 @@ fun StatusBar(
         }
         if (onFindFile != null) {
             StatusAction(glyph = "⌕", onClick = onFindFile)
+        }
+        if (onToggleGitPanel != null) {
+            // Zed's own status-bar panel button, with Zed's own glyph: there
+            // is no character that reads as a branch, and the icon is already
+            // imported for the panel's header.
+            StatusIconAction(
+                icon = R.drawable.ic_ui_git_branch,
+                label = "Toggle the git panel",
+                emphasised = isGitPanelOpen,
+                onClick = onToggleGitPanel,
+            )
         }
         if (onToggleTerminal != null) {
             // The touch twin of Ctrl+`, and the only way to reach a terminal
@@ -93,6 +111,31 @@ fun StatusBar(
             }
         }
     }
+}
+
+@Composable
+private fun StatusIconAction(
+    icon: Int,
+    label: String,
+    emphasised: Boolean = false,
+    onClick: () -> Unit,
+) {
+    Image(
+        painter = painterResource(icon),
+        contentDescription = label,
+        colorFilter = ColorFilter.tint(
+            if (emphasised) {
+                MaterialTheme.colorScheme.onSurface
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            }
+        ),
+        modifier = Modifier
+            .pointerHoverIcon(PointerIcon.Hand)
+            .clickable(onClickLabel = label, onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 4.dp)
+            .size(14.dp),
+    )
 }
 
 @Composable

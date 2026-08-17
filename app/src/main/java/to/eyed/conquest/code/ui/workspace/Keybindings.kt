@@ -125,11 +125,17 @@ enum class WorkspaceCommand(
      *
      * In the table like everything else, and refused at the point of use where
      * there is no Linux userland to run git in — the same way FindFile is
-     * refused with no project open. Shift is required: a bare `Ctrl+G` is "go
-     * to line" in every editor that has one, and this table must not spend it
-     * on a dialog.
+     * refused with no project open. No chord: `Ctrl+Shift+G` is the git panel
+     * in Zed and is the git panel here, and cloning is a thing one does once
+     * per repository — the palette and the picker's footer are enough.
      */
     CloneRepository("git::Clone", isOffered = { it.canClone }),
+
+    /**
+     * Show or hide the git panel — Zed's `git_panel::ToggleFocus`, on the
+     * chord Zed gives it (default-linux.json:700).
+     */
+    ToggleGitPanel("git_panel::ToggleFocus", isAvailable = { it.hasProject }),
 
     /** Show or hide the terminal dock. */
     ToggleTerminal("terminal_panel::Toggle", isAvailable = { it.hasProject }),
@@ -270,8 +276,12 @@ private val BINDINGS: List<Binding> = listOf(
         InWorkspace,
     ),
 
+    // Zed's own `ctrl-shift-g`. Cloning had it while there was no git panel
+    // to give it to; it keeps the palette, the ☰ menu and the project
+    // picker's own footer, which is where somebody looking to clone a
+    // repository actually goes.
     Binding(
-        WorkspaceCommand.CloneRepository,
+        WorkspaceCommand.ToggleGitPanel,
         Chord(AndroidKeyEvent.KEYCODE_G, "G", shift = true),
         Everywhere,
     ),
