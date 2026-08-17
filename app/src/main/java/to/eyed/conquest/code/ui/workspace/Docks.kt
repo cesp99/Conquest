@@ -1,0 +1,217 @@
+package to.eyed.conquest.code.ui.workspace
+
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import to.eyed.conquest.code.R
+import to.eyed.conquest.code.core.AppSettings
+import to.eyed.conquest.code.core.DockSide
+
+/**
+ * A panel that lives in a dock, and what the chrome needs to know about it.
+ *
+ * Zed's four dockable things minus the ones this app has no version of. Search
+ * and the preview are *pane items* in Zed rather than panels; here they are
+ * panels, because a phone has no room for a second editor pane and a dock is
+ * the shape that works — so they get dock settings of their own name rather
+ * than borrowing one of Zed's.
+ */
+enum class WorkspacePanel(
+    /** The key under which its placement lives in settings.json. */
+    val settingsKey: String,
+    /** What the settings screen and the tooltip call it. */
+    val title: String,
+    val icon: Int,
+) {
+    Project("project_panel", "Project panel", R.drawable.ic_ui_file_tree),
+    Git("git_panel", "Git panel", R.drawable.ic_ui_git_branch),
+    Search("project_search", "Project search", R.drawable.ic_ui_magnifying_glass),
+    Preview("preview", "Preview", R.drawable.ic_ui_eye);
+
+    /** Which side this panel is docked on right now. */
+    fun sideIn(settings: AppSettings): DockSide = settings.panel(this).dock
+
+    fun widthIn(settings: AppSettings): Dp = settings.panel(this).defaultWidth.dp
+}
+
+/**
+ * Which panel each dock is showing, and how wide it is.
+ *
+ * Zed's rule, and the one the user asked for: **one panel at a time per
+ * dock**, and the two docks are independent. Opening git while search is up on
+ * the same side replaces it; opening it while the tree is up on the *other*
+ * side leaves the tree alone, because closing something on the opposite edge
+ * of the screen would be answering a question nobody asked.
+ *
+ * Widths live here rather than inside each panel so that dragging the edge
+ * resizes *the dock* — the space — rather than one panel's idea of itself,
+ * which is what made the width jump every time the panel in it changed.
+ */
+class DockLayout {
+    var left by mutableStateOf<WorkspacePanel?>(null)
+        private set
+    var right by mutableStateOf<WorkspacePanel?>(null)
+        private set
+
+    /** Null until a panel opens and seeds it from that panel's setting. */
+    var leftWidth by mutableStateOf<Dp?>(null)
+    var rightWidth by mutableStateOf<Dp?>(null)
+
+    /**
+     * Which dock was opened most recently.
+     *
+     * Only consulted when both are open and the screen cannot hold both: the
+     * more recent act is the more deliberate one, which is the same rule the
+     * search panel already used against the terminal.
+     */
+    var lastOpened by mutableStateOf(DockSide.Left)
+        private set
+
+    fun active(side: DockSide): WorkspacePanel? =
+        if (side == DockSide.Left) left else right
+
+    fun width(side: DockSide): Dp? = if (side == DockSide.Left) leftWidth else rightWidth
+
+    fun setWidth(side: DockSide, width: Dp) {
+        if (side == DockSide.Left) leftWidth = width else rightWidth = width
+    }
+
+    /** Whether [panel] is the one its own dock is showing. */
+    fun isOpen(panel: WorkspacePanel, settings: AppSettings): Boolean =
+        active(panel.sideIn(settings)) == panel
+
+    private fun show(side: DockSide, panel: WorkspacePanel?) {
+        if (side == DockSide.Left) left = panel else right = panel
+    }
+
+    /**
+     * Show [panel], seeding its dock's width the first time. Returns false when
+     * it was already showing — the caller decides whether that means "close it"
+     * or "put the keyboard back in it", which is the difference between a
+     * button press and a chord.
+     */
+    fun open(panel: WorkspacePanel, settings: AppSettings): Boolean {
+        val side = panel.sideIn(settings)
+        if (active(side) == panel) return false
+        if (width(side) == null) setWidth(side, panel.widthIn(settings))
+        show(side, panel)
+        lastOpened = side
+        return true
+    }
+
+    fun close(panel: WorkspacePanel, settings: AppSettings) {
+        val side = panel.sideIn(settings)
+        if (active(side) == panel) show(side, null)
+    }
+
+    fun closeDock(side: DockSide) = show(side, null)
+
+    /** Press: open it, or close it if it was already the one showing. */
+    fun toggle(panel: WorkspacePanel, settings: AppSettings): Boolean =
+        if (open(panel, settings)) true else { close(panel, settings); false }
+
+    /**
+     * Follow a panel that has been moved to the other side in settings.
+     *
+     * Without this, moving the open panel across leaves it drawn on the side it
+     * no longer belongs to until it is closed — and the button for it appears
+     * on the *new* side, so the two disagree.
+     */
+    fun reconcile(settings: AppSettings) {
+        val movedFromLeft = left?.takeIf { it.sideIn(settings) != DockSide.Left }
+        val movedFromRight = right?.takeIf { it.sideIn(settings) != DockSide.Right }
+        if (movedFromLeft != null) {
+            left = null
+            right = movedFromLeft
+            rightWidth = movedFromLeft.widthIn(settings)
+        }
+        if (movedFromRight != null) {
+            right = null
+            left = movedFromRight
+            leftWidth = movedFromRight.widthIn(settings)
+        }
+    }
+}
+
+/** What the work area actually draws, once the widths have been argued out. */
+data class DockPlan(
+    /** Zero when the left dock is not drawn at all. */
+    val left: Dp,
+    val right: Dp,
+    /** A dock drawn over the whole work area, editor and all. */
+    val fullScreen: DockSide?,
+) {
+    fun widthOf(side: DockSide): Dp = if (side == DockSide.Left) left else right
+
+    fun draws(side: DockSide): Boolean = fullScreen == side || widthOf(side) > 0.dp
+}
+
+/**
+ * How much room each dock gets — the whole layout argument, in one pure
+ * function, because it is the part that keeps going wrong.
+ *
+ * The rules, in order:
+ *
+ * 1. A dock is never narrower than [minDock] and never leaves the editor
+ *    narrower than [minEditor].
+ * 2. Two docks on **opposite sides never close each other** — that is the
+ *    point of having two — so when both are open and their preferred widths
+ *    do not fit, they *shrink* to share what is there, down to [minDock].
+ * 3. Only when even two floors will not fit does the most recently opened one
+ *    win, and the other waits — not closed, so it returns when there is room.
+ * 4. A single dock that still leaves no editor takes the whole work area,
+ *    which is what every phone does.
+ */
+fun planDocks(
+    window: Dp,
+    leftWanted: Dp?,
+    rightWanted: Dp?,
+    lastOpened: DockSide,
+    minEditor: Dp,
+    minDock: Dp,
+    /** False on a compact screen, where a dock always takes the work area. */
+    canSplit: Boolean = true,
+): DockPlan {
+    fun clamp(width: Dp): Dp = width.coerceAtLeast(minDock)
+    val left = leftWanted?.let(::clamp)
+    val right = rightWanted?.let(::clamp)
+    if (left == null && right == null) return DockPlan(0.dp, 0.dp, null)
+
+    if (canSplit && left != null && right != null) {
+        val forDocks = window - minEditor
+        if (left + right <= forDocks) return DockPlan(left, right, null)
+        // Share what there is, in proportion to what each asked for, and never
+        // below the floor. A tree and a git panel on a foldable land here.
+        if (minDock * 2 <= forDocks) {
+            val scale = forDocks / (left + right)
+            var shrunkLeft = (left * scale).coerceAtLeast(minDock)
+            var shrunkRight = (right * scale).coerceAtLeast(minDock)
+            // Raising one to the floor can take the pair back over; the other
+            // gives up the difference, since it is the one with room to.
+            val over = shrunkLeft + shrunkRight - forDocks
+            if (over > 0.dp) {
+                if (shrunkLeft > shrunkRight) {
+                    shrunkLeft = (shrunkLeft - over).coerceAtLeast(minDock)
+                } else {
+                    shrunkRight = (shrunkRight - over).coerceAtLeast(minDock)
+                }
+            }
+            return DockPlan(shrunkLeft, shrunkRight, null)
+        }
+    }
+
+    // One of them, either because only one is open or because two floors and
+    // an editor will not fit on this screen at all.
+    val side = when {
+        left == null -> DockSide.Right
+        right == null -> DockSide.Left
+        else -> lastOpened
+    }
+    val width = if (side == DockSide.Left) left!! else right!!
+    if (!canSplit || window - width < minEditor) {
+        return DockPlan(0.dp, 0.dp, side)
+    }
+    return if (side == DockSide.Left) DockPlan(width, 0.dp, null) else DockPlan(0.dp, width, null)
+}

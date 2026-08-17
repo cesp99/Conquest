@@ -1,7 +1,7 @@
 package to.eyed.conquest.code.ui.workspace
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
@@ -16,21 +16,34 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ColorFilter
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import to.eyed.conquest.code.R
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
+/** One panel's button: which panel, whether its dock is showing it, and the tap. */
+data class PanelButton(
+    val panel: WorkspacePanel,
+    val isOpen: Boolean,
+    val onClick: () -> Unit,
+)
+
 /**
  * Zed-style status bar: **state, not actions**.
  *
- * Zed splits these deliberately — the title bar holds commands, the status
- * bar reports where you are. Left: the panel toggle and search, which are
- * view state. Right: cursor position and language. Everything that *does*
- * something to a project or a file moved to the title-bar menu, which also
+ * Zed splits these deliberately — the title bar holds commands, the status bar
+ * reports where you are and which panels are up. Everything that *does*
+ * something to a project or a file lives in the title-bar menu, which also
  * keeps it reachable when the soft keyboard covers the bottom of the screen.
+ *
+ * The panel buttons follow their docks, exactly as Zed's do: the left dock's
+ * buttons at the left end of the bar, the right dock's at the right end, and
+ * the bottom dock's — the terminal — at the right after them
+ * (`workspace.rs:1757-1759`). Move a panel across in settings and its button
+ * moves with it, which is the only arrangement in which the button says where
+ * the panel will appear.
  */
 @Composable
 fun StatusBar(
@@ -39,13 +52,12 @@ fun StatusBar(
     modifier: Modifier = Modifier,
     language: String? = null,
     hasFile: Boolean = false,
-    isPanelVisible: Boolean = true,
-    onToggleProjectPanel: (() -> Unit)? = null,
+    /** Panels docked left, in the order they appear in the enum. */
+    leftPanels: List<PanelButton> = emptyList(),
+    rightPanels: List<PanelButton> = emptyList(),
     onFindFile: (() -> Unit)? = null,
     isTerminalOpen: Boolean = false,
     onToggleTerminal: (() -> Unit)? = null,
-    isGitPanelOpen: Boolean = false,
-    onToggleGitPanel: (() -> Unit)? = null,
 ) {
     val theme = LocalZedTheme.current
     Row(
@@ -60,34 +72,14 @@ fun StatusBar(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        if (onToggleProjectPanel != null) {
-            StatusAction(
-                glyph = "▤",
-                emphasised = isPanelVisible,
-                onClick = onToggleProjectPanel,
-            )
+        for (button in leftPanels) {
+            PanelStatusButton(button)
         }
         if (onFindFile != null) {
-            StatusAction(glyph = "⌕", onClick = onFindFile)
-        }
-        if (onToggleGitPanel != null) {
-            // Zed's own status-bar panel button, with Zed's own glyph: there
-            // is no character that reads as a branch, and the icon is already
-            // imported for the panel's header.
             StatusIconAction(
-                icon = R.drawable.ic_ui_git_branch,
-                label = "Toggle the git panel",
-                emphasised = isGitPanelOpen,
-                onClick = onToggleGitPanel,
-            )
-        }
-        if (onToggleTerminal != null) {
-            // The touch twin of Ctrl+`, and the only way to reach a terminal
-            // on a device with no keyboard attached.
-            StatusAction(
-                glyph = "❯_",
-                emphasised = isTerminalOpen,
-                onClick = onToggleTerminal,
+                icon = R.drawable.ic_ui_magnifying_glass,
+                label = "Find a file",
+                onClick = onFindFile,
             )
         }
 
@@ -110,7 +102,32 @@ fun StatusBar(
                 )
             }
         }
+
+        for (button in rightPanels) {
+            PanelStatusButton(button)
+        }
+        if (onToggleTerminal != null) {
+            // The touch twin of Ctrl+`, and the only way to reach a terminal
+            // on a device with no keyboard attached. At the right end, where
+            // Zed puts its bottom dock's buttons.
+            StatusIconAction(
+                icon = R.drawable.ic_ui_terminal,
+                label = "Toggle the terminal",
+                emphasised = isTerminalOpen,
+                onClick = onToggleTerminal,
+            )
+        }
     }
+}
+
+@Composable
+private fun PanelStatusButton(button: PanelButton) {
+    StatusIconAction(
+        icon = button.panel.icon,
+        label = if (button.isOpen) "Close the ${button.panel.title}" else button.panel.title,
+        emphasised = button.isOpen,
+        onClick = button.onClick,
+    )
 }
 
 @Composable
@@ -135,26 +152,5 @@ private fun StatusIconAction(
             .clickable(onClickLabel = label, onClick = onClick)
             .padding(horizontal = 8.dp, vertical = 4.dp)
             .size(14.dp),
-    )
-}
-
-@Composable
-private fun StatusAction(
-    glyph: String,
-    emphasised: Boolean = false,
-    onClick: () -> Unit,
-) {
-    Text(
-        text = glyph,
-        style = MaterialTheme.typography.bodyMedium,
-        color = if (emphasised) {
-            MaterialTheme.colorScheme.onSurface
-        } else {
-            MaterialTheme.colorScheme.onSurfaceVariant
-        },
-        modifier = Modifier
-            .pointerHoverIcon(PointerIcon.Hand)
-            .clickable(onClick = onClick)
-            .padding(horizontal = 8.dp, vertical = 4.dp),
     )
 }

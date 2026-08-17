@@ -187,7 +187,6 @@ fun GitPanel(
     var identityWanted by remember(project) { mutableStateOf(false) }
     var identityName by remember(project) { mutableStateOf(TextFieldValue()) }
     var identityEmail by remember(project) { mutableStateOf(TextFieldValue()) }
-    var dockWidth by remember { mutableStateOf(GitPanelDockWidth) }
     var messageFocused by remember { mutableStateOf(false) }
 
     val listState = rememberLazyListState()
@@ -351,7 +350,7 @@ fun GitPanel(
 
     Row(
         modifier = modifier
-            .then(if (isDock) Modifier.width(dockWidth).fillMaxHeight() else Modifier.fillMaxSize())
+            .fillMaxSize()
             // The panel itself is the focus target the arrows talk to. The
             // commit box takes focus away from it while it is being typed in,
             // which is exactly what `messageFocused` below is watching for.
@@ -404,9 +403,6 @@ fun GitPanel(
                 }
             },
     ) {
-        if (isDock) {
-            ResizeHandle { delta -> dockWidth = (dockWidth - delta).coerceAtLeast(DockMinWidth) }
-        }
         Column(
             modifier = Modifier
                 .fillMaxSize()

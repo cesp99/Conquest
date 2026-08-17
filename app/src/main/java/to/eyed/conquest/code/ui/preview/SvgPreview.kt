@@ -96,7 +96,6 @@ fun SvgPreview(
 ) {
     val theme = LocalZedTheme.current
     val focus = remember { FocusRequester() }
-    var dockWidth by remember { mutableStateOf(PreviewDockWidth) }
 
     val isSvg = PreviewKind.of(path) == PreviewKind.Svg
 
@@ -132,20 +131,8 @@ fun SvgPreview(
     var zoom by remember(editor) { mutableFloatStateOf(1f) }
     var pan by remember(editor) { mutableStateOf(Offset.Zero) }
 
-    BoxWithConstraints(
-        modifier = modifier.then(if (isDock) Modifier.fillMaxHeight() else Modifier.fillMaxSize())
-    ) {
-        val available = if (constraints.hasBoundedWidth) maxWidth else Dp.Infinity
-        Row(
-            modifier = if (isDock) {
-                Modifier.width(clampDockWidth(dockWidth, available)).fillMaxHeight()
-            } else {
-                Modifier.fillMaxSize()
-            }
-        ) {
-            if (isDock) {
-                PreviewResizeHandle { delta -> dockWidth = clampDockWidth(dockWidth - delta, available) }
-            }
+    Box(modifier = modifier.fillMaxSize()) {
+        Row(modifier = Modifier.fillMaxSize()) {
             Column(
                 modifier = Modifier
                     .fillMaxSize()

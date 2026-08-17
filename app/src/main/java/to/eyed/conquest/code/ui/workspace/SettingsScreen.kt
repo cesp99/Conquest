@@ -25,6 +25,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import to.eyed.conquest.code.core.AppSettings
+import to.eyed.conquest.code.core.DockSide
 import to.eyed.conquest.code.ui.editor.SoftWrapMode
 import to.eyed.conquest.code.core.GitignoredFiles
 import to.eyed.conquest.code.core.ThemeMode
@@ -135,6 +136,19 @@ fun SettingsScreen(
                         selected = settings.inlineBlame,
                         onSelect = { onSet(AppSettings.KEY_INLINE_BLAME, it.toString()) },
                     )
+                    // Where each panel lives. Zed's own setting, one per
+                    // panel, and the buttons in the status bar follow it.
+                    for (panel in WorkspacePanel.entries) {
+                        ChoiceRow(
+                            label = panel.title,
+                            detail = if (panel == WorkspacePanel.Project) "Which side it docks on" else null,
+                            options = DockSide.entries.map { it to it.label },
+                            selected = settings.panel(panel).dock,
+                            onSelect = {
+                                onSet(AppSettings.keyForDock(panel.settingsKey), "\"${it.key}\"")
+                            },
+                        )
+                    }
                     ChoiceRow(
                         label = "Gitignored files",
                         detail = "In the project tree",

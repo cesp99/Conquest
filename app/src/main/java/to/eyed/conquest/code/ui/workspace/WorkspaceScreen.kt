@@ -11,15 +11,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalDrawerSheet
-import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
-import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -43,6 +39,9 @@ import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -51,6 +50,7 @@ import kotlinx.coroutines.withContext
 import to.eyed.conquest.code.core.AppSettings
 import to.eyed.conquest.code.core.BufferSession
 import to.eyed.conquest.code.core.CoreBridge
+import to.eyed.conquest.code.core.DockSide
 import to.eyed.conquest.code.core.ProjectEntry
 import to.eyed.conquest.code.core.ProjectSession
 import to.eyed.conquest.code.core.ProjectSummary
@@ -92,7 +92,11 @@ import to.eyed.conquest.code.ui.terminal.TerminalDock
  */
 private val WideLayoutMinWidth = 600.dp
 // Zed's own default (assets/settings/default.json:816).
-private val ProjectPanelWidth = 240.dp
+/**
+ * The narrowest a dock can be dragged. Narrower than this and the panel's own
+ * rows stop making sense — a file name in 120dp is an ellipsis.
+ */
+private val DockMinWidth = 200.dp
 
 /** What ProjectSearchPanel asks for as a dock — kept in step with it. */
 private val ProjectSearchDockWidth = 360.dp
@@ -197,7 +201,7 @@ fun WorkspaceScreen(
      * switching tabs switches it with them rather than leaving a rendered
      * README beside a Rust file.
      */
-    var rightDock by remember { mutableStateOf<RightDock?>(null) }
+    val docks = remember { DockLayout() }
     /** Ctrl+G. A surface rather than a command: it answers for itself. */
     var goToLineOpen by remember { mutableStateOf(false) }
     /** Ctrl+Shift+F. The token is bumped to pull focus back to its query. */
@@ -449,9 +453,19 @@ fun WorkspaceScreen(
     }
 
     // Wide layouts can hide the panel (Ctrl+B); compact ones use the drawer.
-    var panelVisible by remember { mutableStateOf(true) }
-    val drawerState = rememberDrawerState(DrawerValue.Closed)
     var isWide by remember { mutableStateOf(false) }
+    // A wide screen opens with its sidebar up, which is what it did before
+    // docks existed and what Zed does. A compact one does not: there, a dock
+    // *is* the work area, and starting on the tree would hide the editor
+    // behind it. Seeded once, so closing it stays closed.
+    var docksSeeded by remember { mutableStateOf(false) }
+    LaunchedEffect(isWide, project) {
+        if (!docksSeeded && isWide && project != null) {
+            docks.open(WorkspacePanel.Project, settings)
+            docksSeeded = true
+        }
+    }
+
 
 
     /** Whether the open tab is text the preview can draw. */
@@ -459,6 +473,47 @@ fun WorkspaceScreen(
         val open = files.active ?: return false
         return open.editor != null && PreviewKind.of(open.path) != null
     }
+
+    /**
+     * Show or hide a panel, and put the keyboard somewhere the key table can
+     * see it.
+     *
+     * The focus half is not incidental: panels do not all take focus when they
+     * appear — the preview deliberately does not, since it follows a file being
+     * typed in — and a compact screen can take a terminal off the screen while
+     * `terminalFocused` still says the shell has the keys. Returns whether the
+     * panel is now open.
+     */
+    fun togglePanel(panel: WorkspacePanel): Boolean {
+        val opened = docks.toggle(panel, settings)
+        terminalFocused = false
+        rootFocus.requestFocus()
+        return opened
+    }
+
+    /** Zed's `workspace::ToggleLeftDock` / `ToggleRightDock`. */
+    fun toggleDock(side: DockSide): Boolean {
+        val showing = docks.active(side)
+        if (showing != null) {
+            docks.closeDock(side)
+            rootFocus.requestFocus()
+            return true
+        }
+        // Nothing in it: open the panel that lives on this side, preferring
+        // the tree, which is what a person means by "show the sidebar".
+        val panel = WorkspacePanel.entries.firstOrNull { it.sideIn(settings) == side }
+            ?: return false
+        // A panel with nothing to show would open onto its empty state and
+        // take the screen with it.
+        val usable = when (panel) {
+            WorkspacePanel.Preview -> canPreviewActiveFile()
+            WorkspacePanel.Search, WorkspacePanel.Git -> project != null
+            WorkspacePanel.Project -> true
+        }
+        if (!usable) return false
+        return togglePanel(panel)
+    }
+
 
     fun runCommand(command: WorkspaceCommand): Boolean {
         val active = files.active
@@ -496,16 +551,14 @@ fun WorkspaceScreen(
             }
             WorkspaceCommand.RevealInProjectPanel -> {
                 if (files.active == null) return false
-                if (isWide) panelVisible = true else scope.launch { drawerState.open() }
+                docks.open(WorkspacePanel.Project, settings)
                 revealInPanel = true
             }
             WorkspaceCommand.NextTab -> files.selectRelative(1)
             WorkspaceCommand.PreviousTab -> files.selectRelative(-1)
-            WorkspaceCommand.ToggleProjectPanel -> if (isWide) {
-                panelVisible = !panelVisible
-            } else {
-                scope.launch { if (drawerState.isOpen) drawerState.close() else drawerState.open() }
-            }
+            WorkspaceCommand.ToggleProjectPanel -> togglePanel(WorkspacePanel.Project)
+            WorkspaceCommand.ToggleLeftDock -> toggleDock(DockSide.Left)
+            WorkspaceCommand.ToggleRightDock -> toggleDock(DockSide.Right)
             WorkspaceCommand.OpenProjects -> {
                 refreshProjects()
                 transferError = null
@@ -526,19 +579,7 @@ fun WorkspaceScreen(
             WorkspaceCommand.SelectTheme -> themeSelectorOpen = true
             WorkspaceCommand.TogglePreview -> {
                 if (!canPreviewActiveFile()) return false
-                if (rightDock == RightDock.Preview) {
-                    rightDock = null
-                } else {
-                    rightDock = RightDock.Preview
-                }
-                // Either way the keyboard has to land somewhere the key table
-                // can see. The preview deliberately does not take focus when
-                // it appears — it follows a file being typed in — so without
-                // this the chord that opened it could not close it, and on a
-                // compact screen a terminal that is no longer on screen went
-                // on claiming the keymap.
-                terminalFocused = false
-                rootFocus.requestFocus()
+                togglePanel(WorkspacePanel.Preview)
             }
             WorkspaceCommand.ToggleSoftWrap -> {
                 val next = if (settings.softWrap.wraps) SoftWrapMode.None else SoftWrapMode.EditorWidth
@@ -551,16 +592,7 @@ fun WorkspaceScreen(
             }
             WorkspaceCommand.ToggleGitPanel -> {
                 if (project == null) return false
-                if (rightDock == RightDock.Git) {
-                    rightDock = null
-                    rootFocus.requestFocus()
-                } else {
-                    rightDock = RightDock.Git
-                    // The panel takes a compact screen away from a focused
-                    // terminal, and nothing else would tell the key table.
-                    terminalFocused = false
-                    gitPanelFocus++
-                }
+                if (togglePanel(WorkspacePanel.Git)) gitPanelFocus++
             }
             WorkspaceCommand.FindInFile -> {
                 if (files.active?.editor == null) return false
@@ -610,7 +642,7 @@ fun WorkspaceScreen(
             // A compact screen gave the panel the whole work area, so opening a
             // file has to hand it back — and hand the keyboard back with it, or
             // the keymap dies the way it did when Stop-all closed the dock.
-            rightDock = null
+            docks.closeDock(docks.lastOpened)
             terminalFocused = false
             rootFocus.requestFocus()
         }
@@ -628,7 +660,7 @@ fun WorkspaceScreen(
         val open = project ?: return
         openFile(open, path)
         if (dockTookWorkArea) {
-            rightDock = null
+            docks.closeDock(docks.lastOpened)
             terminalFocused = false
             rootFocus.requestFocus()
         }
@@ -636,7 +668,7 @@ fun WorkspaceScreen(
 
     fun openProjectSearch(): Boolean {
         if (project == null) return false
-        rightDock = RightDock.Search
+        docks.open(WorkspacePanel.Search, settings)
         // The panel takes a compact screen away from a focused terminal, and
         // nothing else would tell the key table that the terminal is gone.
         terminalFocused = false
@@ -756,6 +788,12 @@ fun WorkspaceScreen(
                 MenuAction("Reveal in project panel", shortcutLabel(WorkspaceCommand.RevealInProjectPanel), enabled = active != null) {
                     runCommand(WorkspaceCommand.RevealInProjectPanel)
                 },
+                MenuAction("Toggle left dock", shortcutLabel(WorkspaceCommand.ToggleLeftDock)) {
+                    runCommand(WorkspaceCommand.ToggleLeftDock)
+                },
+                MenuAction("Toggle right dock", shortcutLabel(WorkspaceCommand.ToggleRightDock)) {
+                    runCommand(WorkspaceCommand.ToggleRightDock)
+                },
                 MenuAction("Toggle project panel", shortcutLabel(WorkspaceCommand.ToggleProjectPanel)) {
                     runCommand(WorkspaceCommand.ToggleProjectPanel)
                 },
@@ -784,66 +822,52 @@ fun WorkspaceScreen(
             )
             DockDivider()
             // Compact screens have no room to split: the dock takes the whole
-            // work area, as the settings screen and the drawer already do.
-            // The right dock wins the compact work area while it is open —
-            // opening it is the more recent and more deliberate act — and
-            // Escape gives the terminal straight back.
+            // work area, and the docks decide between themselves how much of
+            // it each gets — see planDocks, which is where that argument lives
+            // and where its cases are tested.
             //
-            // "Compact" here is not the same line as for the sidebar: a 674dp
-            // foldable is wide enough for a sidebar *or* a dock and not for
-            // both, and squeezing the editor between them left it one
-            // character wide. So the dock takes the whole area unless what
-            // would be left for the editor is still a usable width.
-            //
-            // The preview needs a buffer to follow, so a media tab cannot have
-            // one — a picture *is* the preview — and search and git need a
-            // project. A dock whose subject has gone shows nothing rather than
-            // holding the screen.
-            val previewEditor = active?.editor
-            val dockShowing = when (rightDock) {
-                // Previewable, not merely "has a buffer": switching to a
-                // .rs from a full-screen preview otherwise left the preview
-                // holding the screen, saying it had nothing to show, with
-                // both routes that could close it now refused.
-                RightDock.Preview -> RightDock.Preview.takeIf { canPreviewActiveFile() }
-                RightDock.Search, RightDock.Git -> rightDock.takeIf { project != null }
-                null -> null
+            // A dock whose subject has gone shows nothing rather than holding
+            // the screen: the preview needs a buffer to follow (a picture *is*
+            // the preview), and search and git need a project.
+            docks.reconcile(settings)
+            fun panelHasSubject(panel: WorkspacePanel): Boolean = when (panel) {
+                WorkspacePanel.Preview -> canPreviewActiveFile()
+                WorkspacePanel.Search, WorkspacePanel.Git -> project != null
+                WorkspacePanel.Project -> true
             }
-            val dockWidth = when (dockShowing) {
-                RightDock.Search -> ProjectSearchDockWidth
-                RightDock.Preview -> PreviewDockWidth
-                RightDock.Git -> GitPanelDockWidth
-                null -> 0.dp
-            }
-            val editorWidthWithDock =
-                windowWidth - (if (panelVisible) ProjectPanelWidth else 0.dp) - dockWidth
-            // On a screen that fits a dock *or* a sidebar and not both — the
-            // Fold's inner display at 841dp is exactly that — the sidebar
-            // makes way rather than the dock taking the whole screen. It is
-            // what a person would do by hand, and `panelVisible` is left
-            // alone, so closing the dock brings the sidebar straight back.
-            val editorWidthWithoutPanel = windowWidth - dockWidth
-            val panelYieldsToDock = dockShowing != null && isWide && panelVisible &&
-                editorWidthWithDock < MinEditorWidth &&
-                editorWidthWithoutPanel >= MinEditorWidth
-            val panelShows = panelVisible && !panelYieldsToDock
-            val dockTakesWorkArea = dockShowing != null && !panelYieldsToDock &&
-                (!isWide || editorWidthWithDock < MinEditorWidth)
-            dockTookWorkArea = dockTakesWorkArea
-            val terminalIsFullScreen = !isWide && terminals.isOpen && !dockTakesWorkArea
+            val plan = planDocks(
+                window = windowWidth,
+                leftWanted = docks.left?.takeIf(::panelHasSubject)
+                    ?.let { docks.leftWidth ?: it.widthIn(settings) },
+                rightWanted = docks.right?.takeIf(::panelHasSubject)
+                    ?.let { docks.rightWidth ?: it.widthIn(settings) },
+                lastOpened = docks.lastOpened,
+                minEditor = MinEditorWidth,
+                minDock = DockMinWidth,
+                canSplit = isWide,
+            )
+            dockTookWorkArea = plan.fullScreen != null
+            val terminalIsFullScreen = !isWide && terminals.isOpen && plan.fullScreen == null
             Box(modifier = Modifier.weight(1f)) {
-                if (dockTakesWorkArea && dockShowing != null) {
-                    RightDockPanel(
-                        kind = dockShowing,
-                        isDock = false,
+                val fullScreen = plan.fullScreen
+                if (fullScreen != null) {
+                    DockPanel(
+                        panel = docks.active(fullScreen)!!,
                         project = project,
                         file = active,
+                        settings = settings,
                         searchFocus = projectSearchFocus,
                         gitFocus = gitPanelFocus,
+                        revealRequest = revealInPanel,
+                        onRevealHandled = { revealInPanel = false },
+                        onOpenEntry = onOpenEntry,
                         onOpenMatch = ::openMatch,
                         onOpenPath = ::openFromDock,
+                        onEntryRemoved = ::closeTabsUnder,
+                        onEntryMoved = ::retitleTabs,
+                        openedPath = files.active?.path,
                         onDismiss = {
-                            rightDock = null
+                            docks.closeDock(fullScreen)
                             rootFocus.requestFocus()
                         },
                     )
@@ -855,100 +879,77 @@ fun WorkspaceScreen(
                         onCommand = { runCommand(it) },
                         onFocusChanged = { focused -> terminalFocused = focused },
                     )
-                } else if (isWide) {
-                    Row(modifier = Modifier.fillMaxSize()) {
-                        if (panelShows) {
-                            Box(
-                                modifier = Modifier
-                                    .width(ProjectPanelWidth)
-                                    .fillMaxHeight()
-                            ) {
-                                ProjectPanel(
-                                project = project,
-                                onOpenFile = onOpenEntry,
-                                openedPath = files.active?.path,
-                                gitignoredFiles = settings.gitignoredFiles,
-                                revealRequest = revealInPanel,
-                                onRevealHandled = { revealInPanel = false },
-                                onEntryRemoved = ::closeTabsUnder,
-                                onEntryMoved = ::retitleTabs,
-                            )
-                            }
-                            DockDivider(vertical = true)
-                        }
-                        EditorArea(
-                            files = files,
-                            dismissed = dismissedConflicts,
-                            onSave = ::save,
-                            onReload = ::reload,
-                            onReopen = { runCommand(WorkspaceCommand.ReopenClosedTab) },
-                            searchOpen = searchBarOpen,
-                            onSearchDismissed = {
-                                searchBarOpen = false
-                                rootFocus.requestFocus()
-                            },
-                            isPreviewOpen = rightDock == RightDock.Preview,
-                            onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
-                            softWrap = settings.softWrap,
-                            showInlineBlame = settings.inlineBlame,
-                            modifier = Modifier.weight(1f),
-                        )
-                        // Each panel draws its own left edge, which is also
-                        // the handle that drags it wider, so no divider here.
-                        if (dockShowing != null) {
-                            RightDockPanel(
-                                kind = dockShowing,
-                                isDock = true,
-                                project = project,
-                                file = active,
-                                searchFocus = projectSearchFocus,
-                                gitFocus = gitPanelFocus,
-                                onOpenMatch = ::openMatch,
-                                onOpenPath = ::openFromDock,
-                                onDismiss = {
-                                    rightDock = null
-                                    rootFocus.requestFocus()
-                                },
-                            )
-                        }
-                    }
                 } else {
-                    ModalNavigationDrawer(
-                        drawerState = drawerState,
-                        drawerContent = {
-                            ModalDrawerSheet(drawerState) {
-                                ProjectPanel(
-                                    project = project,
-                                    onOpenFile = { entry ->
-                                        onOpenEntry(entry)
-                                        scope.launch { drawerState.close() }
+                    Row(modifier = Modifier.fillMaxSize()) {
+                        for (side in DockSide.entries) {
+                            val panel = docks.active(side)?.takeIf { plan.draws(side) }
+                            // The editor sits between the two, so it is drawn
+                            // when the loop reaches the right-hand dock.
+                            if (side == DockSide.Right) {
+                                EditorArea(
+                                    files = files,
+                                    dismissed = dismissedConflicts,
+                                    onSave = ::save,
+                                    onReload = ::reload,
+                                    onReopen = { runCommand(WorkspaceCommand.ReopenClosedTab) },
+                                    searchOpen = searchBarOpen,
+                                    onSearchDismissed = {
+                                        searchBarOpen = false
+                                        rootFocus.requestFocus()
                                     },
-                                    openedPath = files.active?.path,
-                                    gitignoredFiles = settings.gitignoredFiles,
-                                    revealRequest = revealInPanel,
-                                    onRevealHandled = { revealInPanel = false },
-                                    onEntryRemoved = ::closeTabsUnder,
-                                    onEntryMoved = ::retitleTabs,
+                                    isPreviewOpen = docks.isOpen(WorkspacePanel.Preview, settings),
+                                    onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
+                                    softWrap = settings.softWrap,
+                                    showInlineBlame = settings.inlineBlame,
+                                    modifier = Modifier.weight(1f),
                                 )
                             }
+                            if (panel != null) {
+                                Dock(
+                                    side = side,
+                                    width = plan.widthOf(side),
+                                    // The drag moves the width the dock *asked
+                                    // for*, not the one it was given: when two
+                                    // docks are sharing a tight screen the plan
+                                    // shrinks both, and resizing from the
+                                    // shrunk figure would fight the planner and
+                                    // barely move.
+                                    onResize = { delta ->
+                                        val current = docks.width(side)
+                                            ?: panel.widthIn(settings)
+                                        docks.setWidth(
+                                            side,
+                                            (current + delta).coerceIn(
+                                                DockMinWidth,
+                                                (windowWidth - MinEditorWidth)
+                                                    .coerceAtLeast(DockMinWidth),
+                                            ),
+                                        )
+                                    },
+                                ) {
+                                    DockPanel(
+                                        panel = panel,
+                                        project = project,
+                                        file = active,
+                                        settings = settings,
+                                        searchFocus = projectSearchFocus,
+                                        gitFocus = gitPanelFocus,
+                                        revealRequest = revealInPanel,
+                                        onRevealHandled = { revealInPanel = false },
+                                        onOpenEntry = onOpenEntry,
+                                        onOpenMatch = ::openMatch,
+                                        onOpenPath = ::openFromDock,
+                                        onEntryRemoved = ::closeTabsUnder,
+                                        onEntryMoved = ::retitleTabs,
+                                        openedPath = files.active?.path,
+                                        onDismiss = {
+                                            docks.closeDock(side)
+                                            rootFocus.requestFocus()
+                                        },
+                                    )
+                                }
+                            }
                         }
-                    ) {
-                        EditorArea(
-                            files = files,
-                            dismissed = dismissedConflicts,
-                            onSave = ::save,
-                            onReload = ::reload,
-                            onReopen = { runCommand(WorkspaceCommand.ReopenClosedTab) },
-                            searchOpen = searchBarOpen,
-                            onSearchDismissed = {
-                                searchBarOpen = false
-                                rootFocus.requestFocus()
-                            },
-                            isPreviewOpen = rightDock == RightDock.Preview,
-                            onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
-                            softWrap = settings.softWrap,
-                            showInlineBlame = settings.inlineBlame,
-                        )
                     }
                 }
                 // Over the editor, at the top, where Zed's own sits — and only
@@ -956,7 +957,7 @@ fun WorkspaceScreen(
                 // as you type, which is pointless behind a full-screen panel.
                 val goToLineEditor = active?.editor
                 if (goToLineOpen && goToLineEditor != null &&
-                    !dockTakesWorkArea && !terminalIsFullScreen
+                    plan.fullScreen == null && !terminalIsFullScreen
                 ) {
                     GoToLine(
                         editor = goToLineEditor,
@@ -968,7 +969,7 @@ fun WorkspaceScreen(
                     )
                 }
             }
-            if (terminals.isOpen && !terminalIsFullScreen && !dockTakesWorkArea) {
+            if (terminals.isOpen && !terminalIsFullScreen && plan.fullScreen == null) {
                 // Drag handle. Wide screens are where a paired mouse lives, so
                 // it gets a resize cursor as well as a touch target.
                 Box(
@@ -995,21 +996,41 @@ fun WorkspaceScreen(
                 )
             }
             DockDivider()
+            // Each panel's button sits with its dock, so moving a panel in
+            // settings moves the way you reach it.
+            val panelButtons = WorkspacePanel.entries
+                .filter { it != WorkspacePanel.Preview || canPreviewActiveFile() }
+                .filter { it != WorkspacePanel.Project || project != null }
+                .filter { it !in setOf(WorkspacePanel.Search, WorkspacePanel.Git) || project != null }
+                .map { panel ->
+                    PanelButton(
+                        panel = panel,
+                        isOpen = docks.isOpen(panel, settings),
+                        onClick = {
+                            when (panel) {
+                                WorkspacePanel.Search -> if (docks.isOpen(panel, settings)) {
+                                    togglePanel(panel)
+                                } else {
+                                    openProjectSearch()
+                                }
+                                WorkspacePanel.Git -> runCommand(WorkspaceCommand.ToggleGitPanel)
+                                WorkspacePanel.Preview ->
+                                    runCommand(WorkspaceCommand.TogglePreview)
+                                WorkspacePanel.Project ->
+                                    runCommand(WorkspaceCommand.ToggleProjectPanel)
+                            }
+                        },
+                    )
+                }
             StatusBar(
                 cursorRow = active?.editor?.cursorRow ?: 0,
                 cursorCol = active?.editor?.cursorCol ?: 0,
                 language = active?.language,
                 hasFile = active?.editor != null,
-                isPanelVisible = if (isWide) panelVisible else drawerState.isOpen,
-                onToggleProjectPanel = { runCommand(WorkspaceCommand.ToggleProjectPanel) },
+                leftPanels = panelButtons.filter { it.panel.sideIn(settings) == DockSide.Left },
+                rightPanels = panelButtons.filter { it.panel.sideIn(settings) == DockSide.Right },
                 onFindFile = if (project != null) {
                     { runCommand(WorkspaceCommand.FindFile) }
-                } else {
-                    null
-                },
-                isGitPanelOpen = rightDock == RightDock.Git,
-                onToggleGitPanel = if (project != null) {
-                    { runCommand(WorkspaceCommand.ToggleGitPanel) }
                 } else {
                     null
                 },
@@ -1304,45 +1325,95 @@ private fun EditorArea(
  * the entry is missing.
  */
 /**
- * What the right-hand dock is showing.
+ * A dock: the panel in it, and the edge that resizes it.
  *
- * Zed keeps several panels in a dock and shows one; these are the three this
- * app has, and the enum is what makes "one at a time" a property of the state
- * rather than a rule three booleans have to keep between them.
+ * The handle is on the side facing the editor — the *inner* edge — because
+ * that is the edge that moves, and it is the same 6dp grip the terminal dock
+ * has had all along. A drag on the left dock's edge widens it; the same drag
+ * on the right dock's edge narrows it, which is why the sign follows the side.
  */
-private enum class RightDock { Search, Preview, Git }
-
-/** The dock, whichever panel is in it. */
 @Composable
-private fun RightDockPanel(
-    kind: RightDock,
-    isDock: Boolean,
+private fun Dock(
+    side: DockSide,
+    width: Dp,
+    onResize: (Dp) -> Unit,
+    content: @Composable () -> Unit,
+) {
+    Row(modifier = Modifier.width(width).fillMaxHeight()) {
+        if (side == DockSide.Right) DockHandle(side, onResize)
+        Box(modifier = Modifier.weight(1f).fillMaxHeight()) { content() }
+        if (side == DockSide.Left) DockHandle(side, onResize)
+    }
+}
+
+/** The grip, and the border it sits on. */
+@Composable
+private fun DockHandle(side: DockSide, onResize: (Dp) -> Unit) {
+    val density = LocalDensity.current
+    Box(
+        modifier = Modifier
+            .width(6.dp)
+            .fillMaxHeight()
+            .pointerHoverIcon(PointerIcon.Crosshair)
+            .pointerInput(side) {
+                detectHorizontalDragGestures { _, delta ->
+                    val moved = with(density) { delta.toDp() }
+                    onResize(if (side == DockSide.Left) moved else -moved)
+                }
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        DockDivider(vertical = true)
+    }
+}
+
+/** Whichever panel the dock is showing. */
+@Composable
+private fun DockPanel(
+    panel: WorkspacePanel,
     project: ProjectSession?,
     file: OpenFile?,
+    settings: AppSettings,
     searchFocus: Int,
     gitFocus: Int,
+    revealRequest: Boolean,
+    openedPath: String?,
+    onRevealHandled: () -> Unit,
+    onOpenEntry: (ProjectEntry) -> Unit,
     onOpenMatch: (String, ProjectSearchMatch) -> Unit,
     onOpenPath: (String) -> Unit,
+    onEntryRemoved: (String) -> Unit,
+    onEntryMoved: (String, String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    when (kind) {
-        RightDock.Search -> ProjectSearchPanel(
+    when (panel) {
+        WorkspacePanel.Project -> ProjectPanel(
+            project = project,
+            onOpenFile = onOpenEntry,
+            openedPath = openedPath,
+            gitignoredFiles = settings.gitignoredFiles,
+            revealRequest = revealRequest,
+            onRevealHandled = onRevealHandled,
+            onEntryRemoved = onEntryRemoved,
+            onEntryMoved = onEntryMoved,
+        )
+        WorkspacePanel.Search -> ProjectSearchPanel(
             project = project ?: return,
-            isDock = isDock,
+            isDock = true,
             focusToken = searchFocus,
             onOpenMatch = onOpenMatch,
             onDismiss = onDismiss,
         )
-        RightDock.Preview -> PreviewPanel(
+        WorkspacePanel.Preview -> PreviewPanel(
             editor = file?.editor ?: return,
             path = file.path,
-            isDock = isDock,
+            isDock = true,
             onDismiss = onDismiss,
             onOpenPath = onOpenPath,
         )
-        RightDock.Git -> GitPanel(
+        WorkspacePanel.Git -> GitPanel(
             project = project ?: return,
-            isDock = isDock,
+            isDock = true,
             focusToken = gitFocus,
             onOpenFile = onOpenPath,
             onDismiss = onDismiss,

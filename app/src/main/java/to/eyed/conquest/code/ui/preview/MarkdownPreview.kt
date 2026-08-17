@@ -233,7 +233,6 @@ fun MarkdownPreview(
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     val focus = remember { FocusRequester() }
-    var dockWidth by remember { mutableStateOf(PreviewDockWidth) }
 
     val isMarkdown = PreviewKind.of(path) == PreviewKind.Markdown
 
@@ -293,24 +292,8 @@ fun MarkdownPreview(
         }
     }
 
-    BoxWithConstraints(
-        modifier = modifier
-            .then(if (isDock) Modifier.fillMaxHeight() else Modifier.fillMaxSize())
-    ) {
-        // What this panel was offered, which already has the project panel
-        // taken out of it — the Row measures its fixed-width children in order
-        // and leaves the weighted editor whatever is left.
-        val available = if (constraints.hasBoundedWidth) maxWidth else Dp.Infinity
-        Row(
-            modifier = if (isDock) {
-                Modifier.width(clampDockWidth(dockWidth, available)).fillMaxHeight()
-            } else {
-                Modifier.fillMaxSize()
-            }
-        ) {
-            if (isDock) {
-                PreviewResizeHandle { delta -> dockWidth = clampDockWidth(dockWidth - delta, available) }
-            }
+    Box(modifier = modifier.fillMaxSize()) {
+        Row(modifier = Modifier.fillMaxSize()) {
             Column(
                 modifier = Modifier
                     .fillMaxSize()

@@ -105,6 +105,31 @@ survives a restart.
 Wrapped or not, the caret keys mean what they always meant: `Home` and `End` go
 to the ends of the *line*, not of the screen row.
 
+## Panels and docks
+
+Every panel lives in a dock — left or right — and each one's side is a setting,
+as in Zed: **Settings** → *Project panel* / *Git panel* / *Project search* /
+*Preview*, or `project_panel.dock` and friends in settings.json. Its button in
+the status bar moves with it, so the button is always on the side the panel
+will appear.
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl` `B` | Show/hide the left dock |
+| `Ctrl` `Alt` `B` | Show/hide the right dock |
+
+**One panel at a time per dock, and the two docks are independent.** Opening
+git while search is up on the same side replaces it; opening it while the tree
+is up on the *other* side leaves the tree alone. When both are open and the
+screen cannot hold them at their full widths, they shrink to share what there
+is rather than closing each other — and only when even two minimum widths and
+an editor will not fit does the most recently opened one take the space, with
+the other returning as soon as there is room.
+
+Drag a dock's inner edge to resize it, the same way the terminal dock resizes.
+On a phone a dock takes the whole work area, and opening a file from one hands
+the area back.
+
 ## Git panel
 
 `Ctrl` `Shift` `G` shows the changes in the project — Zed's

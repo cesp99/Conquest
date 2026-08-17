@@ -268,7 +268,14 @@ internal val ZED_ICON_DRAWABLE: Map<String, String> = mapOf(
 '''
 
 
-UI_ICONS = ("eye.svg", "eye_off.svg", "git_branch.svg")
+UI_ICONS = (
+    "eye.svg",
+    "eye_off.svg",
+    "file_tree.svg",
+    "git_branch.svg",
+    "magnifying_glass.svg",
+    "terminal.svg",
+)
 
 
 def main() -> int:

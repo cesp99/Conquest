@@ -37,6 +37,19 @@ enum class ThemeMode(val key: String) {
  * comments through edits made here (see `core/crates/engine/src/config.rs`).
  * This is just the read model; every field is wired to something visible.
  */
+/** Which side of the workspace a panel lives on — Zed's `dock`. */
+enum class DockSide(val key: String, val label: String) {
+    Left("left", "Left"),
+    Right("right", "Right");
+
+    companion object {
+        fun fromKey(key: String?): DockSide = entries.firstOrNull { it.key == key } ?: Left
+    }
+}
+
+/** Where a panel docks, and how wide it opens the first time. */
+data class PanelPlacement(val dock: DockSide, val defaultWidth: Float)
+
 data class AppSettings(
     val theme: ThemeMode = ThemeMode.System,
     /** Editor text size in sp. */
@@ -47,9 +60,18 @@ data class AppSettings(
     val softWrap: SoftWrapMode = SoftWrapMode.None,
     /** Zed's `git.inline_blame.enabled`, whose default is on. */
     val inlineBlame: Boolean = true,
+    /**
+     * Where each panel docks and how wide it opens — Zed's `dock` and
+     * `default_width`, per panel.
+     */
+    val panels: Map<String, PanelPlacement> = DEFAULT_PANELS,
     /** How gitignored entries appear in the project tree. */
     val gitignoredFiles: GitignoredFiles = GitignoredFiles.Dimmed,
 ) {
+    /** Where [panel] sits, falling back to the shipped default. */
+    fun panel(panel: to.eyed.conquest.code.ui.workspace.WorkspacePanel): PanelPlacement =
+        panels[panel.settingsKey] ?: DEFAULT_PANELS.getValue(panel.settingsKey)
+
     companion object {
         /** Keys as the engine names them, for [CoreBridge.setSetting]. */
         const val KEY_THEME = "theme"
@@ -57,6 +79,22 @@ data class AppSettings(
         const val KEY_TAB_SIZE = "tab_size"
         const val KEY_SOFT_WRAP = "soft_wrap"
         const val KEY_INLINE_BLAME = "git.inline_blame.enabled"
+
+        /** `project_panel` → `project_panel.dock`. */
+        fun keyForDock(panel: String): String = "$panel.dock"
+
+        /**
+         * What each panel does when settings.json says nothing. The project
+         * tree on the left is *this app's* default rather than Zed's current
+         * one — Zed moved its tree to the right — because every file manager
+         * on this platform puts it left and it is one line to change.
+         */
+        val DEFAULT_PANELS: Map<String, PanelPlacement> = mapOf(
+            "project_panel" to PanelPlacement(DockSide.Left, 240f),
+            "git_panel" to PanelPlacement(DockSide.Right, 360f),
+            "project_search" to PanelPlacement(DockSide.Right, 360f),
+            "preview" to PanelPlacement(DockSide.Right, 400f),
+        )
         const val KEY_GITIGNORED = "project_panel.gitignored_files"
 
         fun parse(json: String): AppSettings = runCatching {
@@ -70,6 +108,16 @@ data class AppSettings(
                 inlineBlame = root.optJSONObject("git")
                     ?.optJSONObject("inline_blame")
                     ?.optBoolean("enabled", true) ?: true,
+                panels = DEFAULT_PANELS.mapValues { (key, fallback) ->
+                    val panel = root.optJSONObject(key) ?: return@mapValues fallback
+                    PanelPlacement(
+                        dock = DockSide.fromKey(panel.optString("dock", fallback.dock.key)),
+                        defaultWidth = panel.optDouble(
+                            "default_width",
+                            fallback.defaultWidth.toDouble(),
+                        ).toFloat().coerceIn(120f, 900f),
+                    )
+                },
                 gitignoredFiles = GitignoredFiles.fromKey(
                     panel?.optString("gitignored_files", "dimmed") ?: "dimmed"
                 ),

@@ -221,7 +221,6 @@ fun ProjectSearchPanel(
     var collapsed by remember { mutableStateOf(emptySet<String>()) }
     var progress by remember { mutableStateOf(SearchProgress()) }
     var selected by remember { mutableIntStateOf(-1) }
-    var dockWidth by remember { mutableStateOf(DockWidth) }
     val listState = rememberLazyListState()
     val focus = remember { FocusRequester() }
 
@@ -356,7 +355,7 @@ fun ProjectSearchPanel(
 
     Row(
         modifier = modifier
-            .then(if (isDock) Modifier.width(dockWidth).fillMaxHeight() else Modifier.fillMaxSize())
+            .fillMaxSize()
             // Arrows, Enter and Escape have to reach us while the query field
             // holds the caret, so they are taken before it sees them. Anything
             // with Ctrl is left alone: those belong to the workspace's table,
@@ -382,9 +381,6 @@ fun ProjectSearchPanel(
                 }
             },
     ) {
-        if (isDock) {
-            ResizeHandle { delta -> dockWidth = (dockWidth - delta).coerceAtLeast(DockMinWidth) }
-        }
         Column(
             modifier = Modifier
                 .fillMaxSize()

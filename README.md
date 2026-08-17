@@ -68,6 +68,7 @@ Samsung DeX.
 | Multiple cursors & line operations | ✅ Ctrl+D, cursors above/below, move/duplicate/delete line, toggle comment |
 | Autoclose, auto-indent, indent guides | ✅ from the language's own brackets |
 | Project panel as a file manager | ✅ new/rename/delete/duplicate, context menu, full keyboard |
+| Docks | ✅ each panel left or right by setting, one per dock, both resizable |
 | Themes | ✅ eleven of Zed's own, with a live-preview picker |
 | Settings | ✅ JSONC file that keeps your comments, settings screen |
 | Integrated terminal | ✅ shells in the project directory, tabs, theme colours, keyboard/mouse/touch |

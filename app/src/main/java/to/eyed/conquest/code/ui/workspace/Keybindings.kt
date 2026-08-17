@@ -144,6 +144,17 @@ enum class WorkspaceCommand(
      */
     ToggleGitPanel("git_panel::ToggleFocus", isAvailable = { it.hasProject }),
 
+    /**
+     * Show or hide the left and right docks — Zed's `workspace::ToggleLeftDock`
+     * on `ctrl-b` and `ToggleRightDock` on `ctrl-alt-b`
+     * (default-linux.json:668-669).
+     *
+     * A dock with nothing in it opens the panel that lives on that side, which
+     * is what "show the sidebar" means to the person pressing it.
+     */
+    ToggleLeftDock("workspace::ToggleLeftDock"),
+    ToggleRightDock("workspace::ToggleRightDock"),
+
     /** Show or hide the terminal dock. */
     ToggleTerminal("terminal_panel::Toggle", isAvailable = { it.hasProject }),
 
@@ -180,10 +191,18 @@ data class Chord(
     val ctrl: Boolean = true,
     /** True: Shift must be held. False: it must not be. Null: either. */
     val shift: Boolean? = false,
+    /**
+     * Whether Alt must be held. Zed uses it for exactly one thing here —
+     * `ctrl-alt-b` for the right dock — and every other chord in this table
+     * requires it *not* to be, so an Alt chord bound by the IME or by a
+     * desktop shell cannot be swallowed by accident.
+     */
+    val alt: Boolean = false,
 ) {
     /** What the menus, the palette and docs/SHORTCUTS.md all print. */
     val label: String = buildString {
         if (ctrl) append("Ctrl ")
+        if (alt) append("Alt ")
         if (shift == true) append("Shift ")
         append(keyName)
     }
@@ -191,6 +210,7 @@ data class Chord(
     internal fun matches(event: AndroidKeyEvent): Boolean =
         event.keyCode == keyCode &&
             event.isCtrlPressed == ctrl &&
+            event.isAltPressed == alt &&
             (shift == null || shift == event.isShiftPressed)
 }
 
@@ -228,9 +248,17 @@ private val BINDINGS: List<Binding> = listOf(
         Chord(AndroidKeyEvent.KEYCODE_W, "W", shift = null),
         InWorkspace,
     ),
+    // Zed's `ctrl-b` and `ctrl-alt-b` (default-linux.json:668-669). The
+    // project panel keeps the plain chord because on this app's default layout
+    // it *is* the left dock, and because it is the one people press.
     Binding(
-        WorkspaceCommand.ToggleProjectPanel,
+        WorkspaceCommand.ToggleLeftDock,
         Chord(AndroidKeyEvent.KEYCODE_B, "B", shift = null),
+        InWorkspace,
+    ),
+    Binding(
+        WorkspaceCommand.ToggleRightDock,
+        Chord(AndroidKeyEvent.KEYCODE_B, "B", shift = null, alt = true),
         InWorkspace,
     ),
     Binding(
@@ -463,9 +491,11 @@ fun workspaceCommandFor(event: KeyEvent, focus: Focus = Focus.Workspace): Worksp
 /** As above, for callers holding an Android key event (the terminal view). */
 fun workspaceCommandFor(event: AndroidKeyEvent, focus: Focus): WorkspaceCommand? {
     if (event.action != AndroidKeyEvent.ACTION_DOWN || !event.isCtrlPressed) return null
-    // Nothing here uses Alt, and on European layouts AltGr can arrive as
-    // Ctrl+Alt — a chord meant to type a character must not run a command.
-    if (event.isAltPressed) return null
+    // Alt is matched by the chord rather than refused outright, and every
+    // chord but one requires it *not* to be held: on European layouts AltGr
+    // arrives as Ctrl+Alt, and a chord meant to type `@` or `[` must not run a
+    // command. The exception is `Ctrl+Alt+B` for the right dock, which is
+    // Zed's own binding and which no Latin layout puts a character on.
     return BINDINGS
         .firstOrNull { focus in it.scope && it.chord.matches(event) }
         ?.command
