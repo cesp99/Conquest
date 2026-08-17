@@ -205,13 +205,15 @@ fun WorkspaceScreen(
     /** Ctrl+Shift+G, the same way: press it again to put focus back on the list. */
     var gitPanelFocus by remember { mutableIntStateOf(0) }
     /**
-     * Whether the panel is drawn over the whole work area rather than beside
+     * Whether the dock is drawn over the whole work area rather than beside
      * the editor. Decided during layout, where the width is known, and read by
-     * [openMatch] — which has to hand the area back when it is true, and must
-     * not when the editor is right there next to it.
+     * whatever opens a file *from* a dock — which has to hand the area back
+     * when it is true, and must not when the editor is right there next to it.
      */
-    var searchTakesWorkArea by remember { mutableStateOf(false) }
+    var dockTookWorkArea by remember { mutableStateOf(false) }
     var settingsValid by remember { mutableStateOf(true) }
+    /** What the engine refused, if it refused the last write. */
+    var settingsRefusal by remember { mutableStateOf<String?>(null) }
     var projects by remember { mutableStateOf(emptyList<ProjectSummary>()) }
     var transferMessage by remember { mutableStateOf<String?>(null) }
     var transferError by remember { mutableStateOf<String?>(null) }
@@ -524,18 +526,25 @@ fun WorkspaceScreen(
             WorkspaceCommand.SelectTheme -> themeSelectorOpen = true
             WorkspaceCommand.TogglePreview -> {
                 if (!canPreviewActiveFile()) return false
-                rightDock = if (rightDock == RightDock.Preview) {
-                    rootFocus.requestFocus()
-                    null
+                if (rightDock == RightDock.Preview) {
+                    rightDock = null
                 } else {
-                    RightDock.Preview
+                    rightDock = RightDock.Preview
                 }
+                // Either way the keyboard has to land somewhere the key table
+                // can see. The preview deliberately does not take focus when
+                // it appears — it follows a file being typed in — so without
+                // this the chord that opened it could not close it, and on a
+                // compact screen a terminal that is no longer on screen went
+                // on claiming the keymap.
+                terminalFocused = false
+                rootFocus.requestFocus()
             }
             WorkspaceCommand.ToggleSoftWrap -> {
                 val next = if (settings.softWrap.wraps) SoftWrapMode.None else SoftWrapMode.EditorWidth
                 scope.launch {
                     val updated = withContext(Dispatchers.IO) {
-                        AppSettings.set(AppSettings.KEY_SOFT_WRAP, "\"${'$'}{next.key}\"")
+                        AppSettings.set(AppSettings.KEY_SOFT_WRAP, "\"" + next.key + "\"")
                     }
                     if (updated != null) onSettingsChanged(updated)
                 }
@@ -597,10 +606,28 @@ fun WorkspaceScreen(
     fun openMatch(path: String, match: ProjectSearchMatch) {
         val open = project ?: return
         openFile(open, path) { file -> file.editor?.revealProjectSearchMatch(match) }
-        if (searchTakesWorkArea) {
+        if (dockTookWorkArea) {
             // A compact screen gave the panel the whole work area, so opening a
             // file has to hand it back — and hand the keyboard back with it, or
             // the keymap dies the way it did when Stop-all closed the dock.
+            rightDock = null
+            terminalFocused = false
+            rootFocus.requestFocus()
+        }
+    }
+
+    /**
+     * A path a dock asked for — a changed file in the git panel, a relative
+     * link in the preview.
+     *
+     * On a compact screen the dock *is* the work area: the tab strip and the
+     * editor are not composed at all, so opening a file behind it looks like
+     * nothing happening. Hand the screen back, exactly as a search hit does.
+     */
+    fun openFromDock(path: String) {
+        val open = project ?: return
+        openFile(open, path)
+        if (dockTookWorkArea) {
             rightDock = null
             terminalFocused = false
             rootFocus.requestFocus()
@@ -774,21 +801,35 @@ fun WorkspaceScreen(
             // holding the screen.
             val previewEditor = active?.editor
             val dockShowing = when (rightDock) {
-                RightDock.Preview -> RightDock.Preview.takeIf { previewEditor != null }
+                // Previewable, not merely "has a buffer": switching to a
+                // .rs from a full-screen preview otherwise left the preview
+                // holding the screen, saying it had nothing to show, with
+                // both routes that could close it now refused.
+                RightDock.Preview -> RightDock.Preview.takeIf { canPreviewActiveFile() }
                 RightDock.Search, RightDock.Git -> rightDock.takeIf { project != null }
                 null -> null
             }
-            val editorWidthWithDock = windowWidth -
-                (if (panelVisible) ProjectPanelWidth else 0.dp) -
-                when (dockShowing) {
-                    RightDock.Search -> ProjectSearchDockWidth
-                    RightDock.Preview -> PreviewDockWidth
-                    RightDock.Git -> GitPanelDockWidth
-                    null -> 0.dp
-                }
-            val dockTakesWorkArea = dockShowing != null &&
+            val dockWidth = when (dockShowing) {
+                RightDock.Search -> ProjectSearchDockWidth
+                RightDock.Preview -> PreviewDockWidth
+                RightDock.Git -> GitPanelDockWidth
+                null -> 0.dp
+            }
+            val editorWidthWithDock =
+                windowWidth - (if (panelVisible) ProjectPanelWidth else 0.dp) - dockWidth
+            // On a screen that fits a dock *or* a sidebar and not both — the
+            // Fold's inner display at 841dp is exactly that — the sidebar
+            // makes way rather than the dock taking the whole screen. It is
+            // what a person would do by hand, and `panelVisible` is left
+            // alone, so closing the dock brings the sidebar straight back.
+            val editorWidthWithoutPanel = windowWidth - dockWidth
+            val panelYieldsToDock = dockShowing != null && isWide && panelVisible &&
+                editorWidthWithDock < MinEditorWidth &&
+                editorWidthWithoutPanel >= MinEditorWidth
+            val panelShows = panelVisible && !panelYieldsToDock
+            val dockTakesWorkArea = dockShowing != null && !panelYieldsToDock &&
                 (!isWide || editorWidthWithDock < MinEditorWidth)
-            searchTakesWorkArea = dockTakesWorkArea && dockShowing == RightDock.Search
+            dockTookWorkArea = dockTakesWorkArea
             val terminalIsFullScreen = !isWide && terminals.isOpen && !dockTakesWorkArea
             Box(modifier = Modifier.weight(1f)) {
                 if (dockTakesWorkArea && dockShowing != null) {
@@ -800,7 +841,7 @@ fun WorkspaceScreen(
                         searchFocus = projectSearchFocus,
                         gitFocus = gitPanelFocus,
                         onOpenMatch = ::openMatch,
-                        onOpenPath = { path -> project?.let { openFile(it, path) } },
+                        onOpenPath = ::openFromDock,
                         onDismiss = {
                             rightDock = null
                             rootFocus.requestFocus()
@@ -816,7 +857,7 @@ fun WorkspaceScreen(
                     )
                 } else if (isWide) {
                     Row(modifier = Modifier.fillMaxSize()) {
-                        if (panelVisible) {
+                        if (panelShows) {
                             Box(
                                 modifier = Modifier
                                     .width(ProjectPanelWidth)
@@ -849,6 +890,7 @@ fun WorkspaceScreen(
                             isPreviewOpen = rightDock == RightDock.Preview,
                             onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
                             softWrap = settings.softWrap,
+                            showInlineBlame = settings.inlineBlame,
                             modifier = Modifier.weight(1f),
                         )
                         // Each panel draws its own left edge, which is also
@@ -862,7 +904,7 @@ fun WorkspaceScreen(
                                 searchFocus = projectSearchFocus,
                                 gitFocus = gitPanelFocus,
                                 onOpenMatch = ::openMatch,
-                                onOpenPath = { path -> project?.let { openFile(it, path) } },
+                                onOpenPath = ::openFromDock,
                                 onDismiss = {
                                     rightDock = null
                                     rootFocus.requestFocus()
@@ -905,6 +947,7 @@ fun WorkspaceScreen(
                             isPreviewOpen = rightDock == RightDock.Preview,
                             onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
                             softWrap = settings.softWrap,
+                            showInlineBlame = settings.inlineBlame,
                         )
                     }
                 }
@@ -985,6 +1028,7 @@ fun WorkspaceScreen(
             settings = settings,
             settingsPath = settingsPath,
             isFileValid = settingsValid,
+            refusal = settingsRefusal,
             onSet = { keyPath, valueJson ->
                 scope.launch {
                     val updated = withContext(Dispatchers.IO) {
@@ -993,10 +1037,22 @@ fun WorkspaceScreen(
                     if (updated != null) {
                         onSettingsChanged(updated)
                         settingsValid = true
+                        settingsRefusal = null
+                    } else {
+                        // The engine refuses a write that would leave the file
+                        // unparseable, and settings.json is untouched. Saying
+                        // nothing here is what made a broken command — the
+                        // soft-wrap toggle, which sent a malformed value —
+                        // look like one that simply did nothing.
+                        settingsRefusal = "$keyPath could not be set to $valueJson. " +
+                            "settings.json is unchanged."
                     }
                 }
             },
-            onDismiss = { settingsOpen = false },
+            onDismiss = {
+                settingsOpen = false
+                settingsRefusal = null
+            },
         )
     }
 
@@ -1032,7 +1088,8 @@ fun WorkspaceScreen(
         CommandPalette(
             workspace = CommandContext(
                 hasProject = project != null,
-                hasActiveFile = files.active?.editor != null,
+                hasActiveFile = files.active != null,
+                hasActiveBuffer = files.active?.editor != null,
                 tabCount = files.tabs.size,
                 terminalCount = terminals.sessions.size,
                 canClone = GitClone.isSupported,
@@ -1153,6 +1210,7 @@ private fun EditorArea(
     isPreviewOpen: Boolean,
     onTogglePreview: () -> Unit,
     softWrap: SoftWrapMode,
+    showInlineBlame: Boolean,
     modifier: Modifier = Modifier,
 ) {
     val active = files.active
@@ -1222,6 +1280,7 @@ private fun EditorArea(
                 modifier = Modifier.weight(1f),
                 onSave = { onSave(active) },
                 softWrap = softWrap,
+                showInlineBlame = showInlineBlame,
             )
         } else {
             MediaPane(

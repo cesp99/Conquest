@@ -73,8 +73,14 @@ Samsung DeX.
 | Integrated terminal | ✅ shells in the project directory, tabs, theme colours, keyboard/mouse/touch |
 | Terminal sessions survive backgrounding | ✅ foreground service, notification with **Stop all**, survives a swipe from Recents |
 | Debian userland (`apt`) | ✅ in the `full` edition — installs on demand, ~30 MB |
-| Clone a repository into a project | ✅ `Ctrl+Shift+G`, progress and cancel (`full` edition) |
+| Clone a repository into a project | ✅ progress and cancel (`full` edition) |
 | Git status colours in the project panel | ✅ engine-side, from the theme's own colours |
+| Git panel | ✅ `Ctrl+Shift+G`, stage/unstage/discard/commit, keyboard and touch |
+| Diff bars in the gutter, inline blame | ✅ Zed's own widths and colours; blame while the file is clean |
+| Markdown and SVG preview | ✅ the toolbar's 👁, split beside the editor or full screen |
+| Images, audio and video | ✅ opened as media, never as a text buffer |
+| Soft wrap | ✅ `soft_wrap`, off by default as in Zed |
+| Go to line | ✅ `Ctrl+G`, `42:8`, Escape puts everything back |
 | LSP on-device | ⬜ planned |
 | ACP agent panel | ⬜ planned |
 

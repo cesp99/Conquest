@@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import kotlinx.coroutines.delay
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -68,26 +70,69 @@ fun MediaPane(
     }
 }
 
+/** What a decode produced. "Not yet" and "cannot" are different answers. */
+private sealed interface Decoded {
+    object Loading : Decoded
+    object Failed : Decoded
+    class Ready(val bitmap: ImageBitmap) : Decoded
+}
+
+/** How often the file behind an open picture is re-checked. */
+private const val FILE_POLL_MS = 500L
+
 @Composable
 private fun ImageView(absolutePath: String) {
     val theme = LocalZedTheme.current
-    // Decoded off the main thread, and only when the path changes: a photo is
-    // tens of megabytes of pixels and the decode is not free.
-    val bitmap by produceState<ImageBitmap?>(initialValue = null, absolutePath) {
-        value = withContext(Dispatchers.IO) {
-            runCatching { BitmapFactory.decodeFile(absolutePath)?.asImageBitmap() }.getOrNull()
+    val file = remember(absolutePath) { File(absolutePath) }
+
+    // A picture has no buffer, so nothing else in the app is watching this
+    // file: without this poll, overwriting or deleting it from the terminal
+    // left the tab showing a bitmap that no longer exists on disk, with no
+    // sign that anything had happened. Two longs, twice a second.
+    var stamp by remember(absolutePath) { mutableStateOf(0L to 0L) }
+    LaunchedEffect(absolutePath) {
+        while (true) {
+            val next = withContext(Dispatchers.IO) { file.lastModified() to file.length() }
+            if (next != stamp) stamp = next
+            delay(FILE_POLL_MS)
         }
     }
-    val image = bitmap
-    if (image == null) {
-        Message(
-            title = File(absolutePath).name,
-            detail = "Reading…",
-        )
-        return
+
+    // Decoded off the main thread: a photo is tens of megabytes of pixels and
+    // the decode is not free.
+    val decoded by produceState<Decoded>(Decoded.Loading, absolutePath, stamp) {
+        value = Decoded.Loading
+        value = withContext(Dispatchers.IO) {
+            val bitmap = runCatching { BitmapFactory.decodeFile(absolutePath) }.getOrNull()
+            if (bitmap == null) Decoded.Failed else Decoded.Ready(bitmap.asImageBitmap())
+        }
     }
-    var zoom by remember(absolutePath) { mutableFloatStateOf(1f) }
-    var pan by remember(absolutePath) { mutableStateOf(Offset.Zero) }
+
+    when (val state = decoded) {
+        is Decoded.Loading -> Message(title = file.name, detail = "Reading…")
+        // Said, rather than left saying "Reading…" for ever. An empty or
+        // truncated file is the common case — a download that stopped, a
+        // placeholder somebody committed — and "Reading…" reads as a hang.
+        is Decoded.Failed -> Message(
+            title = file.name,
+            detail = when {
+                !file.exists() -> "This file is gone from disk."
+                file.length() == 0L -> "This file is empty."
+                else -> "Android cannot decode this image."
+            },
+        )
+        is Decoded.Ready -> Picture(state.bitmap, file, theme)
+    }
+}
+
+@Composable
+private fun Picture(
+    image: ImageBitmap,
+    file: File,
+    theme: to.eyed.conquest.code.ui.theme.ZedTheme,
+) {
+    var zoom by remember(file.path) { mutableFloatStateOf(1f) }
+    var pan by remember(file.path) { mutableStateOf(Offset.Zero) }
     Column(
         modifier = Modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -96,17 +141,20 @@ private fun ImageView(absolutePath: String) {
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
-                .pointerInput(absolutePath) {
-                    detectTransformGestures { _, dragged, zoomed, _ ->
-                        zoom = (zoom * zoomed).coerceIn(MIN_ZOOM, MAX_ZOOM)
-                        pan += dragged
+                .pointerInput(file.path) {
+                    detectTransformGestures { centroid, dragged, zoomed, _ ->
+                        val next = (zoom * zoomed).coerceIn(MIN_ZOOM, MAX_ZOOM)
+                        // Keep what is under the fingers under the fingers.
+                        val factor = next / zoom
+                        pan = (pan + centroid) * factor - centroid + dragged
+                        zoom = next
                     }
                 },
             contentAlignment = Alignment.Center,
         ) {
             Image(
                 bitmap = image,
-                contentDescription = File(absolutePath).name,
+                contentDescription = file.name,
                 contentScale = ContentScale.Fit,
                 modifier = Modifier
                     .fillMaxSize()

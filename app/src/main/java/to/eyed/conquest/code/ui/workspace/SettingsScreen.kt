@@ -47,6 +47,8 @@ fun SettingsScreen(
     settings: AppSettings,
     settingsPath: String?,
     isFileValid: Boolean,
+    /** Set when the last write was refused; see [AppSettings.set]. */
+    refusal: String? = null,
     onSet: (keyPath: String, valueJson: String) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -70,6 +72,18 @@ fun SettingsScreen(
                     Text(
                         text = "settings.json could not be parsed — showing defaults. " +
                             "Fix the file, or change something here to rewrite it.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = theme.color("error", MaterialTheme.colorScheme.error),
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
+                    )
+                }
+
+                // A value the engine refused never reached the file, and the
+                // rest of the settings are untouched — but silence here is
+                // what let a broken command look like a working one.
+                if (refusal != null) {
+                    Text(
+                        text = refusal,
                         style = MaterialTheme.typography.bodySmall,
                         color = theme.color("error", MaterialTheme.colorScheme.error),
                         modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
@@ -113,6 +127,13 @@ fun SettingsScreen(
                         ),
                         selected = settings.softWrap,
                         onSelect = { onSet(AppSettings.KEY_SOFT_WRAP, "\"${it.key}\"") },
+                    )
+                    ChoiceRow(
+                        label = "Inline blame",
+                        detail = "Who last touched the line the caret is on",
+                        options = listOf(true to "Show", false to "Hide"),
+                        selected = settings.inlineBlame,
+                        onSelect = { onSet(AppSettings.KEY_INLINE_BLAME, it.toString()) },
                     )
                     ChoiceRow(
                         label = "Gitignored files",

@@ -441,10 +441,12 @@ fun FileConflictBar(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
-        if (file.isDeleted) {
-            ConflictAction("Save", onSave)
-        } else {
-            ConflictAction("Reload", onReload)
+        when {
+            // A picture has no buffer to write back, so "Save" would be a
+            // button that does nothing; the tab is all there is to close.
+            file.isDeleted && file.session == null -> Unit
+            file.isDeleted -> ConflictAction("Save", onSave)
+            else -> ConflictAction("Reload", onReload)
         }
         ConflictAction("Dismiss", onDismiss)
     }

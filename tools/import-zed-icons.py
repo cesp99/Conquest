@@ -48,14 +48,29 @@ def convert(svg_path: Path) -> str:
     _, _, vb_w, vb_h = (float(n) for n in view_box.replace(",", " ").split())
 
     paths: list[str] = []
-    for node in root.iter():
-        tag = node.tag.replace(SVG_NS, "")
-        if tag in ("svg", "g", "defs", "title", "desc", "mask", "clipPath"):
-            # A `g` carrying a transform would move its children, and none of
-            # Zed's file icons use one; refuse rather than draw it wrong.
-            if tag == "g" and "transform" in node.attrib:
-                raise ValueError(f"{svg_path.name}: <g transform> is not handled")
-            continue
+    # `root.iter()` walks *everything*, including what is inside a <defs>, a
+    # <mask> or a <clipPath> — so skipping those containers skipped only the
+    # container. Their children came out as ordinary opaque shapes, drawn last:
+    # the C, C++, Odin and Helm icons were solid white blocks, because a clip
+    # rectangle is a full-viewport rectangle. Walk the tree by hand instead,
+    # and do not descend into a container whose children are definitions.
+    def visit(parent: ET.Element) -> None:
+        for node in parent:
+            tag = node.tag.replace(SVG_NS, "")
+            if tag in ("defs", "mask", "clipPath", "title", "desc", "style"):
+                # Definitions, not drawings: something has to reference them.
+                continue
+            if tag in ("svg", "g"):
+                # A `g` carrying a transform would move its children, and none
+                # of Zed's file icons use one; refuse rather than draw it wrong.
+                if tag == "g" and "transform" in node.attrib:
+                    raise ValueError(f"{svg_path.name}: <g transform> is not handled")
+                visit(node)
+                continue
+            emit(node, tag)
+
+    def emit(node: ET.Element, tag: str) -> None:
+        nonlocal paths
         # VectorDrawable can carry a transform only on a <group>, so a
         # transformed shape becomes its own group. Four of Zed's icons need
         # this — two translate a rectangle, two place a scaled glyph.
@@ -98,7 +113,7 @@ def convert(svg_path: Path) -> str:
 
         data = attr(node, "d")
         if not data:
-            continue
+            return
         fill = attr(node, "fill", "none")
         stroke = attr(node, "stroke", "none")
         opacity = attr(node, "opacity")
@@ -134,6 +149,8 @@ def convert(svg_path: Path) -> str:
                 + "\n    </group>"
             )
         paths.append(drawn)
+
+    visit(root)
 
     if not paths:
         raise ValueError(f"{svg_path.name}: no drawable paths")

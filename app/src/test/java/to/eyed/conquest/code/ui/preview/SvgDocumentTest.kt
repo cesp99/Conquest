@@ -256,6 +256,83 @@ class SvgDocumentTest {
         assertEquals(1, document.shapes.size)
     }
 
+    // ---- the edges a device found, and a desktop JVM never would ---------
+
+    /**
+     * `viewBox="min-x min-y w h"` moves the origin. Google's Material Symbols
+     * are all `0 -960 960 960`: ignoring the offset drew every one of them a
+     * whole canvas above the pane, which is to say not at all.
+     */
+    @Test
+    fun theViewBoxOriginMovesTheDrawing() {
+        val shape = svg(
+            """<rect x="-8" y="-8" width="16" height="16"/>""",
+            attributes = """viewBox="-8 -8 16 16"""",
+        ).shapes.single()
+        val (x, y) = shape.transform.map(-8f, -8f)
+        assertEquals(0f, x, 1e-4f)
+        assertEquals(0f, y, 1e-4f)
+    }
+
+    /**
+     * `style="fill:red"` says what `fill="red"` says, and tool-generated files
+     * use it constantly — six of Zed's own icons do. Reading only attributes
+     * drew all of them as black silhouettes and said nothing about why.
+     */
+    @Test
+    fun theStyleAttributeIsRead() {
+        val shape = svg(
+            """<path d="M0,0" style="fill:#ff0000;stroke:#00ff00;stroke-width:4"/>"""
+        ).shapes.single()
+        assertEquals(SvgPaint.Solid(0xFFFF0000L), shape.fill)
+        assertEquals(SvgPaint.Solid(0xFF00FF00L), shape.stroke)
+        assertEquals(4f, shape.strokeWidth, 0f)
+    }
+
+    /** A hidden layer is hidden in every other renderer. */
+    @Test
+    fun hiddenElementsAreNotDrawn() {
+        assertEquals(0, svg("""<g display="none"><path d="M0,0"/></g>""").shapes.size)
+        assertEquals(0, svg("""<rect width="4" height="4" visibility="hidden"/>""").shapes.size)
+    }
+
+    /** With both given, `rx` and `ry` are different radii — not the larger one twice. */
+    @Test
+    fun aRectangleKeepsBothItsRadii() {
+        val shape = svg("""<rect width="20" height="20" rx="2" ry="8"/>""").shapes.single()
+        assertTrue(shape.pathData.startsWith("M2.0,"))
+    }
+
+    /**
+     * The transform is baked into the geometry, so the pen has to be scaled to
+     * match or a scaled shape gets a hairline outline.
+     */
+    @Test
+    fun aScaledShapeGetsAScaledPen() {
+        val shape = svg("""<g transform="scale(4)"><path d="M0,0" stroke="#000"/></g>""")
+            .shapes.single()
+        assertEquals(4f, shape.transform.scaleFactor, 1e-4f)
+        // A rotation scales nothing.
+        assertEquals(1f, SvgTransform.rotate(30f).scaleFactor, 1e-4f)
+    }
+
+    /**
+     * What cannot be drawn is *named*. A shape sized in percentages resolves
+     * against a viewport this has none of, so it comes out empty — and the
+     * pane has to be able to say so instead of showing a blank.
+     */
+    @Test
+    fun whatCannotBeSizedIsReportedRatherThanDroppedSilently() {
+        val document = svg("""<rect width="100%" height="100%" fill="#f00"/>""")
+        assertEquals(setOf("percentage sizes"), document.unsupported)
+    }
+
+    @Test
+    fun aNestedSvgIsReported() {
+        val document = svg("""<svg x="50" y="50" viewBox="0 0 10 10"><path d="M0,0"/></svg>""")
+        assertTrue("nested SVG" in document.unsupported)
+    }
+
     /** The fit is the drawing centred in what it is given, ratio kept. */
     @Test
     fun theDrawingIsCentredInThePaneItIsGiven() {

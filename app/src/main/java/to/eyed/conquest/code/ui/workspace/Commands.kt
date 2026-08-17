@@ -27,7 +27,13 @@ import android.content.Context
  */
 data class CommandContext(
     val hasProject: Boolean,
+    /** A tab is open — any tab, a picture included. */
     val hasActiveFile: Boolean,
+    /**
+     * The open tab is *text*. Closing, pinning and revealing work on a
+     * picture; saving and searching in it do not.
+     */
+    val hasActiveBuffer: Boolean,
     val tabCount: Int,
     val terminalCount: Int,
     /** Whether this build has a Linux userland to run git in. */

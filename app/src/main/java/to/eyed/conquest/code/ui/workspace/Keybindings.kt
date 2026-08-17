@@ -67,7 +67,7 @@ enum class WorkspaceCommand(
     val isAvailable: (CommandContext) -> Boolean = { true },
 ) {
     /** Write the active file to disk. */
-    Save("workspace::Save", isAvailable = { it.hasActiveFile }),
+    Save("workspace::Save", isAvailable = { it.hasActiveBuffer }),
 
     /** Close the active tab. */
     CloseTab("pane::CloseActiveItem", isAvailable = { it.hasActiveFile }),
@@ -103,7 +103,7 @@ enum class WorkspaceCommand(
     FindFile("file_finder::Toggle", isAvailable = { it.hasProject }),
 
     /** Find within the open file — Zed's buffer search. */
-    FindInFile("buffer_search::Deploy", isAvailable = { it.hasActiveFile }),
+    FindInFile("buffer_search::Deploy", isAvailable = { it.hasActiveBuffer }),
 
     /**
      * Show or hide the preview of the open file.

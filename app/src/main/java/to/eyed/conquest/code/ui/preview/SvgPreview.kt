@@ -46,6 +46,9 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.Dp
@@ -107,7 +110,7 @@ fun SvgPreview(
         }
     }
 
-    var drawing by remember(editor) { mutableStateOf(SvgDrawing.EMPTY) }
+    var drawing by remember(editor) { mutableStateOf(SvgDrawing.LOADING) }
     LaunchedEffect(editor, isSvg, editor.revision, engineVersion) {
         if (!isSvg) {
             drawing = SvgDrawing.EMPTY
@@ -193,17 +196,27 @@ fun SvgPreview(
                     drawing.isTooLarge -> PreviewNotice(
                         "This file is too large to preview. It is still open in the editor."
                     )
+                    // The debounce plus the first read is a couple of hundred
+                    // milliseconds; asserting the file is broken for that long
+                    // every time it is opened is a lie the user reads first.
+                    drawing.isLoading -> PreviewNotice("Reading…")
                     drawing.document == null -> PreviewNotice(
-                        "This is not an SVG that can be drawn — the editor still has the source."
+                        "This is not an SVG that can be drawn — the editor still has the source. " +
+                            "A file that declares a DOCTYPE is refused on purpose."
                     )
                     else -> Column(modifier = Modifier.fillMaxSize()) {
                         SvgCanvas(
                             drawing = drawing,
                             zoom = zoom,
                             pan = pan,
-                            onGesture = { panned, zoomed ->
-                                zoom = (zoom * zoomed).coerceIn(MIN_ZOOM, MAX_ZOOM)
-                                pan += panned
+                            onGesture = { centroid, panned, zoomed ->
+                                val next = (zoom * zoomed).coerceIn(MIN_ZOOM, MAX_ZOOM)
+                                // Keep whatever is under the fingers under the
+                                // fingers: the point they are on has to stay
+                                // put while everything around it grows.
+                                val factor = next / zoom
+                                pan = (pan + centroid) * factor - centroid + panned
+                                zoom = next
                             },
                             onReset = {
                                 zoom = 1f
@@ -224,7 +237,7 @@ private fun SvgCanvas(
     drawing: SvgDrawing,
     zoom: Float,
     pan: Offset,
-    onGesture: (Offset, Float) -> Unit,
+    onGesture: (Offset, Offset, Float) -> Unit,
     onReset: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -238,14 +251,39 @@ private fun SvgCanvas(
         modifier = modifier
             .padding(Inset)
             .pointerInput(Unit) {
-                detectTransformGestures { _, panned, zoomed, _ -> onGesture(panned, zoomed) }
+                // The centroid matters: zooming about the pane's middle slides
+                // the drawing out from under the fingers doing the zooming.
+                detectTransformGestures { centroid, panned, zoomed, _ ->
+                    onGesture(centroid, panned, zoomed)
+                }
             }
             // Second gesture detector, after the transform one: a double tap is
             // the universal "put it back", and it must not eat the pinch.
             .pointerInput(Unit) {
                 detectTapGestures(onDoubleTap = { onReset() })
             }
+            // A mouse has no pinch. Zed zooms its image viewer on the wheel and
+            // so does every other viewer; without this the only zoom a paired
+            // mouse had was the keyboard's.
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    val event = awaitPointerEvent()
+                    if (event.type != PointerEventType.Scroll) return@awaitEachGesture
+                    val change = event.changes.firstOrNull() ?: return@awaitEachGesture
+                    val wheel = change.scrollDelta.y
+                    if (wheel == 0f) return@awaitEachGesture
+                    // Wheel down is positive; zooming *out* is what that means.
+                    onGesture(change.position, Offset.Zero, if (wheel < 0f) 1.1f else 1 / 1.1f)
+                    change.consume()
+                }
+            }
     ) {
+        // The drawing's own backing. An SVG says nothing about what is behind
+        // it, and Zed's icons — like most icon sets — are drawn in black: on
+        // the editor's own background, in a dark theme, that is a black
+        // rectangle. The chequer is what every image editor uses to say
+        // "transparent", and it makes both black and white ink readable.
+        drawChequer(theme.color("border"), theme.color("editor.background"))
         if (size.width <= 0f || size.height <= 0f) return@Canvas
         val (scale, offsetX, offsetY) = document.fit(size.width, size.height)
         withTransform({
@@ -325,6 +363,8 @@ private class SvgDrawing private constructor(
     val shapes: List<Drawable>,
     /** True when the file was refused for its size. See [MAX_PREVIEW_CHARS]. */
     val isTooLarge: Boolean = false,
+    /** True until the first parse has landed. */
+    val isLoading: Boolean = false,
 ) {
     class Drawable(
         val path: Path,
@@ -338,6 +378,8 @@ private class SvgDrawing private constructor(
     )
 
     companion object {
+        /** Before the first parse lands — *not* the same as "cannot draw it". */
+        val LOADING = SvgDrawing(null, emptyList(), isLoading = true)
         val EMPTY = SvgDrawing(null, emptyList())
         val TOO_LARGE = SvgDrawing(null, emptyList(), isTooLarge = true)
 
@@ -369,7 +411,12 @@ private class SvgDrawing private constructor(
                     fillAlpha = shape.fillAlpha,
                     stroke = shape.stroke,
                     strokeAlpha = shape.strokeAlpha,
-                    strokeWidth = shape.strokeWidth,
+                    // The transform is baked into the *geometry* above, so a
+                    // stroke drawn at its declared width would come out
+                    // thinner or thicker than the shape it outlines. The
+                    // factor is the square root of the area scale, which is
+                    // what a renderer that transformed the pen would give.
+                    strokeWidth = shape.strokeWidth * shape.transform.scaleFactor,
                     capRound = shape.strokeCapRound,
                     joinRound = shape.strokeJoinRound,
                 )
@@ -391,5 +438,33 @@ private fun PreviewNotice(text: String) {
             style = TextStyle(fontFamily = UiFontFamily, fontSize = 13.sp),
             color = theme.color("text.muted"),
         )
+    }
+}
+
+/**
+ * The chequerboard behind a drawing — the universal "there is nothing here".
+ *
+ * Two colours a hair apart rather than the usual grey-on-white: this sits in a
+ * themed editor, and a bright chequer beside a dark buffer would be the
+ * loudest thing on screen.
+ */
+private fun DrawScope.drawChequer(mark: Color, ground: Color) {
+    drawRect(color = ground)
+    val cell = 12.dp.toPx()
+    val faint = mark.copy(alpha = 0.16f)
+    var y = 0f
+    var row = 0
+    while (y < size.height) {
+        var x = if (row % 2 == 0) 0f else cell
+        while (x < size.width) {
+            drawRect(
+                color = faint,
+                topLeft = Offset(x, y),
+                size = Size(minOf(cell, size.width - x), minOf(cell, size.height - y)),
+            )
+            x += cell * 2
+        }
+        y += cell
+        row++
     }
 }

@@ -78,6 +78,12 @@ class EditorState private constructor(
     val session: BufferSession
         get() = requireNotNull(boundSession) { "this editor has no engine buffer" }
 
+    /**
+     * The same buffer, for callers that have something else to do when there
+     * isn't one — the git annotations, which a fake buffer has no id for.
+     */
+    internal val sessionOrNull: BufferSession? get() = boundSession
+
     var scrollY by mutableFloatStateOf(0f)
         private set
     var scrollX by mutableFloatStateOf(0f)

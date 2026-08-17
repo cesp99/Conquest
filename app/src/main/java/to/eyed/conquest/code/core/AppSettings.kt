@@ -45,6 +45,8 @@ data class AppSettings(
     val tabSize: Int = 4,
     /** What a line longer than the editor does. */
     val softWrap: SoftWrapMode = SoftWrapMode.None,
+    /** Zed's `git.inline_blame.enabled`, whose default is on. */
+    val inlineBlame: Boolean = true,
     /** How gitignored entries appear in the project tree. */
     val gitignoredFiles: GitignoredFiles = GitignoredFiles.Dimmed,
 ) {
@@ -54,6 +56,7 @@ data class AppSettings(
         const val KEY_FONT_SIZE = "buffer_font_size"
         const val KEY_TAB_SIZE = "tab_size"
         const val KEY_SOFT_WRAP = "soft_wrap"
+        const val KEY_INLINE_BLAME = "git.inline_blame.enabled"
         const val KEY_GITIGNORED = "project_panel.gitignored_files"
 
         fun parse(json: String): AppSettings = runCatching {
@@ -64,6 +67,9 @@ data class AppSettings(
                 bufferFontSize = root.optDouble("buffer_font_size", 14.0).toFloat(),
                 tabSize = root.optInt("tab_size", 4),
                 softWrap = SoftWrapMode.fromKey(root.optString("soft_wrap", "none")),
+                inlineBlame = root.optJSONObject("git")
+                    ?.optJSONObject("inline_blame")
+                    ?.optBoolean("enabled", true) ?: true,
                 gitignoredFiles = GitignoredFiles.fromKey(
                     panel?.optString("gitignored_files", "dimmed") ?: "dimmed"
                 ),

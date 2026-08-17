@@ -59,6 +59,28 @@ pub enum SoftWrap {
     EditorWidth,
 }
 
+/// Zed's `git.inline_blame`. An object with one field rather than a bare
+/// bool, because that is the shape Zed's settings file has and someone
+/// pasting a line out of their Zed config should find it works.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InlineBlameSettings {
+    pub enabled: bool,
+}
+
+impl Default for InlineBlameSettings {
+    fn default() -> Self {
+        // Zed's own default (assets/settings/default.json).
+        Self { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct GitSettings {
+    pub inline_blame: InlineBlameSettings,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ProjectPanelSettings {
@@ -77,6 +99,7 @@ pub struct Settings {
     pub tab_size: u32,
     /// What a line longer than the pane does.
     pub soft_wrap: SoftWrap,
+    pub git: GitSettings,
     pub project_panel: ProjectPanelSettings,
 }
 
@@ -87,6 +110,7 @@ impl Default for Settings {
             buffer_font_size: 14.0,
             tab_size: 4,
             soft_wrap: SoftWrap::default(),
+            git: GitSettings::default(),
             project_panel: ProjectPanelSettings::default(),
         }
     }
@@ -124,6 +148,14 @@ const DEFAULT_FILE: &str = r#"// Conquest Code settings.
   // What a line longer than the editor does: "none" scrolls it off the
   // right edge, "editor_width" wraps it.
   "soft_wrap": "none",
+
+  "git": {
+    // Who last touched the line the caret is on, shown after the end of it.
+    // Only while the file has no unsaved edits — blame describes the file on
+    // disk, and once it is edited the line numbers describe a file that is
+    // not there any more.
+    "inline_blame": { "enabled": true }
+  },
 
   "project_panel": {
     // Gitignored files in the tree: "show", "dimmed" or "hide".

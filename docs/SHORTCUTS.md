@@ -80,6 +80,20 @@ exists only in the `full` edition — cloning runs the git inside the Linux
 userland, so the edition with no userland leaves the command and its menu entry
 out entirely rather than showing them greyed — see [USERLAND.md](USERLAND.md).
 
+## Git in the editor
+
+The gutter carries a bar down its left edge for every line that differs from
+the last commit — Zed's own strip, at Zed's own width (floor of 0.275 × the
+line height) and in the colours the project panel already uses: added,
+modified, and a rounded pill on the boundary where lines were deleted.
+
+The end of the caret's line says who last touched it — Zed's `inline_blame`,
+on by default as in Zed, and switchable in **Settings** → *Inline blame*. It
+appears only while the file has **no unsaved edits**: blame describes the file
+on disk, and once it is edited those line numbers describe a file that is not
+there any more. It runs git when the file is opened and after each save, never
+on a keystroke.
+
 ## Wrapping long lines
 
 Off by default, as in Zed. **Settings** → *Wrap long lines*, `☰` → **Wrap long

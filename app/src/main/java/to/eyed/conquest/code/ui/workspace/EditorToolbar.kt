@@ -25,6 +25,15 @@ import to.eyed.conquest.code.ui.preview.PreviewKind
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
 /**
+ * Tall enough for the touch target inside it. Zed's toolbar is shorter — its
+ * buttons are 26px, drawn for a mouse — but a control a finger cannot hit is
+ * not a control, and this project's floor is 40dp.
+ */
+private val ToolbarHeight = 40.dp
+private val TouchTarget = 40.dp
+private val IconSize = 16.dp
+
+/**
  * The row under the tab strip: Zed's toolbar, and specifically the quick
  * action bar at the right of it.
  *
@@ -32,16 +41,10 @@ import to.eyed.conquest.code.ui.theme.LocalZedTheme
  * exactly the button Zed's `quick_action_bar/preview.rs` renders and for
  * exactly the same two file kinds. Breadcrumbs are the other half of Zed's
  * toolbar and are not written yet, which is why this row appears *only* when
- * there is something in it: an empty 32dp band above every file would be a
- * strip of chrome that does nothing, on a device where vertical space is the
- * scarcest thing there is.
+ * there is something in it: an empty band above every file would be a strip of
+ * chrome that does nothing, on a device where vertical space is the scarcest
+ * thing there is.
  */
-private val ToolbarHeight = 34.dp
-
-/** Zed draws a 26px button; a finger needs more than that around it. */
-private val TouchTarget = 32.dp
-private val IconSize = 16.dp
-
 @Composable
 fun EditorToolbar(
     kind: PreviewKind,

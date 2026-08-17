@@ -40,6 +40,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
@@ -85,6 +86,12 @@ import kotlin.math.min
 import kotlinx.coroutines.delay
 import to.eyed.conquest.code.ui.theme.LocalAppSettings
 import to.eyed.conquest.code.ui.theme.BufferFontFamily
+import to.eyed.conquest.code.core.GitHunk
+import to.eyed.conquest.code.core.GitHunkKind
+import to.eyed.conquest.code.ui.git.blameText
+import to.eyed.conquest.code.ui.git.rememberGitAnnotations
+import to.eyed.conquest.code.ui.workspace.GitStatusColours
+import kotlin.math.floor
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import to.eyed.conquest.code.ui.theme.ZedTheme
 
@@ -147,6 +154,12 @@ fun EditorPane(
      * has no setting to pass gets Zed's behaviour rather than ours.
      */
     softWrap: SoftWrapMode = SoftWrapMode.None,
+    /**
+     * Whether to show who last touched the caret's line — Zed's
+     * `git.inline_blame`, whose default is on. Off here by default so the
+     * host tests and any caller with no setting get a pane that runs no git.
+     */
+    showInlineBlame: Boolean = false,
 ) {
     val theme = LocalZedTheme.current
     val settings = LocalAppSettings.current
@@ -178,6 +191,13 @@ fun EditorPane(
             textPadding = 8.dp.toPx(),
             cursorWidth = 2.dp.toPx(),
         )
+    }
+    // git, for the gutter and the end of the caret's line. Cheap when there is
+    // no repository: the engine answers with no hunks and blame is not asked
+    // for at all unless it is switched on.
+    val git = rememberGitAnnotations(state, showInlineBlame)
+    val gitColours = remember(theme) {
+        GitStatusColours.from(theme, theme.color("editor.foreground"))
     }
     val handleRadiusPx = with(density) { 6.dp.toPx() }
     val handleTouchRadiusPx = with(density) { 24.dp.toPx() }
@@ -634,6 +654,40 @@ fun EditorPane(
                 topLeft = Offset.Zero,
                 size = Size(gutterWidth, size.height),
             )
+            // git's own strip down the left of the gutter — Zed's, at Zed's
+            // width: floor(0.275 × line height) (element.rs:5322-5327), with
+            // the colours the project panel already uses for the same states.
+            if (git.hunks.isNotEmpty()) {
+                val strip = floor(0.275f * lineHeight)
+                for (i in 0 until window.size) {
+                    val hunk = hunkAt(git.hunks, window.bufferRow(i)) ?: continue
+                    if (hunk.kind == GitHunkKind.Deleted) continue
+                    drawRect(
+                        color = when (hunk.kind) {
+                            GitHunkKind.Added -> gitColours.added
+                            else -> gitColours.modified
+                        },
+                        topLeft = Offset(0f, topOf(i)),
+                        size = Size(strip, lineHeight),
+                    )
+                }
+                // A deletion occupies no rows, so Zed draws it as a rounded
+                // pill straddling the boundary above the row that replaced it
+                // (element.rs:5265-5275) — wider than the strip, and centred
+                // on the line between two rows rather than on a row.
+                val pill = floor(0.35f * lineHeight)
+                for (hunk in git.hunks) {
+                    if (hunk.kind != GitHunkKind.Deleted) continue
+                    val at = firstSegmentOf(window, hunk.startRow) ?: continue
+                    drawRoundRect(
+                        color = gitColours.deleted,
+                        topLeft = Offset(0f, topOf(at) - lineHeight / 2f),
+                        size = Size(pill * 2f, lineHeight),
+                        cornerRadius = CornerRadius(lineHeight),
+                    )
+                }
+            }
+
             // No divider between gutter and text: Zed draws none
             // (crates/editor/src/element.rs:4905), and the line we drew read
             // as a pane border where there is no pane.
@@ -653,6 +707,35 @@ fun EditorPane(
                         topOf(i) + (lineHeight - layout.size.height) / 2f,
                     ),
                 )
+            }
+
+            // Who last touched the caret's line, after the end of it — Zed's
+            // inline blame (git_ui/src/blame_ui.rs:280-300). Only on the
+            // caret's own line, only when the buffer is clean, and never
+            // covering text: it starts a couple of characters past the end of
+            // the line, and it is the first thing the clip drops when the
+            // pane is too narrow for it.
+            if (showInlineBlame) {
+                git.blameAt(state.cursorRow)?.let { line ->
+                    val at = firstSegmentOf(window, state.cursorRow)
+                    if (at != null) {
+                        val text = blameText(line, System.currentTimeMillis() / 1000L)
+                        val layout = layoutCache.layoutFor(text)
+                        val lineEnd = layoutCache
+                            .layoutFor(lineAt(state.cursorRow))
+                            .size.width.toFloat()
+                        clipRect(left = gutterWidth) {
+                            drawText(
+                                textLayoutResult = layout,
+                                color = theme.color("hint", theme.color("text.muted")),
+                                topLeft = Offset(
+                                    textLeft + lineEnd + state.charWidthPx * 3f,
+                                    topOf(at) + (lineHeight - layout.size.height) / 2f,
+                                ),
+                            )
+                        }
+                    }
+                }
             }
 
             // The scrollbar, over everything: Zed's is a 15px track down the
@@ -1064,4 +1147,34 @@ internal class TextLayoutCache(
             }
         }
     }
+}
+
+/**
+ * The hunk covering [row], or null. Binary search: a file under review can
+ * have hundreds of hunks and this is asked once per drawn row, per frame.
+ *
+ * Deletions are skipped — they cover no rows at all ([GitHunk.endRow] equals
+ * [GitHunk.startRow]) and are drawn on the boundary instead.
+ */
+internal fun hunkAt(hunks: List<GitHunk>, row: Int): GitHunk? {
+    var low = 0
+    var high = hunks.size - 1
+    while (low <= high) {
+        val mid = (low + high) / 2
+        val hunk = hunks[mid]
+        when {
+            row < hunk.startRow -> high = mid - 1
+            row >= hunk.endRow -> low = mid + 1
+            else -> return hunk
+        }
+    }
+    return null
+}
+
+/** Where [row] starts on screen, or null when it is not on screen. */
+private fun firstSegmentOf(window: DisplayWindow, row: Int): Int? {
+    for (i in 0 until window.size) {
+        if (window.bufferRow(i) == row && window.isFirstSegment(i)) return i
+    }
+    return null
 }

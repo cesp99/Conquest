@@ -42,6 +42,19 @@ class OpenFile(
 
     val name: String = path.substringAfterLast('/')
 
+    /**
+     * A media tab has no buffer, so nothing in the engine is watching its
+     * file. The one thing worth knowing is whether it is still there — the
+     * pane itself watches for the contents changing.
+     */
+    private fun refreshMediaStatus(): Boolean {
+        val disk = absolutePath ?: return false
+        val deleted = !java.io.File(disk).exists()
+        if (deleted == isDeleted) return false
+        isDeleted = deleted
+        return true
+    }
+
     var isDirty by mutableStateOf(false)
         private set
     var hasDiskChange by mutableStateOf(false)
@@ -65,7 +78,7 @@ class OpenFile(
 
     /** Whether anything changed, so callers can skip needless work. */
     fun refreshStatus(): Boolean {
-        val open = session ?: return false
+        val open = session ?: return refreshMediaStatus()
         val dirty = open.isDirty
         val disk = open.hasDiskChange
         val deleted = open.isFileDeleted

@@ -11,7 +11,4 @@
         android:fillType="evenOdd"
         android:strokeColor="#FFFFFFFF"
         android:strokeWidth="0.1" />
-    <path
-        android:pathData="M0.0,0.0 h16.0 v16.0 h-16.0 Z"
-        android:fillColor="#FFFFFFFF" />
 </vector>
