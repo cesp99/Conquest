@@ -75,6 +75,24 @@ enum class WorkspaceCommand(
     NextTab("pane::ActivateNextItem", isAvailable = { it.tabCount > 1 }),
     PreviousTab("pane::ActivatePreviousItem", isAvailable = { it.tabCount > 1 }),
 
+    /** Close every other tab. Pinned ones survive, as in Zed. */
+    CloseOtherTabs("pane::CloseOtherItems", isAvailable = { it.tabCount > 1 }),
+
+    /** Close the tabs to the right of the active one. */
+    CloseTabsToTheRight("pane::CloseItemsToTheRight", isAvailable = { it.tabCount > 1 }),
+
+    /** Close every tab. Pinned ones survive. */
+    CloseAllTabs("pane::CloseAllItems", isAvailable = { it.tabCount > 0 }),
+
+    /** Pin the active tab, or unpin it. Pinned tabs sit left. */
+    TogglePinTab("pane::TogglePinTab", isAvailable = { it.hasActiveFile }),
+
+    /** Reopen the tab closed most recently. */
+    ReopenClosedTab("pane::ReopenClosedItem", isAvailable = { it.hasProject }),
+
+    /** Show the active file in the project panel, and give the panel focus. */
+    RevealInProjectPanel("pane::RevealInProjectPanel", isAvailable = { it.hasActiveFile }),
+
     /** Show or hide the project panel. */
     ToggleProjectPanel("project_panel::Toggle"),
 
@@ -206,6 +224,22 @@ private val BINDINGS: List<Binding> = listOf(
     Binding(
         WorkspaceCommand.PreviousTab,
         Chord(AndroidKeyEvent.KEYCODE_TAB, "Tab", shift = true),
+        InWorkspace,
+    ),
+    // Zed's own `ctrl-shift-t`. The rest of the tab commands (close others,
+    // close to the right, close all, pin) are Zed's `ctrl-k` chords, which
+    // this table cannot express — two-key sequences wait for P7-3's keymap
+    // JSON — so they live in the tab's context menu and the palette rather
+    // than being given bindings a Zed user would have to unlearn.
+    Binding(
+        WorkspaceCommand.ReopenClosedTab,
+        Chord(AndroidKeyEvent.KEYCODE_T, "T", shift = true),
+        InWorkspace,
+    ),
+    // Zed's `ctrl-shift-e`.
+    Binding(
+        WorkspaceCommand.RevealInProjectPanel,
+        Chord(AndroidKeyEvent.KEYCODE_E, "E", shift = true),
         InWorkspace,
     ),
 

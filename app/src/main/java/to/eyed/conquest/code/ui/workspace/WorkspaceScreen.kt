@@ -155,6 +155,9 @@ fun WorkspaceScreen(
     /** The picker opens straight into the clone form for Ctrl+Shift+G. */
     var pickerStartsInClone by remember { mutableStateOf(false) }
     var finderOpen by remember { mutableStateOf(false) }
+    var paletteOpen by remember { mutableStateOf(false) }
+    /** Ctrl+Shift+E asked the panel to show the active file and take the keyboard. */
+    var revealInPanel by remember { mutableStateOf(false) }
     var settingsOpen by remember { mutableStateOf(false) }
     var settingsValid by remember { mutableStateOf(true) }
     var projects by remember { mutableStateOf(emptyList<ProjectSummary>()) }
@@ -182,6 +185,36 @@ fun WorkspaceScreen(
     }
 
     /**
+     * A path the panel deleted. The engine keys buffers by path, so a tab left
+     * open on it would keep a live buffer whose next save recreates the file
+     * the user just deleted.
+     */
+    fun closeTabsUnder(path: String) {
+        for (index in files.tabs.indices.reversed()) {
+            val tab = files.tabs[index]
+            if (tab.path == path || tab.path.startsWith("$path/")) files.close(index)
+        }
+    }
+
+    /**
+     * A path the panel renamed or moved. Same reason: the tab has to be
+     * reopened at the new path, or saving writes back to the old one and the
+     * user ends up with both files.
+     */
+    fun retitleTabs(from: String, to: String) {
+        val open = project ?: return
+        val moved = files.tabs.map { it.path }
+            .filter { it == from || it.startsWith("$from/") }
+        if (moved.isEmpty()) return
+        val wasActive = files.active?.path
+        for (path in moved) files.indexOfPath(path).takeIf { it >= 0 }?.let(files::close)
+        for (path in moved) openFile(open, to + path.removePrefix(from))
+        if (wasActive != null && wasActive !in moved) {
+            files.indexOfPath(wasActive).takeIf { it >= 0 }?.let(files::select)
+        }
+    }
+
+    /**
      * Switch the workspace to another project: close every tab and the old
      * worktree first, so the engine isn't left scanning a project nobody is
      * looking at.
@@ -190,6 +223,7 @@ fun WorkspaceScreen(
         scope.launch {
             while (files.tabs.isNotEmpty()) files.close(files.tabs.lastIndex)
             terminals.closeAll()
+            files.clearClosedHistory()
             dismissedConflicts.value = emptySet()
             project?.close()
             val opened = ProjectSession(path)
@@ -321,7 +355,33 @@ fun WorkspaceScreen(
             WorkspaceCommand.Save -> active?.let { save(it) } ?: return false
             WorkspaceCommand.CloseTab -> {
                 if (files.activeIndex < 0) return false
-                files.close(files.activeIndex)
+                // `requestClose`, never `close`: the unconditional one drops
+                // the buffer and every edit since the last save, and this
+                // command is the most-used route to it.
+                files.requestClose(files.activeIndex)
+            }
+            WorkspaceCommand.CloseOtherTabs -> {
+                if (files.activeIndex < 0) return false
+                files.requestCloseOthers(files.activeIndex)
+            }
+            WorkspaceCommand.CloseTabsToTheRight -> {
+                if (files.activeIndex < 0) return false
+                files.requestCloseToTheRight(files.activeIndex)
+            }
+            WorkspaceCommand.CloseAllTabs -> files.requestCloseAll()
+            WorkspaceCommand.TogglePinTab -> {
+                if (files.activeIndex < 0) return false
+                files.togglePin(files.activeIndex)
+            }
+            WorkspaceCommand.ReopenClosedTab -> {
+                val opened = project ?: return false
+                val path = files.takeReopenPath() ?: return false
+                openFile(opened, path)
+            }
+            WorkspaceCommand.RevealInProjectPanel -> {
+                if (files.active == null) return false
+                if (isWide) panelVisible = true else scope.launch { drawerState.open() }
+                revealInPanel = true
             }
             WorkspaceCommand.NextTab -> files.selectRelative(1)
             WorkspaceCommand.PreviousTab -> files.selectRelative(-1)
@@ -406,6 +466,13 @@ fun WorkspaceScreen(
             .focusable()
             .onPreviewKeyEvent { event ->
                 val focus = if (terminalFocused) Focus.Terminal else Focus.Workspace
+                // The palette is not a WorkspaceCommand: it would have to be
+                // dispatched by the same `runCommand` it opens, and a command
+                // that opens the list of commands is a knot for no gain.
+                if (isCommandPalette(event, focus)) {
+                    paletteOpen = true
+                    return@onPreviewKeyEvent true
+                }
                 tabIndexFor(event, files.tabs.size, focus)?.let { index ->
                     files.select(index)
                     return@onPreviewKeyEvent true
@@ -423,37 +490,46 @@ fun WorkspaceScreen(
                 MenuAction("New project…", null) {
                     refreshProjects(); transferError = null; pickerOpen = true
                 },
-                MenuAction("Open project…", "Ctrl O") {
+                MenuAction("Open project…", shortcutLabel(WorkspaceCommand.OpenProjects)) {
                     runCommand(WorkspaceCommand.OpenProjects)
                 },
                 MenuAction("Import folder…", null) { importLauncher.launch(null) },
             ),
             listOf(
-                MenuAction("Find file…", "Ctrl P", enabled = project != null) {
+                MenuAction("Find file…", shortcutLabel(WorkspaceCommand.FindFile), enabled = project != null) {
                     runCommand(WorkspaceCommand.FindFile)
                 },
-                MenuAction("Save", "Ctrl S", enabled = active != null) {
+                MenuAction("Save", shortcutLabel(WorkspaceCommand.Save), enabled = active != null) {
                     active?.let { save(it) }
                 },
                 MenuAction("Save all", null, enabled = files.tabs.any { it.isDirty }) {
                     for (tab in files.tabs) if (tab.isDirty) save(tab)
                 },
-                MenuAction("Close tab", "Ctrl W", enabled = active != null) {
+                MenuAction("Close tab", shortcutLabel(WorkspaceCommand.CloseTab), enabled = active != null) {
                     runCommand(WorkspaceCommand.CloseTab)
                 },
             ),
             listOf(
-                MenuAction("Toggle project panel", "Ctrl B") {
+                // The palette's own route for anyone without a keyboard —
+                // which on a phone is everyone, and it is the only way to
+                // reach the commands this table cannot give a chord to.
+                MenuAction("Command palette…", CommandPaletteChord.label) {
+                    paletteOpen = true
+                },
+                MenuAction("Reveal in project panel", shortcutLabel(WorkspaceCommand.RevealInProjectPanel), enabled = active != null) {
+                    runCommand(WorkspaceCommand.RevealInProjectPanel)
+                },
+                MenuAction("Toggle project panel", shortcutLabel(WorkspaceCommand.ToggleProjectPanel)) {
                     runCommand(WorkspaceCommand.ToggleProjectPanel)
                 },
-                MenuAction("Toggle terminal", "Ctrl `", enabled = project != null) {
+                MenuAction("Toggle terminal", shortcutLabel(WorkspaceCommand.ToggleTerminal), enabled = project != null) {
                     runCommand(WorkspaceCommand.ToggleTerminal)
                 },
-                MenuAction("New terminal", "Ctrl Shift `", enabled = project != null) {
+                MenuAction("New terminal", shortcutLabel(WorkspaceCommand.NewTerminal), enabled = project != null) {
                     runCommand(WorkspaceCommand.NewTerminal)
                 },
 
-                MenuAction("Settings…", "Ctrl ,") {
+                MenuAction("Settings…", shortcutLabel(WorkspaceCommand.OpenSettings)) {
                     runCommand(WorkspaceCommand.OpenSettings)
                 },
             ) + userlandActions(context) { removeUserlandOpen = true },
@@ -492,6 +568,10 @@ fun WorkspaceScreen(
                                 onOpenFile = onOpenEntry,
                                 openedPath = files.active?.path,
                                 gitignoredFiles = settings.gitignoredFiles,
+                                revealRequest = revealInPanel,
+                                onRevealHandled = { revealInPanel = false },
+                                onEntryRemoved = ::closeTabsUnder,
+                                onEntryMoved = ::retitleTabs,
                             )
                             }
                             DockDivider(vertical = true)
@@ -501,6 +581,7 @@ fun WorkspaceScreen(
                             dismissed = dismissedConflicts,
                             onSave = ::save,
                             onReload = ::reload,
+                            onReopen = { runCommand(WorkspaceCommand.ReopenClosedTab) },
                             modifier = Modifier.weight(1f),
                         )
                     }
@@ -517,6 +598,10 @@ fun WorkspaceScreen(
                                     },
                                     openedPath = files.active?.path,
                                     gitignoredFiles = settings.gitignoredFiles,
+                                    revealRequest = revealInPanel,
+                                    onRevealHandled = { revealInPanel = false },
+                                    onEntryRemoved = ::closeTabsUnder,
+                                    onEntryMoved = ::retitleTabs,
                                 )
                             }
                         }
@@ -526,6 +611,7 @@ fun WorkspaceScreen(
                             dismissed = dismissedConflicts,
                             onSave = ::save,
                             onReload = ::reload,
+                            onReopen = { runCommand(WorkspaceCommand.ReopenClosedTab) },
                         )
                     }
                 }
@@ -608,6 +694,27 @@ fun WorkspaceScreen(
                 openFile(openedProject, match.path)
             },
             onDismiss = { finderOpen = false },
+        )
+    }
+
+    if (paletteOpen) {
+        CommandPalette(
+            workspace = CommandContext(
+                hasProject = project != null,
+                hasActiveFile = files.active != null,
+                tabCount = files.tabs.size,
+                terminalCount = terminals.sessions.size,
+                canClone = GitClone.isSupported,
+            ),
+            onRun = { runCommand(it) },
+            onDismiss = {
+                paletteOpen = false
+                // Compose hands focus nowhere when an overlay leaves, and the
+                // whole keymap goes with it — the same failure the terminal's
+                // Stop-all once caused.
+                rootFocus.requestFocus()
+            },
+            keyboardFocus = if (terminalFocused) Focus.Terminal else Focus.Workspace,
         )
     }
 
@@ -700,13 +807,14 @@ private fun EditorArea(
     dismissed: androidx.compose.runtime.MutableState<Set<String>>,
     onSave: (OpenFile) -> Unit,
     onReload: (OpenFile) -> Unit,
+    onReopen: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val active = files.active
     Column(modifier = modifier.fillMaxSize()) {
         if (files.tabs.isNotEmpty()) {
-            EditorTabs(files, onSave = onSave)
-            HorizontalDivider()
+            EditorTabs(files, onSave = onSave, onReopen = onReopen)
+            DockDivider()
         }
 
         // Only a dirty buffer (or a vanished file) needs the user's decision;
