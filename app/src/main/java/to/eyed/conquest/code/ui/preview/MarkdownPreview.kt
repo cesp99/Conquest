@@ -11,6 +11,7 @@ import androidx.compose.foundation.focusable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -30,6 +31,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
@@ -78,6 +80,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import to.eyed.conquest.code.ui.editor.EditorState
 import to.eyed.conquest.code.ui.editor.HighlightSpan
 import to.eyed.conquest.code.ui.theme.BufferFontFamily
@@ -90,6 +93,19 @@ import to.eyed.conquest.code.ui.theme.ZedTheme
 /** Zed's git panel width, which is what the search dock already uses. */
 private val DockWidth = 400.dp
 private val DockMinWidth = 280.dp
+
+/**
+ * What the editor keeps beside the dock however far the grip is dragged.
+ *
+ * The work area's Row measures its fixed-width panels first and gives the
+ * editor what is left, so a dock with no upper bound can leave the editor
+ * exactly 0dp wide — it does not shrink, it disappears.
+ */
+private val MinEditorWidth = 200.dp
+
+/** [DockWidth], clamped to what is actually on offer. See [MinEditorWidth]. */
+internal fun clampDockWidth(width: Dp, available: Dp): Dp =
+    width.coerceIn(DockMinWidth, (available - MinEditorWidth).coerceAtLeast(DockMinWidth))
 
 /** The dock's grip, the same 6dp the terminal and search docks use. */
 private val HandleWidth = 6.dp
@@ -108,6 +124,11 @@ private val ControlSize = 26.dp
  * milliseconds — nothing on its own, and six of them in a row while somebody
  * types a word. The delay is inside the effect, so each keystroke cancels the
  * previous one before it starts and only the last one lands.
+ *
+ * This is the debounce, not the latency: [VERSION_POLL_MS] is a key of the
+ * same effect and typing moves the engine's version too, so the tick after the
+ * last keystroke restarts the wait once more. What a typist actually sees is
+ * up to this plus that.
  */
 private const val REPARSE_DEBOUNCE_MS = 180L
 
@@ -125,6 +146,58 @@ private const val VERSION_POLL_MS = 250L
 
 /** Files the preview will render. Anything else gets the empty state. */
 private val MARKDOWN_SUFFIXES = listOf(".md", ".markdown", ".mdown", ".mkd")
+
+/**
+ * The most text the preview will take.
+ *
+ * The editor opens a 50 MB file happily because it is line-windowed — *"the
+ * pane never holds the whole buffer, only the lines on screen"* — and this
+ * panel is the first thing in the app that pulls all of one into the Java
+ * heap. Measured on a README-shaped document, a parsed block list costs 18-23×
+ * the source: an [InlineSpan] per styled run, *retained* for as long as the
+ * panel is open, and doubled while a reparse builds the next one beside it.
+ * There is no `android:largeHeap` here, so a 5 MB `.md` is ~115 MB in one
+ * burst — an OutOfMemoryError thrown inside a coroutine, which nothing on this
+ * path catches, which is process death, which loses every unsaved tab.
+ *
+ * A megabyte is ~20 MB retained and ~40 MB across a reparse, which fits beside
+ * tree-sitter's arenas and the terminal in a standard per-app heap. The engine
+ * already refuses a file over 4 MB for project search (`project_search.rs`);
+ * this is the same refusal set lower, because what is measured here is not the
+ * file's size but what holding it parsed costs.
+ */
+internal const val MAX_PREVIEW_CHARS = 1024 * 1024
+
+/** Rows per read while measuring the buffer against [MAX_PREVIEW_CHARS]. */
+private const val READ_CHUNK_ROWS = 2000
+
+/**
+ * The buffer's text, or null when there is more of it than [limit].
+ *
+ * Read a chunk of rows at a time and measured as it goes, because the whole
+ * point is to *not* materialise a file that is going to be refused: reading
+ * the lot and then checking its length is the allocation that kills the
+ * process, and it happens before any cap inside the parser could be consulted.
+ *
+ * [read] is the buffer's own `lines(firstRow, lastRow)` — rows `[first, last)`
+ * joined by newlines, which is why the chunks are rejoined with one.
+ */
+internal fun cappedSource(
+    lineCount: Int,
+    limit: Int = MAX_PREVIEW_CHARS,
+    read: (Int, Int) -> String,
+): String? {
+    val text = StringBuilder()
+    var row = 0
+    while (row < lineCount) {
+        val end = minOf(lineCount, row + READ_CHUNK_ROWS)
+        if (row > 0) text.append('\n')
+        text.append(read(row, end))
+        if (text.length > limit) return null
+        row = end
+    }
+    return text.toString()
+}
 
 /**
  * A rendered view of the open Markdown file — Zed's `markdown_preview`, drawn
@@ -188,8 +261,17 @@ fun MarkdownPreview(
         // JNI call that takes the engine's buffer mutex, and highlighting a
         // fence is a tree-sitter parse behind that same mutex.
         document = withContext(Dispatchers.Default) {
-            PreviewDocument.of(editor.linesOf(0, editor.lineCount))
+            val source = cappedSource(editor.lineCount) { first, last ->
+                editor.linesOf(first, last)
+            }
+            if (source == null) PreviewDocument.TOO_LARGE else PreviewDocument.of(source)
         }
+    }
+
+    // The highlighter's cache is keyed by whole fence texts and lives as long
+    // as the process does; a preview that has been closed has no claim on it.
+    DisposableEffect(Unit) {
+        onDispose { CodeFenceHighlighter.clear() }
     }
 
     /** What a tap on a link means. */
@@ -203,7 +285,7 @@ fun MarkdownPreview(
                 runCatching { uriHandler.openUri(target) }
             // An in-document anchor needs the outline work to land somewhere.
             target.startsWith("#") -> Unit
-            else -> onOpenPath?.invoke(resolveRelativePath(path, target))
+            else -> relativeLinkTarget(path, target)?.let { onOpenPath?.invoke(it) }
         }
     }
 
@@ -214,104 +296,132 @@ fun MarkdownPreview(
         }
     }
 
-    Row(
+    BoxWithConstraints(
         modifier = modifier
-            .then(if (isDock) Modifier.width(dockWidth).fillMaxHeight() else Modifier.fillMaxSize())
+            .then(if (isDock) Modifier.fillMaxHeight() else Modifier.fillMaxSize())
     ) {
-        if (isDock) {
-            ResizeHandle { delta -> dockWidth = (dockWidth - delta).coerceAtLeast(DockMinWidth) }
-        }
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(theme.color("editor.background"))
-                .focusRequester(focus)
-                .focusable()
-                // Focus is taken on a press rather than requested when the
-                // panel appears: opening the preview must not pull the
-                // keyboard out of the editor, since following the buffer while
-                // it is typed in is the whole point. The down is watched in the
-                // initial pass and left unconsumed, so the list still scrolls.
-                .pointerInput(Unit) {
-                    awaitEachGesture {
-                        awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                        focus.requestFocus()
-                    }
-                }
-                // Zed's own markdown keymap: pageup/pagedown, up/down and
-                // ctrl-home/ctrl-end scroll the preview
-                // (assets/keymaps/default-linux.json:1343-1350).
-                .onPreviewKeyEvent { event ->
-                    if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
-                    when {
-                        event.key == Key.Escape && !event.isCtrlPressed -> {
-                            onDismiss()
-                            true
-                        }
-                        event.isCtrlPressed && event.key == Key.MoveHome -> {
-                            scope.launch { listState.animateScrollToItem(0) }
-                            true
-                        }
-                        event.isCtrlPressed && event.key == Key.MoveEnd -> {
-                            scope.launch {
-                                listState.animateScrollToItem(
-                                    (document.blocks.size - 1).coerceAtLeast(0)
-                                )
-                            }
-                            true
-                        }
-                        event.isCtrlPressed -> false
-                        event.key == Key.PageDown -> {
-                            scrollBy(1f)
-                            true
-                        }
-                        event.key == Key.PageUp -> {
-                            scrollBy(-1f)
-                            true
-                        }
-                        event.key == Key.DirectionDown -> {
-                            scrollBy(0.12f)
-                            true
-                        }
-                        event.key == Key.DirectionUp -> {
-                            scrollBy(-0.12f)
-                            true
-                        }
-                        else -> false
-                    }
-                }
-        ) {
-            PreviewHeader(path = path, onDismiss = onDismiss)
-            HorizontalDivider(color = theme.color("border"))
-            if (!isMarkdown) {
-                Box(
-                    modifier = Modifier.fillMaxSize().padding(24.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        text = "Markdown preview shows a .md file. " +
-                            "Open one and it appears here.",
-                        style = style.body,
-                        color = theme.color("text.muted"),
-                        textAlign = TextAlign.Center,
-                    )
-                }
+        // What this panel was offered, which already has the project panel
+        // taken out of it — the Row measures its fixed-width children in order
+        // and leaves the weighted editor whatever is left.
+        val available = if (constraints.hasBoundedWidth) maxWidth else Dp.Infinity
+        Row(
+            modifier = if (isDock) {
+                Modifier.width(clampDockWidth(dockWidth, available)).fillMaxHeight()
             } else {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-                ) {
-                    // No key: the block list is rebuilt wholesale on every
-                    // edit, and a content-derived key would make every item
-                    // "new" and throw the scroll position to the top on each
-                    // keystroke. Index keys keep the reader where they were.
-                    items(document.blocks) { block ->
-                        BlockView(block, document, style, ::follow)
+                Modifier.fillMaxSize()
+            }
+        ) {
+            if (isDock) {
+                ResizeHandle { delta -> dockWidth = clampDockWidth(dockWidth - delta, available) }
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(theme.color("editor.background"))
+                    .focusRequester(focus)
+                    .focusable()
+                    // Focus is taken on a press rather than requested when the
+                    // panel appears: opening the preview must not pull the
+                    // keyboard out of the editor, since following the buffer while
+                    // it is typed in is the whole point. The down is watched in the
+                    // initial pass and left unconsumed, so the list still scrolls.
+                    .pointerInput(Unit) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                            focus.requestFocus()
+                        }
+                    }
+                    // Zed's own markdown keymap: pageup/pagedown, up/down and
+                    // ctrl-home/ctrl-end scroll the preview
+                    // (assets/keymaps/default-linux.json:1343-1350).
+                    .onPreviewKeyEvent { event ->
+                        if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                        when {
+                            event.key == Key.Escape && !event.isCtrlPressed -> {
+                                onDismiss()
+                                true
+                            }
+                            event.isCtrlPressed && event.key == Key.MoveHome -> {
+                                scope.launch { listState.animateScrollToItem(0) }
+                                true
+                            }
+                            event.isCtrlPressed && event.key == Key.MoveEnd -> {
+                                scope.launch {
+                                    listState.animateScrollToItem(
+                                        (document.blocks.size - 1).coerceAtLeast(0)
+                                    )
+                                }
+                                true
+                            }
+                            event.isCtrlPressed -> false
+                            event.key == Key.PageDown -> {
+                                scrollBy(1f)
+                                true
+                            }
+                            event.key == Key.PageUp -> {
+                                scrollBy(-1f)
+                                true
+                            }
+                            event.key == Key.DirectionDown -> {
+                                scrollBy(0.12f)
+                                true
+                            }
+                            event.key == Key.DirectionUp -> {
+                                scrollBy(-0.12f)
+                                true
+                            }
+                            else -> false
+                        }
+                    }
+            ) {
+                PreviewHeader(path = path, onDismiss = onDismiss)
+                HorizontalDivider(color = theme.color("border"))
+                when {
+                    !isMarkdown -> Notice(
+                        "Markdown preview shows a .md file. " +
+                            "Open one and it appears here.",
+                        style,
+                    )
+                    // Refused rather than attempted: see MAX_PREVIEW_CHARS.
+                    // The editor still has the file, which is the point of
+                    // saying so instead of dying.
+                    document.isTooLarge -> Notice(
+                        "This file is too large to preview. " +
+                            "It is still open in the editor.",
+                        style,
+                    )
+                    else -> LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                    ) {
+                        // No key: the block list is rebuilt wholesale on every
+                        // edit, and a content-derived key would make every item
+                        // "new" and throw the scroll position to the top on each
+                        // keystroke. Index keys keep the reader where they were.
+                        items(document.blocks) { block ->
+                            BlockView(block, document, style, ::follow)
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+/** The panel with something to say and nothing to draw. */
+@Composable
+private fun Notice(text: String, style: PreviewStyle) {
+    Box(
+        modifier = Modifier.fillMaxSize().padding(24.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = text,
+            style = style.body,
+            color = style.theme.color("text.muted"),
+            textAlign = TextAlign.Center,
+        )
     }
 }
 
@@ -388,18 +498,31 @@ private fun ResizeHandle(onDrag: (Dp) -> Unit) {
 internal class PreviewDocument private constructor(
     val blocks: List<MarkdownBlock>,
     private val code: Map<Pair<String?, String>, List<List<HighlightSpan>>>,
+    /** True when the file was refused for its size. See [MAX_PREVIEW_CHARS]. */
+    val isTooLarge: Boolean = false,
 ) {
     fun spansFor(block: MarkdownBlock.Code): List<List<HighlightSpan>>? =
         code[block.language to block.code]
 
     companion object {
         val EMPTY = PreviewDocument(emptyList(), emptyMap())
+        val TOO_LARGE = PreviewDocument(emptyList(), emptyMap(), isTooLarge = true)
 
-        /** **Blocking.** Parses [source] and highlights its fences. */
-        fun of(source: String): PreviewDocument {
+        /**
+         * Parses [source] and highlights its fences. **Blocks the thread it is
+         * called on** — every fence is a tree-sitter parse behind the engine's
+         * buffer mutex — so it belongs on a worker.
+         *
+         * Suspending for the sake of the [yield]s: `parseMarkdown` has no
+         * suspension point of its own, so without them cancelling the effect
+         * cancelled nothing and a second parse could run beside the first.
+         */
+        suspend fun of(source: String): PreviewDocument {
+            if (source.length > MAX_PREVIEW_CHARS) return TOO_LARGE
             val blocks = parseMarkdown(source)
             val code = mutableMapOf<Pair<String?, String>, List<List<HighlightSpan>>>()
             for (block in codeBlocksIn(blocks)) {
+                yield()
                 val key = block.language to block.code
                 if (key in code) continue
                 CodeFenceHighlighter.highlight(block.code, block.language)
@@ -658,7 +781,7 @@ private fun TableView(
     onLink: (String) -> Unit,
 ) {
     val border = style.theme.color("border.variant")
-    val columns = maxOf(table.alignments.size, table.header.size)
+    val columns = table.columnCount()
     if (columns == 0) return
     // Equal-weight columns that wrap, rather than Zed's measured widths inside
     // a horizontal scroller: a three-column table in a 280dp dock is otherwise

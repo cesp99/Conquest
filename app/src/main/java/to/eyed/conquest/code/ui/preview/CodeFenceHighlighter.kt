@@ -27,13 +27,7 @@ internal object CodeFenceHighlighter {
     /** Distinct fences remembered. A README has a handful; this is generous. */
     private const val CACHE_LIMIT = 64
 
-    private data class Key(val grammar: String, val code: String)
-
-    private val cache = object : LinkedHashMap<Key, List<List<HighlightSpan>>>(16, 0.75f, true) {
-        override fun removeEldestEntry(
-            eldest: MutableMap.MutableEntry<Key, List<List<HighlightSpan>>>,
-        ): Boolean = size > CACHE_LIMIT
-    }
+    private val cache = FenceCache(CACHE_LIMIT)
 
     /**
      * Per-line spans for [code] as [language], or null when we cannot colour
@@ -43,26 +37,38 @@ internal object CodeFenceHighlighter {
     fun highlight(code: String, language: String?): List<List<HighlightSpan>>? {
         val grammar = grammarFor(language) ?: return null
         if (code.length > MAX_HIGHLIGHTED_BYTES) return null
-        val key = Key(grammar, code)
-        synchronized(cache) { cache[key] }?.let { return it }
+        cache.answerFor(grammar, code)?.let { return it.ifEmpty { null } }
 
         val session = BufferSession(code)
-        val spans = try {
+        // A grammar we do not carry answers `false` and there is nothing to
+        // colour — but that is an *answer*, and remembering it is what stops a
+        // README with a ```zigzag fence creating, parsing and closing an
+        // engine buffer on every single reparse. See FenceCache.
+        var spans: List<List<HighlightSpan>> = emptyList()
+        try {
             // `setLanguage` parses on the calling thread, so the spans below
             // are the real ones rather than the empty set a background reparse
             // would still be on its way to producing.
-            if (!session.setLanguage(grammar)) return null
-            val rows = code.count { it == '\n' } + 1
-            groupSpans(CoreBridge.bufferHighlights(session.id, 0, rows.toLong()), rows)
+            if (session.setLanguage(grammar)) {
+                val rows = code.count { it == '\n' } + 1
+                spans = groupSpans(CoreBridge.bufferHighlights(session.id, 0, rows.toLong()), rows)
+            }
         } finally {
             // The engine holds every buffer until it is told not to; a preview
             // that reparses on every keystroke would leak one per fence per
             // keystroke without this.
             session.close()
         }
-        synchronized(cache) { cache[key] = spans }
-        return spans
+        cache.remember(grammar, code, spans)
+        return spans.ifEmpty { null }
     }
+
+    /**
+     * Forget every fence. Called when the preview leaves the composition: the
+     * entries are keyed by whole fence texts and hold a span object per token,
+     * and a panel that has been closed has no claim on any of it.
+     */
+    fun clear() = cache.clear()
 
     /** Flat [row, start, end, style] groups → one list per row. */
     private fun groupSpans(flat: IntArray?, rows: Int): List<List<HighlightSpan>> {
@@ -78,6 +84,45 @@ internal object CodeFenceHighlighter {
         }
         return grouped
     }
+}
+
+/**
+ * What [CodeFenceHighlighter] remembers, and the only part of it that can be
+ * exercised without an engine.
+ *
+ * Bounded and least-recently-used, because the key is a whole fence text and
+ * the value is a span per token — this is not a cache that may be allowed to
+ * grow. A *refusal* is remembered as an empty list rather than as nothing at
+ * all: "we cannot colour this" costs an engine buffer to find out, and a fence
+ * in a language we do not carry is otherwise re-asked on every reparse.
+ */
+internal class FenceCache(private val limit: Int) {
+
+    private data class Key(val grammar: String, val code: String)
+
+    private val entries = object : LinkedHashMap<Key, List<List<HighlightSpan>>>(16, 0.75f, true) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<Key, List<List<HighlightSpan>>>,
+        ): Boolean = size > limit
+    }
+
+    /**
+     * What is remembered for this fence: its spans, an empty list for one we
+     * already know cannot be coloured, or null when we have not seen it.
+     */
+    fun answerFor(grammar: String, code: String): List<List<HighlightSpan>>? =
+        synchronized(entries) { entries[Key(grammar, code)] }
+
+    fun remember(grammar: String, code: String, spans: List<List<HighlightSpan>>) {
+        synchronized(entries) { entries[Key(grammar, code)] = spans }
+    }
+
+    fun clear() {
+        synchronized(entries) { entries.clear() }
+    }
+
+    val size: Int
+        get() = synchronized(entries) { entries.size }
 }
 
 /**

@@ -57,7 +57,7 @@ editor.
 | `Ctrl` `F` | Find in the open file |
 | `Ctrl` `Shift` `F` | Search every file in the project |
 | `Ctrl` `G` | Go to a line (and column) |
-| `Ctrl` `Shift` `V` | Show/hide the Markdown preview |
+| `Ctrl` `Shift` `M` | Show/hide the Markdown preview |
 | `Ctrl` `Shift` `T` | Reopen the tab you closed last |
 | `Ctrl` `Shift` `E` | Reveal the open file in the project panel |
 | `Ctrl` `Shift` `G` | Clone a git repository into a new project |
@@ -119,7 +119,10 @@ it is BEL and readline's abort.
 
 ## Markdown preview
 
-`Ctrl` `Shift` `V` renders the open `.md` file — Zed's `markdown::OpenPreview`.
+`Ctrl` `Shift` `M` renders the open `.md` file — Zed's `markdown::OpenPreview`,
+which Zed itself puts on `Ctrl` `Shift` `V`. That chord is paste in the editor,
+paste in the project panel and paste in the terminal, and a workspace command
+may not take a clipboard chord from any of them.
 On a wide screen it docks beside the editor and its left edge drags to resize;
 on a phone it takes the work area, the way project search and the terminal do.
 `✕` in its title bar closes it, which is the route for a finger.
@@ -315,9 +318,10 @@ and htop need them. The workspace keeps only these:
 | `Ctrl` `Shift` `G` | Clone a repository (`full` edition) |
 | `Ctrl` `Shift` `P` | Open the command palette |
 
-`Ctrl` `Shift` `V` is paste here and nothing else — the Markdown preview does
-not take it from a shell — and `Ctrl` `G` stays BEL. Both are reachable from
-the `☰` menu, which is the route out of a focused terminal.
+`Ctrl` `Shift` `V` is paste here and nothing else — and everywhere else, which
+is why the Markdown preview is on `Ctrl` `Shift` `M` — and `Ctrl` `G` stays
+BEL. Both are reachable from the `☰` menu, which is the route out of a focused
+terminal.
 
 `Ctrl` `Shift` `P` means the command palette here as everywhere else,
 which is why *find file* is the one command with no shifted twin: from a
@@ -368,7 +372,7 @@ a match hands the screen back to the editor — what you typed is kept, and
 
 The Markdown preview is a touch surface too: `✕` in its title bar closes it —
 the one control it needs a finger to reach, since on a phone it covers the
-editor there is no `Ctrl` `Shift` `V` to press into. Tap a link to follow it,
+editor there is no `Ctrl` `Shift` `M` to press into. Tap a link to follow it,
 drag to scroll, and drag the dock's left edge on a wide screen. Go to line is
 the same: the panel's `↵` confirms and `✕` cancels, both reachable while the
 soft keyboard is up.

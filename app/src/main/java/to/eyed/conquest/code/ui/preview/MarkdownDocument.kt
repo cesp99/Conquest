@@ -93,6 +93,49 @@ private val ALERT_KINDS = setOf("NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"
 /** CommonMark's limit: four spaces of indent is a code block, not a marker. */
 private const val CODE_INDENT = 4
 
+/*
+ * The bounds below all exist for one reason, and it is worth stating once:
+ * this reader's input is a file out of a repository the user has just cloned,
+ * so every loop over it is a loop over something an adversary chose. Nothing
+ * here may recurse as deep as the document says, and nothing here may spend
+ * time quadratic in a length the document picks — a `StackOverflowError` or a
+ * half-minute stall on the parse thread is process death, and process death
+ * takes every unsaved buffer in every tab with it.
+ */
+
+/**
+ * How deep block nesting is followed before the rest is shown as plain text.
+ *
+ * A quote and a list item are both read by recursing on their stripped body,
+ * so nesting depth *is* stack depth: a line of 1500 `>` characters overflows a
+ * worker thread's stack, and `- - - - …` copies its own body once per level on
+ * the way down. Nothing legible nests thirty-two deep.
+ */
+private const val MAX_BLOCK_DEPTH = 32
+
+/** The same, for a link inside emphasis inside strikethrough inside a link. */
+private const val MAX_INLINE_DEPTH = 24
+
+/**
+ * How far a closing delimiter is looked for.
+ *
+ * An opener with no partner otherwise scans to the end of its paragraph and
+ * *then* stays literal, so k of them in a paragraph of n characters cost
+ * O(k·n): 240 KB of `*a ` measured at 23 seconds, and a paragraph of glob
+ * patterns — `*.rs *.toml …`, every one of them an opener and none of them a
+ * closer — at 3.7 seconds for 209 KB. A README's emphasis, code span, link
+ * label and autolink are all far shorter than this window.
+ */
+private const val INLINE_SCAN_WINDOW = 1024
+
+/**
+ * Past this, a run of text is drawn as it stands with no markup read out of
+ * it. [readParagraph] joins every consecutive non-blank line, so a "paragraph"
+ * is as long as the file's longest unbroken run of them — prose does not do
+ * this, and generated output does.
+ */
+private const val MAX_INLINE_CHARS = 32 * 1024
+
 /**
  * Read [source] into blocks.
  *
@@ -102,12 +145,26 @@ private const val CODE_INDENT = 4
  */
 fun parseMarkdown(source: String): List<MarkdownBlock> {
     val lines = source.replace("\r\n", "\n").replace('\r', '\n').split('\n')
-    return parseBlocks(lines, collectLinkDefinitions(lines))
+    return parseBlocks(lines, collectLinkDefinitions(lines), depth = 0)
 }
 
 // ---- Block level ---------------------------------------------------------
 
-private fun parseBlocks(lines: List<String>, links: Map<String, String>): List<MarkdownBlock> {
+private fun parseBlocks(
+    lines: List<String>,
+    links: Map<String, String>,
+    depth: Int,
+): List<MarkdownBlock> {
+    if (depth >= MAX_BLOCK_DEPTH) {
+        // Shown rather than descended into: the text is still all there, it
+        // simply stops being given structure. See MAX_BLOCK_DEPTH.
+        val rest = lines.joinToString("\n").trim()
+        return if (rest.isEmpty()) {
+            emptyList()
+        } else {
+            listOf(MarkdownBlock.Paragraph(listOf(InlineSpan(rest))))
+        }
+    }
     val blocks = mutableListOf<MarkdownBlock>()
     var index = 0
     while (index < lines.size) {
@@ -146,11 +203,11 @@ private fun parseBlocks(lines: List<String>, links: Map<String, String>): List<M
             continue
         }
         if (indent < CODE_INDENT && line.trimStart().startsWith('>')) {
-            index = readQuote(lines, index, links, blocks)
+            index = readQuote(lines, index, links, blocks, depth)
             continue
         }
         if (markerAt(line) != null) {
-            index = readList(lines, index, links, blocks)
+            index = readList(lines, index, links, blocks, depth)
             continue
         }
         if (index + 1 < lines.size && '|' in line && tableAlignments(lines[index + 1]) != null) {
@@ -261,6 +318,7 @@ private fun readQuote(
     start: Int,
     links: Map<String, String>,
     blocks: MutableList<MarkdownBlock>,
+    depth: Int,
 ): Int {
     val body = mutableListOf<String>()
     var index = start
@@ -273,9 +331,13 @@ private fun readQuote(
             continue
         }
         // Lazy continuation: an unprefixed line still belongs to the quote's
-        // open paragraph, which is how most people actually wrap a quote.
+        // open paragraph, which is how most people actually wrap a quote. A
+        // fence opener is not a continuation of anything — a ``` immediately
+        // under a quote is the document's own code block, and swallowing it
+        // draws it inside the quote's accent bar.
         if (line.isNotBlank() && body.lastOrNull()?.isNotBlank() == true &&
-            !isThematicBreak(line) && atxHeadingAt(line) == null && markerAt(line) == null
+            !isThematicBreak(line) && atxHeadingAt(line) == null && markerAt(line) == null &&
+            fenceAt(line) == null
         ) {
             body.add(line)
             index++
@@ -292,7 +354,7 @@ private fun readQuote(
             body.removeAt(0)
         }
     }
-    blocks.add(MarkdownBlock.Quote(kind, parseBlocks(body, links)))
+    blocks.add(MarkdownBlock.Quote(kind, parseBlocks(body, links, depth + 1)))
     return index
 }
 
@@ -354,6 +416,7 @@ private fun readList(
     start: Int,
     links: Map<String, String>,
     blocks: MutableList<MarkdownBlock>,
+    depth: Int,
 ): Int {
     val first = markerAt(lines[start])!!
     val items = mutableListOf<ListItem>()
@@ -409,11 +472,21 @@ private fun readList(
         } else {
             "•"
         }
-        items.add(ListItem(label, checked, parseBlocks(body, links)))
+        items.add(ListItem(label, checked, parseBlocks(body, links, depth + 1)))
     }
     blocks.add(MarkdownBlock.Bullets(first.ordered, tight = !loose, items = items))
     return index
 }
+
+/**
+ * How many columns a table has to draw.
+ *
+ * The rows are consulted, not just the header: a hand-maintained table grows a
+ * column at the bottom first, and a row wider than its header should come out
+ * ragged rather than have its last cells silently dropped.
+ */
+internal fun MarkdownBlock.Table.columnCount(): Int =
+    maxOf(alignments.size, header.size, rows.maxOfOrNull { it.size } ?: 0)
 
 /** The alignments a delimiter row declares, or null if it is not one. */
 internal fun tableAlignments(line: String): List<ColumnAlignment>? {
@@ -593,8 +666,9 @@ private fun collectLinkDefinitions(lines: List<String>): Map<String, String> {
  * which is the same answer the stack would give for the cases that matter.
  */
 internal fun parseInline(text: String, links: Map<String, String>): List<InlineSpan> {
+    if (text.length > MAX_INLINE_CHARS) return listOf(InlineSpan(text))
     val out = mutableListOf<InlineSpan>()
-    scanInline(text, emptySet(), null, links, out)
+    scanInline(text, emptySet(), null, links, out, depth = 0)
     return out
 }
 
@@ -604,7 +678,14 @@ private fun scanInline(
     link: String?,
     links: Map<String, String>,
     out: MutableList<InlineSpan>,
+    depth: Int,
 ) {
+    if (depth >= MAX_INLINE_DEPTH) {
+        // As at block level: the text survives, it just stops being read for
+        // markup. See MAX_INLINE_DEPTH.
+        if (text.isNotEmpty()) out.add(InlineSpan(text, styles, link))
+        return
+    }
     val plain = StringBuilder()
     fun flush() {
         if (plain.isEmpty()) return
@@ -652,7 +733,19 @@ private fun scanInline(
                     index++
                 } else {
                     flush()
-                    out.add(InlineSpan(image.label, styles, image.destination, isImage = true))
+                    // An enclosing link wins over the image's own src. A badge
+                    // is written `[![alt](badge.svg)](the-job)` and it is the
+                    // job a tap means; taking the src regardless sent every
+                    // shields.io badge to its own SVG, and a repo-relative src
+                    // opened a PNG as a text buffer.
+                    out.add(
+                        InlineSpan(
+                            image.label,
+                            styles,
+                            link ?: image.destination.ifEmpty { null },
+                            isImage = true,
+                        )
+                    )
                     index = image.end
                 }
             }
@@ -663,12 +756,19 @@ private fun scanInline(
                     index++
                 } else {
                     flush()
-                    scanInline(found.label, styles, found.destination, links, out)
+                    // Both halves of a link may be empty, and neither is worth
+                    // showing as syntax: `[text]()` is its text, and `[](url)`
+                    // has nowhere to put its label, so the destination stands
+                    // in for it rather than the link vanishing without trace.
+                    val destination = found.destination.ifEmpty { null }
+                    val label = found.label.ifBlank { found.destination }
+                    scanInline(label, styles, destination ?: link, links, out, depth + 1)
                     index = found.end
                 }
             }
             char == '<' -> {
-                val close = text.indexOf('>', index)
+                val close = text.indexOf('>', index).takeIf { it <= index + INLINE_SCAN_WINDOW }
+                    ?: -1
                 val inner = if (close < 0) "" else text.substring(index + 1, close)
                 when {
                     close < 0 -> {
@@ -709,6 +809,7 @@ private fun scanInline(
                         link,
                         links,
                         out,
+                        depth + 1,
                     )
                     index = close + 2
                 }
@@ -726,7 +827,14 @@ private fun scanInline(
                 } else {
                     flush()
                     val style = if (run == 2) InlineStyle.Bold else InlineStyle.Italic
-                    scanInline(text.substring(index + run, close), styles + style, link, links, out)
+                    scanInline(
+                        text.substring(index + run, close),
+                        styles + style,
+                        link,
+                        links,
+                        out,
+                        depth + 1,
+                    )
                     index = close + run
                 }
             }
@@ -763,8 +871,10 @@ private fun readLink(text: String, start: Int, links: Map<String, String>): Foun
         val close = text.matchingParen(index) ?: return null
         val inside = text.substring(index + 1, close).trim()
         // `(url "title")` — the title is not something we draw.
+        // An empty destination is still a link's *shape*, and it is the caller
+        // that decides what to do with one — refusing here printed `[text]()`
+        // back at the reader verbatim, syntax and all.
         val destination = inside.substringBefore(' ').trim('<', '>')
-        if (destination.isEmpty()) return null
         return FoundLink(label, destination, close + 1)
     }
     if (index < text.length && text[index] == '[') {
@@ -803,6 +913,22 @@ internal fun resolveRelativePath(from: String, target: String): String {
     return parts.joinToString("/")
 }
 
+/**
+ * The file a relative link should open, or null when it does not name one.
+ *
+ * `[the docs](docs/)` and `[up](../)` are ordinary in a README and neither is
+ * a file: handing either to `openFile` opens a *directory* as a text buffer.
+ * A link that names nothing openable is better left inert than followed into
+ * something the editor cannot show.
+ */
+internal fun relativeLinkTarget(from: String, target: String): String? {
+    val cleaned = target.substringBefore('#').substringBefore('?')
+    if (cleaned.isEmpty() || cleaned.endsWith('/')) return null
+    val last = cleaned.substringAfterLast('/')
+    if (last == "." || last == "..") return null
+    return resolveRelativePath(from, target).ifEmpty { null }
+}
+
 // ---- Small string helpers -------------------------------------------------
 
 /** Leading whitespace in columns, counting a tab as four. */
@@ -839,10 +965,14 @@ private fun String.countRun(char: Char, from: Int): Int {
     return index - from
 }
 
-/** The next run of exactly [run] [char]s at or after [from]. */
+/**
+ * The next run of exactly [run] [char]s at or after [from], within
+ * [INLINE_SCAN_WINDOW] characters of it.
+ */
 private fun String.indexOfRun(char: Char, run: Int, from: Int): Int {
+    val stop = minOf(length, from + INLINE_SCAN_WINDOW)
     var index = from
-    while (index < length) {
+    while (index < stop) {
         if (this[index] != char) {
             index++
             continue
@@ -854,10 +984,14 @@ private fun String.indexOfRun(char: Char, run: Int, from: Int): Int {
     return -1
 }
 
-/** The next [delimiter] not inside a code span and not escaped. */
+/**
+ * The next [delimiter] not inside a code span and not escaped, within
+ * [INLINE_SCAN_WINDOW] characters of [from].
+ */
 private fun String.indexOfDelimiter(delimiter: String, from: Int): Int {
+    val stop = minOf(length, from + INLINE_SCAN_WINDOW)
     var index = from
-    while (index < length) {
+    while (index < stop) {
         when {
             this[index] == '\\' -> index += 2
             this[index] == '`' -> {
@@ -883,10 +1017,15 @@ private fun String.indexOfDelimiter(delimiter: String, from: Int): Int {
  * asterisk and un-italicises the middle.
  *
  * Code spans are stepped over: a `*` inside backticks closes nothing.
+ *
+ * The search stops after [INLINE_SCAN_WINDOW] characters, which is what keeps
+ * a paragraph full of openers with no partners from costing O(k·n) — see that
+ * constant.
  */
 private fun String.indexOfCloser(length: Int, from: Int, char: Char): Int {
+    val stop = minOf(this.length, from + INLINE_SCAN_WINDOW)
     var index = from
-    while (index < this.length) {
+    while (index < stop) {
         if (this[index] == '\\') {
             index += 2
             continue
@@ -923,10 +1062,12 @@ private fun String.canOpenEmphasis(at: Int, run: Int, char: Char): Boolean {
     return before == null || !before.isLetterOrDigit()
 }
 
+/** Bounded like the delimiter searches above: a link label is not a chapter. */
 private fun String.matchingBracket(open: Int): Int? {
+    val stop = minOf(length, open + INLINE_SCAN_WINDOW)
     var depth = 0
     var index = open
-    while (index < length) {
+    while (index < stop) {
         when {
             this[index] == '\\' -> index++
             this[index] == '[' -> depth++
@@ -941,9 +1082,10 @@ private fun String.matchingBracket(open: Int): Int? {
 }
 
 private fun String.matchingParen(open: Int): Int? {
+    val stop = minOf(length, open + INLINE_SCAN_WINDOW)
     var depth = 0
     var index = open
-    while (index < length) {
+    while (index < stop) {
         when {
             this[index] == '\\' -> index++
             this[index] == '(' -> depth++

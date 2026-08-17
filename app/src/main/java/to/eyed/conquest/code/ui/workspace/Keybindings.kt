@@ -401,18 +401,23 @@ fun isGoToLine(event: KeyEvent, focus: Focus = Focus.Workspace): Boolean {
 }
 
 /**
- * Show or hide the Markdown preview — Zed's `markdown::OpenPreview` on
- * `ctrl-shift-v` (default-linux.json:607). Zed's other binding for it,
- * `ctrl-k v` for the side-by-side form, is a two-key sequence this table
- * cannot express; which side the preview lands on is decided by the width of
- * the screen instead.
+ * Show or hide the Markdown preview.
  *
- * It costs paste its shifted twin *inside the editor* — `handleEditorKey`
- * pastes on `Ctrl+V` with or without Shift — which is the same trade Zed
- * itself makes, and `Ctrl+V` is untouched. In a terminal `Ctrl+Shift+V` is
- * paste and nothing else may have it, so this is workspace-only.
+ * Zed puts this on `ctrl-shift-v` (default-linux.json:607) and this table may
+ * not: the convention above is that editor-local clipboard chords never appear
+ * here, and `Ctrl+Shift+V` is paste twice over. It is the editor's own paste —
+ * `handleEditorKey` pastes on `Ctrl+V` with or without Shift — and it is the
+ * project panel's, which matches `Ctrl+V` without looking at Shift at all, so
+ * a chord here would have silently eaten a file paste and offered no feedback
+ * that it had. Zed's other binding, `ctrl-k v`, is a two-key sequence this
+ * table cannot express yet.
+ *
+ * So `Ctrl+Shift+M`, which nothing in this app or in a shell claims, and which
+ * says Markdown. Which side the preview lands on is decided by the width of
+ * the screen rather than by a second chord. Workspace-only: in a terminal
+ * `Ctrl+Shift+M` is free but the preview needs a file open, not a shell.
  */
-val MarkdownPreviewChord = Chord(AndroidKeyEvent.KEYCODE_V, "V", shift = true)
+val MarkdownPreviewChord = Chord(AndroidKeyEvent.KEYCODE_M, "M", shift = true)
 
 /** True when this event should toggle the Markdown preview. */
 fun isMarkdownPreview(event: KeyEvent, focus: Focus = Focus.Workspace): Boolean {

@@ -308,4 +308,181 @@ class MarkdownDocumentTest {
         assertEquals(emptyList<MarkdownBlock>(), parseMarkdown(""))
         assertEquals(emptyList<MarkdownBlock>(), parseMarkdown("\n\n   \n"))
     }
+
+    // ---- Degenerate input ------------------------------------------------
+    //
+    // A previewed `.md` comes out of a repository the user has just cloned, so
+    // every one of these is a document the parser can be handed. None of them
+    // may take the process down, and none may take a wall-clock age: an
+    // uncaught StackOverflowError or OutOfMemoryError on the parse thread is
+    // process death, and process death loses every unsaved tab in every pane.
+
+    /**
+     * Parses on a 512 KB stack, which is the order of an Android worker
+     * thread's — the host JVM's default is several times larger and hides
+     * exactly the overflow this is looking for.
+     */
+    private fun parseOnSmallStack(source: String): List<MarkdownBlock> {
+        var blocks: List<MarkdownBlock> = emptyList()
+        var failure: Throwable? = null
+        val thread = Thread(
+            null,
+            {
+                try {
+                    blocks = parseMarkdown(source)
+                } catch (error: Throwable) {
+                    failure = error
+                }
+            },
+            "markdown-parse",
+            512L * 1024,
+        )
+        thread.start()
+        thread.join()
+        failure?.let { throw AssertionError("parse died on a 512 KB stack", it) }
+        return blocks
+    }
+
+    private fun quoteDepth(blocks: List<MarkdownBlock>): Int = blocks.maxOfOrNull { block ->
+        when (block) {
+            is MarkdownBlock.Quote -> 1 + quoteDepth(block.blocks)
+            is MarkdownBlock.Bullets -> block.items.maxOfOrNull { quoteDepth(it.blocks) } ?: 0
+            else -> 0
+        }
+    } ?: 0
+
+    @Test
+    fun `nesting past the depth limit is drawn rather than descended into`() {
+        val quotes = parseOnSmallStack(">".repeat(1500) + " deep")
+        assertTrue(quotes.isNotEmpty())
+        val depth = quoteDepth(quotes)
+        assertTrue("quote nesting reached $depth", depth <= 32)
+        // The text is still all there, it has simply stopped being structured.
+        assertTrue(blockText(quotes).contains("deep"))
+    }
+
+    @Test
+    fun `degenerate nesting of every kind survives a worker thread's stack`() {
+        val cases = listOf(
+            ">".repeat(5000) + " deep",
+            "> ".repeat(5000) + "deep",
+            "- ".repeat(2000) + "deep",
+            "*".repeat(3000) + "a",
+            "~~".repeat(2000) + "a",
+            "[".repeat(2000) + "a",
+            "![".repeat(2000) + "a",
+            "<".repeat(2000) + "a",
+            "`".repeat(2000) + "a",
+        )
+        for (case in cases) {
+            assertTrue(
+                "produced nothing for a ${case.length}-character degenerate document",
+                parseOnSmallStack(case).isNotEmpty(),
+            )
+        }
+    }
+
+    /**
+     * The reviewer's measurements, as timeouts. Before the scan window and the
+     * inline-length cap these took 23 s and 3.7 s on a desktop JVM — which is
+     * half a minute on a phone, per keystroke, on the shared background pool.
+     */
+    @Test(timeout = 5_000)
+    fun `a paragraph of unmatched emphasis openers does not go quadratic`() {
+        val paragraph = paragraphs("*a ".repeat(80_000)).single()
+        assertTrue(text(paragraph.content).startsWith("*a *a"))
+    }
+
+    @Test(timeout = 2_000)
+    fun `a paragraph of glob patterns does not go quadratic`() {
+        val globs = (1..20_000).joinToString(" ") { "*.ext$it" }
+        val paragraph = paragraphs(globs).single()
+        assertTrue(text(paragraph.content).startsWith("*.ext1 *.ext2"))
+    }
+
+    /**
+     * Under the inline-length cap, so this is the scan window's bound rather
+     * than the cap's: 8000 strikethrough openers, none of them closed, in a
+     * paragraph small enough that the parser still reads it for markup.
+     */
+    @Test(timeout = 5_000)
+    fun `unmatched openers inside a readable paragraph stay bounded`() {
+        val source = "~~a ".repeat(8_000)
+        assertTrue(paragraphs(source).single().content.isNotEmpty())
+    }
+
+    // ---- Links -----------------------------------------------------------
+
+    @Test
+    fun `an image wrapped in a link keeps the link`() {
+        val badge = paragraphs("[![Build](https://img.shields.io/b.svg)](https://ci.example.com/job)")
+            .single().content.single()
+        assertTrue(badge.isImage)
+        assertEquals("Build", badge.text)
+        assertEquals("https://ci.example.com/job", badge.link)
+
+        val logo = paragraphs("[![Logo](docs/logo.png)](https://example.com)")
+            .single().content.single()
+        assertEquals("https://example.com", logo.link)
+
+        // On its own, the image's own src is still what it points at.
+        val bare = paragraphs("![Logo](docs/logo.png)").single().content.single()
+        assertEquals("docs/logo.png", bare.link)
+    }
+
+    @Test
+    fun `a link with an empty half shows text rather than syntax`() {
+        val empty = paragraphs("[text]()").single().content
+        assertEquals("text", text(empty))
+        assertTrue(empty.none { it.link != null })
+
+        val unlabelled = paragraphs("[](https://x.com)").single().content.single()
+        assertEquals("https://x.com", unlabelled.text)
+        assertEquals("https://x.com", unlabelled.link)
+    }
+
+    @Test
+    fun `a link that names a directory is not offered as a file to open`() {
+        assertNull(relativeLinkTarget("README.md", "docs/"))
+        assertNull(relativeLinkTarget("docs/guide/README.md", "../"))
+        assertNull(relativeLinkTarget("README.md", "."))
+        assertNull(relativeLinkTarget("README.md", ""))
+        assertEquals("docs/USERLAND.md", relativeLinkTarget("README.md", "docs/USERLAND.md"))
+        assertEquals("etc/passwd", relativeLinkTarget("README.md", "../../../etc/passwd"))
+    }
+
+    // ---- Blocks ----------------------------------------------------------
+
+    @Test
+    fun `a fence under a quote is not swallowed by its lazy continuation`() {
+        val blocks = parseMarkdown("> a quote\n```rust\nfn main() {}\n```")
+        val quote = blocks[0] as MarkdownBlock.Quote
+        assertTrue(quote.blocks.none { it is MarkdownBlock.Code })
+        assertEquals("fn main() {}", (blocks[1] as MarkdownBlock.Code).code)
+    }
+
+    @Test
+    fun `a row wider than its header still draws every cell`() {
+        val table = parseMarkdown(
+            """
+            | a | b | c |
+            |---|---|---|
+            | 1 | 2 | 3 | 4 | 5 |
+            """.trimIndent()
+        ).single() as MarkdownBlock.Table
+        assertEquals(5, table.columnCount())
+    }
+
+    /** Every run of text in [blocks], structure ignored. */
+    private fun blockText(blocks: List<MarkdownBlock>): String = blocks.joinToString(" ") { block ->
+        when (block) {
+            is MarkdownBlock.Paragraph -> text(block.content)
+            is MarkdownBlock.Heading -> text(block.content)
+            is MarkdownBlock.Quote -> blockText(block.blocks)
+            is MarkdownBlock.Bullets -> block.items.joinToString(" ") { blockText(it.blocks) }
+            is MarkdownBlock.Code -> block.code
+            is MarkdownBlock.Table -> ""
+            MarkdownBlock.Rule -> ""
+        }
+    }
 }
