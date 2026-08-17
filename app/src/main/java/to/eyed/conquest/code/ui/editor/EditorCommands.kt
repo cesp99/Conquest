@@ -701,10 +701,17 @@ internal fun EditorState.typeCharacter(text: String) {
         }
         // The longest opener whose earlier characters are already typed:
         // `f"` in Python only opens when the `f` is right there.
+        // Against the *start* row's line, not the head's: an opener goes in
+        // front of the selection's start, and for a selection spanning rows
+        // those are different lines. Asking the head's line about the start's
+        // column found no opener whenever the head row was the shorter of the
+        // two — and the selection was then replaced by the typed character
+        // instead of being wrapped in it.
+        val startLine = if (caret.startRow == caret.headRow) lineText else line(caret.startRow)
         val opener = candidates
             .filter { live(it) }
             .map { config.brackets[it] }
-            .filter { opensHere(it, lineText, caret.startCol) }
+            .filter { opensHere(it, startLine, caret.startCol) }
             .maxByOrNull { it.open.length }
         // Deliberately *not* filtered by the scope: `not_in` says where a pair
         // may be opened, and Zed applies it to the opening half alone. A `"`

@@ -175,6 +175,20 @@ class EditorState private constructor(
     var lineCount: Int = buffer.lineCount
         private set
 
+    /**
+     * Bumped whenever this editor changes the buffer. Snapshot state, unlike
+     * the engine's own version counter, which is a plain field on
+     * `BufferSession` and therefore invisible to composition — anything that
+     * has to *react* to an edit (the search bar's highlights, for one) needs
+     * something Compose can see.
+     */
+    var revision: Int by mutableIntStateOf(0)
+        private set
+
+    private fun bumpRevision() {
+        revision++
+    }
+
     // Pixel metrics, set from composition (density-dependent).
     var lineHeightPx = 1f
         private set
@@ -335,6 +349,7 @@ class EditorState private constructor(
     /** Call after anything that may change the buffer contents. */
     fun refreshLineCount() {
         lineCount = buffer.lineCount
+        bumpRevision()
     }
 
     /**

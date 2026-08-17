@@ -290,14 +290,23 @@ class LanguageConfigTest {
 
     // ---- Parsing ---------------------------------------------------------
 
-    /** A language the engine does not carry leaves the editor with no rules. */
+    /**
+     * A language the engine does not carry keeps its brackets and loses
+     * everything a grammar would have had to tell us.
+     *
+     * "No grammar" is the common case rather than the exotic one — `.kt`,
+     * `.java`, `.toml`, `.xml` and plain text all land here — so taking
+     * auto-close away from those files to be principled about it would make
+     * the editor worse at its main job in an IDE for Android.
+     */
     @Test
-    fun anUnknownLanguageGetsTheEmptyConfig() {
+    fun anUnknownLanguageKeepsItsBracketsAndNothingElse() {
         val config = EditorLanguage.parse(null)
         assertEquals(EditorLanguage.None, config)
         assertNull(config.lineComment)
-        assertTrue(config.brackets.isEmpty())
-        assertFalse(config.isPairCharacter("("))
+        assertTrue("a bracket pairs in every language", config.isPairCharacter("("))
+        assertTrue(config.isPairCharacter("\""))
+        assertTrue("nothing to indent by, with no grammar", config.increaseIndentPattern == null)
     }
 
     /** And so does one whose JSON the bridge could not produce. */

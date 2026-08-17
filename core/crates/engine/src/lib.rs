@@ -341,6 +341,19 @@ impl Engine {
         let Some(highlighter) = &mut state.highlight else {
             return Ok(vec![u64::MAX; offsets.len()]);
         };
+        // Never a *full* parse on this path. An incremental one is a
+        // millisecond and buys a correct answer for the character just typed;
+        // a full one is 30 ms on a quarter-megabyte buffer — measured — and
+        // this call holds the buffer lock, so the renderer and the highlight
+        // worker would stall with it. Undo sets `needs_full_parse`, so a quote
+        // typed straight after an undo would have paid it.
+        //
+        // When that is the state, answer "everything is live": autoclose then
+        // behaves as it did before scopes existed, which is a pair inserted
+        // inside a string rather than a dropped frame.
+        if highlighter.needs_full_reparse() {
+            return Ok(vec![u64::MAX; offsets.len()]);
+        }
         highlighter.ensure_parsed(&rope);
         let name = highlighter.name();
         let Some(tree) = highlighter.tree() else {

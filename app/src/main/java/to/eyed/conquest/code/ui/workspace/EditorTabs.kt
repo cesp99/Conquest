@@ -47,12 +47,14 @@ import kotlinx.coroutines.launch
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
 // Zed: `DynamicSpacing::Base32` — 32px at the default 16px rem
-// (crates/ui/src/components/tab.rs:84). A tab is only 32 tall but as wide as
-// its label, so the target it presents to a finger is a strip, not a square.
-private val TabBarHeight = 32.dp
+// (crates/ui/src/components/tab.rs:84). We give the bar 40 instead, and not
+// reluctantly: the strip carries the two smallest targets in the app, the ✕
+// that closes a tab and the dot that saves it, and at 32 neither is reachable
+// with a finger. The tab's *contents* keep Zed's proportions inside it.
+private val TabBarHeight = 40.dp
 
 /** Base32 − 1px: the border, or the selected tab's `pb_px`, eats it (tab.rs:79). */
-private val TabContentHeight = 31.dp
+private val TabContentHeight = 39.dp
 
 /** `px(Base04)` inside the tab, and the gap between its slots (tab.rs:173-174). */
 private val TabContentPadding = 4.dp

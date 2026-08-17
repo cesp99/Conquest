@@ -25,6 +25,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -62,7 +63,10 @@ import to.eyed.conquest.code.terminal.TerminalSessions
 import to.eyed.conquest.code.terminal.Userland
 import to.eyed.conquest.code.terminal.UserlandState
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
+import to.eyed.conquest.code.core.ProjectSearchMatch
 import to.eyed.conquest.code.ui.search.BufferSearchBar
+import to.eyed.conquest.code.ui.search.ProjectSearchPanel
+import to.eyed.conquest.code.ui.search.revealProjectSearchMatch
 import to.eyed.conquest.code.ui.editor.EditorPane
 import to.eyed.conquest.code.ui.editor.EditorState
 import to.eyed.conquest.code.ui.terminal.TerminalDock
@@ -79,6 +83,16 @@ import to.eyed.conquest.code.ui.terminal.TerminalDock
 private val WideLayoutMinWidth = 600.dp
 // Zed's own default (assets/settings/default.json:816).
 private val ProjectPanelWidth = 240.dp
+
+/** What ProjectSearchPanel asks for as a dock — kept in step with it. */
+private val ProjectSearchDockWidth = 360.dp
+
+/**
+ * Under this the editor is not worth showing beside two docks; the search
+ * panel takes the whole work area instead. A phone's own width, which is the
+ * least anyone edits code in.
+ */
+private val MinEditorWidth = 360.dp
 
 /** Terminal dock: initial height, and how small or large a drag may make it. */
 private val TerminalDockHeight = 260.dp
@@ -162,6 +176,16 @@ fun WorkspaceScreen(
     var settingsOpen by remember { mutableStateOf(false) }
     var themeSelectorOpen by remember { mutableStateOf(false) }
     var searchBarOpen by remember { mutableStateOf(false) }
+    /** Ctrl+Shift+F. The token is bumped to pull focus back to its query. */
+    var projectSearchOpen by remember { mutableStateOf(false) }
+    var projectSearchFocus by remember { mutableIntStateOf(0) }
+    /**
+     * Whether the panel is drawn over the whole work area rather than beside
+     * the editor. Decided during layout, where the width is known, and read by
+     * [openMatch] — which has to hand the area back when it is true, and must
+     * not when the editor is right there next to it.
+     */
+    var searchTakesWorkArea by remember { mutableStateOf(false) }
     var settingsValid by remember { mutableStateOf(true) }
     var projects by remember { mutableStateOf(emptyList<ProjectSummary>()) }
     var transferMessage by remember { mutableStateOf<String?>(null) }
@@ -173,17 +197,26 @@ fun WorkspaceScreen(
         }
     }
 
-    fun openFile(project: ProjectSession, path: String) {
+    fun openFile(
+        project: ProjectSession,
+        path: String,
+        /** Runs once the tab exists — how a search hit puts the caret on itself. */
+        onOpened: (suspend (OpenFile) -> Unit)? = null,
+    ) {
         val existing = files.indexOfPath(path)
         if (existing >= 0) {
             files.select(existing)
+            val tab = files.tabs[existing]
+            if (onOpened != null) scope.launch { onOpened(tab) }
             return
         }
         scope.launch {
             val absolutePath = project.absolutePathOf(path) ?: return@launch
             val session = withContext(Dispatchers.IO) { BufferSession.openFile(absolutePath) }
                 ?: return@launch
-            files.open(OpenFile(path, EditorState(session)))
+            val opened = OpenFile(path, EditorState(session))
+            files.open(opened)
+            onOpened?.invoke(opened)
         }
     }
 
@@ -200,20 +233,38 @@ fun WorkspaceScreen(
     }
 
     /**
-     * A path the panel renamed or moved. Same reason: the tab has to be
-     * reopened at the new path, or saving writes back to the old one and the
-     * user ends up with both files.
+     * A path the panel renamed or moved: the tab has to be reopened at the new
+     * path, or saving writes back to the old one and the user ends up with
+     * both files.
+     *
+     * **Unsaved edits travel with the file.** Closing the tab is what makes
+     * the engine let the buffer go, and `close` is the unconditional kind — it
+     * drops whatever was unsaved. Asking here would be too late and asking
+     * before the rename would be asking about a file that still had its old
+     * name, so the edits are written to the *new* path first. Saving instead
+     * would write them back to the old name and recreate the file the user
+     * just renamed away.
      */
     fun retitleTabs(from: String, to: String) {
         val open = project ?: return
-        val moved = files.tabs.map { it.path }
-            .filter { it == from || it.startsWith("$from/") }
+        val moved = files.tabs.filter { it.path == from || it.path.startsWith("$from/") }
         if (moved.isEmpty()) return
         val wasActive = files.active?.path
-        for (path in moved) files.indexOfPath(path).takeIf { it >= 0 }?.let(files::close)
-        for (path in moved) openFile(open, to + path.removePrefix(from))
-        if (wasActive != null && wasActive !in moved) {
-            files.indexOfPath(wasActive).takeIf { it >= 0 }?.let(files::select)
+        val movedPaths = moved.map { it.path }
+        scope.launch {
+            for (tab in moved) {
+                if (!tab.isDirty) continue
+                val destination = open.absolutePathOf(to + tab.path.removePrefix(from))
+                val text = withContext(Dispatchers.IO) { CoreBridge.bufferText(tab.session.id) }
+                if (destination != null && text != null) {
+                    withContext(Dispatchers.IO) { File(destination).writeText(text) }
+                }
+            }
+            for (path in movedPaths) files.indexOfPath(path).takeIf { it >= 0 }?.let(files::close)
+            for (path in movedPaths) openFile(open, to + path.removePrefix(from))
+            if (wasActive != null && wasActive !in movedPaths) {
+                files.indexOfPath(wasActive).takeIf { it >= 0 }?.let(files::select)
+            }
         }
     }
 
@@ -451,6 +502,30 @@ fun WorkspaceScreen(
         return true
     }
 
+    /** A project-search hit: open its file and put the caret on the match. */
+    fun openMatch(path: String, match: ProjectSearchMatch) {
+        val open = project ?: return
+        openFile(open, path) { file -> file.editor.revealProjectSearchMatch(match) }
+        if (searchTakesWorkArea) {
+            // A compact screen gave the panel the whole work area, so opening a
+            // file has to hand it back — and hand the keyboard back with it, or
+            // the keymap dies the way it did when Stop-all closed the dock.
+            projectSearchOpen = false
+            terminalFocused = false
+            rootFocus.requestFocus()
+        }
+    }
+
+    fun openProjectSearch(): Boolean {
+        if (project == null) return false
+        projectSearchOpen = true
+        // The panel takes a compact screen away from a focused terminal, and
+        // nothing else would tell the key table that the terminal is gone.
+        terminalFocused = false
+        projectSearchFocus++
+        return true
+    }
+
     LaunchedEffect(Unit) { rootFocus.requestFocus() }
 
     // The dock can close without anyone here asking it to: the foreground
@@ -481,6 +556,7 @@ fun WorkspaceScreen(
                     paletteOpen = true
                     return@onPreviewKeyEvent true
                 }
+                if (isProjectSearch(event)) return@onPreviewKeyEvent openProjectSearch()
                 tabIndexFor(event, files.tabs.size, focus)?.let { index ->
                     files.select(index)
                     return@onPreviewKeyEvent true
@@ -490,6 +566,7 @@ fun WorkspaceScreen(
             }
     ) {
         isWide = maxWidth >= WideLayoutMinWidth
+        val windowWidth = maxWidth
         // The status bar spans the whole window, below the panel as well as
         // the editor — it reports on the workspace, not on the editor pane.
         val active = files.active
@@ -504,6 +581,9 @@ fun WorkspaceScreen(
                 MenuAction("Import folder…", null) { importLauncher.launch(null) },
             ),
             listOf(
+                MenuAction("Search all files…", ProjectSearchChord.label, enabled = project != null) {
+                    openProjectSearch()
+                },
                 MenuAction("Find file…", shortcutLabel(WorkspaceCommand.FindFile), enabled = project != null) {
                     runCommand(WorkspaceCommand.FindFile)
                 },
@@ -556,9 +636,34 @@ fun WorkspaceScreen(
             DockDivider()
             // Compact screens have no room to split: the dock takes the whole
             // work area, as the settings screen and the drawer already do.
-            val dockIsFullScreen = !isWide && terminals.isOpen
+            // Two things want the whole of a compact work area. Search wins
+            // while it is open — opening it is the more recent and more
+            // deliberate act — and Escape gives the terminal straight back.
+            //
+            // "Compact" for search is not the same line as for the panel: a
+            // 674dp foldable is wide enough for a sidebar *or* a search dock
+            // and not for both, and squeezing the editor between them left it
+            // one character wide. So search takes the whole area unless what
+            // would be left for the editor is still a usable width.
+            val editorWidthWithDock = windowWidth -
+                (if (panelVisible) ProjectPanelWidth else 0.dp) - ProjectSearchDockWidth
+            val searchIsFullScreen = projectSearchOpen && project != null &&
+                (!isWide || editorWidthWithDock < MinEditorWidth)
+            searchTakesWorkArea = searchIsFullScreen
+            val dockIsFullScreen = !isWide && terminals.isOpen && !searchIsFullScreen
             Box(modifier = Modifier.weight(1f)) {
-                if (dockIsFullScreen) {
+                if (searchIsFullScreen) {
+                    ProjectSearchPanel(
+                        project = project!!,
+                        isDock = false,
+                        focusToken = projectSearchFocus,
+                        onOpenMatch = ::openMatch,
+                        onDismiss = {
+                            projectSearchOpen = false
+                            rootFocus.requestFocus()
+                        },
+                    )
+                } else if (dockIsFullScreen) {
                     TerminalDock(
                         state = terminals,
                         cwd = project?.rootPath,
@@ -600,6 +705,20 @@ fun WorkspaceScreen(
                             },
                             modifier = Modifier.weight(1f),
                         )
+                        // The panel draws its own left edge, which is also the
+                        // handle that drags it wider, so no divider here.
+                        if (projectSearchOpen && project != null) {
+                            ProjectSearchPanel(
+                                project = project!!,
+                                isDock = true,
+                                focusToken = projectSearchFocus,
+                                onOpenMatch = ::openMatch,
+                                onDismiss = {
+                                    projectSearchOpen = false
+                                    rootFocus.requestFocus()
+                                },
+                            )
+                        }
                     }
                 } else {
                     ModalNavigationDrawer(
@@ -637,7 +756,7 @@ fun WorkspaceScreen(
                     }
                 }
             }
-            if (terminals.isOpen && !dockIsFullScreen) {
+            if (terminals.isOpen && !dockIsFullScreen && !searchIsFullScreen) {
                 // Drag handle. Wide screens are where a paired mouse lives, so
                 // it gets a resize cursor as well as a touch target.
                 Box(

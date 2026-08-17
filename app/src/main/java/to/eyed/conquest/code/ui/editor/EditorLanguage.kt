@@ -135,17 +135,32 @@ internal data class LanguageConfig(
 internal object EditorLanguage {
 
     /**
-     * What a buffer with no language gets: no comment to toggle, no pair to
-     * close, nothing to indent. Zed's plain text behaves the same way — there
-     * is no grammar to say otherwise, and guessing would be inventing rules
-     * for a file we know nothing about.
+     * What a buffer with no grammar gets.
+     *
+     * No comment token and no indent rule — inventing those for a file we
+     * cannot parse would be guessing — but the **brackets stay**. "No
+     * grammar" is not a rare case here: `engine::language_for_path` answers
+     * `None` for `.kt`, `.java`, `.kts`, `.toml`, `.xml`, `.html` and plain
+     * text, which in an IDE for Android is most of what anyone opens. Taking
+     * auto-close away from them to be principled about it would make the
+     * editor worse at its main job, and a bracket pairs with its partner in
+     * every language anyone writes.
+     *
+     * `autocloseBefore` is Zed's own default set (crates/language/src/
+     * language_registry.rs), which is what its grammar-less buffers use too.
      */
     val None = LanguageConfig(
         name = "",
         lineComments = emptyList(),
         blockComment = null,
-        brackets = emptyList(),
-        autocloseBefore = "",
+        brackets = listOf(
+            BracketPair("(", ")", autoClose = true, surround = true, newline = true, notIn = emptyList()),
+            BracketPair("[", "]", autoClose = true, surround = true, newline = true, notIn = emptyList()),
+            BracketPair("{", "}", autoClose = true, surround = true, newline = true, notIn = emptyList()),
+            BracketPair("\"", "\"", autoClose = true, surround = true, newline = false, notIn = emptyList()),
+            BracketPair("'", "'", autoClose = true, surround = true, newline = false, notIn = emptyList()),
+        ),
+        autocloseBefore = ";:.,=}])>\n\t ",
         hardTabs = false,
         increaseIndentPattern = null,
     )
