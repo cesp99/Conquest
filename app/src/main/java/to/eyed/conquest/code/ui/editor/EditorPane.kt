@@ -202,6 +202,43 @@ fun EditorPane(
                 .editorTextInput(state)
                 .onKeyEvent { event -> handleEditorKey(state, actions, event, onSave) }
                 .focusable()
+                // The scrollbar is a real handle, not a picture: a drag on it
+                // moves the viewport, and a tap on the track jumps there. It is
+                // claimed in the initial pass so a drag that starts on the
+                // track never also places the caret under it.
+                .pointerInput(state) {
+                    awaitEachGesture {
+                        val down = awaitPointerEvent(PointerEventPass.Initial).changes.firstOrNull()
+                            ?: return@awaitEachGesture
+                        val trackWidth = state.charWidthPx.coerceIn(10f, 24f)
+                        if (state.maxScrollY <= 0f) return@awaitEachGesture
+                        if (down.position.x < size.width - trackWidth) return@awaitEachGesture
+                        down.consume()
+
+                        // Where in the thumb the finger landed, so the page
+                        // does not jump under it on the first pixel of movement.
+                        val height = size.height.toFloat()
+                        val visible =
+                            (height / (state.lineCount * state.lineHeightPx)).coerceIn(0f, 1f)
+                        val thumbHeight = (height * visible).coerceAtLeast(trackWidth * 2f)
+                        val travel = (height - thumbHeight).coerceAtLeast(1f)
+                        val thumbTop = (state.scrollY / state.maxScrollY) * travel
+                        val grab = (down.position.y - thumbTop).let {
+                            if (it in 0f..thumbHeight) it else thumbHeight / 2f
+                        }
+                        fun scrollTo(y: Float) {
+                            state.scrollToY(((y - grab) / travel) * state.maxScrollY)
+                        }
+                        scrollTo(down.position.y)
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            val change = event.changes.firstOrNull() ?: break
+                            if (!change.pressed) break
+                            change.consume()
+                            scrollTo(change.position.y)
+                        }
+                    }
+                }
                 // Alt+click drops an extra caret. Claimed in the *initial* pass,
                 // before the tap and long-press detectors below get a look, so
                 // an Alt-held click never also moves the cursor it just added.
@@ -492,6 +529,35 @@ fun EditorPane(
                     ),
                 )
             }
+
+            // The scrollbar, over everything: Zed's is a 15px track down the
+            // right edge (crates/ui/src/components/scrollbar.rs:376) and on a
+            // phone it earns its width twice over, as the only way to cross a
+            // long file without a hundred flings.
+            val maxScroll = state.maxScrollY
+            if (maxScroll > 0f) {
+                val trackWidth = state.charWidthPx.coerceIn(10f, 24f)
+                val trackLeft = size.width - trackWidth
+                drawRect(
+                    color = theme.color("scrollbar.track.background"),
+                    topLeft = Offset(trackLeft, 0f),
+                    size = Size(trackWidth, size.height),
+                )
+                val visible = (size.height / (state.lineCount * lineHeight)).coerceIn(0f, 1f)
+                val thumbHeight = (size.height * visible).coerceAtLeast(trackWidth * 2f)
+                val thumbTop = (state.scrollY / maxScroll) * (size.height - thumbHeight)
+                drawRect(
+                    color = theme.color("scrollbar.thumb.background"),
+                    topLeft = Offset(trackLeft, thumbTop),
+                    size = Size(trackWidth, thumbHeight),
+                )
+                drawRect(
+                    color = theme.color("scrollbar.thumb.border"),
+                    topLeft = Offset(trackLeft, thumbTop),
+                    size = Size(1f, thumbHeight),
+                )
+            }
+
         }
 
         EditorActionRow(

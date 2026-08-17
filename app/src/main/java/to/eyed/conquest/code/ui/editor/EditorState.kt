@@ -189,6 +189,9 @@ class EditorState private constructor(
     private var viewportWidth = 0f
     private var viewportHeight = 0f
 
+    /** The visible height, for anything drawing against the viewport. */
+    internal val viewportHeightPx: Float get() = viewportHeight
+
     /** Widest line width seen so far, for the horizontal scroll extent. */
     private var contentWidthPx = 0f
 
@@ -374,8 +377,17 @@ class EditorState private constructor(
      * Consume a vertical scrollable delta (positive = finger moving down,
      * which scrolls the content up). Returns the consumed amount.
      */
+    /** The largest [scrollY] the content allows. */
+    internal val maxScrollY: Float
+        get() = (lineCount * lineHeightPx - viewportHeight).coerceAtLeast(0f)
+
+    /** Put the viewport at [y], clamped — what dragging the scrollbar does. */
+    internal fun scrollToY(y: Float) {
+        scrollY = y.coerceIn(0f, maxScrollY)
+    }
+
     fun applyScrollDeltaY(delta: Float): Float {
-        val maxY = (lineCount * lineHeightPx - viewportHeight).coerceAtLeast(0f)
+        val maxY = maxScrollY
         val new = (scrollY - delta).coerceIn(0f, maxY)
         val consumed = scrollY - new
         scrollY = new
