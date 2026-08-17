@@ -94,6 +94,19 @@ claiming there are no results.
 
 ## Editor
 
+### Moving around
+
+| Shortcut | Action |
+|---|---|
+| `Home` / `End` | Start of the line — first press stops at the indent — / end of it |
+| `Ctrl` `Home` / `Ctrl` `End` | Start / end of the file |
+| `PageUp` / `PageDown` | A screenful, measured from what is actually on screen |
+| `Ctrl` `←` / `Ctrl` `→` | One word (or one run of punctuation) at a time |
+| `Shift` + any of the above | Select instead of jump |
+
+Every one of them moves all your cursors, not just the first.
+
+
 | Shortcut | Action |
 |---|---|
 | `Ctrl` `Z` | Undo |

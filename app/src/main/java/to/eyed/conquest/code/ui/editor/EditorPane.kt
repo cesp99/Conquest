@@ -807,6 +807,23 @@ private fun handleEditorKey(
                 shift
             }
             Key.Slash -> state.toggleComment()
+            // Ctrl+arrow is word-wise; Ctrl+Home/End is the whole document.
+            Key.DirectionLeft -> {
+                state.moveByWord(forward = false, extend = shift)
+                true
+            }
+            Key.DirectionRight -> {
+                state.moveByWord(forward = true, extend = shift)
+                true
+            }
+            Key.MoveHome -> {
+                state.moveToDocumentStart(extend = shift)
+                true
+            }
+            Key.MoveEnd -> {
+                state.moveToDocumentEnd(extend = shift)
+                true
+            }
             else -> false
         }
     }
@@ -841,6 +858,22 @@ private fun handleEditorKey(
         }
         Key.DirectionDown -> {
             state.moveCursorVertically(1, extend)
+            true
+        }
+        Key.MoveHome -> {
+            state.moveToLineStart(extend)
+            true
+        }
+        Key.MoveEnd -> {
+            state.moveToLineEnd(extend)
+            true
+        }
+        Key.PageUp -> {
+            state.movePage(down = false, extend = extend)
+            true
+        }
+        Key.PageDown -> {
+            state.movePage(down = true, extend = extend)
             true
         }
         else -> {

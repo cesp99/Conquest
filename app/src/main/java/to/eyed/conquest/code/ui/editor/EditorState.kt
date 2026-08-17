@@ -192,6 +192,10 @@ class EditorState private constructor(
     /** The visible height, for anything drawing against the viewport. */
     internal val viewportHeightPx: Float get() = viewportHeight
 
+    /** Rows that fit on screen, which is what a page motion moves by. */
+    internal fun viewportRows(): Int =
+        if (lineHeightPx <= 0f) 1 else (viewportHeight / lineHeightPx).toInt().coerceAtLeast(1)
+
     /** Widest line width seen so far, for the horizontal scroll extent. */
     private var contentWidthPx = 0f
 

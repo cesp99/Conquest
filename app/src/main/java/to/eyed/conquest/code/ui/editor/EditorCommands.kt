@@ -648,3 +648,104 @@ internal fun EditorState.insertNewline() {
     }
     applyCaretEdits(edits)
 }
+
+// ---- Motion the arrow keys cannot express ---------------------------------
+//
+// Zed binds all of these (assets/keymaps/default-linux.json), and without them
+// a paired keyboard — which is how this app is used on DeX and on a foldable
+// with a case — can only walk a file one character at a time. Each is
+// multi-caret aware for the same reason the arrows are: a column of cursors
+// that moves as one is the point of having it.
+
+/** Where a caret lands, given a new row and column. */
+private fun EditorState.moveCarets(extend: Boolean, place: (Caret) -> Pair<Int, Int>) {
+    val primary = primaryCaret()
+    fun moved(caret: Caret): Caret {
+        val (row, col) = place(caret)
+        return if (extend) {
+            // Keep the anchor where it was, or plant one if there was none.
+            val anchorRow = if (caret.isEmpty) caret.headRow else caret.anchorRow
+            val anchorCol = if (caret.isEmpty) caret.headCol else caret.anchorCol
+            Caret(anchorRow, anchorCol, row, col)
+        } else {
+            Caret(row, col)
+        }
+    }
+    setCarets(caretsInOrder().map(::moved), moved(primary))
+}
+
+/**
+ * Home, and Zed's "smart" version of it: the first press goes to the first
+ * character that is not whitespace, the second to column zero. Landing on the
+ * indent is what you want nine times in ten, and the plain column is one more
+ * press away rather than gone.
+ */
+fun EditorState.moveToLineStart(extend: Boolean = false) = moveCarets(extend) { caret ->
+    val text = line(caret.headRow)
+    val firstText = text.indexOfFirst { !it.isWhitespace() }.let { if (it < 0) 0 else it }
+    val col = if (caret.headCol == firstText) 0 else firstText
+    caret.headRow to col
+}
+
+fun EditorState.moveToLineEnd(extend: Boolean = false) = moveCarets(extend) { caret ->
+    caret.headRow to line(caret.headRow).length
+}
+
+fun EditorState.moveToDocumentStart(extend: Boolean = false) = moveCarets(extend) { 0 to 0 }
+
+fun EditorState.moveToDocumentEnd(extend: Boolean = false) = moveCarets(extend) {
+    val last = (lineCount - 1).coerceAtLeast(0)
+    last to line(last).length
+}
+
+/**
+ * A screenful, measured from the viewport rather than a constant: the whole
+ * point of Page Down is that it moves by what you can see, and on a foldable
+ * that is a different number folded and unfolded.
+ */
+fun EditorState.movePage(down: Boolean, extend: Boolean = false) {
+    val rows = (viewportRows() - 1).coerceAtLeast(1)
+    val delta = if (down) rows else -rows
+    moveCarets(extend) { caret ->
+        val row = (caret.headRow + delta).coerceIn(0, (lineCount - 1).coerceAtLeast(0))
+        row to caret.headCol.coerceAtMost(line(row).length)
+    }
+}
+
+/**
+ * Ctrl+arrow: to the far end of the run the caret is in — a word, a run of
+ * punctuation, or a run of spaces — which is the rule every editor uses and
+ * the one that makes the key predictable. Crossing a line boundary lands at
+ * the neighbouring line's near end rather than skipping a whole word of it.
+ */
+fun EditorState.moveByWord(forward: Boolean, extend: Boolean = false) = moveCarets(extend) { caret ->
+    val text = line(caret.headRow)
+    var col = caret.headCol.coerceIn(0, text.length)
+    if (forward) {
+        if (col >= text.length) {
+            val row = (caret.headRow + 1).coerceAtMost((lineCount - 1).coerceAtLeast(0))
+            return@moveCarets if (row == caret.headRow) caret.headRow to col else row to 0
+        }
+        val kind = characterClass(text[col])
+        while (col < text.length && characterClass(text[col]) == kind) col++
+        while (col < text.length && text[col].isWhitespace()) col++
+    } else {
+        if (col <= 0) {
+            val row = (caret.headRow - 1).coerceAtLeast(0)
+            return@moveCarets if (row == caret.headRow) caret.headRow to 0 else row to line(row).length
+        }
+        while (col > 0 && text[col - 1].isWhitespace()) col--
+        if (col > 0) {
+            val kind = characterClass(text[col - 1])
+            while (col > 0 && characterClass(text[col - 1]) == kind) col--
+        }
+    }
+    caret.headRow to col
+}
+
+/** Word / punctuation / whitespace — the three runs a word motion stops at. */
+private fun characterClass(char: Char): Int = when {
+    char.isLetterOrDigit() || char == '_' -> 0
+    char.isWhitespace() -> 1
+    else -> 2
+}
