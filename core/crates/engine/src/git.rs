@@ -26,10 +26,19 @@
 //! all, and the `full` flavour has none until the user installs one. Both must
 //! look like "this repository has no changes", not like an error: every failure
 //! path here logs at debug and yields an empty map.
+//!
+//! **Queries are silent; commands are not.** Everything above is a query, and a
+//! query that fails shows the user nothing. The four operations at the bottom
+//! of this file — stage, unstage, discard, commit — are the opposite: they are
+//! the user's own act, they block until git has finished, and when git refuses
+//! ("Please tell me who you are") the message is what they need to read. That
+//! is why they go through [`run_git`] rather than [`capture`], which reports
+//! only that something went wrong.
 
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -70,12 +79,137 @@ pub enum GitStatus {
     Ignored,
 }
 
+/// One changed path, with both of git's status letters kept.
+///
+/// The rolled-up [`GitStatus`] is what a project-panel row needs; the git panel
+/// needs the letters themselves, because "staged" and "unstaged" are exactly
+/// the distinction they carry and nothing downstream can recover it once the
+/// pair has been reduced to one enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileChange {
+    /// Repository-relative while parsing; project-relative once
+    /// [`parse_porcelain`] has re-based it.
+    pub path: String,
+    /// The index against HEAD.
+    pub x: u8,
+    /// The worktree against the index.
+    pub y: u8,
+}
+
+impl FileChange {
+    fn status(&self) -> GitStatus {
+        classify(self.x, self.y)
+    }
+
+    fn is_conflicted(&self) -> bool {
+        self.status() == GitStatus::Conflicted
+    }
+
+    /// What is staged for the next commit, or `None` when nothing is.
+    ///
+    /// An untracked file has nothing staged even though its `X` is `?`, and a
+    /// conflict is not a staged change either — it is a decision the user has
+    /// not made yet, which is why it gets a section of its own in the panel.
+    fn staged(&self) -> Option<GitStatus> {
+        if self.is_conflicted() || self.x == b'?' || self.x == b'!' || self.x == b' ' {
+            return None;
+        }
+        Some(letter(self.x))
+    }
+
+    /// What is changed in the worktree and not staged.
+    fn unstaged(&self) -> Option<GitStatus> {
+        if self.is_conflicted() {
+            return None;
+        }
+        if self.x == b'?' || self.y == b'?' {
+            return Some(GitStatus::Untracked);
+        }
+        if self.y == b' ' || self.y == b'!' {
+            return None;
+        }
+        Some(letter(self.y))
+    }
+
+    /// Whether the last commit has a version of this path to restore.
+    ///
+    /// `A` is "added to the index", `?` is "git has never seen it": in both
+    /// cases HEAD holds nothing, so discarding cannot mean `git restore` and
+    /// means the trash instead — see [`crate::Engine::git_discard`].
+    fn in_head(&self) -> bool {
+        self.x != b'A' && self.x != b'?'
+    }
+}
+
+/// One porcelain letter to a status. The pair is [`classify`]'s job; this is
+/// for the panel, which shows each side of the pair separately.
+fn letter(code: u8) -> GitStatus {
+    match code {
+        b'A' => GitStatus::Added,
+        b'D' => GitStatus::Deleted,
+        b'R' | b'C' => GitStatus::Renamed,
+        b'?' => GitStatus::Untracked,
+        b'!' => GitStatus::Ignored,
+        b'U' => GitStatus::Conflicted,
+        _ => GitStatus::Modified,
+    }
+}
+
+/// Which branch the repository is on, and how far it has drifted from its
+/// upstream. From the `## ` record `--branch` adds to the porcelain output, so
+/// it costs no second git run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct BranchInfo {
+    /// `None` on a detached HEAD, which has no branch to name.
+    pub name: Option<String>,
+    /// Commits the branch has that its upstream does not, and the reverse.
+    /// Both 0 when there is no upstream to compare against.
+    pub ahead: u32,
+    pub behind: u32,
+    /// The branch exists but has no commits yet — a repository just created.
+    pub unborn: bool,
+}
+
+/// Everything the git panel draws, as one snapshot.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct GitChanges {
+    /// A status run has completed. Until it has, an empty list means "not
+    /// asked yet" rather than "nothing changed", and the panel says so.
+    pub scanned: bool,
+    /// The project is inside a git repository at all.
+    pub has_repo: bool,
+    pub branch: Option<BranchInfo>,
+    pub entries: Vec<ChangedFile>,
+}
+
+/// One row of the git panel.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChangedFile {
+    /// Project-relative, `/`-separated — the same spelling `TreeEntry::path`
+    /// uses, so the panel can open it through the project it already holds.
+    pub path: String,
+    /// What is staged for the next commit; `None` when nothing of this file is.
+    pub staged: Option<GitStatus>,
+    /// What is changed and not staged.
+    pub unstaged: Option<GitStatus>,
+    pub conflicted: bool,
+    /// HEAD has a version of this path — so discarding restores it rather than
+    /// throwing it away. See [`crate::Engine::git_discard`].
+    pub in_head: bool,
+}
+
 /// Cached status for one project.
 #[derive(Default)]
 struct ProjectGit {
     statuses: Arc<BTreeMap<String, GitStatus>>,
-    /// Bumped only when [`ProjectGit::statuses`] actually changed, so a poll
-    /// loop that sees a steady number can skip the JNI read entirely.
+    /// The same run's output, unreduced, for the git panel.
+    changes: Arc<Vec<FileChange>>,
+    branch: Option<BranchInfo>,
+    /// Where the enclosing repository is, once a run has looked. `None` after
+    /// a completed run means the project is not in a repository.
+    repo_root: Option<PathBuf>,
+    /// Bumped when anything above actually changed, so a poll loop that sees a
+    /// steady number can skip the JNI read entirely.
     version: u64,
     /// A run has completed at least once (successfully or not).
     scanned: bool,
@@ -89,6 +223,29 @@ struct ProjectGit {
 #[derive(Default)]
 pub(crate) struct GitStatuses {
     projects: Mutex<HashMap<ProjectId, Arc<Mutex<ProjectGit>>>>,
+}
+
+/// Bumped whenever anything git owns might have moved: a status run that found
+/// a change, and every write below.
+///
+/// It exists for the diff gutter (git_diff.rs), whose base text comes from HEAD
+/// and is therefore stale only when HEAD or the index moves — which is
+/// precisely what this reports.
+///
+/// Process-global rather than a field, because the threads that bump it outlive
+/// any borrow of the engine and because it is deliberately coarse: a bump from
+/// one project costs another project's gutter one redundant `git show`, and
+/// nothing else. A test that builds two engines shares it, with the same
+/// harmless consequence.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn bump_generation() {
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The current value, for the diff gutter's staleness check.
+pub(crate) fn generation() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
 }
 
 impl crate::Engine {
@@ -113,6 +270,33 @@ impl crate::Engine {
         self.refresh_git_status(id);
         self.with_git(id, |git| (*git.statuses).clone())
             .unwrap_or_default()
+    }
+
+    /// The same run's output as the git panel needs it: the branch, and every
+    /// changed file with its staged and unstaged halves kept apart.
+    ///
+    /// Reads the same cache [`Engine::git_status`] does and schedules the same
+    /// refresh, so a panel and a project tree looking at one project share one
+    /// `git status` between them and one counter to poll.
+    pub fn git_changes(&self, id: ProjectId) -> GitChanges {
+        self.refresh_git_status(id);
+        self.with_git(id, |git| GitChanges {
+            scanned: git.scanned,
+            has_repo: git.repo_root.is_some(),
+            branch: git.branch.clone(),
+            entries: git
+                .changes
+                .iter()
+                .map(|change| ChangedFile {
+                    path: change.path.clone(),
+                    staged: change.staged(),
+                    unstaged: change.unstaged(),
+                    conflicted: change.is_conflicted(),
+                    in_head: change.in_head(),
+                })
+                .collect(),
+        })
+        .unwrap_or_default()
     }
 
     /// Start a run if one is warranted and none is in flight.
@@ -195,13 +379,23 @@ fn run_until_settled(
         // Read the version *after* sleeping: everything that happened during
         // the debounce is covered by the run we are about to do.
         let observed = project.lock().unwrap().version;
-        let statuses = status_for(id, userland, root).unwrap_or_default();
+        let outcome = status_for(id, userland, root);
 
         {
             let mut git = cache.lock().unwrap();
-            if *git.statuses != statuses {
-                git.statuses = Arc::new(statuses);
+            // Compared on the unreduced changes rather than the rolled-up map:
+            // staging a file moves its letters without moving its colour, and
+            // a panel watching this counter has to see that.
+            if *git.changes != outcome.changes
+                || git.branch != outcome.branch
+                || git.repo_root != outcome.repo_root
+            {
+                git.statuses = Arc::new(outcome.statuses);
+                git.changes = Arc::new(outcome.changes);
+                git.branch = outcome.branch;
+                git.repo_root = outcome.repo_root;
                 git.version += 1;
+                bump_generation();
             }
             git.scanned = true;
             git.scanned_worktree_version = observed;
@@ -217,32 +411,54 @@ fn run_until_settled(
     cache.lock().unwrap().running = false;
 }
 
-/// One status run, or `None` when there is nothing to run (which is not an
-/// error and is never shown to the user).
-fn status_for(
-    id: ProjectId,
-    userland: &Userland,
-    root: &Path,
-) -> Option<BTreeMap<String, GitStatus>> {
+/// What one status run learned. Every field is "nothing" when git could not be
+/// asked, which is not an error and is never shown to the user — except
+/// [`RunOutcome::repo_root`], which is answered by the host filesystem and is
+/// therefore known even with no guest to run git in.
+#[derive(Default)]
+struct RunOutcome {
+    repo_root: Option<PathBuf>,
+    changes: Vec<FileChange>,
+    branch: Option<BranchInfo>,
+    statuses: BTreeMap<String, GitStatus>,
+}
+
+/// One status run.
+fn status_for(id: ProjectId, userland: &Userland, root: &Path) -> RunOutcome {
     // Cheapest gate first, and it needs no guest at all: a handful of `stat`
     // calls up the host filesystem. A project that isn't in a repository never
     // pays for a proot spawn.
-    let repo_root = repo_root_of(root)?;
-    let prefix = relative_prefix(&repo_root, root)?;
-
+    let Some(repo_root) = repo_root_of(root) else {
+        return RunOutcome::default();
+    };
+    let outcome = RunOutcome {
+        repo_root: Some(repo_root.clone()),
+        ..RunOutcome::default()
+    };
+    let Some(prefix) = relative_prefix(&repo_root, root) else {
+        return outcome;
+    };
     if !userland.is_installed() {
-        return None;
+        return outcome;
     }
 
     let started = Instant::now();
-    let output = capture(userland, &repo_root, root)?;
-    let statuses = parse_porcelain(&output, &prefix);
+    let Some(output) = capture(userland, &repo_root, root) else {
+        return outcome;
+    };
+    let changes = rebase(parse_changes(&output), &prefix);
+    let statuses = roll_up(&statuses_of(&changes));
     log::debug!(
         "project {id}: git status took {:?}, {} paths",
         started.elapsed(),
-        statuses.len()
+        changes.len()
     );
-    Some(statuses)
+    RunOutcome {
+        branch: parse_branch(&output),
+        changes,
+        statuses,
+        ..outcome
+    }
 }
 
 /// `git status` arguments, minus the `-C`.
@@ -255,15 +471,33 @@ fn status_for(
 /// Keeping this query from writing `index.lock` is `--no-optional-locks`,
 /// which is *git's* option and not `git status`'s: passed after the
 /// subcommand, real git exits 129 with "unknown option", every run produces
-/// nothing, and the panel is silently colourless. It lives in [`git_argv`],
-/// before the subcommand, next to the other git-level flags.
+/// nothing, and the panel is silently colourless. It is first in the list
+/// below for that reason, and only the *queries* pass it: a `git add` needs the
+/// index lock it is refusing, and asking for it back is not this flag's job.
 ///
 /// `--ignored` is *not* passed. It would list every file under `target/` and
 /// `node_modules/`, which is the opposite of cheap, and the worktree already
 /// knows what is ignored (`TreeEntry::is_ignored`) from the same `.gitignore`
 /// files.
-fn status_args() -> [&'static str; 4] {
-    ["status", "--porcelain=v1", "-z", "--untracked-files=normal"]
+///
+/// `--branch` costs nothing — one extra `## ` record at the head of the output —
+/// and is the only way to learn the branch and its drift without a second
+/// process spawn, which on this filesystem is the expensive part.
+fn status_args() -> [&'static str; 6] {
+    [
+        // Read-only query: don't refresh the index, don't write index.lock. The
+        // panel polls this, so a lock here would fight the user's own git.
+        // Git-level, so before the subcommand — see the doc above.
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--branch",
+        // Not the default everywhere: `status.showUntrackedFiles` can turn it
+        // off, and a repository configured that way would silently show no new
+        // files at all.
+        "--untracked-files=normal",
+    ]
 }
 
 /// Everything from `git` onwards, in order: the git-level options first, then
@@ -273,7 +507,7 @@ fn status_args() -> [&'static str; 4] {
 /// the very argv the device uses. That is the only thing that catches a
 /// git-level option written after the subcommand: git exits 129 with "unknown
 /// option" while every parser test in this file still passes.
-fn git_argv(project: &Path) -> Vec<OsString> {
+pub(crate) fn git_argv<S: AsRef<OsStr>>(project: &Path, args: &[S]) -> Vec<OsString> {
     let mut argv: Vec<OsString> = vec![OsString::from("git")];
     argv.push(OsString::from("-C"));
     argv.push(project.as_os_str().to_owned());
@@ -281,10 +515,12 @@ fn git_argv(project: &Path) -> Vec<OsString> {
     // ownership" check would have passed anyway. Supported since git 2.35.3;
     // Debian stable is well past that.
     argv.extend(["-c", "safe.directory=*"].map(OsString::from));
-    // Read-only query: don't refresh the index, don't write index.lock. The
-    // panel polls this, so a lock here would fight the user's own git.
-    argv.push(OsString::from("--no-optional-locks"));
-    argv.extend(status_args().map(OsString::from));
+    // A file called `*.rs` is a file, not a glob, and a file called `-f` is not
+    // an option. Every path this module hands git comes from the user's own
+    // worktree, so both are reachable — and pathspec magic would silently touch
+    // the wrong files.
+    argv.push(OsString::from("--literal-pathspecs"));
+    argv.extend(args.iter().map(|arg| arg.as_ref().to_owned()));
     argv
 }
 
@@ -295,17 +531,24 @@ fn git_argv(project: &Path) -> Vec<OsString> {
 /// git's own is the argv, a bind for a repository that lives outside the
 /// projects directory, and these two variables.
 fn capture(userland: &Userland, repo_root: &Path, project: &Path) -> Option<Vec<u8>> {
-    guest::capture(userland, &git_command(repo_root, project), RUN_TIMEOUT)
+    let argv = git_argv(project, &status_args());
+    guest::capture(
+        userland,
+        &git_command("git status", repo_root, argv),
+        RUN_TIMEOUT,
+    )
 }
 
 /// git's half of the guest command: the argv, the bind for a repository that
 /// lives outside the projects directory, and two variables.
-fn git_command(repo_root: &Path, project: &Path) -> GuestCommand {
-    GuestCommand::new("git status", git_argv(project))
+pub(crate) fn git_command(label: &str, repo_root: &Path, argv: Vec<OsString>) -> GuestCommand {
+    GuestCommand::new(label.to_owned(), argv)
         .bind(repo_root)
         // `--no-optional-locks` in its environment form, which git(1) gives as
         // equivalent; unlike the flag it is inherited, so a git that runs
-        // another git still writes no lock.
+        // another git still writes no lock. Set for the writes below as well,
+        // where it costs nothing: what it suppresses is the *optional* locking,
+        // and a `git add` takes the index lock because it must.
         .env("GIT_OPTIONAL_LOCKS", "0")
         // There is nobody on this end to answer a credential prompt, and a git
         // waiting for one would sit there until the deadline killed it.
@@ -317,7 +560,7 @@ fn git_command(repo_root: &Path, project: &Path) -> GuestCommand {
 /// `.git` is a directory in a normal clone and a *file* in a worktree or
 /// submodule, so this only asks whether the name exists. A few `stat` calls,
 /// no subprocess: this is what makes "not a repository" free.
-fn repo_root_of(project: &Path) -> Option<PathBuf> {
+pub(crate) fn repo_root_of(project: &Path) -> Option<PathBuf> {
     let mut dir = Some(project);
     while let Some(candidate) = dir {
         if candidate.join(".git").exists() {
@@ -334,7 +577,7 @@ fn repo_root_of(project: &Path) -> Option<PathBuf> {
 /// Porcelain paths are always relative to the repository root, not to `-C`, so
 /// a project that is a subdirectory of a bigger repository needs this to turn
 /// them back into project-relative paths.
-fn relative_prefix(repo_root: &Path, project: &Path) -> Option<String> {
+pub(crate) fn relative_prefix(repo_root: &Path, project: &Path) -> Option<String> {
     let relative = project.strip_prefix(repo_root).ok()?;
     let relative = relative.to_string_lossy();
     if relative.is_empty() {
@@ -346,26 +589,58 @@ fn relative_prefix(repo_root: &Path, project: &Path) -> Option<String> {
 
 /// Parse `git status --porcelain=v1 -z` output into project-relative paths,
 /// with directories rolled up (see [`roll_up`]).
+///
+/// Only the tests reach for this now: a real run keeps the unreduced changes
+/// too, so [`status_for`] builds both halves from the one parse.
+#[cfg(test)]
 pub(crate) fn parse_porcelain(output: &[u8], strip_prefix: &str) -> BTreeMap<String, GitStatus> {
-    let mut files = parse_records(output);
-    if !strip_prefix.is_empty() {
-        files.retain(|(path, _)| path.starts_with(strip_prefix));
-        for (path, _) in &mut files {
-            *path = path[strip_prefix.len()..].to_owned();
-        }
-    }
-    roll_up(&files)
+    let changes = rebase(parse_changes(output), strip_prefix);
+    roll_up(&statuses_of(&changes))
 }
 
-/// The records themselves: one `(path, status)` per changed file, in git's
-/// order.
+/// Drop everything outside the project and re-base what is left on its root.
+///
+/// Porcelain paths are relative to the *repository* root, so a project that is
+/// a subdirectory of a bigger repository sees paths that mean nothing to it —
+/// and files outside it that are none of its business.
+fn rebase(mut changes: Vec<FileChange>, strip_prefix: &str) -> Vec<FileChange> {
+    if strip_prefix.is_empty() {
+        return changes;
+    }
+    changes.retain(|change| change.path.starts_with(strip_prefix));
+    for change in &mut changes {
+        change.path = change.path[strip_prefix.len()..].to_owned();
+    }
+    changes
+}
+
+fn statuses_of(changes: &[FileChange]) -> Vec<(String, GitStatus)> {
+    changes
+        .iter()
+        .map(|change| (change.path.clone(), change.status()))
+        .collect()
+}
+
+/// The reduced form: one `(path, status)` per changed file, in git's order.
+#[cfg(test)]
+pub(crate) fn parse_records(output: &[u8]) -> Vec<(String, GitStatus)> {
+    statuses_of(&parse_changes(output))
+}
+
+/// The records themselves: one entry per changed file, in git's order, with
+/// both status letters kept.
 ///
 /// Each record is `XY<space><path>`, NUL-terminated. A rename or copy emits
 /// **two** paths — the new one in its own record, the original in the record
 /// immediately after — so the loop is index-based rather than a plain
 /// iterator: it has to consume that second record itself, or the old path
 /// would be read back as a garbled status line.
-pub(crate) fn parse_records(output: &[u8]) -> Vec<(String, GitStatus)> {
+///
+/// `--branch` puts one more record in front of all of them, `## <branch>…`,
+/// which [`parse_branch`] reads and this skips. It has to be skipped
+/// explicitly: `#` and `#` are two characters followed by a space, so the
+/// shape test below would let it through as a change to a file called `main`.
+pub(crate) fn parse_changes(output: &[u8]) -> Vec<FileChange> {
     let records: Vec<&[u8]> = output
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
@@ -376,13 +651,15 @@ pub(crate) fn parse_records(output: &[u8]) -> Vec<(String, GitStatus)> {
     while index < records.len() {
         let record = records[index];
         index += 1;
+        if record.starts_with(BRANCH_HEADER) {
+            continue;
+        }
         // "XY path": two code letters, a space, and at least one path byte.
         if record.len() < 4 || record[2] != b' ' {
             continue;
         }
         let x = record[0];
         let y = record[1];
-        let status = classify(x, y);
 
         // Paths arrive as raw bytes. They are UTF-8 in every case we can
         // create, but a repository cloned from elsewhere can hold anything, and
@@ -400,9 +677,64 @@ pub(crate) fn parse_records(output: &[u8]) -> Vec<(String, GitStatus)> {
             // something that no longer exists.
             index += 1;
         }
-        out.push((path, status));
+        out.push(FileChange { path, x, y });
     }
     out
+}
+
+/// What `--branch` prefixes the output with.
+const BRANCH_HEADER: &[u8] = b"## ";
+
+/// The branch, from that header record.
+///
+/// git writes it in four shapes, and all four are here: `## main`, `##
+/// main...origin/main [ahead 1, behind 2]`, `## No commits yet on main`, and
+/// `## HEAD (no branch)` for a detached head.
+pub(crate) fn parse_branch(output: &[u8]) -> Option<BranchInfo> {
+    let record = output
+        .split(|byte| *byte == 0)
+        .find(|record| record.starts_with(BRANCH_HEADER))?;
+    let text = String::from_utf8_lossy(&record[BRANCH_HEADER.len()..]).into_owned();
+
+    if text.starts_with("HEAD (no branch)") {
+        return Some(BranchInfo::default());
+    }
+    let (text, unborn) = match text.strip_prefix("No commits yet on ") {
+        Some(rest) => (rest, true),
+        None => (text.as_str(), false),
+    };
+
+    // The upstream half and the drift are both optional, and the name is
+    // whatever comes before whichever of them is present.
+    let (name, rest) = match text.split_once("...") {
+        Some((name, rest)) => (name, Some(rest)),
+        None => match text.split_once(" [") {
+            Some((name, rest)) => (name, Some(rest)),
+            None => (text, None),
+        },
+    };
+    let mut info = BranchInfo {
+        name: Some(name.trim().to_owned()).filter(|name| !name.is_empty()),
+        unborn,
+        ..BranchInfo::default()
+    };
+    if let Some(rest) = rest {
+        info.ahead = drift(rest, "ahead ");
+        info.behind = drift(rest, "behind ");
+    }
+    Some(info)
+}
+
+/// `[ahead 1, behind 2]` → the number after `keyword`, or 0.
+fn drift(text: &str, keyword: &str) -> u32 {
+    text.split_once(keyword)
+        .map(|(_, rest)| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(0)
 }
 
 /// One porcelain code pair to one status.
@@ -524,6 +856,386 @@ fn summary(tier: u8, from: GitStatus) -> GitStatus {
         1 => GitStatus::Added,
         _ => from,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Commands. Everything above answers a question; everything below changes the
+// repository, blocks until git says it is done, and hands back git's own words
+// when it refuses.
+// ---------------------------------------------------------------------------
+
+/// A command that takes longer than this has gone wrong. Shorter than the
+/// query's deadline because somebody is waiting on it with a finger on a
+/// button, and a spinner that never ends is worse than an error.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What the shell wrapper prints after the command it ran.
+const EXIT_MARKER: &str = "conquest-exit:";
+
+/// The wrapper itself.
+///
+/// [`guest::capture`] gives back stdout and only on success, which is right for
+/// a query and useless for a command: the whole value of a failed `git commit`
+/// is the sentence on *stderr*, and a non-zero exit is a fact the user has to
+/// be told rather than a reason to hand back `None`. Both are fixed by running
+/// git under `sh`, which merges the two streams and always exits 0 itself,
+/// printing git's real status where it can be read back.
+///
+/// `"$@"` and not an interpolated command line: the arguments arrive as `sh`'s
+/// own positional parameters, so a path with a quote or a space in it is passed
+/// through untouched and there is no quoting to get wrong. A user's file name
+/// must never be able to become shell syntax.
+///
+/// The marker is printed with no newline before it, deliberately. `git show` is
+/// read through this too, and one added newline is one added *line* — a phantom
+/// deleted row at the end of every file the gutter draws.
+const WRAPPER: &str = r#""$@" 2>&1; printf 'conquest-exit:%d' "$?""#;
+
+/// What one command did.
+pub(crate) struct GitRun {
+    /// git's own exit status.
+    pub status: i32,
+    /// stdout and stderr together, in the order git wrote them.
+    pub output: String,
+}
+
+impl GitRun {
+    /// git's complaint, shortened to the one line a panel can show.
+    ///
+    /// Not the first line, which is what it looks like it should be: a commit
+    /// with nothing staged opens with "On branch main" and says what is wrong
+    /// three lines later, and an identity git cannot guess opens with a blank
+    /// line and a paragraph of advice. What is reliable is that git marks the
+    /// sentence with `fatal:` or `error:` when there is one, and that when
+    /// there is not — the commit case — it is the last thing said.
+    pub fn message(&self) -> String {
+        let lines: Vec<&str> = self
+            .output
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        let marked = lines.iter().find_map(|line| {
+            line.strip_prefix("fatal: ")
+                .or_else(|| line.strip_prefix("error: "))
+        });
+        match marked.or_else(|| lines.last().copied()) {
+            Some(line) => line.trim().to_owned(),
+            None => format!("git exited with {}", self.status),
+        }
+    }
+}
+
+/// Run one git command inside the guest and read back everything it said.
+///
+/// `Err` means the *guest* failed — no proot, no `sh`, a deadline — which is
+/// not something git said and not something the user can act on beyond
+/// installing the userland.
+pub(crate) fn run_git(
+    userland: &Userland,
+    repo_root: &Path,
+    label: &str,
+    argv: Vec<OsString>,
+) -> Result<GitRun, String> {
+    let output = guest::capture(
+        userland,
+        &git_command(label, repo_root, wrapped_argv(argv)),
+        COMMAND_TIMEOUT,
+    )
+    .ok_or_else(|| "Could not run git in the Linux userland".to_owned())?;
+    parse_run(&output)
+}
+
+/// git's argv, wrapped in the shell that makes its failure readable.
+fn wrapped_argv(argv: Vec<OsString>) -> Vec<OsString> {
+    let mut wrapped: Vec<OsString> = vec![
+        OsString::from("/bin/sh"),
+        OsString::from("-c"),
+        OsString::from(WRAPPER),
+        // `$0`. Names the wrapper in any diagnostic `sh` itself produces; git
+        // starts at `$1`, which is what `"$@"` expands to.
+        OsString::from("conquest-git"),
+    ];
+    wrapped.extend(argv);
+    wrapped
+}
+
+/// Split the wrapper's output back into what git said and how it exited.
+fn parse_run(output: &[u8]) -> Result<GitRun, String> {
+    let output = String::from_utf8_lossy(output).into_owned();
+    // From the *last* marker: git is free to print the string itself, and a
+    // repository holding a file called `conquest-exit:0` must not be able to
+    // make a failure read as a success.
+    let (before, after) = output
+        .rsplit_once(EXIT_MARKER)
+        .ok_or_else(|| "git produced no result".to_owned())?;
+    Ok(GitRun {
+        status: after.trim().parse().unwrap_or(-1),
+        output: before.to_owned(),
+    })
+}
+
+/// Where a command is going to run: the guest, the project, and the repository
+/// around it. Resolved once per command, and every failure here is a sentence
+/// the panel shows rather than a log line.
+struct Repo {
+    userland: Arc<Userland>,
+    project_root: PathBuf,
+    repo_root: PathBuf,
+}
+
+impl crate::Engine {
+    fn repo_for(&self, id: ProjectId) -> Result<Repo, String> {
+        let project = self
+            .projects
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| "That project is not open".to_owned())?;
+        let project_root = project.lock().unwrap().root.clone();
+        let userland = self
+            .userland()
+            .filter(|userland| userland.is_installed())
+            .ok_or_else(|| "The Linux userland is not installed".to_owned())?;
+        let repo_root =
+            repo_root_of(&project_root).ok_or_else(|| "Not a git repository".to_owned())?;
+        Ok(Repo {
+            userland,
+            project_root,
+            repo_root,
+        })
+    }
+
+    /// Every changed file the last status run saw, project-relative.
+    fn changed_files(&self, id: ProjectId) -> Arc<Vec<FileChange>> {
+        self.with_git(id, |git| git.changes.clone())
+            .unwrap_or_default()
+    }
+
+    /// Force the next poll to ask git again, and tell the diff gutter that
+    /// HEAD or the index has moved.
+    ///
+    /// Without this the panel would sit on the pre-command status until the
+    /// worktree happened to change — and staging a file changes the index, not
+    /// the worktree, so for staging that is *never*.
+    fn git_state_changed(&self, id: ProjectId) {
+        if let Some(cache) = self.git.projects.lock().unwrap().get(&id).cloned() {
+            cache.lock().unwrap().scanned = false;
+        }
+        bump_generation();
+    }
+
+    /// Stage every listed path. Blocking; call it off the main thread.
+    ///
+    /// `add -A` rather than `add`, so that staging a file the user deleted
+    /// stages the deletion. Both are what the panel's checkbox means.
+    pub fn git_stage(&self, id: ProjectId, paths: &[String]) -> Result<(), String> {
+        let repo = self.repo_for(id)?;
+        let paths = checked_paths(paths)?;
+        let mut args: Vec<OsString> = ["add", "-A", "--"].iter().map(OsString::from).collect();
+        args.extend(paths);
+        let run = run_git(
+            &repo.userland,
+            &repo.repo_root,
+            "git add",
+            git_argv(&repo.project_root, &args),
+        )?;
+        self.git_state_changed(id);
+        if run.status == 0 {
+            Ok(())
+        } else {
+            Err(run.message())
+        }
+    }
+
+    /// Take every listed path back out of the index. Blocking.
+    ///
+    /// Two commands, because a repository with no commits yet has no HEAD to
+    /// restore from and `git restore --staged` says so rather than doing the
+    /// obvious thing. `git rm --cached` is what "unstage" means there — the
+    /// file is new, and only the index entry goes — and it is only reached
+    /// when the first command has already failed.
+    pub fn git_unstage(&self, id: ProjectId, paths: &[String]) -> Result<(), String> {
+        let repo = self.repo_for(id)?;
+        let paths = checked_paths(paths)?;
+
+        let mut args: Vec<OsString> = ["restore", "--staged", "--"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        args.extend(paths.clone());
+        let run = run_git(
+            &repo.userland,
+            &repo.repo_root,
+            "git restore --staged",
+            git_argv(&repo.project_root, &args),
+        )?;
+        if run.status == 0 {
+            self.git_state_changed(id);
+            return Ok(());
+        }
+
+        let mut args: Vec<OsString> = ["rm", "--cached", "--quiet", "-r", "--"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        args.extend(paths);
+        let fallback = run_git(
+            &repo.userland,
+            &repo.repo_root,
+            "git rm --cached",
+            git_argv(&repo.project_root, &args),
+        )?;
+        self.git_state_changed(id);
+        if fallback.status == 0 {
+            Ok(())
+        } else {
+            // The first command's complaint, not the fallback's: the fallback
+            // is a guess about an unborn HEAD, and its error is about `git rm`.
+            Err(run.message())
+        }
+    }
+
+    /// Throw away the changes to every listed path. Blocking.
+    ///
+    /// **This is the destructive one**, and it is two different operations
+    /// wearing one name:
+    ///
+    /// * A path HEAD knows is *restored* to what HEAD has, index and worktree
+    ///   together. What is lost is uncommitted, and nothing else.
+    /// * A path HEAD has never seen — untracked, or staged-new — cannot be
+    ///   restored from anywhere, so it goes to the app's trash instead of being
+    ///   unlinked. `git clean` would delete it outright; Zed's own panel trashes
+    ///   untracked files for the same reason (`TrashUntrackedFiles`), and here
+    ///   it is the difference between a mistake and a loss.
+    ///
+    /// The caller is expected to have confirmed with the user first, naming the
+    /// files. Nothing in this function asks.
+    pub fn git_discard(&self, id: ProjectId, paths: &[String]) -> Result<(), String> {
+        let repo = self.repo_for(id)?;
+        let checked = checked_paths(paths)?;
+        let known = self.changed_files(id);
+
+        // A path we have no status for is treated as tracked: `git restore`
+        // will refuse a path HEAD does not have, and refusing is the safe way
+        // to be wrong here — the other way round trashes a file on a guess.
+        let (tracked, new): (Vec<OsString>, Vec<OsString>) =
+            checked.into_iter().partition(|path| {
+                known
+                    .iter()
+                    .find(|change| OsStr::new(&change.path) == path.as_os_str())
+                    .is_none_or(FileChange::in_head)
+            });
+
+        let mut failures = Vec::new();
+        if !tracked.is_empty() {
+            let mut args: Vec<OsString> =
+                ["restore", "--source=HEAD", "--staged", "--worktree", "--"]
+                    .iter()
+                    .map(OsString::from)
+                    .collect();
+            args.extend(tracked);
+            let run = run_git(
+                &repo.userland,
+                &repo.repo_root,
+                "git restore",
+                git_argv(&repo.project_root, &args),
+            )?;
+            if run.status != 0 {
+                failures.push(run.message());
+            }
+        }
+        for path in new {
+            // Joined onto the project root rather than passed to git: this half
+            // never enters the guest, and the trash is the engine's own.
+            let absolute = repo.project_root.join(Path::new(&path));
+            if let Err(err) = trash::delete_with_info(&absolute) {
+                failures.push(format!("{}: {err}", absolute.display()));
+                continue;
+            }
+            // A staged-new file also has an index entry, which trashing the
+            // file does not remove; without this the panel would keep showing
+            // it as staged for a file that is no longer there.
+            let mut args: Vec<OsString> = ["rm", "--cached", "--quiet", "--ignore-unmatch", "--"]
+                .iter()
+                .map(OsString::from)
+                .collect();
+            args.push(path);
+            let _ = run_git(
+                &repo.userland,
+                &repo.repo_root,
+                "git rm --cached",
+                git_argv(&repo.project_root, &args),
+            );
+        }
+
+        self.git_state_changed(id);
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    /// Commit what is staged. Blocking.
+    ///
+    /// An empty message is refused here rather than by git: `git commit
+    /// --allow-empty-message` is not passed, so git would refuse it too, but it
+    /// would do so after a process spawn and with a sentence about editors. A
+    /// message that is only whitespace is empty — git strips it and ends up in
+    /// the same place.
+    pub fn git_commit(&self, id: ProjectId, message: &str) -> Result<(), String> {
+        if message.trim().is_empty() {
+            return Err("Write a commit message first".to_owned());
+        }
+        let repo = self.repo_for(id)?;
+        let args: Vec<OsString> = vec![
+            OsString::from("commit"),
+            OsString::from("--quiet"),
+            OsString::from("-m"),
+            OsString::from(message),
+        ];
+        let run = run_git(
+            &repo.userland,
+            &repo.repo_root,
+            "git commit",
+            git_argv(&repo.project_root, &args),
+        )?;
+        self.git_state_changed(id);
+        if run.status == 0 {
+            Ok(())
+        } else {
+            Err(run.message())
+        }
+    }
+}
+
+/// Turn caller-supplied project-relative paths into arguments, or refuse.
+///
+/// Every path here came across the JNI boundary from a UI holding a list the
+/// engine gave it — but "came from us a moment ago" is not a property this
+/// function can check, and the commands below delete files. So the rules are
+/// the ones that make a path unable to name anything outside the project:
+/// relative, no `..`, no empty component, no NUL. A path that breaks them is an
+/// error rather than a silent skip, because a discard that quietly did nothing
+/// to one of three files is worse than one that did nothing at all.
+fn checked_paths(paths: &[String]) -> Result<Vec<OsString>, String> {
+    if paths.is_empty() {
+        return Err("No files given".to_owned());
+    }
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let bad = path.is_empty()
+            || path.starts_with('/')
+            || path.contains('\0')
+            || path.split('/').any(|part| part.is_empty() || part == "..");
+        if bad {
+            return Err(format!("{path:?} is not a path inside the project"));
+        }
+        out.push(OsString::from(path));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -766,8 +1478,9 @@ mod tests {
     #[test]
     fn the_git_command_binds_the_repository_and_silences_prompts() {
         let command = git_command(
+            "git status",
             Path::new("/elsewhere/repo"),
-            Path::new("/elsewhere/repo/sub"),
+            git_argv(Path::new("/elsewhere/repo/sub"), &status_args()),
         );
         assert_eq!(command.binds(), [PathBuf::from("/elsewhere/repo")]);
         let env: Vec<(String, String)> = command
@@ -789,27 +1502,186 @@ mod tests {
         );
     }
 
+    /// Everything `git_argv` produces, for the query and for one command each
+    /// way it can be shaped. What is pinned is the *order*: git-level options
+    /// before the subcommand, `--` before any path, and paths last.
     #[test]
     fn the_git_argv_is_exactly_this() {
-        let argv: Vec<String> = git_argv(Path::new("/files/projects/thing"))
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+        let project = Path::new("/files/projects/thing");
         assert_eq!(
-            argv,
+            argv_strings(git_argv(project, &status_args())),
             vec![
                 "git",
                 "-C",
                 "/files/projects/thing",
                 "-c",
                 "safe.directory=*",
+                "--literal-pathspecs",
                 "--no-optional-locks",
                 "status",
                 "--porcelain=v1",
                 "-z",
+                "--branch",
                 "--untracked-files=normal",
             ]
         );
+
+        let args: Vec<OsString> = ["add", "-A", "--", "src/main.rs"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(
+            argv_strings(git_argv(project, &args)),
+            vec![
+                "git",
+                "-C",
+                "/files/projects/thing",
+                "-c",
+                "safe.directory=*",
+                "--literal-pathspecs",
+                "add",
+                "-A",
+                "--",
+                "src/main.rs",
+            ]
+        );
+    }
+
+    fn argv_strings(argv: Vec<OsString>) -> Vec<String> {
+        argv.iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The wrapper is the only reason a command's failure is visible at all,
+    /// and every part of it is load-bearing: `sh -c` with the argv as
+    /// positional parameters (so a file name can never become shell syntax),
+    /// `2>&1` (so git's complaint survives), and the marker (so the exit status
+    /// does, through a `capture` that only reports success).
+    #[test]
+    fn a_command_runs_under_a_wrapper_that_reports_what_git_said() {
+        let argv = argv_strings(wrapped_argv(git_argv(Path::new("/repo"), &["add", "-A"])));
+        assert_eq!(argv[0], "/bin/sh");
+        assert_eq!(argv[1], "-c");
+        assert_eq!(argv[2], r#""$@" 2>&1; printf 'conquest-exit:%d' "$?""#);
+        // `$0` is not the program: git starts at `$1`, which is what `"$@"`
+        // expands to.
+        assert_eq!(argv[3], "conquest-git");
+        assert_eq!(argv[4], "git");
+    }
+
+    #[test]
+    fn a_run_is_read_back_from_the_last_marker() {
+        let run = parse_run(b"nothing to commit\nconquest-exit:1").unwrap();
+        assert_eq!(run.status, 1);
+        assert_eq!(run.message(), "nothing to commit");
+
+        let run = parse_run(b"conquest-exit:0").unwrap();
+        assert_eq!(run.status, 0);
+
+        // git printing the marker itself — a file with that name, a commit
+        // message quoting one — must not be able to fake a success.
+        let run = parse_run(b"error: conquest-exit:0 is unmerged\nconquest-exit:1").unwrap();
+        assert_eq!(run.status, 1);
+        assert_eq!(run.message(), "conquest-exit:0 is unmerged");
+
+        // The wrapper never ran, so there is nothing to believe.
+        assert!(parse_run(b"killed").is_err());
+    }
+
+    #[test]
+    fn a_message_is_the_line_git_marked_or_the_last_thing_it_said() {
+        // git's own shape for an identity it cannot guess: a heading, a
+        // paragraph of advice, and the actual reason at the bottom.
+        let run = parse_run(
+            b"Author identity unknown\n\n*** Please tell me who you are.\n\n\
+              Run\n  git config --global user.email \"you@example.com\"\n\
+              fatal: unable to auto-detect email address (got 'root@x.(none)')\n\
+              conquest-exit:128",
+        )
+        .unwrap();
+        assert_eq!(
+            run.message(),
+            "unable to auto-detect email address (got 'root@x.(none)')"
+        );
+
+        // And its shape for a commit with nothing staged, where nothing is
+        // marked at all and the first line is the least useful one there is.
+        let run = parse_run(
+            b"On branch main\nChanges not staged for commit:\n\t\
+              modified:   README\n\nnothing added to commit\nconquest-exit:1",
+        )
+        .unwrap();
+        assert_eq!(run.message(), "nothing added to commit");
+
+        // Nothing said at all: the status is the only thing left to report.
+        let run = parse_run(b"conquest-exit:129").unwrap();
+        assert_eq!(run.message(), "git exited with 129");
+    }
+
+    /// The paths reaching git come from a UI that got them from us — and this
+    /// is the function that does not take that on trust, because what is on the
+    /// other end of it deletes files.
+    #[test]
+    fn a_path_that_could_escape_the_project_is_refused() {
+        assert!(checked_paths(&[]).is_err());
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../outside.rs",
+            "src/../../outside.rs",
+            "src//main.rs",
+            "with\0nul.rs",
+        ] {
+            assert!(
+                checked_paths(&[bad.to_owned()]).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
+        // One bad path refuses the whole list: a discard that silently did
+        // two of three files is worse than one that did none.
+        assert!(checked_paths(&["ok.rs".to_owned(), "../bad.rs".to_owned()]).is_err());
+
+        assert_eq!(
+            checked_paths(&["src/main.rs".to_owned(), "a b/-weird.rs".to_owned()]).unwrap(),
+            vec![
+                OsString::from("src/main.rs"),
+                OsString::from("a b/-weird.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_commit_message_never_reaches_git() {
+        let engine = crate::Engine::new();
+        let dir = tempfile::tempdir().unwrap();
+        let id = engine.open_project(dir.path());
+        // Refused before anything is resolved — there is no userland here, and
+        // the message says nothing about one.
+        assert_eq!(
+            engine.git_commit(id, "   \n\t "),
+            Err("Write a commit message first".to_owned())
+        );
+    }
+
+    #[test]
+    fn commands_without_a_userland_say_so_rather_than_failing_silently() {
+        let engine = crate::Engine::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let id = engine.open_project(dir.path());
+        let paths = vec!["a.rs".to_owned()];
+        for result in [
+            engine.git_stage(id, &paths),
+            engine.git_unstage(id, &paths),
+            engine.git_discard(id, &paths),
+            engine.git_commit(id, "a message"),
+        ] {
+            assert_eq!(
+                result,
+                Err("The Linux userland is not installed".to_owned())
+            );
+        }
     }
 
     #[test]
@@ -975,22 +1847,387 @@ mod tests {
         std::fs::write(repo.join("README"), "Hello World!\nx\n").unwrap();
         std::fs::write(repo.join("new.txt"), "").unwrap();
 
-        let argv = git_argv(repo);
-        let args: Vec<&str> = argv
-            .iter()
-            .skip(1) // the program name; `host_git` supplies it
-            .map(|arg| arg.to_str().expect("argv is UTF-8 in this test"))
-            .collect();
-        let out = host_git(repo, &args);
+        let out = run_argv(repo, git_argv(repo, &status_args()));
         assert!(
             out.status.success(),
-            "git rejected the argv we send on device: {:?}\n{}",
-            args,
+            "git rejected the argv we send on device:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
 
         let statuses = parse_porcelain(&out.stdout, "");
         assert_eq!(statuses.get("README"), Some(&GitStatus::Modified));
         assert_eq!(statuses.get("new.txt"), Some(&GitStatus::Untracked));
+
+        // `--branch` is part of that same argv, and its record has to survive
+        // the parse rather than arriving as a file called `main`.
+        let branch = parse_branch(&out.stdout).expect("the header record is there");
+        assert_eq!(branch.name.as_deref(), Some("main"));
+        assert!(
+            !parse_changes(&out.stdout)
+                .iter()
+                .any(|change| change.path.contains("main"))
+        );
+    }
+
+    /// Run one of ours through the host's git, minus the program name.
+    fn run_argv(dir: &Path, argv: Vec<OsString>) -> std::process::Output {
+        let args: Vec<&str> = argv
+            .iter()
+            .skip(1) // the program name; `host_git` supplies it
+            .map(|arg| arg.to_str().expect("argv is UTF-8 in this test"))
+            .collect();
+        host_git(dir, &args)
+    }
+
+    /// The same check for the four commands: real git, the real argv.
+    ///
+    /// Every other test of them asserts about strings we wrote ourselves, so
+    /// all of them pass whatever flags the argv carries — which is exactly how
+    /// `--no-optional-locks` came to sit after the subcommand for months. A
+    /// command's version of that mistake is worse than the query's: the panel
+    /// would report "unknown option" to the user for every stage and commit.
+    #[test]
+    fn real_git_accepts_the_command_argvs() {
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: no git on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        assert!(
+            host_git(repo, &["init", "--quiet", "-b", "main"])
+                .status
+                .success()
+        );
+        std::fs::write(repo.join("README"), "one\n").unwrap();
+
+        let staged: Vec<OsString> = ["add", "-A", "--", "README"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let out = run_argv(repo, git_argv(repo, &staged));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let commit: Vec<OsString> = ["commit", "--quiet", "-m", "first commit"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let out = run_argv(repo, git_argv(repo, &commit));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Now the other three, over a file HEAD has: stage, unstage, restore.
+        std::fs::write(repo.join("README"), "two\n").unwrap();
+        for args in [
+            vec!["add", "-A", "--", "README"],
+            vec!["restore", "--staged", "--", "README"],
+            vec![
+                "restore",
+                "--source=HEAD",
+                "--staged",
+                "--worktree",
+                "--",
+                "README",
+            ],
+        ] {
+            let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+            let out = run_argv(repo, git_argv(repo, &argv));
+            assert!(
+                out.status.success(),
+                "git rejected {args:?}:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        // The restore put the committed content back, which is what discard
+        // promises for a file HEAD knows.
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README")).unwrap(),
+            "one\n"
+        );
+
+        // And the fallback path for a repository with no commits at all.
+        let fresh = tempfile::tempdir().unwrap();
+        assert!(
+            host_git(fresh.path(), &["init", "--quiet", "-b", "main"])
+                .status
+                .success()
+        );
+        std::fs::write(fresh.path().join("new.rs"), "").unwrap();
+        let argv: Vec<OsString> = ["add", "-A", "--", "new.rs"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert!(
+            run_argv(fresh.path(), git_argv(fresh.path(), &argv))
+                .status
+                .success()
+        );
+        // `restore --staged` is the one that cannot work without a HEAD — the
+        // reason `git_unstage` has a second command at all.
+        let argv: Vec<OsString> = ["restore", "--staged", "--", "new.rs"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert!(
+            !run_argv(fresh.path(), git_argv(fresh.path(), &argv))
+                .status
+                .success(),
+            "an unborn HEAD should refuse `restore --staged`; the fallback exists for it"
+        );
+        let argv: Vec<OsString> = ["rm", "--cached", "--quiet", "-r", "--", "new.rs"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert!(
+            run_argv(fresh.path(), git_argv(fresh.path(), &argv))
+                .status
+                .success()
+        );
+    }
+
+    #[test]
+    fn the_branch_header_is_read_in_every_shape_git_writes_it() {
+        let branch = |header: &str| parse_branch(&porcelain(&[header])).unwrap();
+
+        assert_eq!(branch("## main").name.as_deref(), Some("main"));
+
+        let tracked = branch("## main...origin/main");
+        assert_eq!(tracked.name.as_deref(), Some("main"));
+        assert_eq!((tracked.ahead, tracked.behind), (0, 0));
+
+        let drifted = branch("## feature/x...origin/feature/x [ahead 12, behind 3]");
+        assert_eq!(drifted.name.as_deref(), Some("feature/x"));
+        assert_eq!((drifted.ahead, drifted.behind), (12, 3));
+
+        let ahead = branch("## main...origin/main [ahead 1]");
+        assert_eq!((ahead.ahead, ahead.behind), (1, 0));
+
+        let unborn = branch("## No commits yet on main");
+        assert_eq!(unborn.name.as_deref(), Some("main"));
+        assert!(unborn.unborn);
+
+        // A detached HEAD is on no branch, and saying it is on one called
+        // "HEAD (no branch)" would be a lie the panel would print.
+        let detached = branch("## HEAD (no branch)");
+        assert_eq!(detached.name, None);
+
+        // No header at all — `--branch` not passed, or output from an older
+        // cache — is "we don't know", not a branch called "".
+        assert_eq!(parse_branch(&porcelain(&[" M a.rs"])), None);
+    }
+
+    #[test]
+    fn the_branch_header_is_not_a_changed_file() {
+        let output = porcelain(&["## main...origin/main [ahead 1]", " M src/main.rs"]);
+        let changes = parse_changes(&output);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "src/main.rs");
+    }
+
+    /// The whole point of keeping both letters: which section a file is in.
+    #[test]
+    fn a_file_can_be_staged_and_unstaged_at_once() {
+        let changes = parse_changes(&porcelain(&[
+            "M  staged.rs",
+            " M unstaged.rs",
+            "MM both.rs",
+            "A  new.rs",
+            "?? untracked.rs",
+            "D  staged-delete.rs",
+            " D deleted.rs",
+            "UU conflict.rs",
+        ]));
+        let by_path = |name: &str| {
+            changes
+                .iter()
+                .find(|change| change.path == name)
+                .unwrap_or_else(|| panic!("{name} is missing"))
+        };
+
+        assert_eq!(by_path("staged.rs").staged(), Some(GitStatus::Modified));
+        assert_eq!(by_path("staged.rs").unstaged(), None);
+        assert_eq!(by_path("unstaged.rs").staged(), None);
+        assert_eq!(by_path("unstaged.rs").unstaged(), Some(GitStatus::Modified));
+        // The same file in both sections, which is what `MM` means and what a
+        // single rolled-up status cannot say.
+        assert_eq!(by_path("both.rs").staged(), Some(GitStatus::Modified));
+        assert_eq!(by_path("both.rs").unstaged(), Some(GitStatus::Modified));
+        assert_eq!(by_path("new.rs").staged(), Some(GitStatus::Added));
+        assert_eq!(by_path("untracked.rs").staged(), None);
+        assert_eq!(
+            by_path("untracked.rs").unstaged(),
+            Some(GitStatus::Untracked)
+        );
+        assert_eq!(
+            by_path("staged-delete.rs").staged(),
+            Some(GitStatus::Deleted)
+        );
+        assert_eq!(by_path("deleted.rs").unstaged(), Some(GitStatus::Deleted));
+
+        // A conflict is in neither section: it is a decision, not a change.
+        assert!(by_path("conflict.rs").is_conflicted());
+        assert_eq!(by_path("conflict.rs").staged(), None);
+        assert_eq!(by_path("conflict.rs").unstaged(), None);
+
+        // And which of them discarding can restore rather than trash.
+        assert!(by_path("staged.rs").in_head());
+        assert!(!by_path("new.rs").in_head());
+        assert!(!by_path("untracked.rs").in_head());
+    }
+
+    /// Stand in for the guest, so the commands can be run end to end on a host
+    /// with no rootfs.
+    ///
+    /// It drops every flag up to and including `-w <dir>` and execs the rest —
+    /// the contract `guest::proot_command` relies on — and then does the one
+    /// other thing a real guest does that these commands depend on: it gives
+    /// git a `HOME` that exists and a config it can read. Inside proot that is
+    /// `/root` in the Debian rootfs; here it is a directory of the test's own,
+    /// with an identity in it, because a git with nowhere to read a config from
+    /// refuses to commit and the point of this test is that a commit works.
+    #[cfg(unix)]
+    fn fake_guest(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[user]\n\tname = test\n\temail = test@example.invalid\n",
+        )
+        .unwrap();
+
+        let path = dir.join("fake-proot");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 while [ \"$1\" != \"-w\" ]; do shift; done\n\
+                 shift 2\n\
+                 HOME={home}\n\
+                 GIT_CONFIG_GLOBAL={home}/.gitconfig\n\
+                 GIT_CONFIG_SYSTEM=/dev/null\n\
+                 export HOME GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM\n\
+                 exec \"$@\"\n",
+                home = home.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// The commands, end to end: our argv, our shell wrapper, a real `/bin/sh`,
+    /// a real git and a real repository.
+    ///
+    /// Every other test of the commands checks a string we built. This one
+    /// checks that the thing we built *works* — that the wrapper passes the
+    /// arguments through, that git's exit status survives a `capture` which
+    /// reports only success, and that a failure comes back as the sentence git
+    /// actually wrote.
+    #[test]
+    #[cfg(unix)]
+    fn the_commands_reach_git_and_report_what_it_said() {
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: no git on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let repo = projects.join("thing");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(
+            host_git(&repo, &["init", "--quiet", "-b", "main"])
+                .status
+                .success()
+        );
+        std::fs::write(repo.join("README"), "one\n").unwrap();
+        assert!(host_git(&repo, &["add", "README"]).status.success());
+        assert!(
+            host_git(&repo, &["commit", "--quiet", "-m", "first"])
+                .status
+                .success()
+        );
+
+        let engine = crate::Engine::new();
+        engine.set_userland(&fake_guest(dir.path()), dir.path(), dir.path(), &projects);
+        let id = engine.open_project(&repo);
+
+        // Staging a modification, and reading it back through the panel's own
+        // query rather than through git.
+        std::fs::write(repo.join("README"), "two\n").unwrap();
+        std::fs::write(repo.join("new.rs"), "fn main() {}\n").unwrap();
+        engine.git_stage(id, &["README".to_owned()]).unwrap();
+        let staged = await_change(&engine, id, "README");
+        assert_eq!(staged.staged, Some(GitStatus::Modified));
+        assert_eq!(staged.unstaged, None);
+        assert!(staged.in_head);
+
+        // …and back out of the index again.
+        engine.git_unstage(id, &["README".to_owned()]).unwrap();
+        let unstaged = await_change(&engine, id, "README");
+        assert_eq!(unstaged.staged, None);
+        assert_eq!(unstaged.unstaged, Some(GitStatus::Modified));
+
+        // Discarding a tracked file restores what HEAD has; discarding an
+        // untracked one takes it out of the worktree, and not with `rm`.
+        engine
+            .git_discard(id, &["README".to_owned(), "new.rs".to_owned()])
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README")).unwrap(),
+            "one\n"
+        );
+        assert!(!repo.join("new.rs").exists());
+
+        // Committing with nothing staged is git's own refusal, in git's own
+        // words — which is the whole reason the wrapper exists.
+        let refused = engine.git_commit(id, "nothing here").unwrap_err();
+        assert!(
+            refused.to_lowercase().contains("nothing"),
+            "expected git's own complaint, got {refused:?}"
+        );
+
+        // And a real commit lands.
+        std::fs::write(repo.join("README"), "three\n").unwrap();
+        engine.git_stage(id, &["README".to_owned()]).unwrap();
+        engine.git_commit(id, "second").unwrap();
+        let log = host_git(&repo, &["log", "--format=%s"]);
+        assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "second\nfirst");
+    }
+
+    /// Wait for the status cache to catch up with a command, and hand back what
+    /// it says about one path. Commands invalidate the cache rather than
+    /// refilling it — refilling means a `git status` the caller did not ask for
+    /// — so the next poll runs it, one debounce later.
+    #[cfg(unix)]
+    fn await_change(engine: &crate::Engine, id: ProjectId, path: &str) -> ChangedFile {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            let changes = engine.git_changes(id);
+            if changes.scanned
+                && let Some(found) = changes.entries.iter().find(|entry| entry.path == path)
+            {
+                return found.clone();
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("git status never reported {path}");
+    }
+
+    #[test]
+    fn changes_are_empty_and_repoless_without_a_project() {
+        let engine = crate::Engine::new();
+        let changes = engine.git_changes(404);
+        assert!(!changes.scanned);
+        assert!(!changes.has_repo);
+        assert!(changes.entries.is_empty());
     }
 }

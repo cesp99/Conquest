@@ -201,6 +201,83 @@ object CoreBridge {
      */
     external fun gitStatus(projectId: Long): String
 
+    /**
+     * Everything the git panel draws, as JSON — see [GitPanelState] for the
+     * shape. It is the *same* `git status` run [gitStatus] reads, unreduced:
+     * one process serves both, and [gitStatusVersion] is the counter for both.
+     *
+     * Never blocks, never null. `scanned` is false until a run has completed,
+     * which is how "nothing changed" is told from "not asked yet".
+     */
+    external fun gitChanges(projectId: Long): String
+
+    /**
+     * Stages every path in [pathsJson] (a JSON array of project-relative
+     * paths), deletions included. Returns null when it worked, and git's own
+     * message when it did not.
+     *
+     * **Blocking** — it waits for a process inside the Linux userland, which is
+     * tens of milliseconds at best. Call it off the main thread.
+     */
+    external fun gitStage(projectId: Long, pathsJson: String): String?
+
+    /** Takes every path back out of the index. **Blocking**; see [gitStage]. */
+    external fun gitUnstage(projectId: Long, pathsJson: String): String?
+
+    /**
+     * **Destructive.** Throws away every uncommitted change to those paths.
+     *
+     * A path the last commit has is restored to what the commit holds — index
+     * and worktree both. A path it does not have (untracked, or staged-new)
+     * cannot be restored from anywhere, so it is moved to the app's trash
+     * rather than deleted: a mistake here must not be a loss.
+     *
+     * **Confirm with the user first, naming the files.** Nothing below this
+     * call asks anything. **Blocking**.
+     */
+    external fun gitDiscard(projectId: Long, pathsJson: String): String?
+
+    /**
+     * Commits what is staged. An empty or whitespace-only message is refused
+     * rather than becoming an empty commit, and nothing is staged implicitly —
+     * a commit with an empty index comes back with git's own "nothing added to
+     * commit". **Blocking**.
+     */
+    external fun gitCommit(projectId: Long, message: String): String?
+
+    /**
+     * Generation counter for a buffer's diff hunks; 0 while there is nothing to
+     * show. Poll it exactly like [gitStatusVersion] — polling is what schedules
+     * the diff, and it never waits for one.
+     */
+    external fun gitHunksVersion(bufferId: Long): Long
+
+    /**
+     * The buffer's difference from the last commit, flattened as groups of four
+     * ints: kind (0 added, 1 modified, 2 deleted), first row, end row
+     * (exclusive), and how many rows the commit had there. [GitHunk] wraps it.
+     *
+     * Rows are *buffer* rows and follow unsaved edits: only the base text comes
+     * from git, and the diff against it is computed in the engine whenever the
+     * buffer moves. A deletion occupies no rows — first and end row are equal,
+     * and mark the boundary the rows were removed from.
+     *
+     * Reads a cache: never blocks, never null. Empty for a buffer with no file,
+     * one outside a repository, and one that matches the commit.
+     */
+    external fun gitHunks(bufferId: Long): IntArray
+
+    /**
+     * Who last touched each run of rows, as JSON — see [BlameLine].
+     *
+     * The rows are the rows of the file **on disk**. git blames what it can
+     * read, and a buffer with unsaved edits has drifted from that.
+     *
+     * **Blocking and uncached**: it runs git every time. Ask when the user asks
+     * for blame, off the main thread — never on a poll loop.
+     */
+    external fun gitBlame(bufferId: Long): String
+
     // -----------------------------------------------------------------------
     // Settings. The file is JSONC and hand-editable; writes are surgical, so
     // comments survive. All of these touch the filesystem — call them off the

@@ -20,10 +20,12 @@
 //! the query (`search.rs`), and over a whole worktree it is background work
 //! published behind a generation counter (`project_search.rs`).
 //!
-//! Git status is not computed here: it comes from the `git` binary inside the
+//! Git is not computed here either: it comes from the `git` binary inside the
 //! Debian userland, reached through proot (`git.rs`), cached behind a
 //! generation counter of the same shape, and silently empty in builds that
-//! have no userland. Reaching *into* that userland at all is `guest.rs`, which
+//! have no userland. What is ours is the *diff* (`git_diff.rs`): git supplies
+//! the file's text at HEAD, and the hunks are computed against the live buffer
+//! here, so the gutter tracks typing rather than the last save. Reaching *into* that userland at all is `guest.rs`, which
 //! owns the proot command line for everything the engine runs there — git
 //! today, language servers next.
 
@@ -39,6 +41,7 @@ mod config;
 mod file;
 mod find;
 mod git;
+mod git_diff;
 mod guest;
 mod highlight;
 mod highlight_worker;
@@ -51,7 +54,8 @@ mod search;
 
 pub use config::{GitignoredFiles, ProjectPanelSettings, Settings, ThemeMode};
 pub use find::FileMatch;
-pub use git::GitStatus;
+pub use git::{BranchInfo, ChangedFile, GitChanges, GitStatus};
+pub use git_diff::{BlameEntry, Hunk, HunkKind};
 pub use highlight::{HighlightSpan, STYLE_NAMES, language_for_path};
 pub use language_config::config_json as language_config_json;
 pub use project::{ProjectId, TreeEntry};
@@ -100,6 +104,9 @@ pub struct Engine {
     /// Cached `git status` per project. Empty and quiet until there is a
     /// userland to run git in — see git.rs.
     git: git::GitStatuses,
+    /// Cached diff hunks per file-backed buffer: the base text from HEAD, and
+    /// the difference between it and the live buffer — see git_diff.rs.
+    diffs: git_diff::BufferDiffs,
     /// Where proot and the Debian rootfs are. It sits here rather than on one
     /// feature's state because it belongs to no feature: git status runs
     /// through it today and language servers will, and there is only ever one

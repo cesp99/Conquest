@@ -12,6 +12,9 @@ fs.workspace = true
 futures.workspace = true
 fuzzy.workspace = true
 gpui.workspace = true
+# Line diffing for the git gutter, and the same one Zed diffs with — see
+# `language::text_diff`, which this mirrors so a hunk lands where Zed puts it.
+imara-diff.workspace = true
 grammars = { workspace = true, features = ["load-grammars"] }
 libc.workspace = true
 log.workspace = true

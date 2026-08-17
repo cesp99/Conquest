@@ -540,6 +540,171 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitStatus(
     to_jstring(&env, json)
 }
 
+/// Everything the git panel draws, as JSON: `scanned`, `has_repo`, `branch`
+/// (`{name, ahead, behind, unborn}` or null) and `entries`, each
+/// `{path, staged, unstaged, conflicted, in_head}` with the two statuses using
+/// the same names `gitStatus` does, or null.
+///
+/// Reads the same cache `gitStatus` does and is versioned by the same
+/// `gitStatusVersion`: one `git status` serves the project panel and this.
+/// Never blocks, never null.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitChanges(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    let changes = engine().git_changes(project_id as u64);
+    let json = serde_json::to_string(&changes).unwrap_or_else(|err| {
+        log::warn!("gitChanges failed to serialize: {err}");
+        "{}".to_owned()
+    });
+    to_jstring(&env, json)
+}
+
+/// Paths from a JSON array, for the four commands below. An unparseable
+/// argument is an empty list, which every command refuses.
+fn path_list(env: &mut JNIEnv, paths_json: &JString) -> Vec<String> {
+    let json = get_string(env, paths_json);
+    serde_json::from_str(&json).unwrap_or_else(|err| {
+        log::warn!("git command: {json:?} is not a path list: {err}");
+        Vec::new()
+    })
+}
+
+/// null when it worked, and the reason when it did not — usually git's own
+/// sentence, which is the only thing that explains an unconfigured identity or
+/// a merge in progress.
+fn command_result(env: &JNIEnv, result: Result<(), String>) -> jstring {
+    match result {
+        Ok(()) => std::ptr::null_mut(),
+        Err(message) => to_jstring(env, message),
+    }
+}
+
+/// Stage every listed path (`git add -A`), deletions included. **Blocking**:
+/// it waits for a process inside the guest — call it off the main thread.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitStage(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    paths_json: JString,
+) -> jstring {
+    let paths = path_list(&mut env, &paths_json);
+    command_result(&env, engine().git_stage(project_id as u64, &paths))
+}
+
+/// Take every listed path back out of the index. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitUnstage(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    paths_json: JString,
+) -> jstring {
+    let paths = path_list(&mut env, &paths_json);
+    command_result(&env, engine().git_unstage(project_id as u64, &paths))
+}
+
+/// **Destructive.** Throw away every uncommitted change to the listed paths: a
+/// path HEAD knows is restored to what HEAD has, and a path it does not —
+/// untracked, or staged-new — is moved to the app's trash rather than deleted.
+/// Confirm with the user, naming the files, before calling this. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitDiscard(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    paths_json: JString,
+) -> jstring {
+    let paths = path_list(&mut env, &paths_json);
+    command_result(&env, engine().git_discard(project_id as u64, &paths))
+}
+
+/// Commit what is staged. An empty or whitespace-only message is refused here
+/// rather than becoming an empty commit. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitCommit(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    message: JString,
+) -> jstring {
+    let message = get_string(&mut env, &message);
+    command_result(&env, engine().git_commit(project_id as u64, &message))
+}
+
+/// Generation counter for a buffer's diff hunks; 0 until there is something to
+/// show. Poll it exactly like `gitStatusVersion` — polling schedules the work
+/// and never waits for it.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitHunksVersion(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+) -> jlong {
+    engine().git_hunks_version(buffer_id as u64) as jlong
+}
+
+/// The buffer's diff against HEAD, flattened as groups of four ints: kind
+/// (0 added, 1 modified, 2 deleted), first row, end row (exclusive), and how
+/// many rows HEAD had there.
+///
+/// Rows are *buffer* rows and track unsaved edits: the base text comes from
+/// git, the diff is computed here against the live buffer. A deletion occupies
+/// no rows, so its first and end row are equal and mark the boundary the rows
+/// were removed from.
+///
+/// Reads a cache: never blocks, never null, empty for a buffer with no file,
+/// no repository, or no difference.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitHunks(
+    env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+) -> jintArray {
+    let hunks = engine().git_hunks(buffer_id as u64);
+    let mut flat = Vec::with_capacity(hunks.len() * 4);
+    for hunk in &hunks {
+        flat.push(match hunk.kind {
+            engine::HunkKind::Added => 0,
+            engine::HunkKind::Modified => 1,
+            engine::HunkKind::Deleted => 2,
+        });
+        flat.push(hunk.start_row as i32);
+        flat.push(hunk.end_row as i32);
+        flat.push(hunk.old_rows as i32);
+    }
+    let array = env
+        .new_int_array(flat.len() as i32)
+        .expect("failed to allocate hunk array");
+    env.set_int_array_region(&array, 0, &flat)
+        .expect("failed to fill hunk array");
+    array.into_raw()
+}
+
+/// Who last touched each run of rows, as JSON: `{"entries": [{sha, start_row,
+/// row_count, author, author_time, summary}]}`, or `{"error": "…"}`.
+///
+/// Rows are the rows of the file **on disk**, not of the buffer: git blames
+/// what it can read, and a buffer with unsaved edits has drifted from it.
+///
+/// **Blocking**, and uncached — it runs git every time. Call it when the user
+/// asks for blame, off the main thread, not on a poll loop.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitBlame(
+    env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+) -> jstring {
+    let json = match engine().git_blame(buffer_id as u64) {
+        Ok(entries) => serde_json::json!({ "entries": entries }),
+        Err(message) => serde_json::json!({ "error": message }),
+    };
+    to_jstring(&env, json.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Settings. The file is JSONC and hand-editable; writes are surgical so
 // comments survive. All of these touch the filesystem — call them off the

@@ -1688,6 +1688,7 @@ dependencies = [
  "fuzzy",
  "gpui",
  "grammars",
+ "imara-diff",
  "libc",
  "log",
  "parking_lot",
