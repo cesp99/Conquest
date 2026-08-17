@@ -5,6 +5,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -265,7 +267,7 @@ private fun ResultRow(
     onClick: () -> Unit,
 ) {
     val theme = LocalZedTheme.current
-    Column(
+    Row(
         modifier = Modifier
             .fillMaxWidth()
             .background(
@@ -274,23 +276,36 @@ private fun ResultRow(
             .pointerHoverIcon(PointerIcon.Hand)
             .clickable(onClick = onClick)
             .padding(horizontal = 20.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        // The path is what was matched, so it carries the highlights; the
-        // name is shown above it because that is what people scan for.
-        Text(
-            text = match.name,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurface,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
+        // Zed's file finder shows the file's icon (`file_finder.file_icons`,
+        // true by default), and it is the same icon the panel draws — so a
+        // file found here and a file seen there are visibly the same thing.
+        EntryIconMark(
+            name = match.name,
+            isDir = false,
+            isExpanded = false,
+            color = theme.color("icon.muted", MaterialTheme.colorScheme.onSurfaceVariant),
         )
-        Text(
-            text = highlighted(match, theme.color("conflict", MaterialTheme.colorScheme.primary)),
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+        Column(modifier = Modifier.weight(1f)) {
+            // The path is what was matched, so it carries the highlights; the
+            // name is shown above it because that is what people scan for.
+            Text(
+                text = match.name,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = highlighted(match, theme.color("conflict", MaterialTheme.colorScheme.primary)),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }
 

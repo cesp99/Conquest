@@ -71,6 +71,7 @@ import to.eyed.conquest.code.core.ProjectSession
 import to.eyed.conquest.code.core.SearchQuery
 import to.eyed.conquest.code.ui.theme.BufferFontFamily
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
+import to.eyed.conquest.code.ui.workspace.EntryIconMark
 
 /**
  * Zed's `git_panel.default_width` (assets/settings/default.json:997) — its one
@@ -669,6 +670,14 @@ private fun FileHeaderRow(
             style = MaterialTheme.typography.labelSmall,
             color = theme.color("icon.muted", theme.color("text.muted")),
             modifier = Modifier.width(10.dp),
+        )
+        // The same icon the panel and the finder draw: a result here and the
+        // file itself have to read as the same thing.
+        EntryIconMark(
+            name = row.name,
+            isDir = false,
+            isExpanded = false,
+            color = theme.color("icon.muted", theme.color("text.muted")),
         )
         Text(
             text = row.name,
