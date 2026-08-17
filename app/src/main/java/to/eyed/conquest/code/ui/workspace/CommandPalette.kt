@@ -1,29 +1,15 @@
 package to.eyed.conquest.code.ui.workspace
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.hoverable
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawingPadding
-import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -35,9 +21,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isCtrlPressed
@@ -45,24 +29,18 @@ import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
-import androidx.compose.ui.input.pointer.PointerIcon
-import androidx.compose.ui.input.pointer.pointerHoverIcon
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
+import to.eyed.conquest.code.ui.theme.rem
 
 /**
  * The command palette: every command in the workspace, searchable by name.
@@ -71,7 +49,8 @@ import to.eyed.conquest.code.ui.theme.LocalZedTheme
  * know is a binding a phone or a tablet cannot offer at all, so the palette is
  * the one surface where *everything* is reachable — type part of a name, tap
  * the row. It deliberately looks and behaves like the file finder ([FileFinder]),
- * because to a user they are one gesture with two contents.
+ * because to a user they are one gesture with two contents — and in Zed they
+ * are literally the same `Picker`, which is why both wear [PickerModal].
  *
  * Names are Zed's own action names, humanised: "terminal panel: toggle", not
  * "Toggle terminal". Searching "term" therefore finds everything the terminal
@@ -93,7 +72,6 @@ fun CommandPalette(
     /** Pre-filled query, for a caller handing the palette a search. */
     initialQuery: String = "",
 ) {
-    val theme = LocalZedTheme.current
     val context = LocalContext.current
     var query by remember { mutableStateOf(TextFieldValue(initialQuery)) }
     var selected by remember { mutableIntStateOf(0) }
@@ -135,135 +113,74 @@ fun CommandPalette(
         if (onRun(command)) recent = CommandRecency.record(context, command)
     }
 
-    Dialog(
-        onDismissRequest = onDismiss,
-        // The palette has to stay usable with the soft keyboard up — on a
-        // phone it is the *only* way to type — and a dialog only learns where
-        // the IME is once it stops fitting the system windows itself.
-        properties = DialogProperties(
-            usePlatformDefaultWidth = false,
-            decorFitsSystemWindows = false,
-        ),
+    PickerModal(
+        onDismiss = onDismiss,
+        // Arrows and Enter must reach us even though the text field has
+        // focus, so they are intercepted before it.
+        modifier = Modifier.onPreviewKeyEvent { event ->
+            if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+            if (isCommandPalette(event)) {
+                // The chord that opened it closes it, as in Zed.
+                onDismiss()
+                return@onPreviewKeyEvent true
+            }
+            when {
+                event.key == Key.DirectionDown -> { move(1); true }
+                event.key == Key.DirectionUp -> { move(-1); true }
+                // Zed's menu bindings: Ctrl+N/Ctrl+P and Tab move
+                // the selection too, for hands that never leave
+                // the home row.
+                event.isCtrlPressed && event.key == Key.N -> { move(1); true }
+                event.isCtrlPressed && event.key == Key.P -> { move(-1); true }
+                event.key == Key.Tab -> {
+                    move(if (event.isShiftPressed) -1 else 1)
+                    true
+                }
+                event.key == Key.Enter || event.key == Key.NumPadEnter -> {
+                    results.getOrNull(selected)?.let(::run)
+                    true
+                }
+                event.key == Key.Escape -> { onDismiss(); true }
+                else -> false
+            }
+        },
     ) {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier = Modifier
-                .fillMaxSize()
-                .safeDrawingPadding()
-                .padding(16.dp)
-                // The content fills the window, so nothing is ever "outside"
-                // it as far as the dialog is concerned; tapping the dimmed
-                // area has to dismiss us by hand.
-                .clickable(
-                    interactionSource = remember { MutableInteractionSource() },
-                    indication = null,
-                    onClick = onDismiss,
-                ),
-        ) {
-            Surface(
-                shape = RoundedCornerShape(12.dp),
-                color = theme.color(
-                    "elevated_surface.background",
-                    MaterialTheme.colorScheme.surface,
-                ),
-                modifier = Modifier
-                    .widthIn(min = 320.dp, max = 640.dp)
-                    .fillMaxWidth()
-                    // Swallow taps, or they would reach the dismiss handler
-                    // above and close the palette from inside it. `clickable`
-                    // would do it too, and would ripple the whole panel.
-                    .pointerInput(Unit) { detectTapGestures { } }
-                    // Arrows and Enter must reach us even though the text
-                    // field has focus, so they are intercepted before it.
-                    .onPreviewKeyEvent { event ->
-                        if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
-                        if (isCommandPalette(event)) {
-                            // The chord that opened it closes it, as in Zed.
-                            onDismiss()
-                            return@onPreviewKeyEvent true
-                        }
-                        when {
-                            event.key == Key.DirectionDown -> { move(1); true }
-                            event.key == Key.DirectionUp -> { move(-1); true }
-                            // Zed's menu bindings: Ctrl+N/Ctrl+P and Tab move
-                            // the selection too, for hands that never leave
-                            // the home row.
-                            event.isCtrlPressed && event.key == Key.N -> { move(1); true }
-                            event.isCtrlPressed && event.key == Key.P -> { move(-1); true }
-                            event.key == Key.Tab -> {
-                                move(if (event.isShiftPressed) -1 else 1)
-                                true
-                            }
-                            event.key == Key.Enter || event.key == Key.NumPadEnter -> {
-                                results.getOrNull(selected)?.let(::run)
-                                true
-                            }
-                            event.key == Key.Escape -> { onDismiss(); true }
-                            else -> false
-                        }
-                    },
+        PickerQueryField(
+            query = query,
+            onQueryChange = { query = it },
+            // Zed's own placeholder (command_palette.rs:394-396).
+            placeholder = "Execute a command...",
+            focusRequester = focus,
+        )
+
+        if (results.isEmpty()) {
+            PickerEmptyState("No matching commands")
+        } else {
+            LazyColumn(
+                state = listState,
+                contentPadding = PickerListPadding,
+                modifier = Modifier.fillMaxWidth().weight(1f, fill = false),
             ) {
-                Column(modifier = Modifier.padding(vertical = 16.dp)) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 20.dp)
-                            .background(theme.color("editor.background"), RoundedCornerShape(6.dp))
-                            .padding(horizontal = 12.dp, vertical = 10.dp)
-                    ) {
-                        BasicTextField(
-                            value = query,
-                            onValueChange = { query = it },
-                            singleLine = true,
-                            textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
-                            cursorBrush = SolidColor(theme.color("editor.foreground")),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .focusRequester(focus),
-                        )
-                        if (query.text.isEmpty()) {
-                            Text(
-                                text = "Execute a command",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-
-                    HorizontalDivider(modifier = Modifier.padding(top = 12.dp))
-
-                    if (results.isEmpty()) {
-                        Text(
-                            text = "No matching commands",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 14.dp),
-                        )
-                    } else {
-                        LazyColumn(
-                            state = listState,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(max = 380.dp),
-                        ) {
-                            itemsIndexed(
-                                results,
-                                key = { _, match -> match.entry.command.id },
-                            ) { index, match ->
-                                CommandRow(
-                                    match = match,
-                                    isSelected = index == selected,
-                                    onClick = { run(match) },
-                                )
-                            }
-                        }
-                    }
+                itemsIndexed(
+                    results,
+                    key = { _, match -> match.entry.command.id },
+                ) { index, match ->
+                    CommandRow(
+                        match = match,
+                        isSelected = index == selected,
+                        onClick = { run(match) },
+                    )
                 }
             }
         }
     }
 }
 
+/**
+ * One command: the name on the left, its chord on the right, `justify_between`
+ * with an extra `py_px` of breathing room inside the inset row
+ * (command_palette.rs:635-654).
+ */
 @Composable
 private fun CommandRow(
     match: CommandMatch,
@@ -272,70 +189,86 @@ private fun CommandRow(
 ) {
     val theme = LocalZedTheme.current
     val entry = match.entry
-    val hover = remember { MutableInteractionSource() }
-    val isHovered by hover.collectIsHoveredAsState()
-    val selectedColor = theme.color("element.selected", Color.Transparent)
 
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(24.dp),
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(
-                when {
-                    isSelected -> selectedColor
-                    isHovered -> theme.color("element.hover", selectedColor)
-                    else -> Color.Transparent
-                }
-            )
-            .then(
-                if (entry.isEnabled) {
-                    Modifier
-                        .hoverable(hover)
-                        .pointerHoverIcon(PointerIcon.Hand)
-                        .clickable(onClick = onClick)
-                } else {
-                    Modifier
-                }
-            )
-            .padding(horizontal = 20.dp, vertical = 10.dp),
+    PickerListItem(
+        isSelected = isSelected,
+        enabled = entry.isEnabled,
+        onClick = onClick,
     ) {
         Text(
-            text = highlighted(
-                entry.name,
-                match.positions,
-                theme.color("conflict", MaterialTheme.colorScheme.primary),
-            ),
+            text = highlighted(entry.name, match.positions, theme.color("text.accent")),
             style = MaterialTheme.typography.bodyMedium,
             color = if (entry.isEnabled) {
-                MaterialTheme.colorScheme.onSurface
+                theme.color("text")
             } else {
-                MaterialTheme.colorScheme.onSurfaceVariant
+                theme.color("text.disabled", MaterialTheme.colorScheme.onSurfaceVariant)
             },
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
+            modifier = Modifier.weight(1f).padding(vertical = 1.dp),
         )
         if (entry.shortcut != null) {
-            Text(
-                text = entry.shortcut,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            KeyChips(entry.shortcut)
         }
     }
 }
 
-/** The name with matched characters emphasised, as the file finder does. */
+/**
+ * A chord as Zed renders it: one chip per keystroke, 4px apart (`gap(Base04)`,
+ * keybinding.rs:216), each chip `py_0p5` with `rounded_xs` corners — and no
+ * fill, so the rounding is invisible — in `text.muted` (keybinding.rs:218-230).
+ * Glyphs are the default 14px text size on a `relative(1.)` line; a
+ * single-character key is boxed to a square of that size and centred, longer
+ * ones get 2px of side padding (keybinding.rs:418-438). Our chord labels
+ * separate keys with spaces, so that is the seam the split uses.
+ */
+@Composable
+private fun KeyChips(shortcut: String) {
+    val theme = LocalZedTheme.current
+    val glyphStyle = MaterialTheme.typography.bodyMedium
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        for (key in shortcut.split(' ')) {
+            if (key.isEmpty()) continue
+            Box(
+                modifier = Modifier
+                    .padding(vertical = 2.dp)
+                    .then(
+                        if (key.length == 1) {
+                            // `size × size`, glyph centred (keybinding.rs:427-429);
+                            // the text size is `rems(0.875)` (typography.rs:139).
+                            Modifier.width(rem(0.875f))
+                        } else {
+                            Modifier.padding(horizontal = 2.dp)
+                        }
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = key,
+                    style = glyphStyle.copy(lineHeight = glyphStyle.fontSize),
+                    color = theme.color("text.muted"),
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The name with matched characters recoloured to `text.accent` — a colour
+ * change and nothing else, which is all Zed's `HighlightedLabel` does
+ * (crates/ui/src/components/label/highlighted_label.rs:208-218).
+ */
 private fun highlighted(name: String, positions: List<Int>, color: Color): AnnotatedString {
     if (positions.isEmpty()) return AnnotatedString(name)
     val marked = positions.toHashSet()
     return buildAnnotatedString {
         name.forEachIndexed { index, character ->
             if (index in marked) {
-                withStyle(SpanStyle(color = color, fontWeight = FontWeight.Bold)) {
-                    append(character)
-                }
+                withStyle(SpanStyle(color = color)) { append(character) }
             } else {
                 append(character)
             }

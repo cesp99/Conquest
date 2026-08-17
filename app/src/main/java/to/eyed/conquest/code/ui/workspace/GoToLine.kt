@@ -3,13 +3,17 @@ package to.eyed.conquest.code.ui.workspace
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -27,6 +31,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -41,6 +46,7 @@ import androidx.compose.ui.unit.dp
 import to.eyed.conquest.code.ui.editor.Caret
 import to.eyed.conquest.code.ui.editor.EditorState
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
+import to.eyed.conquest.code.ui.theme.rem
 
 /** A line, and optionally a column, both as the user counts them: from 1. */
 internal data class GoToLineTarget(val line: Int, val column: Int?)
@@ -87,14 +93,6 @@ internal fun goToLinePosition(
     return row to column
 }
 
-/** Zed's own control size, drawn inside a target a finger can hit. */
-private val FieldHeight = 26.dp
-private val TouchTarget = 40.dp
-private val FieldRadius = 6.dp
-
-/** `rounded_lg`, the radius every elevated surface in this app wears. */
-private val SurfaceRadius = 8.dp
-
 /**
  * Go to line — Zed's `go_to_line::Toggle`, on `Ctrl` `G`.
  *
@@ -102,6 +100,12 @@ private val SurfaceRadius = 8.dp
  * caret moves *while* you type, and a dialog's scrim would dim the file you
  * are watching go past. Escape puts the caret, the selection and the viewport
  * back exactly where they were; Enter keeps the move.
+ *
+ * The dress is Zed's exactly (go_to_line.rs:327-347): `rems(24)` wide, an
+ * elevated surface — `elevated_surface.background`, `rounded_lg` 8px, 1px
+ * `border.variant` (styled_ext.rs:6-12) — a bare query editor padded `px_2`
+ * `py_1` over a 1px `border.variant` underline, and a muted status line in
+ * the same padding underneath.
  *
  * [modifier] is where the caller places it — `Modifier.align(Alignment.TopCenter)`
  * inside the work area, which is where Zed's own goes.
@@ -148,13 +152,28 @@ internal fun GoToLine(
         onDismiss()
     }
 
-    Box(
+    // Where the caret was when the panel opened, as the user counts it. The
+    // placeholder is that position in the form the field wants back, which is
+    // exactly Zed's placeholder (go_to_line.rs:127-131); the status line
+    // echoes it in words until the query parses (go_to_line.rs:136-141).
+    val openedAt = original.second
+    val target = parseGoToLine(query.text)
+    val statusText = when {
+        target == null -> "Current Line: ${openedAt.headRow + 1} of ${editor.lineCount} " +
+            "(column ${openedAt.headCol + 1})"
+        target.column != null -> "Go to line ${target.line}, character ${target.column}"
+        else -> "Go to line ${target.line}"
+    }
+
+    Column(
         modifier = modifier
             .padding(8.dp)
-            .width(260.dp)
-            .clip(RoundedCornerShape(SurfaceRadius))
+            // `rems(24)` = 384dp at the default UI font (go_to_line.rs:328) —
+            // narrowed to what a phone actually has when it has less.
+            .widthIn(max = rem(24f))
+            .clip(RoundedCornerShape(8.dp))
             .background(theme.color("elevated_surface.background"))
-            .border(1.dp, theme.color("border.variant"), RoundedCornerShape(SurfaceRadius))
+            .border(1.dp, theme.color("border.variant"), RoundedCornerShape(8.dp))
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 when (event.key) {
@@ -173,31 +192,33 @@ internal fun GoToLine(
                 }
             }
     ) {
+        // The query line: `px_2` `py_1` around a bare editor — no box, no
+        // fill of its own (go_to_line.rs:333-340). The two buttons ride in
+        // the same line because Zed's Enter and Escape don't exist on a soft
+        // keyboard; they wear the 22dp ghost-button dress, and the chords and
+        // the IME's Go key remain the other routes to both verbs.
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             Box(
                 modifier = Modifier
                     .weight(1f)
-                    .height(FieldHeight)
-                    .clip(RoundedCornerShape(FieldRadius))
-                    .background(theme.color("editor.background"))
-                    .border(1.dp, theme.color("border"), RoundedCornerShape(FieldRadius))
-                    .pointerHoverIcon(PointerIcon.Text)
-                    .padding(horizontal = 8.dp),
+                    .pointerHoverIcon(PointerIcon.Text),
                 contentAlignment = Alignment.CenterStart,
             ) {
                 BasicTextField(
                     value = query,
                     onValueChange = { value ->
                         query = value
-                        val target = parseGoToLine(value.text)
+                        val typed = parseGoToLine(value.text)
                         // A half-typed or emptied field puts the caret back
                         // rather than leaving it wherever the last valid
                         // number happened to land.
-                        if (target == null) restore() else moveTo(target)
+                        if (typed == null) restore() else moveTo(typed)
                     },
                     singleLine = true,
                     // Deliberately *not* `KeyboardType.Number`: the numeric pad
@@ -217,7 +238,7 @@ internal fun GoToLine(
                 )
                 if (query.text.isEmpty()) {
                     Text(
-                        text = "Go to line: column",
+                        text = "${openedAt.headRow + 1}:${openedAt.headCol + 1}",
                         style = MaterialTheme.typography.bodyMedium,
                         color = theme.color("text.placeholder"),
                         maxLines = 1,
@@ -227,24 +248,62 @@ internal fun GoToLine(
             Action("↵", "Go to the line", onClick = onDismiss)
             Action("✕", "Cancel", onClick = ::cancel)
         }
+        // The underline between the query and the status line: 1px
+        // `border.variant` (go_to_line.rs:335-336).
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(theme.color("border.variant")),
+        )
+        // Zed's status line: what the query means right now, muted, in the
+        // same `px_2` `py_1` (go_to_line.rs:342-346).
+        Text(
+            text = statusText,
+            style = MaterialTheme.typography.bodyMedium,
+            color = theme.color("text.muted"),
+            maxLines = 1,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+        )
     }
 }
 
 /**
- * One of the two buttons. Zed's controls are 26px, drawn for a mouse; these
- * keep that size inside a 40dp box, because the soft keyboard is up while this
- * panel is open and a thumb is the only pointer there is.
+ * One of the two verbs, dressed as Zed's ghost `IconButton`: 22px tall
+ * (`ButtonSize::Default`, button_like.rs:469), `rounded_sm`, 4px side padding
+ * (button_like.rs:798-803), transparent until the ghost ramp colours it
+ * (button_like.rs:242-247, 298-303). Sub-40dp on purpose — the 2026-08-17
+ * density decision — and never the only route: Enter, Escape and the IME's Go
+ * key do the same two things.
  */
 @Composable
 private fun Action(glyph: String, description: String, onClick: () -> Unit) {
     val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val pressed by interaction.collectIsPressedAsState()
     Box(
         modifier = Modifier
-            .height(TouchTarget)
-            .width(TouchTarget)
+            .height(22.dp)
+            .widthIn(min = 22.dp)
             .clip(RoundedCornerShape(4.dp))
-            .clickable(onClickLabel = description, onClick = onClick)
-            .pointerHoverIcon(PointerIcon.Hand),
+            .background(
+                when {
+                    pressed -> theme.color("ghost_element.active")
+                    hovered -> theme.color("ghost_element.hover")
+                    else -> Color.Transparent
+                }
+            )
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                onClickLabel = description,
+                onClick = onClick,
+            )
+            .pointerHoverIcon(PointerIcon.Hand)
+            .padding(horizontal = 4.dp),
         contentAlignment = Alignment.Center,
     ) {
         Text(

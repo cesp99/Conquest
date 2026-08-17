@@ -3,11 +3,16 @@ package to.eyed.conquest.code.ui.search
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -38,6 +43,7 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
@@ -46,29 +52,41 @@ import to.eyed.conquest.code.core.BufferMatch
 import to.eyed.conquest.code.core.SearchQuery
 import to.eyed.conquest.code.core.searchBuffer
 import to.eyed.conquest.code.ui.editor.EditorState
+import to.eyed.conquest.code.ui.theme.BufferFontFamily
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
 /**
- * Zed's `buffer_search` toolbar is one row (crates/search/src/buffer_search.rs)
- * at 36px. Ours is 44 because every control in it has to be tappable: Zed's
- * bar is driven by a mouse, and a 26dp toggle is not a target a finger can
- * hit. The controls keep Zed's *visual* size inside a 40dp touch box.
+ * The toolbar chrome the bar sits in: `py(Base06)` = 6px and `px(Base08)` =
+ * 8px around the items, with a 1px `border.variant` underline
+ * (workspace/src/toolbar.rs:123-129). Zed's bar is a toolbar item; ours is
+ * the whole toolbar, so it carries the chrome itself.
  */
-private val BarHeight = 44.dp
+private val ToolbarVPad = 6.dp
+private val ToolbarHPad = 8.dp
 
-/** What a finger needs. Everything clickable in here is at least this. */
-private val TouchTarget = 40.dp
-
-/** Zed's own control size, drawn inside [TouchTarget]. */
-private val ControlSize = 26.dp
+/** `min_h_8` = 32px, the search input's floor (search/src/search_bar.rs:73). */
+private val InputMinHeight = 32.dp
 
 /** `rounded_md`, the radius Zed gives a search input (styles.rs:1246). */
 private val FieldRadius = 6.dp
 
 /**
+ * An `IconButtonShape::Square` button: a 16px `IconSize::Medium` glyph plus
+ * `Base02` = 2px of padding a side (ui/src/components/icon.rs:75, 89-92,
+ * 102-107; icon_button.rs:258-260). Sub-40dp on purpose, per the 2026-08-17
+ * density decision; Enter/Shift+Enter and Escape are the keyboard routes to
+ * the arrows and the close button.
+ */
+private val ButtonBox = 20.dp
+
+/** `min_w(rems_from_px(40))` under the match counter (buffer_search.rs:334). */
+private val CountMinWidth = 40.dp
+
+/**
  * Find within the open buffer — Zed's buffer search, in its shape: a row above
- * the editor with the query, the three toggles, the match count and the two
- * arrows.
+ * the editor with the query (the three toggles live *inside* its right edge,
+ * as in Zed), the prev/next arrows behind a hairline, the match count and the
+ * close button.
  *
  * The search itself is an engine call that scans the whole buffer in a few
  * milliseconds even at 100k lines, so it runs on every keystroke rather than
@@ -117,6 +135,11 @@ fun BufferSearchBar(
         val text = query.text
         if (text.isEmpty()) {
             matches = emptyList()
+            // The rows-and-columns twin clears with them: Enter must not walk
+            // the previous query's hits, least of all as byte offsets into a
+            // buffer they were never measured against.
+            ranges = emptyList()
+            current = 0
             total = 0
             error = null
             editor.clearSearchMatches()
@@ -131,24 +154,33 @@ fun BufferSearchBar(
         // The range conversion belongs in here with the search. It reads a
         // line per match, and a line outside the drawn window is a JNI call
         // that takes the engine's buffer lock — ten thousand of those on the
-        // main thread is not a frame, it is a freeze.
+        // main thread is not a frame, it is a freeze. The error string rides
+        // back with the result for the same reason: `search.error()` is a
+        // second regex compile through JNI, not a getter.
         val found = withContext(Dispatchers.Default) {
-            if (search.error() != null) return@withContext null
-            val result = searchBuffer(editor.session.id, search)
-            result to result.matches.map { editor.rangeOf(it) }
+            when (val message = search.error()) {
+                null -> {
+                    val result = searchBuffer(editor.session.id, search)
+                    Triple(result, result.matches.map { editor.rangeOf(it) }, null)
+                }
+                else -> Triple(null, emptyList(), message)
+            }
         }
-        if (found == null) {
+        if (found.first == null) {
             // A half-typed regex — "[" — is the normal state of the field, not
             // a failure to report loudly. Say it quietly and keep the old
             // highlights off the screen.
-            error = search.error()
+            error = found.third
             matches = emptyList()
+            ranges = emptyList()
+            current = 0
             total = 0
             editor.clearSearchMatches()
             return@LaunchedEffect
         }
         error = null
-        val (result, converted) = found
+        val result = found.first ?: return@LaunchedEffect
+        val converted = found.second
         matches = result.matches
         ranges = converted
         total = result.total
@@ -165,12 +197,17 @@ fun BufferSearchBar(
         editor.selectRange(ranges[current])
     }
 
-    Row(
+    // Zed renders search input text in the *buffer* font at `text_ui` size
+    // (rems 0.875 = 14px) with `relative(1.3)` line height
+    // (search_bar.rs:112-120), not in the UI font of the chrome around it.
+    val inputStyle = MaterialTheme.typography.bodyMedium.let { base ->
+        base.copy(fontFamily = BufferFontFamily, lineHeight = base.fontSize * 1.3)
+    }
+
+    Column(
         modifier = modifier
             .fillMaxWidth()
-            .height(BarHeight)
             .background(theme.color("toolbar.background"))
-            .padding(horizontal = 8.dp)
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 when (event.key) {
@@ -191,113 +228,212 @@ fun BufferSearchBar(
                     else -> false
                 }
             },
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
     ) {
-        Box(
+        Column(
             modifier = Modifier
-                .weight(1f)
-                .widthIn(min = 96.dp)
-                .height(ControlSize)
-                .clip(RoundedCornerShape(FieldRadius))
-                .background(theme.color("editor.background"))
-                .border(
-                    1.dp,
-                    theme.color(if (error == null) "border" else "error"),
-                    RoundedCornerShape(FieldRadius),
-                )
-                .padding(horizontal = 8.dp),
-            contentAlignment = Alignment.CenterStart,
+                .fillMaxWidth()
+                .padding(horizontal = ToolbarHPad, vertical = ToolbarVPad),
         ) {
-            BasicTextField(
-                value = query,
-                onValueChange = { query = it },
-                singleLine = true,
-                textStyle = MaterialTheme.typography.bodyMedium.copy(
-                    color = theme.color("text"),
-                ),
-                cursorBrush = SolidColor(theme.cursor),
-                modifier = Modifier.fillMaxWidth().focusRequester(focus),
-            )
-            if (query.text.isEmpty()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                // `gap_2` between the input column and the mode column
+                // (buffer_search.rs:372).
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                // The input box: `min_w_32 min_h_8 pl_2 pr_1 border_1
+                // rounded_md` (search_bar.rs:69-79), the border in `border` —
+                // `error` while the regex will not compile
+                // (buffer_search.rs:213-217). No fill of its own: Zed paints
+                // the text on `toolbar.background` (search_bar.rs:124). On a
+                // phone the viewport is under Zed's 1200px threshold, so the
+                // input takes the whole remaining width
+                // (ui/src/utils/search_input.rs:13-18).
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = InputMinHeight)
+                        .clip(RoundedCornerShape(FieldRadius))
+                        .border(
+                            1.dp,
+                            theme.color(if (error == null) "border" else "error"),
+                            RoundedCornerShape(FieldRadius),
+                        )
+                        .padding(start = 8.dp, end = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            // Inner `py_1` around the text (buffer_search.rs:233).
+                            .padding(vertical = 4.dp)
+                            .pointerHoverIcon(PointerIcon.Text),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        BasicTextField(
+                            value = query,
+                            onValueChange = { query = it },
+                            singleLine = true,
+                            textStyle = inputStyle.copy(
+                                // Zed turns the query text itself `error` when
+                                // a non-empty query has no matches
+                                // (buffer_search.rs:188-208).
+                                color = theme.color(
+                                    if (query.text.isNotEmpty() && matches.isEmpty()) "error"
+                                    else "text"
+                                ),
+                            ),
+                            cursorBrush = SolidColor(theme.cursor),
+                            modifier = Modifier.fillMaxWidth().focusRequester(focus),
+                        )
+                        if (query.text.isEmpty()) {
+                            Text(
+                                // Zed's own placeholder (buffer_search.rs:180).
+                                text = "Search…",
+                                style = inputStyle,
+                                color = theme.color("text.placeholder"),
+                            )
+                        }
+                    }
+                    // The three toggles live inside the input's right edge,
+                    // `gap_1` apart (buffer_search.rs:238-262).
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        BarButton("Aa", "Match case", selected = caseSensitive) {
+                            caseSensitive = !caseSensitive
+                        }
+                        BarButton("ab", "Whole word", selected = wholeWord) {
+                            wholeWord = !wholeWord
+                        }
+                        BarButton(".*", "Regular expression", selected = regex) {
+                            regex = !regex
+                        }
+                    }
+                }
+
+                // The matches column: `ml_2 border_l_1` in `border.variant`,
+                // then `pl_2`, the two arrows flush against each other, and
+                // the counter `ml_2` further right (buffer_search.rs:308-343).
+                // The row's own 8dp gap is the `ml_2`; the divider and spacer
+                // supply the border and the `pl_2`.
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .width(1.dp)
+                            .height(ButtonBox)
+                            .background(theme.color("border.variant"))
+                    )
+                    Box(modifier = Modifier.width(8.dp))
+                    BarButton(
+                        "‹",
+                        "Previous match",
+                        enabled = matches.isNotEmpty(),
+                        textStyle = MaterialTheme.typography.bodyMedium,
+                    ) { step(-1) }
+                    BarButton(
+                        "›",
+                        "Next match",
+                        enabled = matches.isNotEmpty(),
+                        textStyle = MaterialTheme.typography.bodyMedium,
+                    ) { step(1) }
+                    Text(
+                        // Zed's counter is "3/12", "0/0" when nothing matches
+                        // — including the empty query (buffer_search.rs:189-208).
+                        text = if (matches.isNotEmpty()) "${current + 1}/$total" else "0/0",
+                        // `LabelSize::Small` (12px); `text` with a live match,
+                        // `text.disabled` without one (buffer_search.rs:334-342).
+                        style = MaterialTheme.typography.labelMedium,
+                        color = theme.color(if (matches.isNotEmpty()) "text" else "text.disabled"),
+                        maxLines = 1,
+                        modifier = Modifier
+                            .padding(start = 8.dp)
+                            .widthIn(min = CountMinWidth),
+                    )
+                }
+
+                // Zed pins the close button to the bar's right edge
+                // (buffer_search.rs:436-454); at a row's end it lands there too.
+                BarButton(
+                    "✕",
+                    "Close",
+                    textStyle = MaterialTheme.typography.bodyMedium,
+                ) { onDismiss() }
+            }
+
+            error?.let { message ->
                 Text(
-                    text = "Find",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = theme.color("text.placeholder"),
+                    // The regex error under the bar: `LabelSize::Small`,
+                    // `Color::Error`, `ml_2`, and `mt_neg_1` pulling it 4px
+                    // back into the 8px line gap (buffer_search.rs:423-429).
+                    text = message,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = theme.color("error"),
+                    maxLines = 1,
+                    modifier = Modifier.padding(start = 8.dp, top = 4.dp),
                 )
             }
         }
-
-        Toggle("Aa", caseSensitive, "Match case") { caseSensitive = !caseSensitive }
-        Toggle("ab", wholeWord, "Whole word") { wholeWord = !wholeWord }
-        Toggle(".*", regex, "Regular expression") { regex = !regex }
-
-        Text(
-            text = error?.let { "no match" } ?: when {
-                query.text.isEmpty() -> ""
-                matches.isEmpty() -> "no results"
-                // "3 of 12 000" stays honest when the engine capped the list:
-                // the count is what it found, not what it kept.
-                else -> "${current + 1} of $total"
-            },
-            style = MaterialTheme.typography.labelMedium,
-            color = theme.color("text.muted"),
-            maxLines = 1,
-            // Wraps to its content rather than reserving a fixed slot: six
-            // fixed controls plus a fixed counter left a 360dp phone about
-            // 50dp for the field the whole bar exists for.
-            modifier = Modifier.widthIn(max = 112.dp),
-        )
-
-        Arrow("‹", "Previous match") { step(-1) }
-        Arrow("›", "Next match") { step(1) }
-        Arrow("✕", "Close") { onDismiss() }
+        // Zed underlines the toolbar with 1px of `border.variant`
+        // (toolbar.rs:128-129). The workspace already draws its divider
+        // right under this bar, so a second hairline here would double it —
+        // the underline is that divider's job.
     }
 }
 
+/**
+ * Zed's `IconButton` with `IconButtonShape::Square`, drawn with a text glyph
+ * where Zed has an SVG: a [ButtonBox] square, `rounded_sm` 4px
+ * (button_like.rs:527 via `ButtonLikeRounding::ALL`), `ButtonStyle::Subtle`
+ * state colours — `ghost_element.background`, hover `ghost_element.hover`,
+ * pressed `ghost_element.active`, disabled `ghost_element.disabled`
+ * (button_like.rs:242-243, 298-299, 324-325, 417-418) — swapped instantly,
+ * no ripple. Selected keeps the ghost background and turns the glyph
+ * `Color::Selected` = `text.accent` (icon_button.rs:243-252; color.rs:108);
+ * disabled turns it `text.disabled` (icon_button.rs:243-244).
+ */
 @Composable
-private fun Toggle(label: String, on: Boolean, description: String, onClick: () -> Unit) {
+private fun BarButton(
+    glyph: String,
+    description: String,
+    selected: Boolean = false,
+    enabled: Boolean = true,
+    textStyle: TextStyle = MaterialTheme.typography.labelMedium,
+    onClick: () -> Unit,
+) {
     val theme = LocalZedTheme.current
-    Box(
-        modifier = Modifier
-            .size(TouchTarget)
-            .clickable(onClickLabel = description, onClick = onClick)
-            .pointerHoverIcon(PointerIcon.Hand),
-        contentAlignment = Alignment.Center,
-    ) {
-        Box(
-            modifier = Modifier
-                .size(ControlSize)
-                .clip(RoundedCornerShape(4.dp))
-                .background(
-                    theme.color(if (on) "element.selected" else "ghost_element.background")
-                ),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                text = label,
-                style = MaterialTheme.typography.labelMedium,
-                color = theme.color(if (on) "text" else "text.muted"),
-            )
-        }
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val pressed by interaction.collectIsPressedAsState()
+    val background = when {
+        !enabled -> theme.color("ghost_element.disabled")
+        pressed -> theme.color("ghost_element.active")
+        hovered -> theme.color("ghost_element.hover")
+        else -> theme.color("ghost_element.background")
     }
-}
-
-@Composable
-private fun Arrow(glyph: String, description: String, onClick: () -> Unit) {
-    val theme = LocalZedTheme.current
     Box(
         modifier = Modifier
-            .size(TouchTarget)
+            .size(ButtonBox)
             .clip(RoundedCornerShape(4.dp))
-            .clickable(onClickLabel = description, onClick = onClick)
-            .pointerHoverIcon(PointerIcon.Hand),
+            .background(background)
+            .then(if (enabled) Modifier.pointerHoverIcon(PointerIcon.Hand) else Modifier)
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                enabled = enabled,
+                onClickLabel = description,
+                onClick = onClick,
+            ),
         contentAlignment = Alignment.Center,
     ) {
         Text(
             text = glyph,
-            style = MaterialTheme.typography.bodyMedium,
-            color = theme.color("icon"),
+            style = textStyle,
+            color = theme.color(
+                when {
+                    !enabled -> "text.disabled"
+                    selected -> "text.accent"
+                    else -> "text"
+                }
+            ),
         )
     }
 }

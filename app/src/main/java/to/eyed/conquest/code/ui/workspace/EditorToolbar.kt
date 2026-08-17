@@ -3,6 +3,9 @@ package to.eyed.conquest.code.ui.workspace
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -12,9 +15,15 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
@@ -25,13 +34,23 @@ import to.eyed.conquest.code.ui.preview.PreviewKind
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
 /**
- * Tall enough for the touch target inside it. Zed's toolbar is shorter — its
- * buttons are 26px, drawn for a mouse — but a control a finger cannot hit is
- * not a control, and this project's floor is 40dp.
+ * Zed's toolbar frame: `py(Base06)` = 6px and `px(Base08)` = 8px around a
+ * 32px item row (workspace/src/toolbar.rs:123-124, 140, 150), on
+ * `toolbar.background` with a 1px `border.variant` underline
+ * (toolbar.rs:128-130). Per the 2026-08-17 density decision the 40dp floor is
+ * gone; the whole eye button's actions stay a chord away (Ctrl+Shift+M).
  */
-private val ToolbarHeight = 40.dp
-private val TouchTarget = 40.dp
-private val IconSize = 16.dp
+private val ToolbarItemRowHeight = 32.dp
+private val ToolbarVerticalPad = 6.dp
+private val ToolbarHorizontalPad = 8.dp
+
+/**
+ * Zed's IconButton at `ButtonSize::Default`: a 22px box (button_like.rs:469)
+ * around an `IconSize::Small` 14px glyph — the exact button the quick action
+ * bar's eye is (quick_action_bar/preview.rs:66-68).
+ */
+private val ButtonBox = 22.dp
+private val IconSize = 14.dp
 
 /**
  * The row under the tab strip: Zed's toolbar, and specifically the quick
@@ -53,12 +72,23 @@ fun EditorToolbar(
     modifier: Modifier = Modifier,
 ) {
     val theme = LocalZedTheme.current
+    val underline = theme.color("border.variant")
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .height(ToolbarHeight)
             .background(theme.color("toolbar.background", theme.color("editor.background")))
-            .padding(horizontal = 4.dp),
+            // The underline is drawn inside the frame, as gpui draws borders
+            // (toolbar.rs:128-129).
+            .drawBehind {
+                val line = 1.dp.toPx()
+                drawRect(
+                    color = underline,
+                    topLeft = Offset(0f, size.height - line),
+                    size = Size(size.width, line),
+                )
+            }
+            .padding(horizontal = ToolbarHorizontalPad, vertical = ToolbarVerticalPad)
+            .height(ToolbarItemRowHeight),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Spacer(modifier = Modifier.weight(1f))
@@ -66,28 +96,46 @@ fun EditorToolbar(
             PreviewKind.Markdown -> "Preview Markdown"
             PreviewKind.Svg -> "Preview SVG"
         }
+        val interaction = remember { MutableInteractionSource() }
+        val hovered by interaction.collectIsHoveredAsState()
+        val pressed by interaction.collectIsPressedAsState()
         Box(
             modifier = Modifier
-                .size(TouchTarget)
+                .size(ButtonBox)
                 .clip(RoundedCornerShape(4.dp))
-                // The pressed look is the background Zed gives a toggled
-                // button, not a different icon: the eye stays the eye.
+                // `Subtle`, a ghost button: transparent at rest,
+                // `ghost_element.hover` under the pointer and
+                // `ghost_element.active` while pressed, swapped instantly
+                // (button_like.rs:298-303, 324-329).
                 .background(
-                    if (isPreviewOpen) {
-                        theme.color("element.selected", theme.color("border"))
-                    } else {
-                        theme.color("editor.background")
+                    when {
+                        pressed -> theme.color("ghost_element.active", Color.Transparent)
+                        hovered -> theme.color("ghost_element.hover", Color.Transparent)
+                        else -> Color.Transparent
                     }
                 )
-                .clickable(onClickLabel = label, onClick = onTogglePreview)
+                .clickable(
+                    interactionSource = interaction,
+                    indication = null,
+                    onClickLabel = label,
+                    onClick = onTogglePreview,
+                )
                 .pointerHoverIcon(PointerIcon.Hand),
             contentAlignment = Alignment.Center,
         ) {
             Image(
                 painter = painterResource(R.drawable.ic_ui_eye),
                 contentDescription = label,
+                // A toggled IconButton keeps its ghost background and swaps
+                // the glyph to `Color::Selected` = `text.accent`
+                // (icon_button.rs:246-248, color.rs:108): the eye stays the
+                // eye, it just lights up.
                 colorFilter = ColorFilter.tint(
-                    if (isPreviewOpen) theme.color("icon.accent", theme.color("icon")) else theme.color("icon")
+                    if (isPreviewOpen) {
+                        theme.color("text.accent", theme.color("icon"))
+                    } else {
+                        theme.color("text", theme.color("icon"))
+                    }
                 ),
                 modifier = Modifier.size(IconSize),
             )

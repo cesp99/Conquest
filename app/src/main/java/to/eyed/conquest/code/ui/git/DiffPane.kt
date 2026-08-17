@@ -1,21 +1,27 @@
 package to.eyed.conquest.code.ui.git
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -27,7 +33,10 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -42,7 +51,6 @@ import to.eyed.conquest.code.core.ProjectSession
 import to.eyed.conquest.code.ui.theme.BufferFontFamily
 import to.eyed.conquest.code.ui.theme.LocalAppSettings
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
-import to.eyed.conquest.code.ui.theme.UiFontFamily
 
 /** What a diff tab is looking at. */
 data class DiffTarget(
@@ -120,7 +128,13 @@ private fun DiffBody(files: List<FileDiff>, onOpenFile: (String) -> Unit) {
     val theme = LocalZedTheme.current
     val settings = LocalAppSettings.current
     val code = remember(settings.bufferFontSize) {
-        TextStyle(fontFamily = BufferFontFamily, fontSize = settings.bufferFontSize.sp)
+        TextStyle(
+            fontFamily = BufferFontFamily,
+            fontSize = settings.bufferFontSize.sp,
+            // `buffer_line_height: "comfortable"` = φ, as in the editor
+            // itself (theme_settings/src/settings.rs:390).
+            lineHeight = (settings.bufferFontSize * 1.618034f).sp,
+        )
     }
     // One scroll for the whole patch, horizontal as well: a diff of a long
     // line must not be wrapped, or the two sides stop lining up.
@@ -191,9 +205,20 @@ private fun DiffBody(files: List<FileDiff>, onOpenFile: (String) -> Unit) {
     }
 }
 
+/**
+ * A file's header, in the clothes of Zed's multibuffer excerpt header: the
+ * whole strip is `FILE_HEADER_HEIGHT` = 2 buffer lines with 4px of padding
+ * around a card (`BUFFER_HEADER_PADDING` = rems(0.25); editor.rs:290-291),
+ * and the card is `rounded_sm`, 1px `border`, `editor.subheader.background`,
+ * `pl_1`/`pr_2` with a `gap_1p5`, the filename set in the buffer font
+ * (element/header.rs:707-733, 843-851). The +/− counts are the header's diff
+ * stat; "open" stands in for its open-file button, one label instead of an
+ * icon we do not ship.
+ */
 @Composable
 private fun FileHeader(file: FileDiff, onOpenFile: (String) -> Unit) {
     val theme = LocalZedTheme.current
+    val settings = LocalAppSettings.current
     val colours = remember(theme) {
         to.eyed.conquest.code.ui.workspace.GitStatusColours.from(
             theme,
@@ -201,41 +226,71 @@ private fun FileHeader(file: FileDiff, onOpenFile: (String) -> Unit) {
             theme.color("text.muted"),
         )
     }
-    Column(
+    val bufferLine = settings.bufferFontSize * 1.618034f
+    Box(
         modifier = Modifier
             .fillMaxWidth()
-            .background(theme.color("panel.background"))
-            .padding(horizontal = 10.dp, vertical = 8.dp),
+            .height((bufferLine * 2).dp)
+            .padding(4.dp),
     ) {
-        Text(
-            text = file.original?.let { "$it → ${file.path}" } ?: file.path,
-            style = TextStyle(fontFamily = UiFontFamily, fontSize = 13.sp),
-            color = theme.color("text"),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Row {
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .clip(RoundedCornerShape(4.dp))
+                .background(theme.color("editor.subheader.background"))
+                .border(1.dp, theme.color("border"), RoundedCornerShape(4.dp))
+                .padding(start = 4.dp, end = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = file.original?.let { "$it → ${file.path}" } ?: file.path,
+                style = TextStyle(
+                    fontFamily = BufferFontFamily,
+                    fontSize = settings.bufferFontSize.sp,
+                ),
+                color = theme.color("text"),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
             Text(
                 text = "+${file.added}",
-                style = TextStyle(fontFamily = UiFontFamily, fontSize = 11.sp),
+                style = MaterialTheme.typography.labelMedium,
                 color = colours.added,
             )
             Text(
-                text = "  −${file.removed}",
-                style = TextStyle(fontFamily = UiFontFamily, fontSize = 11.sp),
+                text = "−${file.removed}",
+                style = MaterialTheme.typography.labelMedium,
                 color = colours.deleted,
             )
+            Spacer(modifier = Modifier.weight(1f))
+            val openInteraction = remember { MutableInteractionSource() }
+            val openHovered by openInteraction.collectIsHoveredAsState()
             Text(
-                text = "   open",
-                style = TextStyle(fontFamily = UiFontFamily, fontSize = 11.sp),
-                color = theme.color("text.accent", MaterialTheme.colorScheme.primary),
+                text = "open",
+                style = MaterialTheme.typography.labelMedium,
+                color = theme.color("text.muted"),
                 modifier = Modifier
-                    .padding(start = 4.dp)
-                    .clickable(onClickLabel = "Open the file") { onOpenFile(file.path) },
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(
+                        if (openHovered) {
+                            theme.color("ghost_element.hover", Color.Transparent)
+                        } else {
+                            Color.Transparent
+                        }
+                    )
+                    .pointerHoverIcon(PointerIcon.Hand)
+                    .clickable(
+                        interactionSource = openInteraction,
+                        // Instant swap, no ripple, as everywhere in Zed.
+                        indication = null,
+                        onClickLabel = "Open the file",
+                    ) { onOpenFile(file.path) }
+                    .padding(horizontal = 4.dp),
             )
         }
     }
-    HorizontalDivider(color = theme.color("border.variant"))
 }
 
 @Composable
@@ -246,11 +301,12 @@ private fun DiffLineRow(
     contentWidth: Int,
 ) {
     val theme = LocalZedTheme.current
-    // Zed flattens the hunk colour over the editor background rather than
-    // drawing a translucent quad, so text on it keeps its contrast.
+    // The tokens Zed highlights expanded hunk rows with: the status pair
+    // `created.background` / `deleted.background` (crates/theme/src/styles/
+    // status.rs:19, 96), whose alpha is baked into the theme hex.
     val background = when (line.kind) {
-        '+' -> theme.color("version_control.added", theme.color("created")).copy(alpha = 0.16f)
-        '-' -> theme.color("version_control.deleted", theme.color("deleted")).copy(alpha = 0.16f)
+        '+' -> theme.color("created.background", theme.color("created").copy(alpha = 0.16f))
+        '-' -> theme.color("deleted.background", theme.color("deleted").copy(alpha = 0.16f))
         else -> Color.Transparent
     }
     Row(
@@ -297,7 +353,8 @@ private fun Notice(text: String, isError: Boolean = false) {
     ) {
         Text(
             text = text,
-            style = TextStyle(fontFamily = UiFontFamily, fontSize = 13.sp),
+            // Zed centres a muted default-size label in an empty surface.
+            style = MaterialTheme.typography.bodyMedium,
             color = if (isError) theme.color("error") else theme.color("text.muted"),
         )
     }

@@ -1,20 +1,28 @@
 package to.eyed.conquest.code.ui.workspace
 
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerIcon
@@ -55,12 +63,18 @@ internal fun ContextMenu(
         expanded = expanded,
         onDismissRequest = onDismiss,
         offset = offset,
+        // Zed's `elevation_2`: an elevated surface, `rounded_lg` 8px, and a
+        // 1px border in `border.variant` (styled_ext.rs:6-12).
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, theme.color("border.variant")),
         containerColor = theme.color(
             "elevated_surface.background",
             MaterialTheme.colorScheme.surface,
         ),
     ) {
-        Column(modifier = Modifier.widthIn(min = minWidth)) {
+        // Entries are inset ListItems: 4px of surface around each row, the
+        // row itself `rounded_sm` with 6px inside (list_item.rs:309, 364, 405).
+        Column(modifier = Modifier.widthIn(min = minWidth).padding(horizontal = 4.dp)) {
             for (item in items) {
                 ContextMenuRow(item, onChosen = onDismiss)
             }
@@ -70,16 +84,29 @@ internal fun ContextMenu(
 
 @Composable
 private fun ContextMenuRow(item: ContextMenuItem, onChosen: () -> Unit) {
+    val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(24.dp),
+        // `ml_4` between a label and its keybinding (context_menu.rs:2089).
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
         modifier = Modifier
             .fillMaxWidth()
+            .clip(RoundedCornerShape(4.dp))
+            .background(
+                if (hovered && item.enabled) {
+                    theme.color("ghost_element.hover", Color.Transparent)
+                } else {
+                    Color.Transparent
+                }
+            )
             .then(
                 if (item.enabled) {
                     Modifier
                         .pointerHoverIcon(PointerIcon.Hand)
-                        .clickable {
+                        // Instant colour swap, no ripple, as everywhere in Zed.
+                        .clickable(interactionSource = interaction, indication = null) {
                             onChosen()
                             item.onClick()
                         }
@@ -87,7 +114,7 @@ private fun ContextMenuRow(item: ContextMenuItem, onChosen: () -> Unit) {
                     Modifier
                 }
             )
-            .padding(horizontal = 16.dp, vertical = 10.dp),
+            .padding(horizontal = 6.dp, vertical = 2.dp),
     ) {
         Text(
             text = item.label,
@@ -95,7 +122,7 @@ private fun ContextMenuRow(item: ContextMenuItem, onChosen: () -> Unit) {
             color = if (item.enabled) {
                 MaterialTheme.colorScheme.onSurface
             } else {
-                MaterialTheme.colorScheme.onSurfaceVariant
+                theme.color("text.disabled", MaterialTheme.colorScheme.onSurfaceVariant)
             },
             modifier = Modifier.weight(1f),
         )

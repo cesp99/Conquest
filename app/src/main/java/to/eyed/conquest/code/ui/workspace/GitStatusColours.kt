@@ -139,24 +139,24 @@ class GitStatusColours(
      *
      * [isIgnored] comes from the worktree, which knows about .gitignore
      * without any git query; [dimIgnored] is the `project_panel
-     * .gitignored_files` setting. Ignored wins over status, matching Zed —
-     * an ignored file that is also modified still reads as ignored.
+     * .gitignored_files` setting. A real change wins over ignored-ness, as in
+     * Zed — `entry_git_aware_label_color` checks conflict, deleted, modified
+     * and created *before* ignored (editor/src/items.rs:2205-2219), so an
+     * ignored file that is also modified reads as modified.
      */
     fun colorFor(
         status: GitFileStatus,
         isIgnored: Boolean = false,
         dimIgnored: Boolean = true,
-    ): Color = when {
-        (isIgnored || status == GitFileStatus.Ignored) && dimIgnored -> ignored
-        else -> when (status) {
-            GitFileStatus.Modified -> modified
-            GitFileStatus.Added -> added
-            GitFileStatus.Untracked -> untracked
-            GitFileStatus.Deleted -> deleted
-            GitFileStatus.Renamed -> renamed
-            GitFileStatus.Conflicted -> conflicted
-            GitFileStatus.None, GitFileStatus.Ignored -> default
-        }
+    ): Color = when (status) {
+        GitFileStatus.Conflicted -> conflicted
+        GitFileStatus.Deleted -> deleted
+        GitFileStatus.Modified -> modified
+        GitFileStatus.Added -> added
+        GitFileStatus.Untracked -> untracked
+        GitFileStatus.Renamed -> renamed
+        GitFileStatus.None, GitFileStatus.Ignored ->
+            if ((isIgnored || status == GitFileStatus.Ignored) && dimIgnored) ignored else default
     }
 
     companion object {
@@ -167,9 +167,31 @@ class GitStatusColours(
          * ignored entries, matching what the panel dimmed them to before git
          * status existed.
          */
-        fun from(theme: ZedTheme, default: Color, muted: Color = default): GitStatusColours {
+        fun from(theme: ZedTheme, default: Color, muted: Color = default): GitStatusColours =
+            resolve(theme, default, muted, statusFamilyFirst = false)
+
+        /**
+         * The project panel's resolution order. Its rows tint through
+         * `Color::Modified` and friends, which map to the **status family**
+         * (`modified`, `created`, `deleted`, `conflict` —
+         * ui/src/styles/color.rs:94-99) rather than to `version_control.*`,
+         * which belongs to the git panel and the branch icon. The two
+         * families differ in the shipped themes — One Light's
+         * `version_control.*` hexes are not light-adapted — so the order is
+         * visible, not academic.
+         */
+        fun forProjectPanel(theme: ZedTheme, default: Color, muted: Color = default) =
+            resolve(theme, default, muted, statusFamilyFirst = true)
+
+        private fun resolve(
+            theme: ZedTheme,
+            default: Color,
+            muted: Color,
+            statusFamilyFirst: Boolean,
+        ): GitStatusColours {
             fun key(vararg keys: String): Color {
-                for (name in keys) lookup(theme, name)?.let { return it }
+                val order = if (statusFamilyFirst) keys.reversed() else keys.toList()
+                for (name in order) lookup(theme, name)?.let { return it }
                 return default
             }
             return GitStatusColours(

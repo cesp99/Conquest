@@ -3,18 +3,28 @@ package to.eyed.conquest.code.ui.workspace
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
@@ -29,6 +39,15 @@ data class PanelButton(
     val isOpen: Boolean,
     val onClick: () -> Unit,
 )
+
+/**
+ * Every item is Zed's IconButton at `ButtonSize::Default`: a 22px box
+ * (button_like.rs:469) with `rounded_sm` corners (button_like.rs:527) around
+ * an `IconSize::Small` 14px glyph (status_bar.rs:187 spec; dock.rs:1398-1400).
+ * Two of them plus the bar's 4px `p(Base04)` is the whole 30px height.
+ */
+private val ItemBox = 22.dp
+private val ItemIconSize = 14.dp
 
 /**
  * Zed-style status bar: **state, not actions**.
@@ -69,6 +88,7 @@ fun StatusBar(
             .background(theme.color("status_bar.background"))
             .padding(4.dp),
         verticalAlignment = Alignment.CenterVertically,
+        // `gap_1` = 4px within a group (status_bar.rs:196, 215).
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         for (button in leftPanels) {
@@ -78,23 +98,30 @@ fun StatusBar(
         Spacer(modifier = Modifier.weight(1f))
 
         if (hasFile) {
-            // Zed writes the caret as line:column.
+            // Zed writes the caret as line:column — both it and the language
+            // are `Label`s at the default colour, `text`, not muted
+            // (cursor_position.rs:210-247).
             Text(
                 text = "${cursorRow + 1}:${cursorCol + 1}",
                 style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 8.dp),
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.padding(horizontal = 4.dp),
             )
             if (language != null) {
                 Text(
                     text = language,
                     style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 8.dp),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.padding(horizontal = 4.dp),
                 )
             }
         }
 
+        // A dock group is fenced with a 1px × 16px divider on the side facing
+        // the middle (dock.rs:1433-1446, divider.rs:29, 147-149).
+        if (rightPanels.isNotEmpty() || onToggleTerminal != null) {
+            GroupDivider(theme.color("border"))
+        }
         for (button in rightPanels) {
             PanelStatusButton(button)
         }
@@ -129,20 +156,64 @@ private fun StatusIconAction(
     emphasised: Boolean = false,
     onClick: () -> Unit,
 ) {
-    Image(
-        painter = painterResource(icon),
-        contentDescription = label,
-        colorFilter = ColorFilter.tint(
-            if (emphasised) {
-                MaterialTheme.colorScheme.onSurface
-            } else {
-                MaterialTheme.colorScheme.onSurfaceVariant
-            }
-        ),
+    val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val pressed by interaction.collectIsPressedAsState()
+    Box(
         modifier = Modifier
+            .size(ItemBox)
+            .clip(RoundedCornerShape(4.dp))
+            // `Subtle`, a ghost button: transparent at rest,
+            // `ghost_element.hover` under the pointer, `ghost_element.active`
+            // while pressed, swapped instantly — no ripple
+            // (button_like.rs:298-303, 324-329).
+            .background(
+                when {
+                    pressed -> theme.color("ghost_element.active", Color.Transparent)
+                    hovered -> theme.color("ghost_element.hover", Color.Transparent)
+                    else -> Color.Transparent
+                }
+            )
             .pointerHoverIcon(PointerIcon.Hand)
-            .clickable(onClickLabel = label, onClick = onClick)
-            .padding(horizontal = 8.dp, vertical = 4.dp)
-            .size(14.dp),
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                onClickLabel = label,
+                onClick = onClick,
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Image(
+            painter = painterResource(icon),
+            contentDescription = label,
+            // An open panel's button is `toggle_state(true)` (dock.rs:1400):
+            // the box stays ghost and the glyph swaps to `Color::Selected` =
+            // `text.accent` (icon_button.rs:246-248, color.rs:108). At rest
+            // the glyph is `Color::Default` = `text` (color.rs:92).
+            colorFilter = ColorFilter.tint(
+                if (emphasised) {
+                    theme.color("text.accent", MaterialTheme.colorScheme.onSurface)
+                } else {
+                    theme.color("text", MaterialTheme.colorScheme.onSurface)
+                }
+            ),
+            modifier = Modifier.size(ItemIconSize),
+        )
+    }
+}
+
+/**
+ * Zed's `Divider::vertical()` between the middle and a dock's button group:
+ * 1px wide, `h_4` (16px) tall, in `border` (divider.rs:29, 147-149;
+ * dock.rs:1433-1446).
+ */
+@Composable
+private fun GroupDivider(color: androidx.compose.ui.graphics.Color) {
+    Box(
+        modifier = Modifier
+            .width(1.dp)
+            .height(16.dp)
+            .background(color)
     )
 }

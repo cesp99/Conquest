@@ -37,14 +37,23 @@ class GitStatusColoursTest {
     }
 
     @Test
-    fun ignoredBeatsStatus() {
+    fun aRealChangeBeatsIgnored() {
+        // Zed's `entry_git_aware_label_color` checks conflict, deleted,
+        // modified and created before it ever looks at ignored-ness
+        // (editor/src/items.rs:2205-2219): an ignored file that is also
+        // modified reads as modified.
         assertEquals(
-            colours.ignored,
+            colours.modified,
             colours.colorFor(GitFileStatus.Modified, isIgnored = true, dimIgnored = true),
         )
+        // With no change to show, ignored-ness still dims.
         assertEquals(
             colours.ignored,
             colours.colorFor(GitFileStatus.Ignored, isIgnored = false, dimIgnored = true),
+        )
+        assertEquals(
+            colours.ignored,
+            colours.colorFor(GitFileStatus.None, isIgnored = true, dimIgnored = true),
         )
     }
 

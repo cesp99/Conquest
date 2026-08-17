@@ -1,5 +1,6 @@
 package to.eyed.conquest.code.ui.workspace
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -10,9 +11,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -23,9 +25,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -74,10 +79,22 @@ fun ProjectContextMenu(
     offset: DpOffset,
     onDismiss: () -> Unit,
 ) {
+    // The same dress as every other context menu — ContextMenu.kt's
+    // elevation-2 container and dense ripple-free rows — rather than stock
+    // DropdownMenuItems, which bring their own ripple (material3's Menu.kt
+    // passes `indication = ripple()` explicitly, so the theme's NoIndication
+    // never reaches them) and Material's menu surface tokens.
+    val theme = LocalZedTheme.current
     DropdownMenu(
         expanded = true,
         onDismissRequest = onDismiss,
         offset = offset,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, theme.color("border.variant")),
+        containerColor = theme.color(
+            "elevated_surface.background",
+            MaterialTheme.colorScheme.surface,
+        ),
         modifier = Modifier.onPreviewKeyEvent { event ->
             // Escape closes it. Arrows and Enter are Compose's own focus
             // traversal, which the items are already wired for.
@@ -89,42 +106,72 @@ fun ProjectContextMenu(
             }
         },
     ) {
-        for (entry in entries.withoutStraySeparators()) {
-            when (entry) {
-                is PanelMenuEntry.Separator ->
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+        Column(modifier = Modifier.widthIn(min = 220.dp).padding(horizontal = 4.dp)) {
+            for (entry in entries.withoutStraySeparators()) {
+                when (entry) {
+                    is PanelMenuEntry.Separator ->
+                        // Zed's ListSeparator: 1px `border.variant`, 6px above
+                        // and below (list_separator.rs:9-12).
+                        HorizontalDivider(
+                            color = theme.color("border.variant"),
+                            modifier = Modifier.padding(vertical = 6.dp),
+                        )
 
-                is PanelMenuEntry.Action -> {
-                    DropdownMenuItem(
-                        text = {
-                            Text(
-                                text = entry.label,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = if (entry.enabled) {
-                                    MaterialTheme.colorScheme.onSurface
-                                } else {
-                                    MaterialTheme.colorScheme.onSurfaceVariant
-                                },
-                            )
-                        },
-                        trailingIcon = entry.shortcut?.let { shortcut ->
-                            {
-                                Text(
-                                    text = shortcut,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        },
-                        enabled = entry.enabled,
-                        onClick = {
-                            onDismiss()
-                            entry.onClick()
-                        },
-                        modifier = Modifier.pointerHoverIcon(PointerIcon.Hand),
-                    )
+                    is PanelMenuEntry.Action -> PanelMenuRow(entry, onDismiss)
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun PanelMenuRow(entry: PanelMenuEntry.Action, onDismiss: () -> Unit) {
+    val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(4.dp))
+            .background(
+                if (hovered && entry.enabled) {
+                    theme.color("ghost_element.hover", Color.Transparent)
+                } else {
+                    Color.Transparent
+                }
+            )
+            .then(
+                if (entry.enabled) {
+                    Modifier
+                        .pointerHoverIcon(PointerIcon.Hand)
+                        .clickable(interactionSource = interaction, indication = null) {
+                            onDismiss()
+                            entry.onClick()
+                        }
+                } else {
+                    Modifier
+                }
+            )
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+    ) {
+        Text(
+            text = entry.label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (entry.enabled) {
+                MaterialTheme.colorScheme.onSurface
+            } else {
+                theme.color("text.disabled", MaterialTheme.colorScheme.onSurfaceVariant)
+            },
+            modifier = Modifier.weight(1f),
+        )
+        if (entry.shortcut != null) {
+            Text(
+                text = entry.shortcut,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }

@@ -9,15 +9,18 @@ import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 
-/** Zed's `IconSize::Small` — a 14px glyph (crates/ui/src/components/icon.rs:75). */
-private val EntryIconSize = 14.dp
+/**
+ * `IconSize::Medium` — the panel's `Icon::from_path` never asks for a size,
+ * so it gets the 16px default (project_panel.rs:6247, icon.rs:61-63, 76).
+ */
+private val EntryIconSize = 16.dp
 
 /**
- * The slot the icon sits in. Wider than the glyph so every row's name starts
- * at the same column whatever its icon is — Zed's `ListItem` start slot does
- * the same (list_item.rs:429).
+ * The slot the icon sits in. The same 16px: Zed's alignment spacer for a row
+ * with no icon is `IconSize::default().rems()` (project_panel.rs:6253-6259),
+ * so every row's name starts at the same column whatever its icon is.
  */
-val EntryIconWidth = 20.dp
+val EntryIconWidth = 16.dp
 
 /**
  * The icon in front of a row: Zed's own, for the language the file is in.

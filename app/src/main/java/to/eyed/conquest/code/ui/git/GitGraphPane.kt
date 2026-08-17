@@ -3,6 +3,8 @@ package to.eyed.conquest.code.ui.git
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -32,10 +34,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import to.eyed.conquest.code.core.Commit
@@ -43,7 +45,6 @@ import to.eyed.conquest.code.core.CommitDetails
 import to.eyed.conquest.code.core.GitSession
 import to.eyed.conquest.code.core.ProjectSession
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
-import to.eyed.conquest.code.ui.theme.UiFontFamily
 import to.eyed.conquest.code.ui.theme.ZedTheme
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -58,10 +59,20 @@ private val DATE_FORMAT = SimpleDateFormat("d MMM yyyy HH:mm", Locale.getDefault
 /** However tangled the history, the diagram may not eat the whole row. */
 private const val MAX_DRAWN_LANES = 8
 
-/** Row metrics. The lane column is a diagram, so it is measured, not padded. */
-private val RowHeight = 44.dp
+/**
+ * Row metrics — Zed's own graph constants. A single-line row is the UI line
+ * box plus `ROW_VERTICAL_PADDING` = 4px (git_graph.rs:78, 1354-1361): 14 × φ
+ * ≈ 22.7, so ~27. The stacked row a narrow screen gets is ours, sized the
+ * same way for its two line boxes. Lanes are `LANE_WIDTH` = 16px with a
+ * 3.5px-radius dot and 1.5px lines (git_graph.rs:68-72), and the diagram is
+ * inset `LEFT_PADDING` = 12px (git_graph.rs:71).
+ */
+private val RowHeight = 27.dp
+private val StackedRowHeight = 46.dp
 private val LaneWidth = 16.dp
 private val DotRadius = 3.5.dp
+private val LineWidth = 1.5.dp
+private val GraphLeftPadding = 12.dp
 
 /** Where the columns appear, rather than the second line of a stacked row. */
 private val ColumnsFrom = 640.dp
@@ -225,7 +236,7 @@ private fun GraphHeader() {
         modifier = Modifier
             .fillMaxWidth()
             .background(theme.color("panel.background"))
-            .padding(horizontal = 10.dp, vertical = 6.dp),
+            .padding(start = GraphLeftPadding, end = 8.dp, top = 4.dp, bottom = 4.dp),
     ) {
         HeaderCell("Graph", 90.dp)
         HeaderCell("Description", null)
@@ -242,8 +253,9 @@ private fun androidx.compose.foundation.layout.RowScope.HeaderCell(
 ) {
     val theme = LocalZedTheme.current
     Text(
+        // Column titles are Small muted labels, as every Zed table header.
         text = text,
-        style = TextStyle(fontFamily = UiFontFamily, fontSize = 11.sp),
+        style = MaterialTheme.typography.labelMedium,
         color = theme.color("text.muted"),
         maxLines = 1,
         modifier = if (width != null) Modifier.width(width) else Modifier.weight(1f),
@@ -258,22 +270,33 @@ private fun GraphRowView(
     onClick: () -> Unit,
 ) {
     val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
     val date = remember(row.commit.authorTime) {
         DATE_FORMAT.format(Date(row.commit.authorTime * 1000L))
     }
+    // No divider under a row: Zed's graph rows meet edge to edge, told apart
+    // by the lane drawing and the hover fill alone.
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(if (columns) RowHeight else RowHeight * 1.3f)
+            .height(if (columns) RowHeight else StackedRowHeight)
             .background(
-                if (isOpen) {
-                    theme.color("element.selected", theme.color("border.variant"))
-                } else {
-                    Color.Transparent
+                when {
+                    isOpen -> theme.color("element.selected", theme.color("border.variant"))
+                    hovered -> theme.color("element.hover", Color.Transparent)
+                    else -> Color.Transparent
                 }
             )
-            .clickable(onClickLabel = "Show what this commit changed", onClick = onClick)
-            .padding(horizontal = 10.dp),
+            .pointerHoverIcon(PointerIcon.Hand)
+            .clickable(
+                interactionSource = interaction,
+                // Instant swap, no ripple — Zed's rows never animate.
+                indication = null,
+                onClickLabel = "Show what this commit changed",
+                onClick = onClick,
+            )
+            .padding(start = GraphLeftPadding, end = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Lanes(row, theme)
@@ -282,22 +305,26 @@ private fun GraphRowView(
             verticalArrangement = Arrangement.Center,
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
+                // Ref chips in Zed's Chip clothes: `px_1`, 1px `border`,
+                // `rounded_sm`, `element.background` (chip.rs:106-115).
                 for (name in row.commit.refs.take(2)) {
                     Text(
                         text = name.removePrefix("HEAD -> "),
-                        style = TextStyle(fontFamily = UiFontFamily, fontSize = 10.sp),
-                        color = theme.color("text.accent", theme.color("text")),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = theme.color("text"),
+                        maxLines = 1,
                         modifier = Modifier
                             .padding(end = 4.dp)
                             .background(
                                 theme.color("element.background", theme.color("border.variant")),
+                                androidx.compose.foundation.shape.RoundedCornerShape(4.dp),
                             )
-                            .padding(horizontal = 4.dp, vertical = 1.dp),
+                            .padding(horizontal = 4.dp),
                     )
                 }
                 Text(
                     text = row.commit.subject.ifBlank { "(no message)" },
-                    style = TextStyle(fontFamily = UiFontFamily, fontSize = 13.sp),
+                    style = MaterialTheme.typography.bodyMedium,
                     color = theme.color("text"),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -306,7 +333,7 @@ private fun GraphRowView(
             if (!columns) {
                 Text(
                     text = "${row.commit.author} · $date · ${row.commit.shortSha}",
-                    style = TextStyle(fontFamily = UiFontFamily, fontSize = 11.sp),
+                    style = MaterialTheme.typography.labelMedium,
                     color = theme.color("text.muted"),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -319,7 +346,6 @@ private fun GraphRowView(
             Cell(row.commit.shortSha, 80.dp)
         }
     }
-    HorizontalDivider(color = theme.color("border.variant"))
 }
 
 @Composable
@@ -327,7 +353,7 @@ private fun Cell(text: String, width: androidx.compose.ui.unit.Dp) {
     val theme = LocalZedTheme.current
     Text(
         text = text,
-        style = TextStyle(fontFamily = UiFontFamily, fontSize = 11.sp),
+        style = MaterialTheme.typography.labelMedium,
         color = theme.color("text.muted"),
         maxLines = 1,
         overflow = TextOverflow.Ellipsis,
@@ -367,7 +393,8 @@ private fun Lanes(row: GraphRow, theme: ZedTheme) {
         val top = 0f
         val middle = size.height / 2f
         val bottom = size.height
-        val stroke = 1.6.dp.toPx()
+        // `LINE_WIDTH` (git_graph.rs:72).
+        val stroke = LineWidth.toPx()
 
         // Lines belonging to branches this commit is not on: straight through.
         for (lane in row.through) {
@@ -409,28 +436,30 @@ private fun CommitFiles(details: CommitDetails, onOpenFile: (String) -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .background(theme.color("panel.background"))
-            .padding(horizontal = 16.dp, vertical = 8.dp),
+            .padding(start = GraphLeftPadding, end = 8.dp, top = 6.dp, bottom = 6.dp),
     ) {
         val body = details.message.substringAfter('\n', "").trim()
         if (body.isNotEmpty()) {
             Text(
                 text = body,
-                style = TextStyle(fontFamily = UiFontFamily, fontSize = 12.sp),
+                style = MaterialTheme.typography.labelMedium,
                 color = theme.color("text.muted"),
                 modifier = Modifier.padding(bottom = 6.dp),
             )
         }
         for (file in details.files) {
+            // A file line is its label's line box, and the whole width is the
+            // tap target — Zed's dense-list rule (list_item.rs:365-368).
             Text(
                 text = "${file.status}  ${file.original?.let { "$it → " } ?: ""}${file.path}",
-                style = TextStyle(fontFamily = UiFontFamily, fontSize = 12.sp),
+                style = MaterialTheme.typography.labelMedium,
                 color = theme.color("text"),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable(onClickLabel = "Open ${file.path}") { onOpenFile(file.path) }
-                    .padding(vertical = 3.dp),
+                    .pointerHoverIcon(PointerIcon.Hand)
+                    .clickable(onClickLabel = "Open ${file.path}") { onOpenFile(file.path) },
             )
         }
     }
@@ -450,7 +479,7 @@ private fun Message(text: String, isError: Boolean = false, inline: Boolean = fa
     ) {
         Text(
             text = text,
-            style = TextStyle(fontFamily = UiFontFamily, fontSize = 13.sp),
+            style = MaterialTheme.typography.bodyMedium,
             color = if (isError) theme.color("error") else theme.color("text.muted"),
         )
     }

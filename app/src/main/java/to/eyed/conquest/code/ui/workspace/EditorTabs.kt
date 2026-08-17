@@ -4,6 +4,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -47,14 +49,14 @@ import kotlinx.coroutines.launch
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
 // Zed: `DynamicSpacing::Base32` — 32px at the default 16px rem
-// (crates/ui/src/components/tab.rs:84). We give the bar 40 instead, and not
-// reluctantly: the strip carries the two smallest targets in the app, the ✕
-// that closes a tab and the dot that saves it, and at 32 neither is reachable
-// with a finger. The tab's *contents* keep Zed's proportions inside it.
-private val TabBarHeight = 40.dp
+// (crates/ui/src/components/tab.rs:84). It was 40 for a while, for the ✕ and
+// the dot; the 2026-08-17 density decision in DECISIONS.md reversed that —
+// exact Zed metrics win, and every small target keeps a second route (the
+// tab's long-press menu closes it, Ctrl+S saves it).
+private val TabBarHeight = 32.dp
 
 /** Base32 − 1px: the border, or the selected tab's `pb_px`, eats it (tab.rs:79). */
-private val TabContentHeight = 39.dp
+private val TabContentHeight = 31.dp
 
 /** `px(Base04)` inside the tab, and the gap between its slots (tab.rs:173-174). */
 private val TabContentPadding = 4.dp
@@ -66,13 +68,12 @@ private val TabBorder = 1.dp
 /** `Indicator::dot()` — `w_1p5`/`h_1p5` (crates/ui/src/components/indicator.rs:74). */
 private val DirtyDotSize = 6.dp
 
-// Zed's slots are fixed 12px and 14px squares (tab.rs:8-9) — mouse targets on
-// a desktop. Ours are doubled, because the dot is also the save button and the
-// ✕ is the only way to close a tab by hand. They stop here rather than at the
-// 40dp a finger really wants: any wider and either the tab outgrows its label
-// or the slots start overlapping the neighbouring tab's own targets.
-private val StartSlotWidth = 24.dp
-private val EndSlotWidth = 28.dp
+// Zed's slots: fixed 12px and 14px squares (tab.rs:8-9). The dot doubles as
+// the save button and the ✕ closes — both keep a bigger route (Ctrl+S, the
+// long-press menu), which is what the density decision in DECISIONS.md asks
+// for instead of widening the slots.
+private val StartSlotWidth = 12.dp
+private val EndSlotWidth = 14.dp
 
 private val MaxTabLabelWidth = 180.dp
 
@@ -274,6 +275,8 @@ private fun EditorTab(
 ) {
     val theme = LocalZedTheme.current
     var menuAt by remember { mutableStateOf<DpOffset?>(null) }
+    val tabInteraction = remember { MutableInteractionSource() }
+    val tabHovered by tabInteraction.collectIsHoveredAsState()
     val background = if (isActive) {
         theme.color("tab.active_background")
     } else {
@@ -315,6 +318,11 @@ private fun EditorTab(
             .onSecondaryClick { position -> menuAt = position }
             .onMiddleClick { if (!file.isPinned) onClose() }
             .combinedClickable(
+                interactionSource = tabInteraction,
+                // Zed's tabs do not change colour on hover (tab.rs:112-125
+                // computes the hover fills and drops them); the source is only
+                // for knowing when to show the ✕.
+                indication = null,
                 onClick = onSelect,
                 onLongClick = { menuAt = DpOffset.Zero },
             ),
@@ -377,20 +385,34 @@ private fun EditorTab(
             )
             // A pinned tab shows the pin where the ✕ would be, as Zed does:
             // the way out of a pinned tab is to unpin it, and the mark is the
-            // button that does that.
+            // button that does that. The ✕ itself appears on hover, which is
+            // Zed's default (pane.rs:3014-3015) — and on the active tab, which
+            // is not: a finger has no hover, and the active tab's ✕ is the
+            // only one-tap close it gets. Inactive tabs close from their
+            // long-press menu or the wheel button.
+            val showEnd = file.isPinned || isActive || tabHovered
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
                     .width(EndSlotWidth)
                     .fillMaxHeight()
-                    .pointerHoverIcon(PointerIcon.Hand)
-                    .clickable(onClick = if (file.isPinned) onTogglePin else onClose),
+                    .then(
+                        if (showEnd) {
+                            Modifier
+                                .pointerHoverIcon(PointerIcon.Hand)
+                                .clickable(onClick = if (file.isPinned) onTogglePin else onClose)
+                        } else {
+                            Modifier
+                        }
+                    ),
             ) {
-                Text(
-                    text = if (file.isPinned) "⚑" else "✕",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                if (showEnd) {
+                    Text(
+                        text = if (file.isPinned) "⚑" else "✕",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
         val position = menuAt

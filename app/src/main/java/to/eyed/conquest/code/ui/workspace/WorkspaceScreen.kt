@@ -1,5 +1,6 @@
 package to.eyed.conquest.code.ui.workspace
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -1388,19 +1389,18 @@ private fun EditorArea(
         }
 
         if (active == null) {
+            // An empty pane is empty. Zed's placeholder for a workspace with a
+            // project open renders no hint text at all — and no fill of its
+            // own, so what shows is the workspace body's `background`
+            // (workspace/src/pane.rs:4550-4566, workspace.rs:9111); the
+            // welcome hints belong to the no-project page, which for us is
+            // the project picker.
             Box(
                 modifier = Modifier
                     .weight(1f)
-                    .fillMaxSize(),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = "Open a file from the project panel",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(24.dp),
-                )
-            }
+                    .fillMaxSize()
+                    .background(LocalZedTheme.current.color("background")),
+            )
         } else if (activeEditor != null) {
             EditorPane(
                 state = activeEditor,

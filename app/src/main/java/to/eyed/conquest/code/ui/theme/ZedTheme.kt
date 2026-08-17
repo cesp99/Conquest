@@ -69,6 +69,9 @@ class ZedTheme(
          * hardcoding One Dark's hexes, so a user's own theme stays coherent.
          */
         private val DERIVED = mapOf(
+            // one.json writes the key with a literal `null`; Zed's Rust side
+            // fills it from ThemeColors, where it is the focused-border blue.
+            "panel.focused_border" to "border.focused",
             "editor.indent_guide" to "border.variant",
             "editor.indent_guide_active" to "border",
             "panel.indent_guide" to "border.variant",

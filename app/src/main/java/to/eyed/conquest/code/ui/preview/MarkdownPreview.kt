@@ -9,6 +9,9 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -111,11 +114,20 @@ internal fun clampDockWidth(width: Dp, available: Dp): Dp =
 private val HandleWidth = 6.dp
 
 /**
- * What a finger needs. Zed's toolbar buttons are 26px, drawn for a mouse; the
- * close control keeps that visual size inside a target this tall.
+ * The header wears Zed's toolbar frame: `py(Base06)` = 6px and `px(Base08)` =
+ * 8px around a 32px item row (workspace/src/toolbar.rs:123-124, 140, 150).
  */
-private val TouchTarget = 40.dp
-private val ControlSize = 26.dp
+private val HeaderRowHeight = 32.dp
+private val HeaderVerticalPad = 6.dp
+private val HeaderHorizontalPad = 8.dp
+
+/**
+ * The close control is Zed's IconButton at `ButtonSize::Default`: a 22px box
+ * (button_like.rs:469), `rounded_sm`, ghost hover. Sub-40dp per the
+ * 2026-08-17 density decision; Escape and Ctrl+Shift+M still close the
+ * preview without touching it.
+ */
+private val ControlBox = 22.dp
 
 /**
  * How long the buffer rests before the preview is rebuilt.
@@ -352,7 +364,9 @@ fun MarkdownPreview(
                     }
             ) {
                 PreviewHeader(path = path, onDismiss = onDismiss)
-                HorizontalDivider(color = theme.color("border"))
+                // The toolbar's underline is `border.variant`, not `border`
+                // (workspace/src/toolbar.rs:128-129).
+                HorizontalDivider(color = theme.color("border.variant"))
                 when {
                     !isMarkdown -> Notice(
                         "Markdown preview shows a .md file. " +
@@ -370,7 +384,10 @@ fun MarkdownPreview(
                     else -> LazyColumn(
                         state = listState,
                         modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                        // Zed's scroll container is `p_4` — 16px on all four
+                        // sides (markdown_preview_view.rs:1673) — on
+                        // `editor.background` (markdown_preview_view.rs:1634).
+                        contentPadding = PaddingValues(16.dp),
                     ) {
                         // No key: the block list is rebuilt wholesale on every
                         // edit, and a content-derived key would make every item
@@ -414,26 +431,46 @@ internal fun PreviewHeader(path: String, onDismiss: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(TouchTarget)
             .background(theme.color("toolbar.background"))
-            .padding(start = 12.dp, end = 4.dp),
+            .padding(horizontal = HeaderHorizontalPad, vertical = HeaderVerticalPad)
+            .height(HeaderRowHeight),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         // Named, not just shown: on a phone the preview covers the editor
         // entirely, and "README.md" on its own does not say which of the two
-        // views of that file you are looking at.
+        // views of that file you are looking at. `text_ui` 14px, as the
+        // toolbar's breadcrumbs are (breadcrumbs/src/breadcrumbs.rs:53-55).
         Text(
             text = "Preview · ${path.substringAfterLast('/')}",
-            style = TextStyle(fontFamily = UiFontFamily, fontSize = 13.sp),
+            style = TextStyle(fontFamily = UiFontFamily, fontSize = 14.sp),
             color = theme.color("text"),
             maxLines = 1,
             modifier = Modifier.weight(1f),
         )
+        val closeInteraction = remember { MutableInteractionSource() }
+        val closeHovered by closeInteraction.collectIsHoveredAsState()
+        val closePressed by closeInteraction.collectIsPressedAsState()
         Box(
             modifier = Modifier
-                .size(TouchTarget)
+                .size(ControlBox)
                 .clip(RoundedCornerShape(4.dp))
-                .clickable(onClickLabel = "Close the preview", onClick = onDismiss)
+                // A ghost button: transparent at rest, `ghost_element.hover`
+                // under the pointer, `ghost_element.active` while pressed,
+                // swapped instantly — no ripple (button_like.rs:298-303,
+                // 324-329).
+                .background(
+                    when {
+                        closePressed -> theme.color("ghost_element.active", Color.Transparent)
+                        closeHovered -> theme.color("ghost_element.hover", Color.Transparent)
+                        else -> Color.Transparent
+                    }
+                )
+                .clickable(
+                    interactionSource = closeInteraction,
+                    indication = null,
+                    onClickLabel = "Close the preview",
+                    onClick = onDismiss,
+                )
                 .pointerHoverIcon(PointerIcon.Hand),
             contentAlignment = Alignment.Center,
         ) {

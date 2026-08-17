@@ -174,7 +174,7 @@ fun SvgPreview(
                     }
             ) {
                 PreviewHeader(path = path, onDismiss = onDismiss)
-                HorizontalDivider(color = theme.color("border"))
+                HorizontalDivider(color = theme.color("border.variant"))
                 when {
                     !isSvg -> PreviewNotice(
                         "The SVG preview draws a .svg file. Open one and it appears here."

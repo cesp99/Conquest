@@ -8,6 +8,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,6 +22,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -50,6 +52,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
@@ -67,10 +72,11 @@ import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -81,6 +87,7 @@ import to.eyed.conquest.code.core.GitPanelState
 import to.eyed.conquest.code.core.GitSession
 import to.eyed.conquest.code.core.ProjectSession
 import to.eyed.conquest.code.terminal.Userland
+import to.eyed.conquest.code.ui.theme.BufferFontFamily
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import to.eyed.conquest.code.ui.workspace.ContextMenu
 import to.eyed.conquest.code.ui.workspace.ContextMenuItem
@@ -99,22 +106,31 @@ import to.eyed.conquest.code.ui.workspace.GitFileStatus as PanelStatus
 val isGitPanelSupported: Boolean
     get() = Userland.backend.isSupported
 
-/** Zed's `git_panel.default_width` (assets/settings/default.json:997). */
-/** What the workspace budgets for this dock when it decides on a layout. */
+/**
+ * Zed's `git_panel.default_width` (assets/settings/default.json:997) — what
+ * the workspace budgets for this dock when it decides on a layout.
+ */
 internal val GitPanelDockWidth = 360.dp
 
-/** The project search panel's bar, because this is its twin. */
-private val BarHeight = 36.dp
-private val FieldRadius = 6.dp
+/**
+ * Every list surface in the panel — entry rows, section headers, empty-section
+ * notes — is `list_item_height()` = `rems(1.75)` = 28px (git_panel.rs:7257-7259).
+ */
+private val ListItemHeight = 28.dp
 
 /**
- * Zed's row is its label's line box — 3.6mm on a phone. Everything clickable
- * here is at least this tall, and the visual sits inside it: the panel is used
- * with a thumb as often as with a mouse, and a checkbox you miss twice is worse
- * than one that looks slightly large.
+ * The bar above the change list is `min_h(Tab::container_height)` = `Base32` =
+ * 32px (git_panel.rs:5787; ui/src/components/tab.rs:83-85), and the tab strip
+ * at the top of the panel is the same `Tab::container_height` (git_panel.rs:6303).
  */
-private val RowMinHeight = 40.dp
+private val BarHeight = 32.dp
 
+/** Rows are `pl_2p5` / `pr_1` — 10px in, 4px out (git_panel.rs:7690-7691). */
+private val RowStartPadding = 10.dp
+private val RowEndPadding = 4.dp
+
+/** Inputs are `rounded_md` = 6px (search_bar.rs:78). */
+private val FieldRadius = 6.dp
 
 /** The engine debounces git by 400 ms; polling faster only costs JNI calls. */
 private const val POLL_MS = 250L
@@ -123,10 +139,25 @@ private const val POLL_MS = 250L
 private const val PAGE_ROWS = 10
 
 /**
- * Zed's own default: the commit box is three lines and grows no further, so the
- * file list keeps the panel.
+ * Zed's commit box is exactly six lines of the commit font and grows no
+ * further — `MAX_PANEL_EDITOR_LINES = 6`, pinned as both `min_lines` and
+ * `max_lines` (git_panel.rs:1080, 1091-1095) — so the file list keeps the
+ * panel.
  */
-private val CommitBoxHeight = 76.dp
+private const val CommitEditorLines = 6
+
+/**
+ * Zed pins the commit editor's type to 12px in its own defaults
+ * (`git_commit_buffer_font_size`, assets/settings/default.json:81); the
+ * buffer-size fallback in settings.rs:446-451 never applies at defaults.
+ */
+private const val CommitBufferFontSize = 12f
+
+/**
+ * gpui's φ — the `buffer_line_height: "comfortable"` the commit editor is laid
+ * out in (theme_settings/src/settings.rs:390).
+ */
+private const val BufferLineHeight = 1.618034f
 
 /**
  * The git panel — Zed's `crates/git_ui/src/git_panel.rs`, in the shape a phone
@@ -198,6 +229,8 @@ fun GitPanel(
     var messageFocused by remember { mutableStateOf(false) }
 
     val listState = rememberLazyListState()
+    // History's own scroll survives a round trip through the Changes tab.
+    val historyListState = rememberLazyListState()
     val listFocus = remember { FocusRequester() }
     // Map reads, so once per theme rather than once per row per frame.
     val colours = remember(theme) {
@@ -410,6 +443,11 @@ fun GitPanel(
                     return@onPreviewKeyEvent true
                 }
                 if (messageFocused) return@onPreviewKeyEvent false
+                // The keys below act on the Changes list. On the History tab
+                // that list is not on screen, and Space or Delete would stage
+                // or discard a file the user cannot see — silent git mutation
+                // from the keyboard.
+                if (tab != GitPanelTab.Changes) return@onPreviewKeyEvent false
                 when (event.key) {
                     Key.DirectionDown -> { move(1); true }
                     Key.DirectionUp -> { move(-1); true }
@@ -441,43 +479,58 @@ fun GitPanel(
                 .fillMaxSize()
                 .background(theme.color("panel.background"))
         ) {
-            HeaderBar(state = state, busy = busy, onClose = onDismiss)
-            HorizontalDivider(color = theme.color("border.variant"))
+            // Zed's panel opens straight onto its tab strip: no header bar, no
+            // title, no close button — the branch lives at the bottom, in the
+            // repo footer above the commit editor (git_panel.rs:8245-8365).
             TabBar(
                 tab = tab,
                 changeCount = state.entries.size,
                 onTab = {
-                    tab = it
-                    openCommit = null
+                    // Re-selecting the open tab is a no-op: it must not throw
+                    // away the expanded commit the user is reading.
+                    if (it != tab) {
+                        tab = it
+                        openCommit = null
+                    }
                 },
             )
-            HorizontalDivider(color = theme.color("border.variant"))
 
             if (tab == GitPanelTab.Changes) {
                 ActionBar(
                     state = state,
-                    busy = busy,
                     onViewDiff = { onOpenDiff(null) },
-                    onPush = ::push,
                 )
-                HorizontalDivider(color = theme.color("border.variant"))
             }
 
             if (tab == GitPanelTab.History) {
+                // Zed's History tab is the bare list; the Graph view is ours,
+                // so its way in wears the changes header's clothes — the same
+                // 32px row, a ghost button at its end (git_panel.rs:5786-5796).
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(theme.color("toolbar.background"))
-                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                        .heightIn(min = BarHeight)
+                        .padding(start = 4.dp, end = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    // Ctrl+Enter commits from this tab too, and the repo
+                    // footer with its busy mark lives on the Changes tab —
+                    // a running git command must not be invisible here.
+                    if (busy) {
+                        Text(
+                            text = "…",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = theme.color("text.muted"),
+                            modifier = Modifier.padding(start = 6.dp),
+                        )
+                    }
                     Spacer(modifier = Modifier.weight(1f))
-                    BarAction(label = "Graph", enabled = true, onClick = onOpenGraph)
+                    GhostButton(label = "Graph", enabled = true, onClick = onOpenGraph)
                 }
-                HorizontalDivider(color = theme.color("border.variant"))
                 HistoryList(
                     page = history,
                     open = openCommit,
+                    listState = historyListState,
                     onOpen = { commit ->
                         if (openCommit?.commit?.sha == commit.sha) {
                             openCommit = null
@@ -570,6 +623,9 @@ fun GitPanel(
             }
 
             if (tab == GitPanelTab.Changes) {
+            RepoFooter(state = state, busy = busy, onPush = ::push)
+            // The commit editor's own `border_t_1` in `border`
+            // (git_panel.rs:5991-5996).
             HorizontalDivider(color = theme.color("border"))
             CommitBox(
                 message = message,
@@ -600,26 +656,30 @@ fun GitPanel(
 }
 
 /**
- * The dock's left edge: the border between it and the editor, and the grip that
- * drags it wider. The project search panel's handle, unchanged.
+ * Zed's `PanelRepoFooter` — the branch on the left, the remote button on the
+ * right, in an `px_2` / `py_1p5` row above the commit editor
+ * (git_panel.rs:8709-8747). The branch name is a `LabelSize::Small` button
+ * label there (git_panel.rs:8689-8692); ours is the same size, plus the drift
+ * arrows its remote button would otherwise carry.
  */
-
-/** Branch, drift, and the close button. */
 @Composable
-private fun HeaderBar(state: GitPanelState, busy: Boolean, onClose: () -> Unit) {
+private fun RepoFooter(state: GitPanelState, busy: Boolean, onPush: () -> Unit) {
     val theme = LocalZedTheme.current
+    val branch = state.branch
+    // An unborn branch — `git init`, nothing committed — has no commit to
+    // push, and git answers a publish with "src refspec does not match any".
+    val canPush = branch?.name != null && !busy && !branch.unborn &&
+        (branch.ahead > 0 || !branch.hasUpstream)
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = BarHeight)
-            .background(theme.color("toolbar.background"))
-            .padding(start = 10.dp, end = 2.dp),
+            .padding(horizontal = 8.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         Text(
             text = branchLabel(state),
-            style = MaterialTheme.typography.bodyMedium,
+            style = MaterialTheme.typography.labelMedium,
             color = theme.color("text"),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
@@ -628,11 +688,24 @@ private fun HeaderBar(state: GitPanelState, busy: Boolean, onClose: () -> Unit) 
         if (busy) {
             Text(
                 text = "…",
-                style = MaterialTheme.typography.bodyMedium,
+                style = MaterialTheme.typography.labelMedium,
                 color = theme.color("text.muted"),
             )
         }
-        Glyph("✕", "Close the git panel", onClose)
+        if (branch?.name != null) {
+            FilledButton(
+                // Zed's wording: "Publish" makes the branch exist on the
+                // remote, "Push" sends the commits it is ahead by
+                // (git_ui.rs:785-838).
+                label = when {
+                    !branch.hasUpstream -> "Publish"
+                    branch.ahead > 0 -> "↑${branch.ahead} Push"
+                    else -> "Pushed"
+                },
+                enabled = canPush,
+                onClick = onPush,
+            )
+        }
     }
 }
 
@@ -660,8 +733,12 @@ private fun EmptyMessage(state: GitPanelState) {
         // with no git in their Debian that their tree was clean.
         !state.ran -> "Could not run git here — ${Userland.backend.displayName} needs git " +
             "installed before the panel can show anything"
-        else -> "Nothing has changed since the last commit"
+        // Zed's words for a clean tree (git_panel.rs:6940). The other cases
+        // are ours: Zed never has to explain a missing userland.
+        else -> "No changes to commit"
     }
+    // Zed centres a muted default-size label in the empty panel
+    // (git_panel.rs:6926-6940).
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Text(
             text = text,
@@ -672,6 +749,15 @@ private fun EmptyMessage(state: GitPanelState) {
     }
 }
 
+/**
+ * A section header, in Zed's `render_list_header` shape: the same 28px row as
+ * an entry, `pl_2p5`/`pr_1`, the title a `LabelSize::Small` in `text.muted`,
+ * and the stage-all control a checkbox at the row's end rather than a word
+ * (git_panel.rs:7288-7318, 7322-7345). No count — Zed's headers carry none;
+ * the tab already says how many. No chevron either: Zed's collapses the
+ * section (git_panel.rs:7307-7315) and ours does not, and a disclosure that
+ * discloses nothing would be a lie.
+ */
 @Composable
 private fun SectionHeader(
     row: GitPanelRow.SectionRow,
@@ -682,21 +768,22 @@ private fun SectionHeader(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = RowMinHeight)
-            .background(theme.color("elevated_surface.background", Color.Transparent))
-            .padding(start = 10.dp, end = 2.dp),
+            .height(ListItemHeight)
+            .padding(start = RowStartPadding, end = RowEndPadding),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
-            text = "${row.section.title} (${row.paths.size})",
+            text = row.section.title,
             style = MaterialTheme.typography.labelMedium,
             color = theme.color("text.muted"),
             modifier = Modifier.weight(1f),
         )
         if (row.section != GitSection.Conflicts) {
-            TextAction(
-                label = if (row.section == GitSection.Staged) "Unstage all" else "Stage all",
+            ZedCheckbox(
+                checked = row.section == GitSection.Staged,
+                partial = false,
                 enabled = enabled && row.paths.isNotEmpty(),
+                label = if (row.section == GitSection.Staged) "Unstage all" else "Stage all",
                 onClick = onStageAll,
             )
         }
@@ -718,11 +805,20 @@ private fun ChangeRow(
     val theme = LocalZedTheme.current
     val interaction = remember { MutableInteractionSource() }
     val hovered by interaction.collectIsHoveredAsState()
+    val pressed by interaction.collectIsPressedAsState()
     var menuAt by remember { mutableStateOf<DpOffset?>(null) }
 
     val status = if (section == GitSection.Staged) change.staged else change.unstaged
+    val deleted = status == GitFileStatus.Deleted
+    // Zed's entry ramp: a selected row is `status.info` at 0.08 alpha, not a
+    // `ghost_element` fill — and hover/press on a selected row brighten the
+    // same wash to 0.12/0.16 rather than swapping to the ghost pair
+    // (git_panel.rs:7616-7640).
     val background = when {
-        isSelected -> theme.color("ghost_element.selected")
+        isSelected && pressed -> theme.color("info").copy(alpha = 0.16f)
+        isSelected && hovered -> theme.color("info").copy(alpha = 0.12f)
+        isSelected -> theme.color("info").copy(alpha = 0.08f)
+        pressed -> theme.color("ghost_element.active", Color.Transparent)
         hovered -> theme.color("ghost_element.hover", Color.Transparent)
         else -> Color.Transparent
     }
@@ -731,7 +827,9 @@ private fun ChangeRow(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = RowMinHeight)
+                // `list_item_height()` exactly — no minimum, no padding
+                // (git_panel.rs:7688-7689).
+                .height(ListItemHeight)
                 .background(background)
                 .pointerHoverIcon(PointerIcon.Hand)
                 // The list is the one focus target; rows taking it in turn
@@ -745,37 +843,61 @@ private fun ChangeRow(
                     onLongClick = { onSelect(); menuAt = DpOffset.Zero },
                     onClick = onOpen,
                 )
-                .padding(end = 2.dp),
+                // `pl_2p5` / `pr_1` (git_panel.rs:7690-7691).
+                .padding(start = RowStartPadding, end = RowEndPadding),
             verticalAlignment = Alignment.CenterVertically,
+            // `gap_1p5` between the name row and the checkbox
+            // (git_panel.rs:7692).
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            StageBox(
-                staged = change.staged != null,
-                partial = change.staged != null && change.unstaged != null,
-                enabled = enabled && !change.conflicted,
-                path = change.path,
-                onClick = onToggleStaged,
-            )
-            Text(
-                text = change.name,
-                style = MaterialTheme.typography.bodyMedium,
-                color = colours.colorFor(status.forColours(), dimIgnored = false),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                text = change.directory,
-                style = MaterialTheme.typography.labelMedium,
-                color = theme.color("text.muted"),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f).padding(start = 6.dp),
-            )
+            // Zed leads with the status mark, tinted by the
+            // `version_control.*` colour for that status (git_ui.rs:1185-1207);
+            // ours is git's letter where Zed draws an icon, in a fixed slot so
+            // the filenames line up.
             Text(
                 text = statusLetter(change, section),
                 style = MaterialTheme.typography.labelMedium,
                 color = colours.colorFor(status.forColours(), dimIgnored = false),
+                maxLines = 1,
+                modifier = Modifier.width(14.dp),
             )
-            Glyph("⋯", "Actions for ${change.name}") { menuAt = DpOffset.Zero }
+            Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                // With the mark carrying the status, the filename is plain
+                // `text` and the directory `text.muted` — a deleted file goes
+                // `text.disabled` and struck through instead of shouting in
+                // red (git_panel.rs:7571-7592, 7965-8003).
+                Text(
+                    text = change.name,
+                    style = if (deleted) {
+                        MaterialTheme.typography.bodyMedium
+                            .copy(textDecoration = TextDecoration.LineThrough)
+                    } else {
+                        MaterialTheme.typography.bodyMedium
+                    },
+                    color = theme.color(if (deleted) "text.disabled" else "text"),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = change.directory,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = theme.color(if (deleted) "text.disabled" else "text.muted"),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    // Zed separates name from path with a literal space
+                    // (git_panel.rs:7978).
+                    modifier = Modifier.padding(start = 4.dp),
+                )
+            }
+            // Zed's staging checkbox sits at the *end* of the row
+            // (git_panel.rs:7712-7724).
+            ZedCheckbox(
+                checked = change.staged != null,
+                partial = change.staged != null && change.unstaged != null,
+                enabled = enabled && !change.conflicted,
+                label = if (change.staged != null) "Unstage ${change.path}" else "Stage ${change.path}",
+                onClick = onToggleStaged,
+            )
         }
 
         ContextMenu(
@@ -807,28 +929,48 @@ private fun ChangeRow(
 }
 
 /**
- * The stage checkbox. Zed draws a 16dp box; this one is a 16dp box inside a
- * 40dp target, because it is the control the panel is used through and a thumb
- * cannot hit 16dp reliably.
+ * Zed's checkbox, as the git panel builds it: `Checkbox::new(..).fill()
+ * .elevation(ElevationIndex::Surface)` (git_panel.rs:7718-7720). The container
+ * is a 20px square (toggle.rs:180-182); the box inside it is `size_4` = 16px,
+ * `rounded_xs` 2px, bordered 1px in `border` — `border.variant` when disabled
+ * — and filled `editor.background`, which is what `darker_bg` resolves to at
+ * Surface elevation (toggle.rs:169-178, 226-236; elevation.rs:108-111). The
+ * mark is a check or a dash in `Color::Selected` → `text.accent`
+ * (toggle.rs:186-208; color.rs:108). Hovering fades the border to 0.7 alpha
+ * (toggle.rs:215).
+ *
+ * 20dp is under the 40dp thumb rule; per the 2026-08-17 density decision that
+ * is accepted, and staging keeps its other routes — Space on the selected row
+ * and the long-press menu's Stage/Unstage item.
  */
 @Composable
-private fun StageBox(
-    staged: Boolean,
+private fun ZedCheckbox(
+    checked: Boolean,
     partial: Boolean,
     enabled: Boolean,
-    path: String,
+    label: String,
     onClick: () -> Unit,
 ) {
     val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val border = when {
+        !enabled -> theme.color("border.variant")
+        hovered -> theme.color("border").copy(alpha = 0.7f)
+        else -> theme.color("border")
+    }
     Box(
         modifier = Modifier
-            .size(RowMinHeight)
+            .size(20.dp)
             .then(
                 if (enabled) {
                     Modifier
                         .pointerHoverIcon(PointerIcon.Hand)
                         .clickable(
-                            onClickLabel = if (staged) "Unstage $path" else "Stage $path",
+                            interactionSource = interaction,
+                            // Instant, rippleless, as every toggle in Zed.
+                            indication = null,
+                            onClickLabel = label,
                             onClick = onClick,
                         )
                 } else {
@@ -840,24 +982,39 @@ private fun StageBox(
         Box(
             modifier = Modifier
                 .size(16.dp)
-                .clip(RoundedCornerShape(3.dp))
+                .clip(RoundedCornerShape(2.dp))
                 .background(
-                    if (staged) theme.color("element.selected") else Color.Transparent
+                    if (enabled) {
+                        theme.color("editor.background")
+                    } else {
+                        theme.color("element.disabled").copy(alpha = 0.6f)
+                    }
                 )
-                .border(1.dp, theme.color("border"), RoundedCornerShape(3.dp)),
+                .border(1.dp, border, RoundedCornerShape(2.dp)),
             contentAlignment = Alignment.Center,
         ) {
-            if (staged) {
+            if (checked || partial) {
                 Text(
                     text = if (partial) "–" else "✓",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = theme.color("text"),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = theme.color(if (enabled) "text.accent" else "text.disabled"),
                 )
             }
         }
     }
 }
 
+/**
+ * The commit editor and its footer, in Zed's anatomy: not a rounded input but
+ * a bare region of `editor.background` under a 1px top border (drawn by the
+ * caller), the message set in the *buffer* font at
+ * `git_commit_buffer_font_size` — pinned to **12** in Zed's own defaults
+ * (default.json:81), so the buffer_font_size fallback in
+ * theme_settings/src/settings.rs:446-451 never applies at defaults —
+ * exactly [CommitEditorLines] lines tall, with `pt_2`/`px_2` around the text
+ * (git_panel.rs:6002-6006). Below it, a `p_1p5` footer row with the commit
+ * button at its end (git_panel.rs:6021-6045).
+ */
 @Composable
 private fun CommitBox(
     message: TextFieldValue,
@@ -868,27 +1025,30 @@ private fun CommitBox(
     onCommit: () -> Unit,
 ) {
     val theme = LocalZedTheme.current
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(theme.color("panel.background"))
-            .padding(8.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
+    // sp treated as dp, which at font scale 1 is what Zed's px-per-line rule
+    // means; a user's font scale then grows the text but not the box, which
+    // scrolls — the list keeping the panel matters more than the sixth line.
+    val fontSize = CommitBufferFontSize
+    val lineHeight = fontSize * BufferLineHeight
+    val editorStyle = MaterialTheme.typography.bodyMedium.copy(
+        fontFamily = BufferFontFamily,
+        fontSize = fontSize.sp,
+        lineHeight = lineHeight.sp,
+        color = theme.color("text"),
+    )
+    Column(modifier = Modifier.fillMaxWidth()) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(CommitBoxHeight)
-                .clip(RoundedCornerShape(FieldRadius))
+                .height((lineHeight * CommitEditorLines).dp + 8.dp)
                 .background(theme.color("editor.background"))
-                .border(1.dp, theme.color("border"), RoundedCornerShape(FieldRadius))
                 .pointerHoverIcon(PointerIcon.Text)
-                .padding(horizontal = 8.dp, vertical = 6.dp),
+                .padding(start = 8.dp, end = 8.dp, top = 8.dp),
         ) {
             BasicTextField(
                 value = message,
                 onValueChange = onMessage,
-                textStyle = MaterialTheme.typography.bodyMedium.copy(color = theme.color("text")),
+                textStyle = editorStyle,
                 cursorBrush = SolidColor(theme.cursor),
                 modifier = Modifier
                     .fillMaxSize()
@@ -896,17 +1056,22 @@ private fun CommitBox(
             )
             if (message.text.isEmpty()) {
                 Text(
-                    // Zed's own placeholder (git_panel.rs).
+                    // Zed's own placeholder (git_panel.rs:1109).
                     text = "Enter commit message",
-                    style = MaterialTheme.typography.bodyMedium,
+                    style = editorStyle,
                     color = theme.color("text.placeholder"),
                 )
             }
         }
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(theme.color("editor.background"))
+                .padding(6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            // Zed's footer keeps an AI message button here; ours counts what
+            // will be committed, which is the more honest use of the corner.
             Text(
                 text = if (stagedCount == 0) {
                     "Nothing staged"
@@ -919,7 +1084,7 @@ private fun CommitBox(
                 color = theme.color("text.muted"),
                 modifier = Modifier.weight(1f),
             )
-            TextAction(
+            FilledButton(
                 label = "Commit",
                 // Enabled with nothing staged on purpose: git's refusal is the
                 // honest explanation, and a button that greys out for reasons
@@ -932,58 +1097,135 @@ private fun CommitBox(
     }
 }
 
-/** A word-shaped button, sized for a thumb. */
+/**
+ * Zed's ghost button: `ButtonSize::Default` = 22px tall, `rounded_sm`, `px`
+ * Base04 = 4px, and the Subtle ramp — transparent at rest,
+ * `ghost_element.hover` under the pointer, `ghost_element.active` pressed
+ * (button_like.rs:469, 796-803; 245-330). The label is `LabelSize::Small` in
+ * `text.muted`, as the changes header's own buttons wear it
+ * (git_panel.rs:5805-5809).
+ */
 @Composable
-private fun TextAction(
+private fun GhostButton(label: String, enabled: Boolean, onClick: () -> Unit) {
+    val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val pressed by interaction.collectIsPressedAsState()
+    // As with [FilledButton]: the 22dp ghost box is the visual, the tap
+    // target is the taller invisible wrapper (density decision, DECISIONS.md).
+    Box(
+        modifier = Modifier
+            .heightIn(min = 30.dp)
+            .then(
+                if (enabled) {
+                    Modifier
+                        .pointerHoverIcon(PointerIcon.Hand)
+                        .clickable(
+                            interactionSource = interaction,
+                            indication = null,
+                            onClickLabel = label,
+                            onClick = onClick,
+                        )
+                } else {
+                    Modifier
+                }
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            modifier = Modifier
+                .height(22.dp)
+                .clip(RoundedCornerShape(4.dp))
+                .background(
+                    when {
+                        !enabled -> Color.Transparent
+                        pressed -> theme.color("ghost_element.active", Color.Transparent)
+                        hovered -> theme.color("ghost_element.hover", Color.Transparent)
+                        else -> Color.Transparent
+                    }
+                )
+                .padding(horizontal = 4.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = theme.color(if (enabled) "text.muted" else "text.disabled"),
+            )
+        }
+    }
+}
+
+/**
+ * Zed's filled small button — the commit and remote buttons are `ButtonLike`s
+ * at `ButtonSize::Compact` = 18px on the ModalSurface layer, whose fill is the
+ * `background` token (git_panel.rs:6072-6075; button_like.rs:470, 200-207),
+ * with the 1px `border`-at-0.8 ring their `SplitButton` wrapper paints
+ * (split_button.rs:71-73, 88-95) and a `LabelSize::Small` label. Hover fades
+ * the fill to half (button_like.rs:263-272); press is `element.active`
+ * (button_like.rs:317-321).
+ */
+@Composable
+private fun FilledButton(
     label: String,
     enabled: Boolean,
     onClick: () -> Unit,
     shortcut: String? = null,
 ) {
     val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val pressed by interaction.collectIsPressedAsState()
+    val fill = theme.color("background")
+    // The 18dp pill is the *visual*; the tap target is this outer box, held
+    // open to 30dp with a little horizontal slack — the density decision's
+    // remedy for a small control with no keyboard twin: expand the hit area
+    // invisibly, never the drawing.
     Box(
         modifier = Modifier
-            .heightIn(min = RowMinHeight)
-            .clip(RoundedCornerShape(4.dp))
-            .background(
-                if (enabled) theme.color("element.background", Color.Transparent) else Color.Transparent
-            )
+            .heightIn(min = 30.dp)
             .then(
                 if (enabled) {
                     Modifier
                         .pointerHoverIcon(PointerIcon.Hand)
-                        .clickable(onClickLabel = shortcut?.let { "$label ($it)" }, onClick = onClick)
+                        .clickable(
+                            interactionSource = interaction,
+                            indication = null,
+                            onClickLabel = shortcut?.let { "$label ($it)" } ?: label,
+                            onClick = onClick,
+                        )
                 } else {
                     Modifier
                 }
             )
-            .padding(horizontal = 12.dp),
+            .padding(horizontal = 2.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelMedium,
-            color = theme.color(if (enabled) "text" else "text.disabled"),
-        )
-    }
-}
-
-@Composable
-private fun Glyph(glyph: String, description: String, onClick: () -> Unit) {
-    val theme = LocalZedTheme.current
-    Box(
-        modifier = Modifier
-            .size(RowMinHeight)
-            .clip(RoundedCornerShape(4.dp))
-            .clickable(onClickLabel = description, onClick = onClick)
-            .pointerHoverIcon(PointerIcon.Hand),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            text = glyph,
-            style = MaterialTheme.typography.bodyMedium,
-            color = theme.color("icon"),
-        )
+        Box(
+            modifier = Modifier
+                .height(18.dp)
+                .clip(RoundedCornerShape(4.dp))
+                .background(
+                    when {
+                        pressed && enabled -> theme.color("element.active")
+                        hovered && enabled -> fill.copy(alpha = fill.alpha * 0.5f)
+                        else -> fill
+                    }
+                )
+                .border(
+                    1.dp,
+                    theme.color("border").copy(alpha = 0.8f),
+                    RoundedCornerShape(4.dp),
+                )
+                .padding(horizontal = 4.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = theme.color(if (enabled) "text" else "text.disabled"),
+            )
+        }
     }
 }
 
@@ -1115,11 +1357,14 @@ internal object CommitDrafts {
     }
 }
 
-/** Which section a row belongs to. */
+/**
+ * Which section a row belongs to. The titles are Zed's own for grouping by
+ * staging: "Conflicts", "Staged", "Unstaged" (git_panel.rs:641-645).
+ */
 internal enum class GitSection(val title: String) {
     Conflicts("Conflicts"),
     Staged("Staged"),
-    Changes("Changes"),
+    Changes("Unstaged"),
 }
 
 /** The flat list the panel draws: section headers and file rows, in order. */
@@ -1258,9 +1503,9 @@ private fun IdentityForm(
             horizontalArrangement = Arrangement.End,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            PanelAction("Not now", enabled = !busy, onClick = onDismiss)
+            GhostButton("Not now", enabled = !busy, onClick = onDismiss)
             Spacer(modifier = Modifier.width(8.dp))
-            PanelAction(
+            FilledButton(
                 "Save and commit",
                 enabled = !busy && name.text.isNotBlank() && email.text.isNotBlank(),
                 onClick = onSave,
@@ -1277,13 +1522,17 @@ private fun IdentityField(
     keyboard: KeyboardType = KeyboardType.Text,
 ) {
     val theme = LocalZedTheme.current
+    // Zed's input: `min_h_8` 32px, `rounded_md` 6px, 1px `border`, `pl_2` /
+    // `pr_1`, the text on `py_1` (search_bar.rs:69-79; buffer_search.rs:233).
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(4.dp))
+            .heightIn(min = 32.dp)
+            .clip(RoundedCornerShape(FieldRadius))
             .background(theme.color("editor.background"))
-            .border(1.dp, theme.color("border.variant"), RoundedCornerShape(4.dp))
-            .padding(horizontal = 8.dp, vertical = 8.dp),
+            .border(1.dp, theme.color("border"), RoundedCornerShape(FieldRadius))
+            .padding(start = 8.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+        contentAlignment = Alignment.CenterStart,
     ) {
         if (value.text.isEmpty()) {
             Text(
@@ -1304,57 +1553,66 @@ private fun IdentityField(
     }
 }
 
-/** A text button in the panel's own idiom. */
-@Composable
-private fun PanelAction(label: String, enabled: Boolean, onClick: () -> Unit) {
-    val theme = LocalZedTheme.current
-    Text(
-        text = label,
-        style = MaterialTheme.typography.labelLarge,
-        color = if (enabled) theme.color("text.accent", MaterialTheme.colorScheme.primary) else theme.color("text.disabled", theme.color("text.muted")),
-        modifier = Modifier
-            .clip(RoundedCornerShape(4.dp))
-            .then(if (enabled) Modifier.clickable(onClick = onClick) else Modifier)
-            .pointerHoverIcon(PointerIcon.Hand)
-            .padding(horizontal = 10.dp, vertical = 8.dp),
-    )
-}
-
 /** Zed's two tabs (`git_panel.rs:507`). */
 enum class GitPanelTab { Changes, History }
 
 /**
- * The tab strip — Zed's, at Zed's proportions: two halves, the inactive one
- * dimmed and set back, the active one carrying the count
- * (`git_panel.rs:6257-6325`).
+ * The tab strip, stroke for stroke from Zed's `render_tab_bar`
+ * (git_panel.rs:6257-6325): `Tab::container_height` = 32px (tab.rs:83-85),
+ * each half `flex_1` and centred with a `gap_1`. The *inactive* tab is set
+ * back — `editor.background` at 0.6 alpha under a 1px bottom border in
+ * `border` at 0.6 — while the active tab has neither, so it opens into the
+ * panel below (git_panel.rs:6276-6282; gpui's unset border colour is
+ * transparent, style.rs:746). Both swap to `element.hover` under the pointer
+ * (git_panel.rs:6277), instantly, and a `BorderFaded` divider stands between
+ * them (git_panel.rs:6313-6317; divider.rs:30).
  */
 @Composable
 private fun TabBar(tab: GitPanelTab, changeCount: Int, onTab: (GitPanelTab) -> Unit) {
     val theme = LocalZedTheme.current
-    Row(modifier = Modifier.fillMaxWidth().height(TabHeight)) {
+    val fadedBorder = theme.color("border").copy(alpha = 0.6f)
+    Row(modifier = Modifier.fillMaxWidth().height(BarHeight)) {
         for (candidate in GitPanelTab.entries) {
             val active = candidate == tab
+            val interaction = remember { MutableInteractionSource() }
+            val hovered by interaction.collectIsHoveredAsState()
             Row(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxHeight()
                     .background(
-                        if (active) {
-                            theme.color("panel.background")
-                        } else {
-                            theme.color("editor.background")
+                        when {
+                            hovered -> theme.color("element.hover")
+                            !active -> theme.color("editor.background").copy(alpha = 0.6f)
+                            else -> Color.Transparent
                         }
                     )
-                    .clickable(onClickLabel = "Show ${candidate.name}") { onTab(candidate) }
+                    .drawBehind {
+                        if (!active) {
+                            drawRect(
+                                color = fadedBorder,
+                                topLeft = Offset(0f, size.height - 1.dp.toPx()),
+                                size = Size(size.width, 1.dp.toPx()),
+                            )
+                        }
+                    }
+                    .clickable(
+                        interactionSource = interaction,
+                        // Instant swap, no ripple — Zed's tabs never animate.
+                        indication = null,
+                        onClickLabel = "Show ${candidate.name}",
+                    ) { onTab(candidate) }
                     .pointerHoverIcon(PointerIcon.Hand),
                 horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
                     text = candidate.name,
-                    style = MaterialTheme.typography.labelLarge,
+                    style = MaterialTheme.typography.bodyMedium,
                     color = if (active) theme.color("text") else theme.color("text.muted"),
                 )
+                // The count rides the Changes tab as a Small muted "(n)"
+                // (git_panel.rs:6284-6290).
                 if (candidate == GitPanelTab.Changes && changeCount > 0) {
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(
@@ -1365,13 +1623,11 @@ private fun TabBar(tab: GitPanelTab, changeCount: Int, onTab: (GitPanelTab) -> U
                 }
             }
             if (candidate == GitPanelTab.Changes) {
-                VerticalDivider(color = theme.color("border.variant"))
+                VerticalDivider(thickness = 1.dp, color = fadedBorder)
             }
         }
     }
 }
-
-private val TabHeight = 36.dp
 
 /**
  * What has been committed — Zed's History tab.
@@ -1388,6 +1644,8 @@ private fun HistoryList(
     open: CommitDetails?,
     onOpen: (Commit) -> Unit,
     onOpenFile: (String) -> Unit,
+    /** Hoisted by the panel so switching tabs keeps the scroll position. */
+    listState: LazyListState,
     modifier: Modifier = Modifier,
 ) {
     val theme = LocalZedTheme.current
@@ -1416,7 +1674,7 @@ private fun HistoryList(
                 modifier = Modifier.padding(24.dp),
             )
         }
-        else -> LazyColumn(modifier = modifier) {
+        else -> LazyColumn(state = listState, modifier = modifier) {
             items(page.commits, key = { it.sha }) { commit ->
                 CommitRow(
                     commit = commit,
@@ -1427,34 +1685,78 @@ private fun HistoryList(
                 if (open?.commit?.sha == commit.sha) {
                     CommitDetail(details = open, onOpenFile = onOpenFile)
                 }
-                HorizontalDivider(color = theme.color("border.variant"))
+                // No divider: Zed's history rows meet edge to edge and are
+                // told apart by hover alone (git_panel.rs:6718-6734).
             }
         }
     }
 }
 
+/**
+ * One commit, in Zed's history-row anatomy (git_panel.rs:6718-6835): a
+ * `py_1` / `px_2` column with `gap_0p5`, the subject a single truncated
+ * default-size line beside its tag chips, and the meta underneath — author,
+ * relative time, short sha — as Small muted labels between half-faded "•"
+ * separators. Hover, like the open row, is `element.hover`.
+ */
 @Composable
 private fun CommitRow(commit: Commit, now: Long, isOpen: Boolean, onClick: () -> Unit) {
     val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .background(
-                if (isOpen) theme.color("element.selected", theme.color("border.variant")) else Color.Transparent
+                if (isOpen || hovered) theme.color("element.hover") else Color.Transparent
             )
-            .clickable(onClickLabel = "Show what this commit changed", onClick = onClick)
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                onClickLabel = "Show what this commit changed",
+                onClick = onClick,
+            )
             .pointerHoverIcon(PointerIcon.Hand)
-            .padding(horizontal = 10.dp, vertical = 8.dp),
+            .padding(horizontal = 8.dp, vertical = 4.dp),
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
-        Text(
-            text = commit.subject.ifBlank { "(no message)" },
-            style = MaterialTheme.typography.bodyMedium,
-            color = theme.color("text"),
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                text = commit.subject.ifBlank { "(no message)" },
+                style = MaterialTheme.typography.bodyMedium,
+                color = theme.color("text"),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            // Branch and tag chips beside the subject, in Zed's Chip clothes:
+            // `px_1`, 1px `border`, `rounded_sm`, `element.background`
+            // (git_panel.rs:6746-6764; chip.rs:106-115).
+            for (name in commit.refs.take(3)) {
+                Text(
+                    text = name.removePrefix("HEAD -> "),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = theme.color("text"),
+                    maxLines = 1,
+                    modifier = Modifier
+                        .background(
+                            theme.color("element.background", theme.color("border.variant")),
+                            RoundedCornerShape(4.dp),
+                        )
+                        .border(1.dp, theme.color("border"), RoundedCornerShape(4.dp))
+                        .padding(horizontal = 4.dp),
+                )
+            }
+        }
+        // Meta gap is `gap_1p5` (git_panel.rs:6839-6843); the dots sit in it
+        // rather than carrying padding of their own.
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
             Text(
                 text = commit.author.ifBlank { "Unknown" },
                 style = MaterialTheme.typography.labelMedium,
@@ -1486,35 +1788,16 @@ private fun CommitRow(commit: Commit, now: Long, isOpen: Boolean, onClick: () ->
                 )
             }
         }
-        if (commit.refs.isNotEmpty()) {
-            // Where the branches and tags are, which is the one thing a list
-            // of subjects cannot tell you.
-            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                for (name in commit.refs.take(3)) {
-                    Text(
-                        text = name.removePrefix("HEAD -> "),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = theme.color("text.accent", theme.color("text")),
-                        modifier = Modifier
-                            .background(
-                                theme.color("element.background", theme.color("border.variant")),
-                                RoundedCornerShape(3.dp),
-                            )
-                            .padding(horizontal = 5.dp, vertical = 1.dp),
-                    )
-                }
-            }
-        }
     }
 }
 
+/** Zed's separator: "•" at Small size, muted, half faded (git_panel.rs:6711-6716). */
 @Composable
 private fun Dot(theme: to.eyed.conquest.code.ui.theme.ZedTheme) {
     Text(
         text = "•",
         style = MaterialTheme.typography.labelMedium,
-        color = theme.color("text.muted"),
-        modifier = Modifier.padding(horizontal = 5.dp),
+        color = theme.color("text.muted").copy(alpha = 0.5f),
     )
 }
 
@@ -1529,7 +1812,8 @@ private fun CommitDetail(details: CommitDetails, onOpenFile: (String) -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .background(theme.color("editor.background"))
-            .padding(horizontal = 10.dp, vertical = 8.dp),
+            // The history row's own `px_2` grid (git_panel.rs:6724).
+            .padding(horizontal = 8.dp, vertical = 6.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         val body = details.message.substringAfter('\n', "").trim()
@@ -1547,12 +1831,13 @@ private fun CommitDetail(details: CommitDetails, onOpenFile: (String) -> Unit) {
             color = theme.color("text.muted"),
         )
         for (file in details.files) {
+            // A file line is its label's line box — Zed's dense-list rule
+            // (list_item.rs:365-368) — and the whole width is the tap target.
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable(onClickLabel = "Open ${file.path}") { onOpenFile(file.path) }
-                    .pointerHoverIcon(PointerIcon.Hand)
-                    .padding(vertical = 3.dp),
+                    .pointerHoverIcon(PointerIcon.Hand),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
@@ -1582,68 +1867,29 @@ private fun statusOf(letter: Char): to.eyed.conquest.code.ui.workspace.GitFileSt
 }
 
 /**
- * Zed's row above the change list: what the whole diff is, and what to do with
- * the commits that are already made.
- *
- * "Publish" rather than "Push" for a branch with no upstream, which is Zed's
- * wording and the more accurate one: the branch does not exist on the remote
- * yet, and this is what makes it.
+ * Zed's `render_changes_header` — the `min_h(Tab::container_height)` row above
+ * the change list, `pl_1` / `pr_2`, with "View Diff" as a ghost button of
+ * Small muted text at its start (git_panel.rs:5786-5809). Its right-hand
+ * menus (view options, more-actions) have no counterpart here; pushing lives
+ * in the repo footer, where Zed keeps its remote button too.
  */
 @Composable
 private fun ActionBar(
     state: GitPanelState,
-    busy: Boolean,
     onViewDiff: () -> Unit,
-    onPush: () -> Unit,
 ) {
-    val theme = LocalZedTheme.current
-    val branch = state.branch
-    // An unborn branch — `git init`, nothing committed — has no commit to
-    // push, and git answers a publish with "src refspec does not match any".
-    val canPush = branch?.name != null && !busy && !branch.unborn &&
-        (branch.ahead > 0 || !branch.hasUpstream)
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(theme.color("toolbar.background"))
-            .padding(horizontal = 6.dp, vertical = 2.dp),
+            .heightIn(min = BarHeight)
+            .padding(start = 4.dp, end = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        BarAction(
-            label = "View diff",
+        GhostButton(
+            label = "View Diff",
             enabled = !state.isClean,
             onClick = onViewDiff,
         )
         Spacer(modifier = Modifier.weight(1f))
-        if (branch?.name != null) {
-            BarAction(
-                label = when {
-                    !branch.hasUpstream -> "Publish"
-                    branch.ahead > 0 -> "Push ${branch.ahead}"
-                    else -> "Pushed"
-                },
-                enabled = canPush,
-                onClick = onPush,
-            )
-        }
     }
-}
-
-@Composable
-private fun BarAction(label: String, enabled: Boolean, onClick: () -> Unit) {
-    val theme = LocalZedTheme.current
-    Text(
-        text = label,
-        style = MaterialTheme.typography.labelLarge,
-        color = if (enabled) {
-            theme.color("text.accent", MaterialTheme.colorScheme.primary)
-        } else {
-            theme.color("text.disabled", theme.color("text.muted"))
-        },
-        modifier = Modifier
-            .clip(RoundedCornerShape(4.dp))
-            .then(if (enabled) Modifier.clickable(onClickLabel = label, onClick = onClick) else Modifier)
-            .pointerHoverIcon(PointerIcon.Hand)
-            .padding(horizontal = 8.dp, vertical = 8.dp),
-    )
 }

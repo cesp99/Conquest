@@ -3,15 +3,14 @@ package to.eyed.conquest.code.ui.search
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -24,10 +23,8 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -52,8 +49,8 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -74,19 +71,50 @@ import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import to.eyed.conquest.code.ui.workspace.EntryIconMark
 
 
-/** The bar is the buffer search bar's twin, so the numbers are its numbers. */
-private val BarHeight = 36.dp
-private val FieldHeight = 26.dp
+/**
+ * The toolbar chrome around the bars: `py(Base06)` = 6px and `px(Base08)` =
+ * 8px, with a 1px `border.variant` underline (workspace/src/toolbar.rs:123-129).
+ * Zed's project search bar is a toolbar item; ours is the whole toolbar.
+ */
+private val ToolbarVPad = 6.dp
+private val ToolbarHPad = 8.dp
+
+/** `min_h_8` = 32px, the search input's floor (search/src/search_bar.rs:73). */
+private val InputMinHeight = 32.dp
+
+/** `rounded_md`, the radius Zed gives a search input (styles.rs:1246). */
 private val FieldRadius = 6.dp
 
 /**
- * The project panel's row height, for the project panel's reason: Zed's row is
- * its label's line box, which is 3.6mm on a phone and too small to hit.
+ * An `IconButtonShape::Square` button: a 16px `IconSize::Medium` glyph plus
+ * `Base02` = 2px of padding a side (ui/src/components/icon.rs:75, 89-92,
+ * 102-107; icon_button.rs:258-260). Sub-40dp per the 2026-08-17 density
+ * decision; the panel's keyboard (arrows, Enter, Escape) is the other route.
  */
-private val RowMinHeight = 40.dp
+private val ButtonBox = 20.dp
 
-/** Room for four digits of the buffer font, right-aligned like the gutter. */
-private val LineNumberWidth = 40.dp
+/**
+ * A results file header is Zed's multibuffer buffer header: an outer block
+ * `FILE_HEADER_HEIGHT` = 2 buffer lines tall (editor.rs:290 — ≈48.5px at
+ * Zed's 15px × 1.618) with `BUFFER_HEADER_PADDING` = 4px around the card
+ * (editor.rs:291), leaving the card itself ≈40px.
+ */
+private val HeaderPadding = 4.dp
+private val HeaderCardMinHeight = 40.dp
+
+/**
+ * Zed's results gutter never drops under `min_line_number_digits` = 4 digits
+ * (editor.rs:11712-11715; default.json:697), and *grows* with the widest
+ * number rather than clipping it. Four digits of the 12sp result font are
+ * ≈29dp; a hit on line 10000+ gets one more digit's width per digit.
+ */
+private val LineNumberWidth = 30.dp
+private val LineNumberDigitWidth = 7.5.dp
+
+private fun lineNumberWidth(line: Int): Dp {
+    val digits = line.toString().length
+    return if (digits <= 4) LineNumberWidth else LineNumberWidth + LineNumberDigitWidth * (digits - 4)
+}
 
 
 /**
@@ -342,9 +370,10 @@ fun ProjectSearchPanel(
         }
     }
 
-    Row(
+    Column(
         modifier = modifier
             .fillMaxSize()
+            .background(theme.color("panel.background"))
             // Arrows, Enter and Escape have to reach us while the query field
             // holds the caret, so they are taken before it sees them. Anything
             // with Ctrl is left alone: those belong to the workspace's table,
@@ -370,69 +399,112 @@ fun ProjectSearchPanel(
                 }
             },
     ) {
+        // The toolbar block: the query line, the filter line and the status
+        // line stacked `gap_2` apart (project_search.rs:2663-2664), on
+        // `toolbar.background` behind its 1px `border.variant` underline
+        // (toolbar.rs:128-130).
         Column(
             modifier = Modifier
-                .fillMaxSize()
-                .background(theme.color("panel.background"))
+                .fillMaxWidth()
+                .background(theme.color("toolbar.background"))
         ) {
-            QueryBar(
-                query = query,
-                onQuery = { query = it },
-                caseSensitive = caseSensitive,
-                onCaseSensitive = { caseSensitive = !caseSensitive },
-                wholeWord = wholeWord,
-                onWholeWord = { wholeWord = !wholeWord },
-                regex = regex,
-                onRegex = { regex = !regex },
-                filtersOpen = filtersOpen,
-                onFilters = { filtersOpen = !filtersOpen },
-                hasError = progress.errorField == ErrorField.Query,
-                focus = focus,
-                onClose = onDismiss,
-            )
-            if (filtersOpen) {
-                FilterBar(
-                    include = include,
-                    onInclude = { include = it },
-                    exclude = exclude,
-                    onExclude = { exclude = it },
-                    includeIgnored = includeIgnored,
-                    onIncludeIgnored = { includeIgnored = !includeIgnored },
-                    hasError = progress.errorField == ErrorField.Filters,
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = ToolbarHPad, vertical = ToolbarVPad),
+            ) {
+                QueryBar(
+                    query = query,
+                    onQuery = { query = it },
+                    caseSensitive = caseSensitive,
+                    onCaseSensitive = { caseSensitive = !caseSensitive },
+                    wholeWord = wholeWord,
+                    onWholeWord = { wholeWord = !wholeWord },
+                    regex = regex,
+                    onRegex = { regex = !regex },
+                    filtersOpen = filtersOpen,
+                    onFilters = { filtersOpen = !filtersOpen },
+                    hasError = progress.errorField == ErrorField.Query,
+                    focus = focus,
+                    onClose = onDismiss,
                 )
+                if (filtersOpen) {
+                    FilterBar(
+                        include = include,
+                        onInclude = { include = it },
+                        exclude = exclude,
+                        onExclude = { exclude = it },
+                        includeIgnored = includeIgnored,
+                        onIncludeIgnored = { includeIgnored = !includeIgnored },
+                        hasError = progress.errorField == ErrorField.Filters,
+                    )
+                }
+                StatusLine(progress = progress, queryIsEmpty = query.text.isEmpty())
             }
-            StatusLine(progress = progress, queryIsEmpty = query.text.isEmpty())
-            HorizontalDivider(color = theme.color("border.variant"))
-            LazyColumn(state = listState, modifier = Modifier.fillMaxWidth().weight(1f)) {
-                itemsIndexed(rows, key = { _, row -> row.key }) { index, row ->
-                    when (row) {
-                        is ProjectSearchRow.FileRow -> FileHeaderRow(
-                            row = row,
-                            isSelected = index == selected,
-                            onClick = {
-                                selected = index
-                                toggle(row.path)
-                            },
-                        )
-                        is ProjectSearchRow.MatchRow -> MatchResultRow(
-                            row = row,
-                            isSelected = index == selected,
-                            onClick = {
-                                selected = index
-                                onOpenMatch(row.path, row.match)
-                            },
-                        )
+            // A bar rather than Zed's rotating-arrow spinner
+            // (project_search.rs:2449-2456): the contract hands over a real
+            // fraction, and chrome here does not animate. It leaves when the
+            // search does, as the numbers do.
+            if (progress.isLive && progress.totalFiles > 0) {
+                val done = (progress.filesSearched.toFloat() / progress.totalFiles).coerceIn(0f, 1f)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(2.dp)
+                        .background(theme.color("border.variant"))
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(done)
+                            .height(2.dp)
+                            .background(theme.color("border.focused"))
+                    )
+                }
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(theme.color("border.variant"))
+            )
+        }
+        // The results live on `editor.background`, as Zed's results editor
+        // and its landing page do (project_search.rs:673).
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .background(theme.color("editor.background")),
+        ) {
+            if (rows.isEmpty()) {
+                Landing(progress = progress, queryIsEmpty = query.text.isEmpty())
+            } else {
+                LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+                    itemsIndexed(rows, key = { _, row -> row.key }) { index, row ->
+                        when (row) {
+                            is ProjectSearchRow.FileRow -> FileHeaderRow(
+                                row = row,
+                                isSelected = index == selected,
+                                onClick = {
+                                    selected = index
+                                    toggle(row.path)
+                                },
+                            )
+                            is ProjectSearchRow.MatchRow -> MatchResultRow(
+                                row = row,
+                                isSelected = index == selected,
+                                onClick = {
+                                    selected = index
+                                    onOpenMatch(row.path, row.match)
+                                },
+                            )
+                        }
                     }
                 }
             }
         }
     }
 }
-
-/**
- * The dock's left edge: the border between it and the editor, and the grip
- * that drags it wider. The terminal dock's handle, turned ninety degrees.
- */
 
 @Composable
 private fun QueryBar(
@@ -450,15 +522,11 @@ private fun QueryBar(
     focus: FocusRequester,
     onClose: () -> Unit,
 ) {
-    val theme = LocalZedTheme.current
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(BarHeight)
-            .background(theme.color("toolbar.background"))
-            .padding(horizontal = 8.dp),
+        modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        // `gap_2` between the input and the mode column (project_search.rs:2538).
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Field(
             value = query,
@@ -466,13 +534,29 @@ private fun QueryBar(
             // Zed's own placeholder (project_search.rs:1073).
             placeholder = "Search all files…",
             hasError = hasError,
-            modifier = Modifier.weight(1f).focusRequester(focus),
-        )
-        Toggle("Aa", caseSensitive, "Match case", onCaseSensitive)
-        Toggle("ab", wholeWord, "Whole word", onWholeWord)
-        Toggle(".*", regex, "Regular expression", onRegex)
-        Toggle("…", filtersOpen, "Include and exclude paths", onFilters)
-        Glyph("✕", "Close", onClose)
+            focus = focus,
+            modifier = Modifier.weight(1f),
+        ) {
+            // The three toggles sit inside the input's right edge, `gap_1`
+            // apart (project_search.rs:2387-2404).
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                BarButton("Aa", "Match case", selected = caseSensitive, onClick = onCaseSensitive)
+                BarButton("ab", "Whole word", selected = wholeWord, onClick = onWholeWord)
+                BarButton(".*", "Regular expression", selected = regex, onClick = onRegex)
+            }
+        }
+        // The mode column: the filter toggle first, `gap_1` from what follows
+        // (project_search.rs:2466-2478). Zed has no close button here — its
+        // bar dismisses with the pane's tab — but a dock has to carry its own.
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            BarButton("…", "Include and exclude paths", selected = filtersOpen, onClick = onFilters)
+            BarButton(
+                "✕",
+                "Close",
+                textStyle = MaterialTheme.typography.bodyMedium,
+                onClick = onClose,
+            )
+        }
     }
 }
 
@@ -486,15 +570,15 @@ private fun FilterBar(
     onIncludeIgnored: () -> Unit,
     hasError: Boolean,
 ) {
-    val theme = LocalZedTheme.current
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(BarHeight)
-            .background(theme.color("toolbar.background"))
-            .padding(horizontal = 8.dp),
+            // `gap_2` below the query line (project_search.rs:2663-2664).
+            .padding(top = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        // Include and exclude grow side by side, `gap_2` apart
+        // (project_search.rs:2331-2334, 2616-2626).
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         // Zed's placeholders, shortened to what a phone's width can show
         // (crates/search/src/search.rs:85-86).
@@ -512,12 +596,27 @@ private fun FilterBar(
             hasError = hasError,
             modifier = Modifier.weight(1f),
         )
-        // Spelt out rather than given a glyph: this row has the width for it,
-        // and no icon says "the files git is hiding from you".
-        Toggle("ignored", includeIgnored, "Search ignored files", onIncludeIgnored, wide = true)
+        // Zed's is a square `FileIgnored` icon toggle (project_search.rs:
+        // 2610-2614); spelt out because no glyph we have says "the files git
+        // is hiding from you", in the same button grammar grown wide.
+        BarButton(
+            "ignored",
+            "Search ignored files",
+            selected = includeIgnored,
+            wide = true,
+            onClick = onIncludeIgnored,
+        )
     }
 }
 
+/**
+ * Zed's search input: `min_h_8` 32px, `pl_2 pr_1`, 1px border in `border` —
+ * `error` when its pattern will not compile — `rounded_md`
+ * (search_bar.rs:69-79), no fill of its own over the toolbar
+ * (search_bar.rs:124). The text inside is the *buffer* font at `text_ui` size
+ * with `relative(1.3)` line height (search_bar.rs:112-120). [trailing] is the
+ * toggle strip Zed nests inside the box's right edge.
+ */
 @Composable
 private fun Field(
     value: TextFieldValue,
@@ -525,82 +624,87 @@ private fun Field(
     placeholder: String,
     hasError: Boolean,
     modifier: Modifier = Modifier,
+    focus: FocusRequester? = null,
+    trailing: (@Composable RowScope.() -> Unit)? = null,
 ) {
     val theme = LocalZedTheme.current
-    Box(
+    val inputStyle = MaterialTheme.typography.bodyMedium.let { base ->
+        base.copy(fontFamily = BufferFontFamily, lineHeight = base.fontSize * 1.3)
+    }
+    Row(
         modifier = modifier
-            .height(FieldHeight)
+            .heightIn(min = InputMinHeight)
             .clip(RoundedCornerShape(FieldRadius))
-            .background(theme.color("editor.background"))
             .border(
                 1.dp,
                 theme.color(if (hasError) "error" else "border"),
                 RoundedCornerShape(FieldRadius),
             )
-            .pointerHoverIcon(PointerIcon.Text)
-            .padding(horizontal = 8.dp),
-        contentAlignment = Alignment.CenterStart,
+            .padding(start = 8.dp, end = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        BasicTextField(
-            value = value,
-            onValueChange = onValue,
-            singleLine = true,
-            textStyle = MaterialTheme.typography.bodyMedium.copy(color = theme.color("text")),
-            cursorBrush = SolidColor(theme.cursor),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        if (value.text.isEmpty()) {
-            Text(
-                text = placeholder,
-                style = MaterialTheme.typography.bodyMedium,
-                color = theme.color("text.placeholder"),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                // Inner `py_1` around the text (project_search.rs:2382).
+                .padding(vertical = 4.dp)
+                .pointerHoverIcon(PointerIcon.Text),
+            contentAlignment = Alignment.CenterStart,
+        ) {
+            BasicTextField(
+                value = value,
+                onValueChange = onValue,
+                singleLine = true,
+                textStyle = inputStyle.copy(color = theme.color("text")),
+                cursorBrush = SolidColor(theme.cursor),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .then(if (focus != null) Modifier.focusRequester(focus) else Modifier),
             )
+            if (value.text.isEmpty()) {
+                Text(
+                    text = placeholder,
+                    style = inputStyle,
+                    color = theme.color("text.placeholder"),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
+        trailing?.invoke(this)
     }
 }
 
-/** How far the search has got and what it found: the buffer bar's counter, grown up. */
+/**
+ * The line under the bars: errors in Zed's error-line grammar —
+ * `LabelSize::Small`, `Color::Error`, `ml_2`, `mt_neg_1` pulling it 4px back
+ * into the 8px line gap (project_search.rs:2640-2661) — and the running
+ * counts, which Zed keeps as a "3/12" label in the bar (project_search.rs:
+ * 2434-2448) but a dock this narrow spells out in the same small muted type.
+ */
 @Composable
 private fun StatusLine(progress: SearchProgress, queryIsEmpty: Boolean) {
     val theme = LocalZedTheme.current
     val error = progress.error
     val text = when {
         error != null -> error
-        queryIsEmpty -> "Search every file in the project"
-        progress.state == null -> ""
-        progress.state == ProjectSearchState.Scanning -> "Scanning the project…"
-        else -> statusOf(progress)
-    }
-    Column(modifier = Modifier.fillMaxWidth()) {
-        Text(
-            text = text,
-            style = MaterialTheme.typography.labelMedium,
-            color = if (error != null) theme.color("error") else theme.color("text.muted"),
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-        )
-        // A bar rather than a spinner, because the contract hands over a real
-        // fraction. It leaves when the search does, as the numbers do.
-        if (progress.isLive && progress.totalFiles > 0) {
-            val done = (progress.filesSearched.toFloat() / progress.totalFiles).coerceIn(0f, 1f)
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(2.dp)
-                    .background(theme.color("border.variant"))
-            ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth(done)
-                        .height(2.dp)
-                        .background(theme.color("border.focused"))
-                )
-            }
-        }
-    }
+        queryIsEmpty || progress.state == null -> null
+        progress.matchCount > 0 -> statusOf(progress)
+        // Nothing matched yet: the landing page says "Searching…" or
+        // "No Results" in the results area, as Zed's does, so only the live
+        // file counter is worth a line here.
+        progress.isLive && progress.totalFiles > 0 ->
+            "searched ${progress.filesSearched} of ${progress.totalFiles}"
+        else -> null
+    } ?: return
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelMedium,
+        color = if (error != null) theme.color("error") else theme.color("text.muted"),
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+        modifier = Modifier.padding(start = 8.dp, top = 4.dp),
+    )
 }
 
 /**
@@ -612,20 +716,75 @@ private fun StatusLine(progress: SearchProgress, queryIsEmpty: Boolean) {
  */
 private fun statusOf(progress: SearchProgress): String {
     val parts = ArrayList<String>(3)
-    if (progress.matchCount > 0) {
-        parts += "${count(progress.matchCount, "result")} in ${count(progress.fileCount, "file")}"
-    } else if (!progress.isLive) {
-        parts += "No results"
-    }
+    parts += "${count(progress.matchCount, "result")} in ${count(progress.fileCount, "file")}"
     if (progress.isLive && progress.totalFiles > 0) {
         parts += "searched ${progress.filesSearched} of ${progress.totalFiles}"
     }
     if (progress.truncated && !progress.isLive) parts += "limit reached"
-    return if (parts.isEmpty()) "Searching…" else parts.joinToString(" · ")
+    return parts.joinToString(" · ")
 }
 
 private fun count(n: Int, noun: String): String = if (n == 1) "1 $noun" else "$n ${noun}s"
 
+/**
+ * Zed's landing page, drawn whenever the results editor has nothing to show:
+ * a centred `LabelSize::Large` heading over a `LabelSize::Small` line, `gap_1`
+ * apart, on `editor.background` (project_search.rs:640-682).
+ */
+@Composable
+private fun Landing(progress: SearchProgress, queryIsEmpty: Boolean) {
+    val theme = LocalZedTheme.current
+    // Zed's headings, state for state (project_search.rs:643-648); our
+    // engine's Scanning is its WaitingForScan.
+    val heading = when {
+        queryIsEmpty -> "Search All Files"
+        progress.state == ProjectSearchState.Scanning -> "Loading project…"
+        progress.isLive -> "Searching…"
+        progress.state == ProjectSearchState.Done && progress.matchCount == 0 -> "No Results"
+        else -> "Search All Files"
+    }
+    val minor = when {
+        queryIsEmpty -> "Search every file in the project"
+        progress.state == ProjectSearchState.Done && progress.matchCount == 0 ->
+            // Zed's wording (project_search.rs:657).
+            "No results found in this project for the provided query"
+        else -> null
+    }
+    Column(
+        modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            text = heading,
+            style = MaterialTheme.typography.bodyLarge,
+            color = theme.color("text"),
+            textAlign = TextAlign.Center,
+        )
+        if (minor != null) {
+            Text(
+                text = minor,
+                style = MaterialTheme.typography.labelMedium,
+                color = theme.color("text.muted"),
+                textAlign = TextAlign.Center,
+                // `gap_1` under the heading (project_search.rs:679).
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+    }
+}
+
+/**
+ * A file's header, in the shape of Zed's multibuffer buffer header
+ * (editor/src/element/header.rs:617-915): a card floated on 4px of editor
+ * background (`BUFFER_HEADER_PADDING`, editor.rs:291), `rounded_sm`, 1px
+ * `border`, filled `editor.subheader.background` with `element.hover` under
+ * the pointer (header.rs:716-734), filename and path in the buffer font
+ * (header.rs:849-852, 878-891). Zed marks the focused header with
+ * `border.focused` (header.rs:721-727); the keyboard selection borrows that.
+ * The match count at the right edge is ours — Zed's headers fold on a
+ * chevron and count nothing — kept because a phone cannot hover to peek.
+ */
 @Composable
 private fun FileHeaderRow(
     row: ProjectSearchRow.FileRow,
@@ -633,44 +792,87 @@ private fun FileHeaderRow(
     onClick: () -> Unit,
 ) {
     val theme = LocalZedTheme.current
-    ResultRow(isSelected = isSelected, onClick = onClick) {
-        Text(
-            text = if (row.isCollapsed) "▸" else "▾",
-            style = MaterialTheme.typography.labelSmall,
-            color = theme.color("icon.muted", theme.color("text.muted")),
-            modifier = Modifier.width(10.dp),
-        )
-        // The same icon the panel and the finder draw: a result here and the
-        // file itself have to read as the same thing.
-        EntryIconMark(
-            name = row.name,
-            isDir = false,
-            isExpanded = false,
-            color = theme.color("icon.muted", theme.color("text.muted")),
-        )
-        Text(
-            text = row.name,
-            style = MaterialTheme.typography.bodyMedium,
-            color = theme.color("text"),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Text(
-            text = row.directory,
-            style = MaterialTheme.typography.labelMedium,
-            color = theme.color("text.muted"),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
-        Text(
-            text = row.matchCount.toString(),
-            style = MaterialTheme.typography.labelMedium,
-            color = theme.color("text.muted"),
-        )
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val bufferStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = BufferFontFamily)
+    Box(modifier = Modifier.fillMaxWidth().padding(HeaderPadding)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = HeaderCardMinHeight)
+                .clip(RoundedCornerShape(4.dp))
+                .background(
+                    if (hovered) theme.color("element.hover")
+                    else theme.color("editor.subheader.background")
+                )
+                .border(
+                    1.dp,
+                    theme.color(if (isSelected) "border.focused" else "border"),
+                    RoundedCornerShape(4.dp),
+                )
+                .pointerHoverIcon(PointerIcon.Hand)
+                // The panel is the one focus target; rows taking it in turn
+                // would fight the arrows for the selection.
+                .focusProperties { canFocus = false }
+                .clickable(
+                    interactionSource = interaction,
+                    // Zed swaps the header's colour instantly, no ripple.
+                    indication = null,
+                    onClick = onClick,
+                )
+                // `pl_1 pr_2` inside the card (header.rs:716-717).
+                .padding(start = 4.dp, end = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            // `gap_1p5` between the card's children (header.rs:719).
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            // Zed's fold chevron, as the glyph the panel already draws.
+            Text(
+                text = if (row.isCollapsed) "▸" else "▾",
+                style = MaterialTheme.typography.labelSmall,
+                color = theme.color("icon.muted", theme.color("text.muted")),
+                modifier = Modifier.width(10.dp),
+            )
+            // The same icon the panel and the finder draw: a result here and
+            // the file itself have to read as the same thing.
+            EntryIconMark(
+                name = row.name,
+                isDir = false,
+                isExpanded = false,
+                color = theme.color("icon.muted", theme.color("text.muted")),
+            )
+            Text(
+                text = row.name,
+                style = bufferStyle,
+                color = theme.color("text"),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = row.directory,
+                style = MaterialTheme.typography.labelMedium.copy(fontFamily = BufferFontFamily),
+                color = theme.color("text.muted"),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                text = row.matchCount.toString(),
+                style = MaterialTheme.typography.labelMedium,
+                color = theme.color("text.muted"),
+            )
+        }
     }
 }
 
+/**
+ * One matching line: its number where the gutter would put it —
+ * `editor.line_number`, buffer font, right-aligned — then the line itself.
+ * The row is its text's line box, nothing taller: Zed's results are editor
+ * lines, and editor lines have no padding. Zed separates gutter from text
+ * with ch-based padding (editor.rs:11757-11765) that a 240dp dock cannot
+ * afford; `Base08` stands in.
+ */
 @Composable
 private fun MatchResultRow(
     row: ProjectSearchRow.MatchRow,
@@ -681,36 +883,12 @@ private fun MatchResultRow(
     val line = remember(row.match, theme) {
         matchLine(row.match, theme.color("search.match_background"))
     }
-    ResultRow(isSelected = isSelected, onClick = onClick) {
-        Text(
-            text = row.match.line.toString(),
-            style = MaterialTheme.typography.labelMedium.copy(fontFamily = BufferFontFamily),
-            color = theme.color("editor.line_number", theme.color("text.muted")),
-            textAlign = TextAlign.End,
-            maxLines = 1,
-            modifier = Modifier.width(LineNumberWidth),
-        )
-        Text(
-            text = line,
-            style = MaterialTheme.typography.bodySmall.copy(fontFamily = BufferFontFamily),
-            color = theme.color("editor.foreground"),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-    }
-}
-
-/** The box every result row shares: hover, selection, a hand cursor, a tap target. */
-@Composable
-private fun ResultRow(
-    isSelected: Boolean,
-    onClick: () -> Unit,
-    content: @Composable RowScope.() -> Unit,
-) {
-    val theme = LocalZedTheme.current
     val interaction = remember { MutableInteractionSource() }
     val hovered by interaction.collectIsHoveredAsState()
     val background = when {
+        // Zed's results are one editor and mark the active match in the text
+        // itself; a row list marks the row, with the ghost keys every list
+        // row here uses (list_item.rs:323-329).
         isSelected -> theme.color("ghost_element.selected")
         hovered -> theme.color("ghost_element.hover", Color.Transparent)
         else -> Color.Transparent
@@ -718,7 +896,6 @@ private fun ResultRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = RowMinHeight)
             .background(background)
             .pointerHoverIcon(PointerIcon.Hand)
             // The panel is the one focus target; rows taking it in turn would
@@ -732,54 +909,75 @@ private fun ResultRow(
             )
             .padding(horizontal = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        content = content,
-    )
-}
-
-@Composable
-private fun Toggle(
-    label: String,
-    on: Boolean,
-    description: String,
-    onClick: () -> Unit,
-    /** A word instead of a glyph, so the chip grows to fit it. */
-    wide: Boolean = false,
-) {
-    val theme = LocalZedTheme.current
-    Box(
-        modifier = Modifier
-            .height(FieldHeight)
-            .clip(RoundedCornerShape(4.dp))
-            .background(theme.color(if (on) "element.selected" else "ghost_element.background"))
-            .clickable(onClickLabel = description, onClick = onClick)
-            .pointerHoverIcon(PointerIcon.Hand)
-            .then(if (wide) Modifier.padding(horizontal = 8.dp) else Modifier.width(FieldHeight)),
-        contentAlignment = Alignment.Center,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Text(
-            text = label,
-            style = MaterialTheme.typography.labelMedium,
-            color = theme.color(if (on) "text" else "text.muted"),
+            text = row.match.line.toString(),
+            style = MaterialTheme.typography.labelMedium.copy(fontFamily = BufferFontFamily),
+            color = theme.color("editor.line_number", theme.color("text.muted")),
+            textAlign = TextAlign.End,
+            maxLines = 1,
+            modifier = Modifier.width(lineNumberWidth(row.match.line)),
+        )
+        Text(
+            text = line,
+            style = MaterialTheme.typography.bodySmall.copy(fontFamily = BufferFontFamily),
+            color = theme.color("editor.foreground"),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
 
+/**
+ * Zed's `IconButton` with `IconButtonShape::Square`, drawn with a text glyph
+ * where Zed has an SVG: a [ButtonBox] square, `rounded_sm` 4px
+ * (button_like.rs:527 via `ButtonLikeRounding::ALL`), `ButtonStyle::Subtle`
+ * state colours — `ghost_element.background`, hover `ghost_element.hover`,
+ * pressed `ghost_element.active` (button_like.rs:242-243, 298-299, 324-325) —
+ * swapped instantly, no ripple. Selected keeps the ghost background and turns
+ * the glyph `Color::Selected` = `text.accent` (icon_button.rs:243-252;
+ * color.rs:108). [wide] keeps the height and lets a word set the width, with
+ * the `px(Base08)` a wide button gets (button_like.rs:799).
+ */
 @Composable
-private fun Glyph(glyph: String, description: String, onClick: () -> Unit) {
+private fun BarButton(
+    glyph: String,
+    description: String,
+    selected: Boolean = false,
+    /** A word instead of a glyph, so the chip grows to fit it. */
+    wide: Boolean = false,
+    textStyle: TextStyle = MaterialTheme.typography.labelMedium,
+    onClick: () -> Unit,
+) {
     val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val pressed by interaction.collectIsPressedAsState()
+    val background = when {
+        pressed -> theme.color("ghost_element.active")
+        hovered -> theme.color("ghost_element.hover")
+        else -> theme.color("ghost_element.background")
+    }
     Box(
         modifier = Modifier
-            .size(FieldHeight)
+            .then(if (wide) Modifier.height(ButtonBox) else Modifier.size(ButtonBox))
             .clip(RoundedCornerShape(4.dp))
-            .clickable(onClickLabel = description, onClick = onClick)
-            .pointerHoverIcon(PointerIcon.Hand),
+            .background(background)
+            .pointerHoverIcon(PointerIcon.Hand)
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                onClickLabel = description,
+                onClick = onClick,
+            )
+            .then(if (wide) Modifier.padding(horizontal = 8.dp) else Modifier),
         contentAlignment = Alignment.Center,
     ) {
         Text(
             text = glyph,
-            style = MaterialTheme.typography.bodyMedium,
-            color = theme.color("icon"),
+            style = textStyle,
+            color = theme.color(if (selected) "text.accent" else "text"),
         )
     }
 }

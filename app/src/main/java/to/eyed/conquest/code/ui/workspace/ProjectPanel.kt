@@ -1,7 +1,6 @@
 package to.eyed.conquest.code.ui.workspace
 
 import android.os.SystemClock
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.focusable
@@ -15,13 +14,14 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -35,6 +35,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
@@ -42,9 +43,6 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEvent
@@ -67,16 +65,16 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
+import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import to.eyed.conquest.code.core.GitFileStatus as EngineStatus
 import to.eyed.conquest.code.core.GitignoredFiles
 import to.eyed.conquest.code.core.ProjectEntry
-import to.eyed.conquest.code.core.GitFileStatus as EngineStatus
 import to.eyed.conquest.code.core.ProjectSession
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
-import java.io.File
 
 /** Zed's `indent_size` (assets/settings/default.json:828). */
 private val IndentPerLevel = 20.dp
@@ -84,21 +82,37 @@ private val IndentPerLevel = 20.dp
 /** `px(Base06)` on the row; the indent is applied inside it (list_item.rs:364). */
 private val RowPadding = 6.dp
 
-/** `Base06` between the disclosure slot and what follows (list_item.rs:429). */
-private val RowGap = 6.dp
+/** `gap_1` between a row's icon and its name (list_item.rs:363). */
+private val RowGap = 4.dp
 
 /**
- * Zed's row is its label's line box — about 22.7px — with no vertical padding
- * at all (list_item.rs:365). That is 3.6mm on a phone: too small to hit, and
- * this panel is driven by a finger as often as by a mouse. So the *content*
- * runs at Zed's density and the row box alone is held open to 40dp, which is
- * the smallest target Android considers reliable. It is the one number in this
- * file that is deliberately not Zed's.
+ * Zed's row: a fixed `h_6` (24px) content box (project_panel.rs:6264) inside a
+ * wrapper that always carries a 1px border — usually painted in the row's own
+ * background, so invisible (project_panel.rs:5793) — for a 26px pitch. Per the
+ * 2026-08-17 density decision in DECISIONS.md that is our row too: the whole
+ * row is the tap target, and everything a small target does is also reachable
+ * from the long-press menu or the keyboard.
  */
-private val RowMinHeight = 40.dp
+private val RowHeight = 26.dp
 
-/** `IconSize::Small` — a 14px glyph (crates/ui/src/components/icon.rs:75). */
-private val ChevronSize = 14.dp
+/** Guides are 1px, at every indent level a row is nested under. */
+private val IndentGuideWidth = 1.dp
+
+/**
+ * Guides sit 15px right of each level's start, lining up with the icon column
+ * (ui::LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET, indent_guides.rs:33, applied in
+ * project_panel.rs:7212-7260).
+ */
+private val IndentGuideOffset = 15.dp
+
+/**
+ * The open file's border is 1px around plus a 2px rail on the right edge —
+ * `border_1().border_r_2()` in `panel.focused_border` (project_panel.rs:5793-5797).
+ */
+private val ActiveRowRail = 2.dp
+
+/** The end slot keeps `pr_3` (12px) from the row's right edge (project_panel.rs:6160). */
+private val StatusSlotEndPadding = 6.dp
 
 /** How often to check the engine for a newer worktree snapshot. */
 private const val SCANNING_POLL_MS = 120L
@@ -246,23 +260,30 @@ fun ProjectPanel(
         // read, and this panel draws one row per visible line per frame.
         val onSurface = MaterialTheme.colorScheme.onSurface
         val onSurfaceVariant = MaterialTheme.colorScheme.onSurfaceVariant
-        val colours = remember(theme, onSurface, onSurfaceVariant) {
-            GitStatusColours.from(theme, onSurface, onSurfaceVariant)
+        // The panel's plain name colour is `text.muted`, not `text` —
+        // `entry_label_color(false)` (items.rs:2177-2183); a marked row's name
+        // is promoted back to `text` in the row itself.
+        val colours = remember(theme, onSurfaceVariant) {
+            GitStatusColours.forProjectPanel(theme, onSurfaceVariant, onSurfaceVariant)
         }
         // One tint for every icon: Zed's file icons are monochrome and it is
         // the row's *name* that carries git status. `icon.muted` is what its
         // project panel asks for.
         val iconColour = theme.color("icon.muted", onSurfaceVariant)
-        // `ghost_element.*`, not `element.*`: a project-panel row is a
-        // borderless `ListItem`, and Zed paints those from the ghost ramp
-        // (list_item.rs:323-329). The `element.*` ramp belongs to things that
-        // look like buttons.
+        // `element.*`, not `ghost_element.*`: the project panel does not take
+        // the generic ListItem ramp — `get_item_color` overrides it with
+        // `element_hover` for hover and `element_selected` for a marked row
+        // (project_panel.rs:611-629), and the active file is marked by a 1px
+        // `panel.focused_border` border rather than by a fill
+        // (project_panel.rs:5729-5743).
         val rowColours = remember(theme, onSurfaceVariant) {
             RowColours(
-                open = theme.color("ghost_element.selected"),
-                hover = theme.color("ghost_element.hover", Color.Transparent),
-                pressed = theme.color("ghost_element.active", Color.Transparent),
-                selection = theme.color("border.focused", onSurfaceVariant),
+                hover = theme.color("element.hover", Color.Transparent),
+                pressed = theme.color("element.active", Color.Transparent),
+                selected = theme.color("element.selected"),
+                activeBorder = theme.color("panel.focused_border"),
+                indentGuide = theme.color("panel.indent_guide"),
+                selectedText = theme.color("text", onSurface),
             )
         }
         val dimIgnored = gitignoredFiles == GitignoredFiles.Dimmed
@@ -826,7 +847,7 @@ private fun ProjectRootRow(
             horizontalArrangement = Arrangement.spacedBy(RowGap),
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = RowMinHeight)
+                .height(RowHeight)
                 .background(
                     when {
                         isPressed -> rowColours.pressed
@@ -845,11 +866,6 @@ private fun ProjectRootRow(
                 )
                 .padding(horizontal = RowPadding),
         ) {
-            DisclosureChevron(
-                isExpanded = true,
-                isVisible = true,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
             Box(
                 modifier = Modifier.width(EntryIconWidth),
                 contentAlignment = Alignment.CenterStart,
@@ -864,7 +880,9 @@ private fun ProjectRootRow(
             Text(
                 text = name,
                 style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurface,
+                // Muted like every other plain entry (items.rs:2177-2183);
+                // the root is an ordinary row in Zed, not a header.
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
@@ -875,10 +893,14 @@ private fun ProjectRootRow(
 
 /** The backgrounds a row can have, resolved once per theme. */
 private class RowColours(
-    val open: Color,
     val hover: Color,
     val pressed: Color,
-    val selection: Color,
+    val selected: Color,
+    /** The 1px border marking the open file (project_panel.rs:5729-5743). */
+    val activeBorder: Color,
+    val indentGuide: Color,
+    /** `text` — what a marked row's plain name turns (items.rs:2177-2183). */
+    val selectedText: Color,
 )
 
 @Composable
@@ -901,22 +923,33 @@ private fun ProjectRow(
 ) {
     // Zed tints the *name* by git status and greys gitignored entries rather
     // than hiding them; "show" opts out of even that, for people who don't
-    // want their tree to editorialise. Ignored still wins over status, as in
-    // Zed: an ignored file that also has changes reads as ignored.
+    // want their tree to editorialise. A real change wins over ignored-ness
+    // (`entry_git_aware_label_color` checks conflict/deleted/modified/created
+    // before ignored — editor/src/items.rs:2205-2219), and a plain entry is
+    // `text.muted`, turning `text` only when its row is marked
+    // (`entry_label_color`, items.rs:2177-2183).
     //
     // Colours were resolved once for the whole panel, so this is a `when` over
     // an enum — no theme lookup and no allocation per row, per frame.
-    val color = colours.colorFor(status, entry.isIgnored, dimIgnored)
+    val tinted = colours.colorFor(status, entry.isIgnored, dimIgnored)
+    val color = if (
+        isSelected && status == GitFileStatus.None && !(entry.isIgnored && dimIgnored)
+    ) {
+        rowColours.selectedText
+    } else {
+        tinted
+    }
     val interaction = remember { MutableInteractionSource() }
     val hovered by interaction.collectIsHoveredAsState()
     val isPressed by interaction.collectIsPressedAsState()
+    // Zed's precedence: a marked row is `element.selected` even under the
+    // pointer (bg_hover_color stays `marked` — project_panel.rs:5708-5711).
     val background = when {
-        isOpen -> rowColours.open
+        isSelected -> rowColours.selected
         isPressed -> rowColours.pressed
-        isSelected || hovered -> rowColours.hover
+        hovered -> rowColours.hover
         else -> Color.Transparent
     }
-    val selectionMark = rowColours.selection
     // A long press has no coordinates of its own, so the last press is
     // remembered: the menu should open under the finger, not at the row's edge.
     val pressed = remember { mutableStateOf(Offset.Zero) }
@@ -933,13 +966,44 @@ private fun ProjectRow(
             horizontalArrangement = Arrangement.spacedBy(RowGap),
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = RowMinHeight)
+                .height(RowHeight)
                 .background(background)
                 .drawBehind {
-                    // A stripe rather than a border: it marks where the
-                    // keyboard is without moving the row's text by a pixel.
-                    if (isSelected) {
-                        drawRect(color = selectionMark, size = Size(2.dp.toPx(), size.height))
+                    // Zed's indent guides: 1px at every level this row is
+                    // nested under, at `level × indent_size + 15` — the offset
+                    // lines them up with the icon column (project_panel.rs:
+                    // 7212-7260). Drawn per row, they join into the same
+                    // continuous runs the uniform-list decoration computes,
+                    // because a guide at level ℓ spans exactly the contiguous
+                    // rows deeper than ℓ.
+                    val guide = IndentGuideWidth.toPx()
+                    val step = IndentPerLevel.toPx()
+                    val guideOffset = IndentGuideOffset.toPx()
+                    for (level in 0 until depth) {
+                        drawRect(
+                            color = rowColours.indentGuide,
+                            topLeft = Offset(level * step + guideOffset, 0f),
+                            size = Size(guide, size.height),
+                        )
+                    }
+                    // The open file wears a 1px border with a 2px rail on the
+                    // right edge, not a fill — `border_1().border_r_2()` in
+                    // `panel.focused_border` (project_panel.rs:5729-5797).
+                    // Ours shows regardless of panel focus: on a touch screen
+                    // the panel is unfocused almost always, and the open file
+                    // is worth finding.
+                    if (isOpen && !isSelected) {
+                        drawRect(
+                            color = rowColours.activeBorder,
+                            topLeft = Offset(guide / 2f, guide / 2f),
+                            size = Size(size.width - guide, size.height - guide),
+                            style = Stroke(width = guide),
+                        )
+                        drawRect(
+                            color = rowColours.activeBorder,
+                            topLeft = Offset(size.width - ActiveRowRail.toPx(), 0f),
+                            size = Size(ActiveRowRail.toPx(), size.height),
+                        )
                     }
                 }
                 .pointerHoverIcon(PointerIcon.Hand)
@@ -957,11 +1021,6 @@ private fun ProjectRow(
                 )
                 .padding(start = RowPadding + IndentPerLevel * depth, end = RowPadding),
         ) {
-            DisclosureChevron(
-                isExpanded = isExpanded,
-                isVisible = entry.isDir,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
             Box(
                 modifier = Modifier.width(EntryIconWidth),
                 contentAlignment = Alignment.CenterStart,
@@ -973,52 +1032,59 @@ private fun ProjectRow(
                     color = iconColour.copy(alpha = if (isCut) CUT_ALPHA else 1f),
                 )
             }
+            // The name takes ALL remaining width — Zed's content group is
+            // `flex_grow_1` with `justify_between` against the end slot
+            // (list_item.rs:425-441) — so the ellipsis uses the full row and
+            // the git mark below is pinned to the row's end.
             Text(
                 text = entry.name,
                 style = MaterialTheme.typography.bodyMedium,
                 color = if (isCut) color.copy(alpha = CUT_ALPHA) else color,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
             )
+            // Zed's trailing git mark, in the row's end slot: a status letter
+            // for files, a half-opacity dot for a directory with changes
+            // (project_panel.rs:6188-6205, 7786-7809).
+            val letter = statusLetter(status)
+            if (letter != null && !(entry.isIgnored && dimIgnored)) {
+                if (entry.isDir) {
+                    Box(
+                        modifier = Modifier
+                            .padding(end = StatusSlotEndPadding)
+                            .size(6.dp)
+                            .clip(CircleShape)
+                            .background(tinted.copy(alpha = 0.5f)),
+                    )
+                } else {
+                    Text(
+                        text = letter,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = tinted,
+                        maxLines = 1,
+                        modifier = Modifier.padding(end = StatusSlotEndPadding),
+                    )
+                }
+            }
         }
         menu()
     }
 }
 
 /**
- * The disclosure triangle, drawn rather than typed.
- *
- * Zed's is an SVG at `IconSize::Small` (project_panel.rs:6577); ours was the
- * text glyph `▾`, which every font sizes and baselines differently and which
- * therefore never sat still between a folder row and a file row. Two strokes
- * of `Canvas` cost nothing and land on the same 14dp box every time.
- *
- * Files keep the box and draw nothing in it, so names line up whether or not
- * the row above them can be opened.
+ * Zed's letter for a change, from `git_status_indicator`
+ * (project_panel.rs:7786-7809): conflicts shout, then the worktree's own
+ * state. Renames surface as the index modification they are.
  */
-@Composable
-private fun DisclosureChevron(isExpanded: Boolean, isVisible: Boolean, color: Color) {
-    Canvas(modifier = Modifier.size(ChevronSize)) {
-        if (!isVisible) return@Canvas
-        val stroke = size.width * 0.1f
-        val inset = size.width * 0.28f
-        val far = size.width - inset
-        val path = Path()
-        if (isExpanded) {
-            path.moveTo(inset, size.height * 0.38f)
-            path.lineTo(size.width / 2f, size.height * 0.66f)
-            path.lineTo(far, size.height * 0.38f)
-        } else {
-            path.moveTo(size.width * 0.38f, inset)
-            path.lineTo(size.width * 0.66f, size.height / 2f)
-            path.lineTo(size.width * 0.38f, far)
-        }
-        drawPath(
-            path = path,
-            color = color,
-            style = Stroke(width = stroke, cap = StrokeCap.Round, join = StrokeJoin.Round),
-        )
-    }
+private fun statusLetter(status: GitFileStatus): String? = when (status) {
+    GitFileStatus.Conflicted -> "!"
+    GitFileStatus.Untracked -> "U"
+    GitFileStatus.Deleted -> "D"
+    GitFileStatus.Modified -> "M"
+    GitFileStatus.Added -> "A"
+    GitFileStatus.Renamed -> "M"
+    GitFileStatus.None, GitFileStatus.Ignored -> null
 }
 
 @Composable
