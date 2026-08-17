@@ -56,7 +56,7 @@ fun UnsavedChangesDialog(files: OpenFilesState) {
                 onClick = {
                     saving = true
                     scope.launch {
-                        val saved = withContext(Dispatchers.IO) { file.session.save() }
+                        val saved = withContext(Dispatchers.IO) { file.session?.save() == true }
                         file.refreshStatus()
                         saving = false
                         // A failed write is the one case where closing anyway

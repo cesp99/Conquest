@@ -7,6 +7,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import to.eyed.conquest.code.core.BufferSession
 import to.eyed.conquest.code.ui.editor.EditorState
+import to.eyed.conquest.code.ui.media.MediaKind
 
 /** How many closed files Ctrl+Shift+T can walk back through. */
 private const val REOPEN_HISTORY = 24
@@ -23,9 +24,21 @@ private const val REOPEN_HISTORY = 24
 class OpenFile(
     /** Project-relative path — what the panel and tab strip display. */
     val path: String,
-    val editor: EditorState,
+    /**
+     * The text editor, or null for a tab that is not text at all.
+     *
+     * A picture has no buffer: nothing to parse, nothing to save, nothing to
+     * be dirty, and closing it cannot lose work. Everything that assumes an
+     * editor has to ask first, which is the point of making it nullable
+     * rather than inventing an empty one.
+     */
+    val editor: EditorState?,
+    /** What this file is, when it is not text. */
+    val media: MediaKind? = null,
+    /** The file on disk, for a tab the engine never opened. */
+    val absolutePath: String? = null,
 ) {
-    val session: BufferSession get() = editor.session
+    val session: BufferSession? get() = editor?.session
 
     val name: String = path.substringAfterLast('/')
 
@@ -48,13 +61,14 @@ class OpenFile(
      * Grammar the engine is highlighting with, for the status bar. Read once:
      * the language is chosen when the file is opened and doesn't change.
      */
-    val language: String? = session.language
+    val language: String? = session?.language
 
     /** Whether anything changed, so callers can skip needless work. */
     fun refreshStatus(): Boolean {
-        val dirty = session.isDirty
-        val disk = session.hasDiskChange
-        val deleted = session.isFileDeleted
+        val open = session ?: return false
+        val dirty = open.isDirty
+        val disk = open.hasDiskChange
+        val deleted = open.isFileDeleted
         if (dirty == isDirty && disk == hasDiskChange && deleted == isDeleted) return false
         isDirty = dirty
         hasDiskChange = disk
@@ -145,7 +159,7 @@ class OpenFilesState {
         val file = _tabs.getOrNull(index) ?: return
         _tabs.removeAt(index)
         closing.remove(file)
-        file.session.close()
+        file.session?.close()
         rememberClosed(file.path)
         activeIndex = when {
             _tabs.isEmpty() -> -1

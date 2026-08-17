@@ -70,6 +70,8 @@ import to.eyed.conquest.code.ui.search.ProjectSearchPanel
 import to.eyed.conquest.code.ui.search.revealProjectSearchMatch
 import to.eyed.conquest.code.ui.editor.EditorPane
 import to.eyed.conquest.code.ui.editor.EditorState
+import to.eyed.conquest.code.ui.media.MediaKind
+import to.eyed.conquest.code.ui.media.MediaPane
 import to.eyed.conquest.code.ui.terminal.TerminalDock
 
 /**
@@ -213,9 +215,18 @@ fun WorkspaceScreen(
         }
         scope.launch {
             val absolutePath = project.absolutePathOf(path) ?: return@launch
+            // A picture never reaches the engine: opening one as text would
+            // put a megabyte of mojibake in a CRDT and set tree-sitter on it.
+            val media = MediaKind.of(path.substringAfterLast('/'))
+            if (media != null) {
+                val opened = OpenFile(path, editor = null, media = media, absolutePath = absolutePath)
+                files.open(opened)
+                onOpened?.invoke(opened)
+                return@launch
+            }
             val session = withContext(Dispatchers.IO) { BufferSession.openFile(absolutePath) }
                 ?: return@launch
-            val opened = OpenFile(path, EditorState(session))
+            val opened = OpenFile(path, EditorState(session), absolutePath = absolutePath)
             files.open(opened)
             onOpened?.invoke(opened)
         }
@@ -256,7 +267,8 @@ fun WorkspaceScreen(
             for (tab in moved) {
                 if (!tab.isDirty) continue
                 val destination = open.absolutePathOf(to + tab.path.removePrefix(from))
-                val text = withContext(Dispatchers.IO) { CoreBridge.bufferText(tab.session.id) }
+                val id = tab.session?.id ?: continue
+                val text = withContext(Dispatchers.IO) { CoreBridge.bufferText(id) }
                 if (destination != null && text != null) {
                     withContext(Dispatchers.IO) { File(destination).writeText(text) }
                 }
@@ -375,7 +387,7 @@ fun WorkspaceScreen(
             files.refreshStatuses()
             for (tab in files.tabs) {
                 if (tab.hasDiskChange && !tab.isDirty) {
-                    withContext(Dispatchers.IO) { tab.session.reload() }
+                    withContext(Dispatchers.IO) { tab.session?.reload() }
                     tab.refreshStatus()
                     dismissedConflicts.value -= tab.path
                 }
@@ -385,16 +397,18 @@ fun WorkspaceScreen(
     }
 
     fun save(file: OpenFile) {
+        val open = file.session ?: return
         scope.launch {
-            withContext(Dispatchers.IO) { file.session.save() }
+            withContext(Dispatchers.IO) { open.save() }
             file.refreshStatus()
             dismissedConflicts.value -= file.path
         }
     }
 
     fun reload(file: OpenFile) {
+        val open = file.session ?: return
         scope.launch {
-            withContext(Dispatchers.IO) { file.session.reload() }
+            withContext(Dispatchers.IO) { open.reload() }
             file.refreshStatus()
             dismissedConflicts.value -= file.path
         }
@@ -413,7 +427,12 @@ fun WorkspaceScreen(
     fun runCommand(command: WorkspaceCommand): Boolean {
         val active = files.active
         when (command) {
-            WorkspaceCommand.Save -> active?.let { save(it) } ?: return false
+            // A picture has no buffer, so there is nothing to save and the
+            // chord is refused rather than silently doing nothing.
+            WorkspaceCommand.Save -> {
+                if (active?.session == null) return false
+                save(active)
+            }
             WorkspaceCommand.CloseTab -> {
                 if (files.activeIndex < 0) return false
                 // `requestClose`, never `close`: the unconditional one drops
@@ -470,7 +489,7 @@ fun WorkspaceScreen(
             }
             WorkspaceCommand.SelectTheme -> themeSelectorOpen = true
             WorkspaceCommand.FindInFile -> {
-                if (files.active == null) return false
+                if (files.active?.editor == null) return false
                 searchBarOpen = true
             }
             WorkspaceCommand.OpenSettings -> {
@@ -512,7 +531,7 @@ fun WorkspaceScreen(
     /** A project-search hit: open its file and put the caret on the match. */
     fun openMatch(path: String, match: ProjectSearchMatch) {
         val open = project ?: return
-        openFile(open, path) { file -> file.editor.revealProjectSearchMatch(match) }
+        openFile(open, path) { file -> file.editor?.revealProjectSearchMatch(match) }
         if (searchTakesWorkArea) {
             // A compact screen gave the panel the whole work area, so opening a
             // file has to hand it back — and hand the keyboard back with it, or
@@ -794,7 +813,7 @@ fun WorkspaceScreen(
                 cursorRow = active?.editor?.cursorRow ?: 0,
                 cursorCol = active?.editor?.cursorCol ?: 0,
                 language = active?.language,
-                hasFile = active != null,
+                hasFile = active?.editor != null,
                 isPanelVisible = if (isWide) panelVisible else drawerState.isOpen,
                 onToggleProjectPanel = { runCommand(WorkspaceCommand.ToggleProjectPanel) },
                 onFindFile = if (project != null) {
@@ -864,7 +883,7 @@ fun WorkspaceScreen(
         CommandPalette(
             workspace = CommandContext(
                 hasProject = project != null,
-                hasActiveFile = files.active != null,
+                hasActiveFile = files.active?.editor != null,
                 tabCount = files.tabs.size,
                 terminalCount = terminals.sessions.size,
                 canClone = GitClone.isSupported,
@@ -989,11 +1008,13 @@ private fun EditorArea(
             EditorTabs(files, onSave = onSave, onReopen = onReopen)
             DockDivider()
         }
-        if (searchOpen && active != null) {
+        // Find-in-file is a text question; a picture has nothing to search.
+        val activeEditor = active?.editor
+        if (searchOpen && activeEditor != null) {
             BufferSearchBar(
-                editor = active.editor,
+                editor = activeEditor,
                 onDismiss = {
-                    active.editor.clearSearchMatches()
+                    activeEditor.clearSearchMatches()
                     onSearchDismissed()
                 },
             )
@@ -1029,11 +1050,17 @@ private fun EditorArea(
                     modifier = Modifier.padding(24.dp),
                 )
             }
-        } else {
+        } else if (activeEditor != null) {
             EditorPane(
-                state = active.editor,
+                state = activeEditor,
                 modifier = Modifier.weight(1f),
                 onSave = { onSave(active) },
+            )
+        } else {
+            MediaPane(
+                absolutePath = active.absolutePath.orEmpty(),
+                kind = active.media ?: MediaKind.Image,
+                modifier = Modifier.weight(1f),
             )
         }
     }
