@@ -65,7 +65,7 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1 as acp;
 use agent_client_protocol::{Agent, Client, ConnectionTo, Lines, Responder};
 
-use crate::acp_thread::{PermissionDecision, Phase, SessionThread};
+use crate::acp_thread::{PermissionDecision, Phase, PromptInput, SessionThread};
 use crate::guest::{self, GuestCommand};
 use crate::{BufferId, BufferState, ProjectId};
 
@@ -249,6 +249,11 @@ struct AgentInfo {
     /// `auth_methods`, in ACP's own wire shape — the UI renders them as
     /// choices for `acp_authenticate`.
     auth_methods: serde_json::Value,
+    /// Whether the agent takes `EmbeddedResource` prompt blocks. Decides how
+    /// an @-mention travels: embedded file text when it can, a `ResourceLink`
+    /// when it cannot — the same split Zed makes
+    /// (agent_ui/src/message_editor.rs:2150-2161).
+    embedded_context: bool,
 }
 
 /// Everything the handlers and worker threads share for one agent process.
@@ -283,6 +288,7 @@ struct AgentShared {
 impl AgentShared {
     fn new(
         spec: &AgentSpec,
+        key: String,
         sessions: Sessions,
         index: Index,
         written: Arc<WrittenFiles>,
@@ -291,7 +297,7 @@ impl AgentShared {
         static NEXT_AGENT: AtomicU64 = AtomicU64::new(1);
         Arc::new(AgentShared {
             id: NEXT_AGENT.fetch_add(1, Ordering::Relaxed),
-            key: spec.key(),
+            key,
             name: spec.name.clone(),
             connection: Mutex::new(None),
             init: Mutex::new(InitPhase::Starting),
@@ -313,6 +319,10 @@ impl AgentShared {
 
     fn initialized(&self) -> bool {
         !matches!(*self.init.lock().unwrap(), InitPhase::Starting)
+    }
+
+    fn supports_embedded_context(&self) -> bool {
+        matches!(&*self.init.lock().unwrap(), InitPhase::Ready(info) if info.embedded_context)
     }
 
     /// The one line of stderr worth showing a user, if there is one.
@@ -975,6 +985,10 @@ async fn agent_main(shared: Arc<AgentShared>, cx: ConnectionTo<Agent>) -> Result
             .filter(|version| !version.is_empty()),
         auth_methods: serde_json::to_value(&response.auth_methods)
             .unwrap_or(serde_json::Value::Null),
+        embedded_context: response
+            .agent_capabilities
+            .prompt_capabilities
+            .embedded_context,
     };
     log::info!(
         "acp: \"{}\" initialized (agent {:?} {:?})",
@@ -1036,7 +1050,13 @@ async fn create_session(shared: Arc<AgentShared>, cx: ConnectionTo<Agent>, our_i
                 // reuses one has just stolen the older session's updates.
                 log::warn!("acp: agent reused session id {acp_id:?}; session {displaced} loses it");
             }
-            handle.update(|thread| thread.ready(acp_id.clone(), response.modes));
+            handle.update(|thread| {
+                thread.ready(
+                    acp_id.clone(),
+                    response.modes,
+                    response.config_options.unwrap_or_default(),
+                )
+            });
             // Updates that raced the response are still in arrival order.
             let early: Vec<acp::SessionUpdate> = {
                 let mut buffered = shared.early_updates.lock().unwrap();
@@ -1055,8 +1075,8 @@ async fn create_session(shared: Arc<AgentShared>, cx: ConnectionTo<Agent>, our_i
             // A prompt typed while the session was starting goes out now. Its
             // entry is already on screen, so nothing is pushed for it here.
             let queued = handle.update(|thread| thread.take_queued_prompt());
-            if let Some(text) = queued {
-                start_prompt(&shared, &cx, our_id, text, false);
+            if let Some(prompt) = queued {
+                start_prompt(&shared, &cx, our_id, prompt, false);
             }
         }
         Err(err) if err.code == acp::ErrorCode::AuthRequired => {
@@ -1077,13 +1097,13 @@ fn start_prompt(
     shared: &Arc<AgentShared>,
     cx: &ConnectionTo<Agent>,
     our_id: u64,
-    text: String,
+    prompt: PromptInput,
     push: bool,
 ) {
     let task_shared = shared.clone();
     let task_cx = cx.clone();
     let _ = cx.spawn(async move {
-        run_prompt(task_shared, task_cx, our_id, text, push).await;
+        run_prompt(task_shared, task_cx, our_id, prompt, push).await;
         // Never propagate an error: a task error tears the whole connection
         // down (SDK contract), and a failed turn is a session-level fact.
         Ok(())
@@ -1094,26 +1114,28 @@ async fn run_prompt(
     shared: Arc<AgentShared>,
     cx: ConnectionTo<Agent>,
     our_id: u64,
-    text: String,
+    prompt: PromptInput,
     push: bool,
 ) {
-    let mut text = text;
+    let mut prompt = prompt;
     let mut push = push;
     loop {
         let Some(handle) = shared.session(our_id) else {
             return;
         };
-        let Some(acp_id) = handle.thread.lock().unwrap().acp_id.clone() else {
-            return;
+        let (acp_id, root) = {
+            let thread = handle.thread.lock().unwrap();
+            let Some(acp_id) = thread.acp_id.clone() else {
+                return;
+            };
+            (acp_id, thread.root.clone())
         };
         if push {
-            handle.update(|thread| thread.push_user_message(&text));
+            handle.update(|thread| thread.push_user_message(&prompt.text));
         }
+        let blocks = prompt_blocks(&root, shared.supports_embedded_context(), &prompt);
         let result = cx
-            .send_request(acp::PromptRequest::new(
-                acp_id,
-                vec![acp::ContentBlock::from(text.clone())],
-            ))
+            .send_request(acp::PromptRequest::new(acp_id, blocks))
             .block_task()
             .await;
 
@@ -1134,7 +1156,7 @@ async fn run_prompt(
         });
         match next {
             Some(follow_up) => {
-                text = follow_up;
+                prompt = follow_up;
                 // `take_queued_prompt` has already made sure the entry showing
                 // it is on screen; pushing again would double it.
                 push = false;
@@ -1142,6 +1164,51 @@ async fn run_prompt(
             None => return,
         }
     }
+}
+
+/// A mentioned file bigger than this travels as a link even to an agent that
+/// takes embedded context: the whole prompt goes down one pipe, and a huge
+/// paste starves the turn.
+const MAX_EMBEDDED_MENTION_BYTES: u64 = 256 * 1024;
+
+/// The prompt as content blocks: the text first, then one block per
+/// @-mentioned file — embedded file text when the agent's prompt
+/// capabilities take it, a `file://` resource link otherwise, which is Zed's
+/// own split (agent_ui/src/message_editor.rs:2150-2161). A mention that
+/// resolves outside the project is dropped: the same `resolves_inside`
+/// boundary the fs handlers enforce, applied before anything is read.
+fn prompt_blocks(root: &Path, embedded: bool, prompt: &PromptInput) -> Vec<acp::ContentBlock> {
+    let mut blocks = vec![acp::ContentBlock::from(prompt.text.clone())];
+    for mention in &prompt.mentions {
+        let path = root.join(mention);
+        if !resolves_inside(root, &path) {
+            log::warn!("acp: mention {mention:?} resolves outside the project; dropped");
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| mention.clone());
+        let uri = format!("file://{}", path.display());
+        let small_enough = std::fs::metadata(&path)
+            .map(|meta| meta.len() <= MAX_EMBEDDED_MENTION_BYTES)
+            .unwrap_or(false);
+        let block = if embedded && small_enough {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                    acp::EmbeddedResourceResource::TextResourceContents(
+                        acp::TextResourceContents::new(content, uri),
+                    ),
+                )),
+                // Unreadable (binary, gone): the link still names it.
+                Err(_) => acp::ContentBlock::ResourceLink(acp::ResourceLink::new(name, uri)),
+            }
+        } else {
+            acp::ContentBlock::ResourceLink(acp::ResourceLink::new(name, uri))
+        };
+        blocks.push(block);
+    }
+    blocks
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,7 +1260,13 @@ impl crate::Engine {
         // the moment anything decides it is over, while `dead` lags it by the
         // watcher's poll and proot's grace, and a session handed to an agent
         // in between would simply never be answered by anyone.
-        let key = spec.key();
+        //
+        // The **root is part of the key**: the guest process binds the
+        // project directory at spawn, so an agent started for one project is
+        // blind to every other — reusing it across projects would hand out
+        // sessions whose files the agent can never read. Threads within one
+        // project share the process; a project switch replaces it.
+        let key = format!("{}\u{0}{}", spec.key(), root.display());
         let mut slot = self.acp.agent.lock().unwrap();
         let reusable = slot
             .as_ref()
@@ -1211,6 +1284,7 @@ impl crate::Engine {
                 }
                 let shared = AgentShared::new(
                     &spec,
+                    key.clone(),
                     self.acp.sessions.clone(),
                     self.acp.index.clone(),
                     self.acp.written.clone(),
@@ -1329,12 +1403,20 @@ impl crate::Engine {
     /// version counter. A prompt while a turn is running interrupts it — the
     /// running turn is cancelled and this prompt follows it, which is Zed's
     /// follow-up behaviour. False for a forgotten id or a dead session.
-    pub fn acp_prompt(&self, session: u64, text: &str) -> bool {
+    /// `mentions_json` is a JSON array of project-relative paths the user
+    /// @-mentioned; they become resource blocks beside the text. Anything
+    /// that is not such an array means no mentions — a malformed list must
+    /// not eat the message it rode in on.
+    pub fn acp_prompt(&self, session: u64, text: &str, mentions_json: &str) -> bool {
         let Some(handle) = self.session_handle(session) else {
             return false;
         };
         let Some(shared) = self.acp.agent.lock().unwrap().clone() else {
             return false;
+        };
+        let prompt = PromptInput {
+            text: text.to_owned(),
+            mentions: serde_json::from_str(mentions_json).unwrap_or_default(),
         };
         enum Route {
             Refused,
@@ -1348,18 +1430,18 @@ impl crate::Engine {
             // send while the agent is still starting or still answering looks
             // like a send rather than like a key that did nothing.
             Phase::Starting => {
-                thread.queue_prompt(text);
+                thread.queue_prompt(&prompt);
                 Route::Queue
             }
             Phase::Running => {
-                thread.queue_prompt(text);
+                thread.queue_prompt(&prompt);
                 match &thread.acp_id {
                     Some(id) => Route::Interrupt(id.clone()),
                     None => Route::Queue,
                 }
             }
             Phase::Ready => {
-                thread.push_user_message(text);
+                thread.push_user_message(&prompt.text);
                 Route::Send
             }
         });
@@ -1387,7 +1469,7 @@ impl crate::Engine {
                     });
                     return false;
                 };
-                start_prompt(&shared, &cx, session, text.to_owned(), false);
+                start_prompt(&shared, &cx, session, prompt, false);
                 true
             }
         }
@@ -1516,6 +1598,55 @@ impl crate::Engine {
                         }
                         // Without this the confirmed mode change is invisible
                         // until something else happens to move the counter.
+                        thread.bump();
+                    });
+                }
+            }
+            Ok(())
+        })
+        .is_ok()
+    }
+
+    /// Ask the agent to change one of its session configuration options —
+    /// `session/set_config_option`, the request behind Zed's model and
+    /// effort selectors. `value_json` is `true`/`false` for a boolean option
+    /// or a JSON string for a select's value id. The response carries the
+    /// full new set of options, which replaces ours.
+    pub fn acp_set_config_option(&self, session: u64, config_id: &str, value_json: &str) -> bool {
+        let Some(handle) = self.session_handle(session) else {
+            return false;
+        };
+        let Some(acp_id) = handle.thread.lock().unwrap().acp_id.clone() else {
+            return false;
+        };
+        let Some(shared) = self.acp.agent.lock().unwrap().clone() else {
+            return false;
+        };
+        let Some(cx) = shared.connection() else {
+            return false;
+        };
+        let value = match serde_json::from_str::<serde_json::Value>(value_json) {
+            Ok(serde_json::Value::Bool(flag)) => acp::SessionConfigOptionValue::boolean(flag),
+            Ok(serde_json::Value::String(id)) => {
+                acp::SessionConfigOptionValue::value_id(acp::SessionConfigValueId::new(id))
+            }
+            _ => return false,
+        };
+        let request = acp::SetSessionConfigOptionRequest::new(
+            acp_id,
+            acp::SessionConfigId::new(config_id.to_owned()),
+            value,
+        );
+        let session_id = session;
+        let task_shared = shared.clone();
+        let task_cx = cx.clone();
+        cx.spawn(async move {
+            if let Ok(response) = task_cx.send_request(request).block_task().await {
+                if let Some(handle) = task_shared.session(session_id) {
+                    handle.update(|thread| {
+                        thread.config_options = response.config_options;
+                        // Without this the confirmed change is invisible until
+                        // something else happens to move the counter.
                         thread.bump();
                     });
                 }
@@ -1708,6 +1839,49 @@ mod tests {
     // Two agents in one process: the sessions map outlives both.
     // -------------------------------------------------------------------
 
+    /// @-mentions become resource blocks after the text — embedded file text
+    /// for an agent that takes it, a `file://` link otherwise — and a mention
+    /// that resolves outside the project never reaches the wire at all.
+    #[test]
+    fn mentions_become_resource_blocks_inside_the_project_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("notes.md"), "the notes\n").unwrap();
+        let prompt = PromptInput {
+            text: "look at this".to_owned(),
+            mentions: vec![
+                "notes.md".to_owned(),
+                "../escape.txt".to_owned(),
+                "missing.txt".to_owned(),
+            ],
+        };
+
+        // An agent that takes embedded context gets the file's text.
+        let blocks = prompt_blocks(&root, true, &prompt);
+        assert_eq!(blocks.len(), 3, "text + notes.md + missing.txt as a link");
+        assert!(matches!(&blocks[0], acp::ContentBlock::Text(text) if text.text == "look at this"));
+        match &blocks[1] {
+            acp::ContentBlock::Resource(resource) => match &resource.resource {
+                acp::EmbeddedResourceResource::TextResourceContents(contents) => {
+                    assert_eq!(contents.text, "the notes\n");
+                    assert!(contents.uri.starts_with("file://"));
+                    assert!(contents.uri.ends_with("/notes.md"));
+                }
+                other => panic!("expected text contents, got {other:?}"),
+            },
+            other => panic!("expected an embedded resource, got {other:?}"),
+        }
+        // A file that cannot be read still travels as a link that names it.
+        assert!(
+            matches!(&blocks[2], acp::ContentBlock::ResourceLink(link) if link.name == "missing.txt")
+        );
+
+        // An agent without the capability gets links for everything.
+        let blocks = prompt_blocks(&root, false, &prompt);
+        assert!(matches!(&blocks[1], acp::ContentBlock::ResourceLink(link)
+                if link.name == "notes.md" && link.uri.starts_with("file://")));
+    }
+
     fn shared_for_test(sessions: &Sessions, index: &Index) -> Arc<AgentShared> {
         AgentShared::new(
             &AgentSpec {
@@ -1715,6 +1889,7 @@ mod tests {
                 argv: vec!["test".to_owned()],
                 env: HashMap::new(),
             },
+            "test-key".to_owned(),
             sessions.clone(),
             index.clone(),
             Arc::new(WrittenFiles::default()),
@@ -1743,8 +1918,8 @@ mod tests {
             SessionThread::new(1, root.clone()),
         ));
         let new_session = Arc::new(SessionHandle::new(new.id, SessionThread::new(1, root)));
-        old_session.update(|thread| thread.ready(acp::SessionId::new("old-1"), None));
-        new_session.update(|thread| thread.ready(acp::SessionId::new("new-1"), None));
+        old_session.update(|thread| thread.ready(acp::SessionId::new("old-1"), None, Vec::new()));
+        new_session.update(|thread| thread.ready(acp::SessionId::new("new-1"), None, Vec::new()));
         sessions.lock().unwrap().insert(1, old_session.clone());
         sessions.lock().unwrap().insert(2, new_session.clone());
         index
@@ -1861,7 +2036,7 @@ mod tests {
             new.id,
             SessionThread::new(1, PathBuf::from("/proj")),
         ));
-        handle.update(|thread| thread.ready(acp::SessionId::new("s1"), None));
+        handle.update(|thread| thread.ready(acp::SessionId::new("s1"), None, Vec::new()));
         sessions.lock().unwrap().insert(7, handle.clone());
         index.lock().unwrap().insert(acp::SessionId::new("s1"), 7);
 
@@ -2053,7 +2228,7 @@ mod tests {
             argv: vec!["fake".to_owned()],
             env: HashMap::new(),
         };
-        let shared = AgentShared::new(&spec, sessions.clone(), index, written, buffers);
+        let shared = AgentShared::new(&spec, spec.key(), sessions.clone(), index, written, buffers);
         let handle = Arc::new(SessionHandle::new(
             shared.id,
             SessionThread::new(1, root.to_path_buf()),
@@ -2102,7 +2277,13 @@ mod tests {
         // asks permission.
         let cx = shared.connection().expect("connection is up");
         handle.update(|thread| thread.push_user_message("edit the file"));
-        start_prompt(shared, &cx, 7, "edit the file".to_owned(), false);
+        start_prompt(
+            shared,
+            &cx,
+            7,
+            PromptInput::text_only("edit the file"),
+            false,
+        );
         wait_for("the permission prompt", || {
             handle.permissions.lock().unwrap().contains_key("t1")
         });
@@ -2191,7 +2372,13 @@ mod tests {
         // the flag first, exactly as `acp_cancel` does, so the ordering is
         // deterministic rather than a race the test usually wins.
         handle.update(|thread| thread.turn_cancelled = true);
-        start_prompt(shared, &cx, 7, "edit the file".to_owned(), false);
+        start_prompt(
+            shared,
+            &cx,
+            7,
+            PromptInput::text_only("edit the file"),
+            false,
+        );
 
         // The turn settles by itself: the agent's permission request was
         // answered `cancelled` on arrival, so it proceeds and responds.
@@ -2236,7 +2423,13 @@ mod tests {
         });
         let cx = shared.connection().expect("connection is up");
         handle.update(|thread| thread.push_user_message("try to escape"));
-        start_prompt(shared, &cx, 7, "try to escape".to_owned(), false);
+        start_prompt(
+            shared,
+            &cx,
+            7,
+            PromptInput::text_only("try to escape"),
+            false,
+        );
         wait_for("the permission prompt", || {
             handle.permissions.lock().unwrap().contains_key("t1")
         });
@@ -2296,6 +2489,7 @@ mod tests {
         };
         let shared = AgentShared::new(
             &spec,
+            spec.key(),
             sessions.clone(),
             index,
             Arc::new(WrittenFiles::default()),
@@ -2476,6 +2670,7 @@ mod tests {
         };
         let shared = AgentShared::new(
             &spec,
+            spec.key(),
             sessions.clone(),
             index,
             Arc::new(WrittenFiles::default()),
@@ -2496,10 +2691,117 @@ mod tests {
             handle.thread.lock().unwrap().phase == Phase::Ready
         });
 
-        // ---- turn one: an allowed edit of an existing file ----------------
+        // The session came up carrying the whole advertised surface: the
+        // config options from session/new, and the slash commands that
+        // followed as an update.
+        wait_for("the advertised commands", || {
+            !handle.thread.lock().unwrap().commands.is_empty()
+        });
+        {
+            let thread = handle.thread.lock().unwrap();
+            let names: Vec<&str> = thread
+                .commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect();
+            assert_eq!(names, ["plan", "echo"]);
+            let ids: Vec<String> = thread
+                .config_options
+                .iter()
+                .map(|option| option.id.0.to_string())
+                .collect();
+            assert_eq!(ids, ["model", "verbose"]);
+        }
+
+        // ---- config: pick the other model, watch it stick -----------------
         let cx = shared.connection().expect("connection is up");
+        {
+            let engine_like = |value: &str| {
+                // The Engine method needs the whole Engine; drive the same
+                // request the way it does, through the connection.
+                let request = acp::SetSessionConfigOptionRequest::new(
+                    handle.thread.lock().unwrap().acp_id.clone().unwrap(),
+                    acp::SessionConfigId::new("model"),
+                    acp::SessionConfigOptionValue::value_id(acp::SessionConfigValueId::new(
+                        value.to_owned(),
+                    )),
+                );
+                let task_shared = shared.clone();
+                let task_cx = cx.clone();
+                let _ = cx.spawn(async move {
+                    match task_cx.send_request(request).block_task().await {
+                        Ok(response) => {
+                            if let Some(handle) = task_shared.session(1) {
+                                handle.update(|thread| {
+                                    thread.config_options = response.config_options;
+                                });
+                            }
+                        }
+                        Err(err) => eprintln!("set_config_option failed: {err:?}"),
+                    }
+                    Ok(())
+                });
+            };
+            engine_like("conf-two");
+        }
+        wait_for("the model change to come back", || {
+            let thread = handle.thread.lock().unwrap();
+            thread.config_options.iter().any(|option| {
+                matches!(&option.kind, acp::SessionConfigKind::Select(select)
+                    if option.id.0.as_ref() == "model"
+                        && select.current_value.0.as_ref() == "conf-two")
+            })
+        });
+
+        // ---- a slash command with an @-mention ----------------------------
+        handle.update(|thread| thread.push_user_message("/echo with context @notes.md"));
+        start_prompt(
+            &shared,
+            &cx,
+            1,
+            PromptInput {
+                text: "/echo with context @notes.md".to_owned(),
+                mentions: vec!["notes.md".to_owned()],
+            },
+            false,
+        );
+        wait_for("the echo turn to end", || {
+            let thread = handle.thread.lock().unwrap();
+            thread.phase == Phase::Ready && thread.stop_reason.as_deref() == Some("end_turn")
+        });
+        {
+            let thread = handle.thread.lock().unwrap();
+            let reply = thread
+                .entries
+                .iter()
+                .rev()
+                .find_map(|entry| match &entry.body {
+                    EntryBody::Assistant { chunks } => Some(
+                        chunks
+                            .iter()
+                            .map(|chunk| chunk.markdown.as_str())
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                })
+                .expect("the echo reply is in the transcript");
+            // The mention arrived as a resource block (the client has no
+            // embedded-context capability advertised by this fake agent, so
+            // as a link), and the picked model rode the reply.
+            assert!(reply.contains("notes.md"), "mention named back: {reply}");
+            assert!(reply.contains("conf-two"), "picked model in: {reply}");
+            assert!(reply.contains("with context"), "echoed text in: {reply}");
+        }
+
+        // ---- turn one: an allowed edit of an existing file ----------------
         handle.update(|thread| thread.push_user_message("please edit notes.md"));
-        start_prompt(&shared, &cx, 1, "please edit notes.md".to_owned(), false);
+        start_prompt(
+            &shared,
+            &cx,
+            1,
+            PromptInput::text_only("please edit notes.md"),
+            false,
+        );
 
         wait_for("the permission prompt", || {
             handle.permissions.lock().unwrap().contains_key("t-1")
@@ -2565,7 +2867,7 @@ mod tests {
             &shared,
             &cx,
             1,
-            "add AGENT_NOTE.md please".to_owned(),
+            PromptInput::text_only("add AGENT_NOTE.md please"),
             false,
         );
         wait_for("the second permission prompt", || {

@@ -87,6 +87,22 @@ class Agent:
         # on the same process.
         self.sessions = 0
         self.session_id = None
+        # Config options, the panel's selector chips: a model select and a
+        # verbose toggle, remembered so set_config_option visibly sticks.
+        self.model = "conf-one"
+        self.verbose = False
+
+    def config_options(self):
+        return [
+            {"id": "model", "name": "Model", "type": "select",
+             "category": "model", "currentValue": self.model,
+             "options": [
+                 {"value": "conf-one", "name": "Conformance One"},
+                 {"value": "conf-two", "name": "Conformance Two"},
+             ]},
+            {"id": "verbose", "name": "Verbose", "type": "boolean",
+             "currentValue": self.verbose},
+        ]
 
     # -- outbound ------------------------------------------------------------
 
@@ -183,9 +199,36 @@ class Agent:
             self.cwd = params.get("cwd") or os.getcwd()
             self.sessions += 1
             self.session_id = "conf-%d" % self.sessions
+            self.model = "conf-one"
+            self.verbose = False
             log("session %s in %s" % (self.session_id, self.cwd))
             send({"jsonrpc": "2.0", "id": request_id,
-                  "result": {"sessionId": self.session_id}})
+                  "result": {"sessionId": self.session_id,
+                             "configOptions": self.config_options()}})
+            # Slash commands arrive as an update, the way live agents send
+            # them (the panel's / popup completes from these).
+            self.update({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    {"name": "plan", "description": "Show a plan and stop"},
+                    {"name": "echo",
+                     "description": "Repeat the text back",
+                     "input": {"hint": "text to repeat"}},
+                ],
+            })
+        elif method == "session/set_config_option":
+            config = params.get("configId")
+            # A select's value id arrives as a bare string; a boolean arrives
+            # tagged ({"type": "boolean", "value": …}). Take both.
+            value = params.get("value")
+            if isinstance(value, dict):
+                value = value.get("value")
+            if config == "model" and value in ("conf-one", "conf-two"):
+                self.model = value
+            elif config == "verbose":
+                self.verbose = bool(value)
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"configOptions": self.config_options()}})
         elif method == "session/prompt":
             stop_reason = self.run_turn(params)
             send({
@@ -200,11 +243,38 @@ class Agent:
 
     def run_turn(self, params):
         self.cancelled = False
+        blocks = params.get("prompt", [])
         prompt = " ".join(
             block.get("text", "")
-            for block in params.get("prompt", [])
+            for block in blocks
             if block.get("type") == "text"
         ).strip()
+        # Mentions arrive as resource blocks beside the text: embedded file
+        # text, or a link. Named back, so the panel's @ flow is visible
+        # end to end.
+        context = []
+        for block in blocks:
+            if block.get("type") == "resource":
+                uri = (block.get("resource") or {}).get("uri", "")
+                context.append(os.path.basename(uri) + " (embedded)")
+            elif block.get("type") == "resource_link":
+                context.append(block.get("name", "?") + " (link)")
+        try:
+            if context:
+                self.chunk("agent_message_chunk",
+                           "Context received: %s. " % ", ".join(context))
+            if prompt.startswith("/echo"):
+                self.chunk("agent_message_chunk",
+                           "Echo [%s]: %s" % (self.model, prompt[5:].strip()))
+                return "end_turn"
+            if prompt.startswith("/plan"):
+                self.plan(("Look around", "in_progress"), ("Report back", "pending"))
+                self.chunk("agent_message_chunk", "That is the plan; say more when ready.")
+                self.plan(("Look around", "completed"), ("Report back", "completed"))
+                return "end_turn"
+        except Cancelled:
+            log("turn cancelled")
+            return "cancelled"
         target = self.pick_target(prompt)
         path = os.path.join(self.cwd or os.getcwd(), target)
         try:

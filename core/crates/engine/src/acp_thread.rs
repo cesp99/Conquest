@@ -201,6 +201,25 @@ pub enum PermissionDecision {
     Cancel,
 }
 
+/// One prompt as the UI sends it: the text, plus the project-relative paths
+/// the user @-mentioned. Mentions ride the queue too, so a follow-up typed
+/// mid-turn keeps its context — Zed's message editor sends the same shape,
+/// text plus resource blocks (agent_ui/src/message_editor.rs:2140-2180).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PromptInput {
+    pub text: String,
+    pub mentions: Vec<String>,
+}
+
+impl PromptInput {
+    pub fn text_only(text: impl Into<String>) -> Self {
+        PromptInput {
+            text: text.into(),
+            mentions: Vec::new(),
+        }
+    }
+}
+
 /// The whole of one session's state. Lives behind a mutex in `acp.rs`; every
 /// method here runs under it and none of them blocks.
 pub struct SessionThread {
@@ -225,12 +244,17 @@ pub struct SessionThread {
     /// Slash commands the agent advertised. Carried in the state JSON;
     /// serialized in ACP's own camelCase shape.
     pub commands: Vec<acp::AvailableCommand>,
+    /// The agent's session configuration options — model, effort, whatever it
+    /// advertises (selects and booleans). Replaced wholesale on every
+    /// `ConfigOptionUpdate`, which is the protocol's own rule: the update
+    /// carries "the full set".
+    pub config_options: Vec<acp::SessionConfigOption>,
     /// How the last turn ended, snake_case (`end_turn`, `cancelled`, …).
     pub stop_reason: Option<String>,
     /// A prompt sent while a turn was running: the running turn is cancelled
     /// and this goes out when it settles — Zed's follow-up interrupt
     /// (acp_thread.rs:3742-3752, where `run_turn` awaits `cancel_inner`).
-    pub queued_prompt: Option<String>,
+    pub queued_prompt: Option<PromptInput>,
     /// Bumped by every mutation; entry stamps come from it.
     ///
     /// **Starts at 1, not 0.** A live session must never report the version an
@@ -266,6 +290,7 @@ impl SessionThread {
             usage: None,
             modes: None,
             commands: Vec::new(),
+            config_options: Vec::new(),
             stop_reason: None,
             queued_prompt: None,
             revision: 1,
@@ -318,11 +343,11 @@ impl SessionThread {
     /// enter, and nothing at all happens until the running turn settles.
     /// Deliberately does not touch `phase`: a session still starting is still
     /// starting, and a running turn is still the running turn's.
-    pub fn queue_prompt(&mut self, text: &str) {
-        self.queued_prompt = Some(text.to_owned());
+    pub fn queue_prompt(&mut self, prompt: &PromptInput) {
+        self.queued_prompt = Some(prompt.clone());
         self.push_entry(EntryBody::User {
-            markdown: text.to_owned(),
-            chunks: vec![text.to_owned()],
+            markdown: prompt.text.clone(),
+            chunks: vec![prompt.text.clone()],
             optimistic: true,
         });
     }
@@ -335,8 +360,8 @@ impl SessionThread {
     /// take this one with it. Re-pushing is cheap and keeps the invariant the
     /// panel relies on: a prompt that is about to be sent is a prompt the user
     /// can see.
-    pub(crate) fn take_queued_prompt(&mut self) -> Option<String> {
-        let text = self.queued_prompt.take()?;
+    pub(crate) fn take_queued_prompt(&mut self) -> Option<PromptInput> {
+        let prompt = self.queued_prompt.take()?;
         let shown = matches!(
             self.entries.last(),
             Some(Entry {
@@ -346,12 +371,12 @@ impl SessionThread {
                     ..
                 },
                 ..
-            }) if *markdown == text
+            }) if *markdown == prompt.text
         );
         if !shown {
             self.push_entry(EntryBody::User {
-                markdown: text.clone(),
-                chunks: vec![text.clone()],
+                markdown: prompt.text.clone(),
+                chunks: vec![prompt.text.clone()],
                 optimistic: true,
             });
         }
@@ -360,14 +385,14 @@ impl SessionThread {
         self.error = None;
         self.turn_cancelled = false;
         self.bump();
-        Some(text)
+        Some(prompt)
     }
 
     /// Throw away a queued prompt that will now never be sent, and the entry
     /// that was showing it — otherwise the transcript keeps a message the
     /// agent never received, which is the one thing a transcript must not do.
     pub fn discard_queued_prompt(&mut self) {
-        let Some(text) = self.queued_prompt.take() else {
+        let Some(prompt) = self.queued_prompt.take() else {
             return;
         };
         let trailing_is_ours = matches!(
@@ -379,7 +404,7 @@ impl SessionThread {
                     ..
                 },
                 ..
-            }) if *markdown == text
+            }) if *markdown == prompt.text
         );
         if trailing_is_ours {
             self.entries.pop();
@@ -457,7 +482,11 @@ impl SessionThread {
                     self.bump();
                 }
             }
-            acp::SessionUpdate::ConfigOptionUpdate(_) => {}
+            acp::SessionUpdate::ConfigOptionUpdate(update) => {
+                // "The full set of configuration options and their current
+                // values" — replacement, never a merge.
+                self.config_options = update.config_options;
+            }
             acp::SessionUpdate::SessionInfoUpdate(update) => {
                 // `MaybeUndefined`: absent means "unchanged", null means
                 // "cleared" — only a real value changes the title.
@@ -648,7 +677,7 @@ impl SessionThread {
     /// Zed's turn-end handling (acp_thread.rs:3790-3895): a cancelled turn
     /// cancels what was pending, and a refusal removes the refused prompt from
     /// the transcript because the agent has removed it from its context.
-    pub fn end_turn(&mut self, stop_reason: acp::StopReason) -> Option<String> {
+    pub fn end_turn(&mut self, stop_reason: acp::StopReason) -> Option<PromptInput> {
         self.phase = Phase::Ready;
         self.stop_reason = Some(stop_reason_name(stop_reason).to_owned());
         self.turn_cancelled = false;
@@ -696,9 +725,15 @@ impl SessionThread {
     }
 
     /// `session/new` answered: the session is live.
-    pub fn ready(&mut self, id: acp::SessionId, modes: Option<acp::SessionModeState>) {
+    pub fn ready(
+        &mut self,
+        id: acp::SessionId,
+        modes: Option<acp::SessionModeState>,
+        config_options: Vec<acp::SessionConfigOption>,
+    ) {
         self.acp_id = Some(id);
         self.modes = modes;
+        self.config_options = config_options;
         self.phase = Phase::Ready;
         self.needs_auth = false;
         self.error = None;
@@ -729,6 +764,7 @@ impl SessionThread {
             "usage": self.usage,
             "modes": self.modes,
             "commands": self.commands,
+            "configOptions": self.config_options,
             "agent": agent,
         })
     }
@@ -1088,7 +1124,7 @@ mod tests {
         thread.fail_turn("the wire broke".to_owned());
         assert!(!thread.turn_cancelled, "a failed turn clears it");
 
-        thread.queue_prompt("queued while running");
+        thread.queue_prompt(&PromptInput::text_only("queued while running"));
         thread.turn_cancelled = true;
         assert!(thread.take_queued_prompt().is_some());
         assert!(
@@ -1316,10 +1352,10 @@ mod tests {
     fn a_queued_prompt_survives_the_turn_it_interrupted() {
         let mut thread = thread();
         thread.push_user_message("first");
-        thread.queued_prompt = Some("follow-up".to_owned());
+        thread.queued_prompt = Some(PromptInput::text_only("follow-up"));
         assert_eq!(
             thread.end_turn(acp::StopReason::Cancelled),
-            Some("follow-up".to_owned())
+            Some(PromptInput::text_only("follow-up"))
         );
     }
 
@@ -1380,7 +1416,7 @@ mod tests {
             "a live session is never version 0 — that means forgotten"
         );
 
-        thread.ready(acp::SessionId::new("s1"), None);
+        thread.ready(acp::SessionId::new("s1"), None, Vec::new());
         assert!(
             thread.revision > fresh,
             "starting → ready must be visible to a poller: {fresh} → {}",
@@ -1396,7 +1432,7 @@ mod tests {
         thread.push_user_message("first");
         let before = thread.revision;
 
-        thread.queue_prompt("second");
+        thread.queue_prompt(&PromptInput::text_only("second"));
         assert!(thread.revision > before, "the queue is news");
         assert_eq!(thread.entries.len(), 2);
         let EntryBody::User { markdown, .. } = &thread.entries[1].body else {
@@ -1410,7 +1446,7 @@ mod tests {
         // not pushed a second time.
         assert_eq!(
             thread.end_turn(acp::StopReason::EndTurn),
-            Some("second".to_owned())
+            Some(PromptInput::text_only("second"))
         );
         assert_eq!(thread.entries.len(), 2);
         assert_eq!(
@@ -1426,7 +1462,7 @@ mod tests {
     fn cancelling_takes_the_queued_prompt_off_the_screen_too() {
         let mut thread = thread();
         thread.push_user_message("first");
-        thread.queue_prompt("second");
+        thread.queue_prompt(&PromptInput::text_only("second"));
         assert_eq!(thread.entries.len(), 2);
 
         thread.discard_queued_prompt();
@@ -1442,10 +1478,10 @@ mod tests {
     fn a_queued_prompt_survives_a_refusal_truncating_its_entry() {
         let mut thread = thread();
         thread.push_user_message("something refused");
-        thread.queue_prompt("the follow-up");
+        thread.queue_prompt(&PromptInput::text_only("the follow-up"));
 
         let queued = thread.end_turn(acp::StopReason::Refusal);
-        assert_eq!(queued, Some("the follow-up".to_owned()));
+        assert_eq!(queued, Some(PromptInput::text_only("the follow-up")));
         let last = thread.entries.last().expect("the follow-up is on screen");
         let EntryBody::User { markdown, .. } = &last.body else {
             panic!("expected the queued user message");
@@ -1616,6 +1652,19 @@ mod tests {
                     "Always Ask",
                 )],
             )),
+            vec![acp::SessionConfigOption::new(
+                acp::SessionConfigId::new("model"),
+                "Model",
+                acp::SessionConfigKind::Select(acp::SessionConfigSelect::new(
+                    acp::SessionConfigValueId::new("fast"),
+                    acp::SessionConfigSelectOptions::Ungrouped(vec![
+                        acp::SessionConfigSelectOption::new(
+                            acp::SessionConfigValueId::new("fast"),
+                            "Fast",
+                        ),
+                    ]),
+                )),
+            )],
         );
         thread.apply_update(acp::SessionUpdate::UsageUpdate(
             serde_json::from_value(serde_json::json!({"used": 10, "size": 100})).unwrap(),

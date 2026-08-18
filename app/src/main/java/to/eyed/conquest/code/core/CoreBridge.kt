@@ -864,8 +864,28 @@ object CoreBridge {
      * queued **and shown immediately** — the running turn is cancelled and
      * this one follows it, which is Zed's follow-up behaviour. False for a
      * forgotten id or a session that is over.
+     *
+     * [mentionsJson] is a JSON array of project-relative paths the user
+     * @-mentioned; the engine sends each as a resource block beside the text
+     * (embedded file text when the agent takes it, a `file://` link
+     * otherwise). `[]` when there are none; a malformed list means none
+     * rather than a lost message.
      */
-    external fun acpPrompt(sessionId: Long, text: String): Boolean
+    external fun acpPrompt(sessionId: Long, text: String, mentionsJson: String): Boolean
+
+    /**
+     * Changes one of the agent's session configuration options — model,
+     * effort, whatever it advertised under `configOptions` in
+     * [acpSessionState]. [valueJson] is `true`/`false` for a boolean option
+     * or a JSON string (`"\"opus\""`) for a select's value id. The change
+     * lands when the agent confirms it — watch the counter. False for a
+     * forgotten id or a value that is neither shape.
+     */
+    external fun acpSetConfigOption(
+        sessionId: Long,
+        configId: String,
+        valueJson: String,
+    ): Boolean
 
     /**
      * Stops the running turn and any prompt queued behind it. Tool calls still

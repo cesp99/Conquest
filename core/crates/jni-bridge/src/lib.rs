@@ -1810,9 +1810,32 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpPrompt(
     _class: JClass,
     session_id: jlong,
     text: JString,
+    mentions_json: JString,
 ) -> jboolean {
     let text = get_string(&mut env, &text);
-    if engine().acp_prompt(session_id as u64, &text) {
+    let mentions_json = get_string(&mut env, &mentions_json);
+    if engine().acp_prompt(session_id as u64, &text, &mentions_json) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Change one of the agent's session configuration options —
+/// `session/set_config_option`, the request behind model/effort selectors.
+/// `value_json` is `true`/`false` for a boolean option or a JSON string for
+/// a select's value id. False for a forgotten id or a value that is neither.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpSetConfigOption(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_id: jlong,
+    config_id: JString,
+    value_json: JString,
+) -> jboolean {
+    let config_id = get_string(&mut env, &config_id);
+    let value_json = get_string(&mut env, &value_json);
+    if engine().acp_set_config_option(session_id as u64, &config_id, &value_json) {
         JNI_TRUE
     } else {
         JNI_FALSE
