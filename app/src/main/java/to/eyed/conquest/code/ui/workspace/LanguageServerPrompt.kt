@@ -47,7 +47,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import to.eyed.conquest.code.core.LanguageServerInstaller
 import to.eyed.conquest.code.core.LanguageServers
-import to.eyed.conquest.code.core.ServerInstallState
+import to.eyed.conquest.code.core.AptInstallState
 import to.eyed.conquest.code.core.targetOrNull
 import to.eyed.conquest.code.terminal.Userland
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
@@ -123,7 +123,7 @@ fun LanguageServerPrompt(
         if (requested != null && stale != null && stale != requested) {
             LanguageServerInstaller.dismiss()
         }
-        if (requested != null && LanguageServerInstaller.state is ServerInstallState.Idle) {
+        if (requested != null && LanguageServerInstaller.state is AptInstallState.Idle) {
             // Asking what it costs is not installing: the estimate answers
             // apt's own confirmation prompt with "no" and fetches nothing.
             LanguageServerInstaller.offer(context, requested)
@@ -149,10 +149,10 @@ fun LanguageServerPrompt(
     /** What Enter does, which is also what the rightmost button does. */
     fun primary() {
         when (val current = state) {
-            is ServerInstallState.Offered ->
+            is AptInstallState.Offered ->
                 LanguageServerInstaller.install(context, current.target)
 
-            is ServerInstallState.Failed -> {
+            is AptInstallState.Failed -> {
                 val target = current.target
                 if (target != null) {
                     LanguageServerInstaller.offer(context, target)
@@ -162,15 +162,15 @@ fun LanguageServerPrompt(
                 }
             }
 
-            is ServerInstallState.Checking, is ServerInstallState.Installing ->
+            is AptInstallState.Checking, is AptInstallState.Installing ->
                 LanguageServerInstaller.cancel()
 
-            is ServerInstallState.AlreadyInstalled, is ServerInstallState.Finished -> {
+            is AptInstallState.AlreadyInstalled, is AptInstallState.Finished -> {
                 LanguageServerInstaller.dismiss()
                 onDismiss()
             }
 
-            ServerInstallState.Idle ->
+            AptInstallState.Idle ->
                 if (unpackaged != null) {
                     close()
                 } else {
@@ -203,7 +203,7 @@ fun LanguageServerPrompt(
                         true
                     }
                     // The list is only on screen while nothing is running.
-                    state !is ServerInstallState.Idle -> false
+                    state !is AptInstallState.Idle -> false
                     event.key == Key.DirectionDown -> { move(1); true }
                     event.key == Key.DirectionUp -> { move(-1); true }
                     event.key == Key.Tab -> {
@@ -228,7 +228,7 @@ fun LanguageServerPrompt(
             )
 
             when (val current = state) {
-                ServerInstallState.Idle -> if (unpackaged != null) {
+                AptInstallState.Idle -> if (unpackaged != null) {
                     Body(unpackaged)
                     Actions {
                         PromptButton("Close", isPrimary = true, onClick = onDismiss)
@@ -251,7 +251,7 @@ fun LanguageServerPrompt(
                     }
                 }
 
-                is ServerInstallState.Checking -> {
+                is AptInstallState.Checking -> {
                     Body("Asking apt what ${current.target.packageList} would cost…")
                     Bar()
                     Actions {
@@ -261,19 +261,13 @@ fun LanguageServerPrompt(
                     }
                 }
 
-                is ServerInstallState.Offered -> {
+                is AptInstallState.Offered -> {
                     Text(
-                        text = LanguageServers.question(current.target, current.plan),
+                        text = current.target.question(current.plan),
                         style = MaterialTheme.typography.bodyMedium,
                         color = theme.color("text"),
                     )
-                    Body(
-                        LanguageServers.detail(
-                            current.target,
-                            current.plan,
-                            Userland.backend.displayName,
-                        )
-                    )
+                    Body(current.target.detail(current.plan, Userland.backend.displayName))
                     Actions {
                         // Zed's own second option, in Zed's own words
                         // (extension_suggest.rs:193).
@@ -285,24 +279,14 @@ fun LanguageServerPrompt(
                     }
                 }
 
-                is ServerInstallState.AlreadyInstalled -> {
-                    // Reached two ways: from the status bar saying a server
-                    // could not start, and from the palette by someone simply
-                    // asking. Only the first means anything is wrong, and
-                    // this state cannot tell them apart — so the sentence
-                    // must be true either way rather than announcing a
-                    // failure that may not have happened.
-                    Body(
-                        "${current.target.packageList} ${current.target.packagesAre} " +
-                            "already installed. If ${current.target.server} still is not " +
-                            "working, running it in the terminal will say why."
-                    )
+                is AptInstallState.AlreadyInstalled -> {
+                    Body(current.target.alreadyInstalledMessage())
                     Actions {
                         PromptButton("Close", isPrimary = true, onClick = { primary() })
                     }
                 }
 
-                is ServerInstallState.Installing -> {
+                is AptInstallState.Installing -> {
                     Text(
                         text = "Installing ${current.target.packageList}",
                         style = MaterialTheme.typography.bodyMedium,
@@ -320,7 +304,7 @@ fun LanguageServerPrompt(
                     }
                 }
 
-                is ServerInstallState.Failed -> {
+                is AptInstallState.Failed -> {
                     Text(
                         text = current.summary,
                         style = MaterialTheme.typography.bodyMedium,
@@ -340,12 +324,8 @@ fun LanguageServerPrompt(
                     }
                 }
 
-                is ServerInstallState.Finished -> {
-                    Body(
-                        "${current.target.packageList} installed. " +
-                            "${current.target.server} starts on its own for open " +
-                            "${current.target.grammars.first()} files."
-                    )
+                is AptInstallState.Finished -> {
+                    Body(current.target.installedMessage())
                     Actions {
                         PromptButton("Close", isPrimary = true, onClick = { primary() })
                     }
