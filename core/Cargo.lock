@@ -1831,6 +1831,7 @@ dependencies = [
  "text",
  "trash",
  "tree-sitter",
+ "url",
  "util",
  "worktree",
 ]
