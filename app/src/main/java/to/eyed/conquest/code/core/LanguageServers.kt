@@ -558,7 +558,7 @@ object LanguageServerInstaller {
         val mine = ++generation
         state = ServerInstallState.Installing(target, "Starting")
         job = scope.launch {
-            val result = runCatching { apt(app, target) }.getOrElse { error ->
+            val result = runCatching { apt(app, target, mine) }.getOrElse { error ->
                 Log.e(TAG, "install failed", error)
                 ServerInstallState.Failed(
                     target,
@@ -622,7 +622,12 @@ object LanguageServerInstaller {
         // apt never got as far as its own summary — no apt in the rootfs, a
         // broken sources.list, proot refusing to start. Ask the question
         // without a price rather than claiming to know something.
-        if (!plan.hasSummary) return ServerInstallState.Offered(target, null)
+        // A plan that names packages apt could not find is worth showing even
+        // though apt never reached its summary — that list is *why* there is
+        // no price, and the sentence built for it was otherwise unreachable.
+        if (!plan.hasSummary) {
+            return ServerInstallState.Offered(target, plan.takeIf { it.missing.isNotEmpty() })
+        }
         // Everything present and nothing to install: the packages are there
         // and the server still would not start, which the user needs told
         // rather than offered a no-op download.
@@ -632,7 +637,17 @@ object LanguageServerInstaller {
         return ServerInstallState.Offered(target, plan)
     }
 
-    private fun apt(context: Context, target: LanguageServerPackage): ServerInstallState {
+    private fun apt(
+        context: Context,
+        target: LanguageServerPackage,
+        /**
+         * The install this reader belongs to. A cancelled apt keeps producing
+         * records through proot's SIGQUIT grace period, and a later install
+         * has already taken the state by then — guarding on "still
+         * Installing" is not enough, because the later one *is* Installing.
+         */
+        mine: Int,
+    ): ServerInstallState {
         val command = Userland.backend.execCommand(
             context,
             ProjectsRoot.directory(context).absolutePath,
@@ -651,6 +666,7 @@ object LanguageServerInstaller {
             val now = System.nanoTime()
             // Never resurrect a state a cancel has already moved past.
             if (now - lastStep >= GuestProcess.PROGRESS_INTERVAL_NS &&
+                generation == mine &&
                 state is ServerInstallState.Installing
             ) {
                 lastStep = now
@@ -679,3 +695,22 @@ object LanguageServerInstaller {
             "This edition has no Linux userland to install a language server into"
         }
 }
+
+/**
+ * Which language a state is about, or null for [ServerInstallState.Idle] and
+ * for a failure with nothing to retry.
+ *
+ * An extension rather than an interface member so the data classes keep their
+ * own plain `target`: the prompt asks this one so that a state left over from
+ * one language cannot answer for another.
+ */
+val ServerInstallState.targetOrNull: LanguageServerPackage?
+    get() = when (this) {
+        is ServerInstallState.Checking -> target
+        is ServerInstallState.Offered -> target
+        is ServerInstallState.Installing -> target
+        is ServerInstallState.AlreadyInstalled -> target
+        is ServerInstallState.Finished -> target
+        is ServerInstallState.Failed -> target
+        ServerInstallState.Idle -> null
+    }

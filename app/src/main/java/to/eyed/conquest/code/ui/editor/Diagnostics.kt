@@ -274,12 +274,22 @@ class BufferDiagnostics(
 fun Diagnostic.contains(row: Int, col: Int): Boolean =
     !isAfter(this.row, colUtf16, row, col) && !isAfter(row, col, endRow, endColUtf16)
 
-/** Zed's `min_by_key((severity, length))`, as a comparison. */
+/**
+ * Zed's `min_by_key((severity, length))`, as far as rows and columns can say
+ * it: severity first, then the range covering fewer rows.
+ *
+ * Zed compares a real length because it holds offsets; we hold (row, column)
+ * pairs, and the difference between two columns on *different* rows is not a
+ * length — it can even be negative, which would rank the longer range tighter.
+ * So columns decide only when both ranges live on one row, and two ranges of
+ * equal row-span are left in document order, which is the order they arrived.
+ */
 internal fun Diagnostic.isTighterThan(other: Diagnostic): Boolean {
     if (severity != other.severity) return severity < other.severity
     val rowsHere = endRow - row
     val rowsThere = other.endRow - other.row
     if (rowsHere != rowsThere) return rowsHere < rowsThere
+    if (rowsHere != 0) return false
     return (endColUtf16 - colUtf16) < (other.endColUtf16 - other.colUtf16)
 }
 

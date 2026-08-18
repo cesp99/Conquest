@@ -283,10 +283,6 @@ class EditorState private constructor(
 
     private fun bumpRevision() {
         revision++
-        // Every change to the text passes through here, which makes it the
-        // one place that can notice the diagnostics have gone stale without
-        // asking the engine anything. See [diagnosticsAreStale].
-        refreshDiagnosticsStale()
     }
 
     // Pixel metrics, set from composition (density-dependent).
@@ -970,19 +966,34 @@ class EditorState private constructor(
      * no longer hold (a close and reopen, most often), which is stale by
      * definition.
      */
-    var diagnosticsAreStale: Boolean by mutableStateOf(false)
-        private set
+    val diagnosticsAreStale: Boolean
+        // Computed, not cached. A cached flag has to be refreshed by every
+        // path that moves the buffer, and one of them does not go through
+        // this class at all: a reload replaces the whole text and bumps the
+        // engine's version from underneath, which left the underlines
+        // painting at full strength over text the server never saw. Both
+        // halves are plain fields — `diagnostics` is snapshot state and
+        // `buffer.version` is a `var Long` the session keeps — so this is two
+        // reads and a comparison, cheap enough for the draw pass that asks.
+        get() {
+            val current = diagnostics
+            return current.version != 0L && current.bufferVersion != buffer.version
+        }
+
+    /**
+     * A chance for an open popup to take the soft keyboard's Enter.
+     *
+     * On a phone Enter is not a key event: the IME commits a newline through
+     * the [EditorInputConnection], so a completion menu listening for
+     * `Key.Enter` never hears it and the user gets a line break where they
+     * asked for a completion. The pane registers the open menu here and the
+     * connection offers the newline to it first; true means "taken".
+     */
+    internal var onImeNewline: (() -> Boolean)? = null
 
     /** Adopt a fresh read from `bufferDiagnostics`. */
     fun showDiagnostics(fresh: BufferDiagnostics) {
         diagnostics = fresh
-        refreshDiagnosticsStale()
-    }
-
-    private fun refreshDiagnosticsStale() {
-        val current = diagnostics
-        diagnosticsAreStale =
-            current.version != 0L && current.bufferVersion != buffer.version
     }
 
     /**
@@ -1044,6 +1055,103 @@ class EditorState private constructor(
         val col = target.colUtf16.coerceIn(0, line(row).length)
         unfoldRowsTouching(row..target.endRow.coerceAtLeast(row), hiddenOnly = true)
         val at = Caret(row, col)
+        setCarets(listOf(at), at)
+        return true
+    }
+
+    // ---- language intelligence at the caret -------------------------------
+
+    /**
+     * The engine's buffer version, for the two LSP answers that carry
+     * positions. Snapshot state is not wanted here and would be wrong: this is
+     * asked once when a request goes out and once when it comes back, to find
+     * out whether the text moved in between — the same comparison
+     * [diagnosticsAreStale] makes, from the same place.
+     */
+    internal val bufferVersion: Long get() = buffer.version
+
+    /**
+     * Text the user just typed, reported to whoever is listening.
+     *
+     * The completion menu needs it because Zed opens on *input* — a trigger
+     * character or a character that can stand in an identifier — and never on
+     * a bare caret move (`is_completion_trigger`,
+     * crates/editor/src/completions.rs:1513-1539). Watching the caret cannot
+     * tell the two apart, and a menu that opened when the user pressed `→`
+     * into the middle of a word is a menu nobody asked for.
+     */
+    internal var onTextTyped: ((String) -> Unit)? = null
+
+    /** The revision [noteTyped] last reported for; see there. */
+    private var typedAtRevision = -1
+
+    /**
+     * Report a typed character, at most once per edit.
+     *
+     * A keystroke reaches the buffer through three doors — a hardware key, an
+     * IME commit, and an IME commit of a character that opens a bracket pair —
+     * and two of them meet inside [applyLineDiff] while the third does not.
+     * Rather than teach each door to report, they all report, and the second
+     * report for one edit is dropped: [revision] has already moved by the time
+     * anyone calls, so "the same revision" is exactly "the same keystroke".
+     */
+    internal fun noteTyped(text: String) {
+        if (typedAtRevision == revision) return
+        typedAtRevision = revision
+        onTextTyped?.invoke(text)
+    }
+
+    /**
+     * Replace a buffer range with text and put the caret [caretUtf16] into it
+     * — how a completion is accepted.
+     *
+     * The range is the server's own `edit` where it gave one, so accepting
+     * over an existing identifier replaces it (the bridge reports the REPLACE
+     * range of an insert-and-replace edit for exactly this reason). Everything
+     * is clamped to the buffer as it stands: a completion answer is allowed to
+     * be a little out of date, and an offset past the end is an edit the
+     * engine refuses outright.
+     */
+    fun replaceRange(range: LspRange, text: String, caretUtf16: Int): Boolean {
+        val last = (lineCount - 1).coerceAtLeast(0)
+        val startRow = range.row.coerceIn(0, last)
+        val endRow = range.endRow.coerceIn(startRow, last)
+        val startCol = range.colUtf16.coerceIn(0, line(startRow).length)
+        val floor = if (endRow == startRow) startCol else 0
+        val endCol = range.endColUtf16.coerceIn(floor, line(endRow).length)
+        val start = byteOffsetOf(startRow, startCol)
+        val end = byteOffsetOf(endRow, endCol)
+        if (end < start) return false
+        applyCaretEdits(
+            listOf(
+                CaretEdit(
+                    start = start,
+                    end = end,
+                    replacement = text,
+                    head = utf8Length(text, caretUtf16.coerceIn(0, text.length)),
+                    isPrimary = true,
+                )
+            )
+        )
+        return true
+    }
+
+    /**
+     * Land on a definition: unfold whatever hides it, then put a bare caret on
+     * the name and scroll it into view.
+     *
+     * Zed's go-to-definition does exactly this — `unfold_ranges` and then
+     * `select_ranges([start..start])` under a go-to-definition autoscroll
+     * (crates/editor/src/navigation.rs:1289-1300) — which is the same shape as
+     * the diagnostic navigation above it, because in Zed it is the same code.
+     * The row is clamped: a target is a position in the file as the *server*
+     * last read it, and this file may since have got shorter.
+     */
+    fun revealDefinition(row: Int, colUtf16: Int): Boolean {
+        val target = row.coerceIn(0, (lineCount - 1).coerceAtLeast(0))
+        val col = colUtf16.coerceIn(0, line(target).length)
+        unfoldRowsTouching(target..target, hiddenOnly = true)
+        val at = Caret(target, col)
         setCarets(listOf(at), at)
         return true
     }
@@ -1747,6 +1855,7 @@ class EditorState private constructor(
         }
         if (typed != null && languageConfig.isPairCharacter(typed)) {
             typeCharacter(typed)
+            noteTyped(typed)
             return true
         }
         if (!hasSelection && cursorRow == row &&
@@ -1780,6 +1889,9 @@ class EditorState private constructor(
         }
         refreshLineCount(row, row)
         ensureCursorVisible()
+        // After the edit, so the revision this reports against is the one the
+        // keystroke produced — see [noteTyped].
+        if (typed != null) noteTyped(typed)
         return structural
     }
 

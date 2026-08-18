@@ -193,6 +193,15 @@ private class EditorInputConnection(
 
     override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
         if (closed) return false
+        // A soft keyboard's Enter arrives here, not as a key event, so a
+        // popup that confirms on Enter has to be offered it here or it never
+        // sees one — the completion menu was inserting line breaks on a
+        // phone while working perfectly under a hardware keyboard.
+        if (text != null && text.length == 1 && text[0] == '\n' &&
+            state.onImeNewline?.invoke() == true
+        ) {
+            return true
+        }
         prepareForEdit()
         return super.commitText(text, newCursorPosition).also { maybeSync() }
     }

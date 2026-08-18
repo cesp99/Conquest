@@ -418,6 +418,33 @@ moved. The gutter carries a mark for every affected row; tapping it goes
 there. The status bar counts the project's errors and warnings and shows the
 message under the caret.
 
+### What the language server knows
+
+A server has to be installed and running — the status bar says when one is
+not, and clicking it offers to install it.
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl` `Space` | Suggest completions where the cursor is |
+| `Enter` / `Tab` | Accept the selected completion |
+| `↑` / `↓` | Move through the list |
+| `PageUp` / `PageDown` | Jump to the first / last one |
+| `Esc` | Close the list (or the hover card) and leave the text alone |
+| `F12` | Go to where the symbol under the cursor is defined |
+| `Ctrl` `K`, then `Ctrl` `I` | Show what the language server knows about the symbol |
+
+The list filters as you keep typing and does not ask the server again unless it
+said its answer was incomplete. It opens **above** the cursor when the soft
+keyboard would otherwise cover it — the one placement rule here that is not
+Zed's, because a desktop editor never has a keyboard eating the bottom third of
+the screen.
+
+By touch: the `suggest` key in the row above the keyboard opens the list and a
+tap accepts a row; a **long press** on a symbol shows what the server knows
+about it, with **Go to definition** on the card. With a mouse, resting the
+pointer on a symbol shows the same card, and `Ctrl` `+ click` goes to the
+definition.
+
 ### Multiple cursors
 
 The bindings are Zed's, from its Linux keymap.

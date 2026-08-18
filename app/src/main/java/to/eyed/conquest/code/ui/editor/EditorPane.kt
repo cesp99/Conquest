@@ -29,6 +29,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -61,7 +62,9 @@ import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.isAltPressed
+import androidx.compose.ui.input.pointer.isCtrlPressed
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.key.utf16CodePoint
@@ -101,6 +104,15 @@ import to.eyed.conquest.code.ui.theme.ZedTheme
 
 private const val HIGHLIGHT_POLL_MILLIS = 100L
 private const val CURSOR_BLINK_MILLIS = 530L
+
+/**
+ * Height of the strip of keys that appears above the soft keyboard.
+ *
+ * A constant rather than a number typed twice: the completion menu and the
+ * hover card are placed against the *top* of this row, because a popup drawn
+ * underneath it is as invisible as one drawn underneath the keyboard.
+ */
+private val ACTION_ROW_HEIGHT = 38.dp
 
 /**
  * How far a diagnostic fades once the buffer has moved under it.
@@ -153,6 +165,25 @@ private fun indentLevels(text: String, tabSize: Int): Int {
  *
  * [bottom] is the bottom of that `3 × thickness` box, not the text baseline.
  */
+/**
+ * Least severe first, so the worst paints last and wins an overlap — Zed's
+ * own order (editor/src/element.rs:6165-6168). A constant rather than
+ * `entries.reversed()`, which allocates a list every frame it is asked.
+ */
+private val SEVERITIES_LEAST_FIRST: List<DiagnosticSeverity> =
+    DiagnosticSeverity.entries.reversed()
+
+/**
+ * The one `Path` and the one `Stroke` the underlines are drawn with.
+ *
+ * The draw pass runs per frame and this file's rule is that it allocates
+ * nothing; a `Path` per squiggle is a `Path` per diagnostic per frame. Reset
+ * and refilled instead — the draw is synchronous and single-threaded, so one
+ * instance is enough.
+ */
+private val diagnosticPath = Path()
+private var diagnosticStroke: Stroke? = null
+
 private fun DrawScope.drawDiagnosticUnderline(
     x0: Float,
     x1: Float,
@@ -164,7 +195,8 @@ private fun DrawScope.drawDiagnosticUnderline(
     val amplitude = 0.8f * thickness
     val halfPeriod = 4.5f * thickness
     val centre = bottom - 1.5f * thickness
-    val path = Path()
+    val path = diagnosticPath
+    path.reset()
     path.moveTo(x0, centre)
     var x = x0
     var up = true
@@ -175,7 +207,9 @@ private fun DrawScope.drawDiagnosticUnderline(
         x = next
         up = !up
     }
-    drawPath(path, color, style = Stroke(width = thickness, cap = StrokeCap.Round))
+    val stroke = diagnosticStroke?.takeIf { it.width == thickness }
+        ?: Stroke(width = thickness, cap = StrokeCap.Round).also { diagnosticStroke = it }
+    drawPath(path, color, style = stroke)
 }
 
 /**
@@ -215,6 +249,13 @@ fun EditorPane(
      * host tests and any caller with no setting get a pane that runs no git.
      */
     showInlineBlame: Boolean = false,
+    /**
+     * Where a definition in *another* file goes. This pane has one buffer and
+     * no way to make a second, so opening one is the workspace's job; null
+     * leaves go-to-definition working inside the open file and silent about
+     * anything outside it.
+     */
+    onOpenDefinition: ((DefinitionTarget) -> Unit)? = null,
 ) {
     val theme = LocalZedTheme.current
     val settings = LocalAppSettings.current
@@ -312,6 +353,24 @@ fun EditorPane(
     val layoutForLine: (String) -> TextLayoutResult =
         remember(layoutCache) { { line -> layoutCache.layoutFor(line) } }
 
+    // Language intelligence at the caret. Each of the three keeps its own
+    // request slot on the bridge, so a hover in flight never cancels the
+    // completion list behind it.
+    val menu = rememberCompletionMenu(state)
+    val hover = rememberHoverCard(state)
+    val definition = rememberDefinition(state) { target -> onOpenDefinition?.invoke(target) }
+    // A long press that finds nothing to say was an ordinary long press, and
+    // an ordinary long press ends with the clipboard toolbar.
+    hover.onNothingToSay = { actions.showToolbar() }
+    // The soft keyboard's Enter never reaches a key handler — it is a newline
+    // committed through the InputConnection — so the open menu claims it
+    // here. Registered per composition against this pane's own menu, and
+    // cleared with it, so a closed tab cannot answer for the open one.
+    DisposableEffect(state, menu) {
+        state.onImeNewline = { menu.rows.isNotEmpty() && menu.accept() }
+        onDispose { state.onImeNewline = null }
+    }
+
     Box(modifier = modifier) {
         Canvas(
             modifier = Modifier
@@ -326,7 +385,9 @@ fun EditorPane(
                 .scrollable(horizontalScroll, Orientation.Horizontal)
                 .focusRequester(focusRequester)
                 .editorTextInput(state)
-                .onKeyEvent { event -> handleEditorKey(state, actions, event, onSave) }
+                .onKeyEvent { event ->
+                    handleEditorKey(state, actions, menu, hover, definition, event, onSave)
+                }
                 .focusable()
                 // The scrollbar is a real handle, not a picture: a drag on it
                 // moves the viewport, and a tap on the track jumps there. It is
@@ -379,6 +440,27 @@ fun EditorPane(
                         down.consume()
                         actions.hideToolbar()
                         state.addCaretAt(down.position, layoutForLine)
+                        focusRequester.requestFocus()
+                    }
+                }
+                // Ctrl+click follows a symbol to where it is defined — Zed's
+                // own mouse route (`hovered_link_modifier`,
+                // crates/editor/src/hover_links.rs:162, and the click that
+                // spends it at :202-262). Claimed in the initial pass beside
+                // Alt+click, so a Ctrl-held click never also moves the caret
+                // it is navigating away from.
+                .pointerInput(state) {
+                    awaitEachGesture {
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        if (event.type != PointerEventType.Press) return@awaitEachGesture
+                        if (!event.keyboardModifiers.isCtrlPressed) return@awaitEachGesture
+                        val down = event.changes.firstOrNull() ?: return@awaitEachGesture
+                        if (down.isConsumed) return@awaitEachGesture
+                        if (down.position.x < state.gutterWidthPx) return@awaitEachGesture
+                        down.consume()
+                        val (row, col) = state.positionAt(down.position, layoutForLine)
+                        hover.clear()
+                        definition.goTo(row, col)
                         focusRequester.requestFocus()
                     }
                 }
@@ -449,18 +531,35 @@ fun EditorPane(
                             val event = awaitPointerEvent(PointerEventPass.Initial)
                             when (event.type) {
                                 PointerEventType.Move, PointerEventType.Enter -> {
-                                    val position = event.changes.firstOrNull()?.position
+                                    val change = event.changes.firstOrNull()
+                                    val position = change?.position
                                     if (position != null) {
                                         val overGutter = position.x < state.gutterWidthPx
                                         if (gutterHovered != overGutter) gutterHovered = overGutter
                                         val chip =
                                             foldChipRowAt(state, layoutCache, position) ?: -1
                                         if (hoveredChipRow != chip) hoveredChipRow = chip
+                                        // The pointer resting over a symbol is
+                                        // Zed's `hover_at`
+                                        // (hover_popover.rs:49). A finger
+                                        // dragging produces Move events too and
+                                        // means something else entirely, so
+                                        // only a mouse asks.
+                                        if (change.type == PointerType.Mouse) {
+                                            if (overGutter) {
+                                                hover.clear()
+                                            } else {
+                                                val (row, col) =
+                                                    state.positionAt(position, layoutForLine)
+                                                hover.pointerAt(row, col)
+                                            }
+                                        }
                                     }
                                 }
                                 PointerEventType.Exit -> {
                                     if (gutterHovered) gutterHovered = false
                                     if (hoveredChipRow >= 0) hoveredChipRow = -1
+                                    hover.clear()
                                 }
                                 else -> {}
                             }
@@ -473,13 +572,27 @@ fun EditorPane(
                             actions.hideToolbar()
                             state.selectWordAt(position, layoutForLine)
                             focusRequester.requestFocus()
+                            // The touch twin of resting a mouse over a symbol.
+                            // The word is selected either way, which is what
+                            // says *which* symbol the card is about; if the
+                            // server has nothing to say the gesture falls back
+                            // to the clipboard toolbar it always was.
+                            val (row, col) = state.positionAt(position, layoutForLine)
+                            hover.longPressAt(row, col)
                         },
                         onDrag = { change, _ ->
                             change.consume()
+                            // Dragging makes this a selection, not a question.
+                            hover.clear()
                             state.extendSelectionTo(change.position, layoutForLine)
                         },
-                        onDragEnd = { actions.showToolbar() },
-                        onDragCancel = { actions.showToolbar() },
+                        onDragEnd = {
+                            if (!hover.isShowing && !hover.isPending) actions.showToolbar()
+                        },
+                        onDragCancel = {
+                            hover.clear()
+                            actions.showToolbar()
+                        },
                     )
                 }
                 .pointerInput(state) {
@@ -496,6 +609,10 @@ fun EditorPane(
                         onLongPress = {},
                         onTap = { tap ->
                             actions.hideToolbar()
+                            // A tap elsewhere is how a popup is dismissed by
+                            // touch — there is no "move the pointer away".
+                            hover.clear()
+                            menu.dismiss()
                             state.moveCursorTo(tap, layoutForLine)
                             focusRequester.requestFocus()
                             keyboard?.show()
@@ -647,19 +764,36 @@ fun EditorPane(
                 var i = window.firstIndexOf(row)
                 if (i < 0) return
                 val line = lineAt(row)
+                // A range that starts exactly on a wrap break belongs to the
+                // segment it *opens*, not to the one that ends there. An
+                // inclusive test on both ends put a one-character squiggle on
+                // the previous visual row, under text with nothing wrong with
+                // it. Only a genuinely empty range — which a server may send
+                // to point at a position — is widened to a character, and
+                // only on the one segment that contains it.
+                val empty = from >= to
+                var placedEmpty = false
                 while (i < window.size && window.bufferRow(i) == row) {
                     val segmentStart = window.startCol(i)
                     val segmentEnd = min(window.endCol(i), line.length)
-                    if (from <= segmentEnd && to >= segmentStart) {
+                    val paints = if (empty) {
+                        !placedEmpty && from >= segmentStart && from <= segmentEnd
+                    } else {
+                        from < segmentEnd && to > segmentStart
+                    }
+                    if (paints) {
+                        if (empty) placedEmpty = true
                         val left = max(from, segmentStart)
-                        val right = max(left, min(to, segmentEnd))
+                        val right = if (empty) left else min(to, segmentEnd)
                         val layout = layoutOf(i)
                         val x0 = leftOf(i) +
                             layout.getHorizontalPosition(left - segmentStart, true)
-                        val x1 = (
+                        val x1 = if (empty) {
+                            x0 + state.charWidthPx
+                        } else {
                             leftOf(i) +
                                 layout.getHorizontalPosition(right - segmentStart, true)
-                            ).coerceAtLeast(x0 + state.charWidthPx)
+                        }
                         // The bottom of the glyph box, plus a hair, so the
                         // wave rides under the descenders rather than through
                         // them.
@@ -872,7 +1006,7 @@ fun EditorPane(
                     // anybody knows and guessing new ones would be a lie
                     // drawn in the right colour.
                     val alpha = if (state.diagnosticsAreStale) STALE_DIAGNOSTIC_ALPHA else 1f
-                    for (severity in DiagnosticSeverity.entries.reversed()) {
+                    for (severity in SEVERITIES_LEAST_FIRST) {
                         val ink = theme.color(severity.token).copy(alpha = alpha)
                         diagnostics.forEachIn(windowFirst, windowLast) { diagnostic ->
                             if (diagnostic.severity != severity) return@forEachIn
@@ -1014,7 +1148,7 @@ fun EditorPane(
                 val windowFirst = window.firstBufferRow()
                 val windowLast = window.lastBufferRow()
                 val alpha = if (state.diagnosticsAreStale) STALE_DIAGNOSTIC_ALPHA else 1f
-                for (severity in DiagnosticSeverity.entries.reversed()) {
+                for (severity in SEVERITIES_LEAST_FIRST) {
                     val ink = theme.color(severity.token).copy(alpha = alpha)
                     state.diagnostics.forEachIn(windowFirst, windowLast) { diagnostic ->
                         if (diagnostic.severity != severity) return@forEachIn
@@ -1183,11 +1317,145 @@ fun EditorPane(
 
         EditorActionRow(
             state = state,
+            menu = menu,
             paneCoordinates = paneCoordinates,
             onActed = { focusRequester.requestFocus() },
             modifier = Modifier.align(Alignment.BottomStart),
         )
+
+        // Last, so they sit over the action row rather than under it.
+        EditorPopups(
+            state = state,
+            menu = menu,
+            hover = hover,
+            definition = definition,
+            layoutCache = layoutCache,
+            paneCoordinates = paneCoordinates,
+            onActed = { focusRequester.requestFocus() },
+        )
     }
+}
+
+/**
+ * The caret-anchored popups: the completion menu and the hover card.
+ *
+ * Its own composable, and that is not tidiness. Placing a popup means reading
+ * [EditorState.scrollY], and a read of it in [EditorPane]'s body would
+ * recompose the whole pane on every frame of every scroll. Here the reads
+ * happen only while something is actually showing, and only this handful of
+ * elements is invalidated when they change.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun EditorPopups(
+    state: EditorState,
+    menu: CompletionMenuState,
+    hover: HoverCardState,
+    definition: DefinitionState,
+    layoutCache: TextLayoutCache,
+    paneCoordinates: LayoutCoordinates?,
+    onActed: () -> Unit,
+) {
+    if (!menu.isOpen && !hover.isShowing) return
+    val coordinates = paneCoordinates?.takeIf { it.isAttached } ?: return
+    val paneHeight = coordinates.size.height.toFloat()
+    val paneWidth = coordinates.size.width.toFloat()
+    val density = LocalDensity.current
+    // The first pixel a popup may not use: the top of the soft keyboard, or of
+    // the row of keys riding above it. See [placeMenuAtCaret], which is where
+    // the one mandatory deviation from Zed's placement lives.
+    val covered = imeOverlapPx(paneCoordinates) +
+        if (WindowInsets.isImeVisible) with(density) { ACTION_ROW_HEIGHT.toPx() } else 0f
+    val areaBottom = (paneHeight - covered).coerceAtLeast(0f)
+
+    if (menu.isOpen) {
+        val anchor = anchorPx(state, layoutCache, state.cursorRow, state.cursorCol)
+        CompletionPopup(
+            menu = menu,
+            caretX = anchor.x,
+            caretTop = anchor.y,
+            lineHeight = state.lineHeightPx,
+            areaWidth = paneWidth,
+            areaBottom = areaBottom,
+            onAccepted = onActed,
+        )
+    }
+    if (hover.isShowing) {
+        val anchor = anchorPx(state, layoutCache, hover.row, hover.col)
+        HoverCard(
+            card = hover,
+            anchorX = anchor.x,
+            anchorTop = anchor.y,
+            lineHeight = state.lineHeightPx,
+            areaWidth = paneWidth,
+            areaBottom = areaBottom,
+            onGoToDefinition = {
+                val row = hover.row
+                val col = hover.col
+                hover.clear()
+                definition.goTo(row, col)
+                onActed()
+            },
+            onDismiss = {
+                hover.clear()
+                onActed()
+            },
+        )
+    }
+}
+
+/**
+ * Pane-local (x, top of the display row) of a buffer position — where a popup
+ * anchored to it hangs from.
+ *
+ * The same arithmetic as [selectionHandles], and for the same reason it is
+ * written out rather than approximated: a position inside a wrapped line
+ * belongs to its own segment, at that segment's own left edge, and a popup
+ * anchored to the line's first row would point at the wrong text.
+ */
+private fun anchorPx(
+    state: EditorState,
+    layoutCache: TextLayoutCache,
+    row: Int,
+    col: Int,
+): Offset {
+    val safeRow = row.coerceIn(0, (state.lineCount - 1).coerceAtLeast(0))
+    val line = state.line(safeRow)
+    val at = col.coerceIn(0, line.length)
+    val wrap = state.displayMap.wrapOf(line)
+    val segment = wrap.segmentOf(at)
+    val start = wrap.startOf(segment)
+    val end = wrap.endOf(segment, line.length)
+    val layout = layoutCache.layoutFor(
+        state.segmentText(line, start, end),
+        spansIn(state.spansFor(safeRow), start, if (wrap.wraps) end else Int.MAX_VALUE),
+    )
+    val indentPx = if (segment > 0) wrap.indentColumns * state.charWidthPx else 0f
+    val x = state.gutterWidthPx + state.textPaddingPx - state.effectiveScrollX + indentPx +
+        layout.getHorizontalPosition(at - start, true)
+    return Offset(x, state.displayRowOf(safeRow, at) * state.lineHeightPx - state.scrollY)
+}
+
+/**
+ * How much of the pane's bottom the soft keyboard covers, in pixels.
+ *
+ * `imePadding` cannot answer this: it would pad by the whole keyboard, and
+ * part of that keyboard is already below this pane — the status bar's worth of
+ * window sits between them. What is left after subtracting that is the
+ * overlap, and it comes out at zero on the devices that resize the window for
+ * the IME instead of letting it float over.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun imeOverlapPx(paneCoordinates: LayoutCoordinates?): Float {
+    if (!WindowInsets.isImeVisible) return 0f
+    val density = LocalDensity.current
+    val windowHeight = LocalWindowInfo.current.containerSize.height
+    val paneBottom = paneCoordinates
+        ?.takeIf { it.isAttached }
+        ?.let { it.localToWindow(Offset(0f, it.size.height.toFloat())).y }
+        ?: windowHeight.toFloat()
+    return (WindowInsets.ime.getBottom(density) - (windowHeight - paneBottom)).coerceAtLeast(0f)
 }
 
 /**
@@ -1204,6 +1472,7 @@ fun EditorPane(
 @Composable
 private fun EditorActionRow(
     state: EditorState,
+    menu: CompletionMenuState,
     paneCoordinates: LayoutCoordinates?,
     onActed: () -> Unit,
     modifier: Modifier = Modifier,
@@ -1213,24 +1482,13 @@ private fun EditorActionRow(
     if (!WindowInsets.isImeVisible) return
     val density = LocalDensity.current
     // How far to lift the row so it lands on top of the keyboard.
-    // `imePadding` can't do it: it would pad by the whole keyboard, and part
-    // of that keyboard is already below this pane — the status bar's worth of
-    // window sits between them. What is left after subtracting that is the
-    // overlap, and it comes out at zero on the devices that resize the window
-    // for the IME instead of letting it float over.
-    val windowHeight = LocalWindowInfo.current.containerSize.height
-    val paneBottom = paneCoordinates
-        ?.takeIf { it.isAttached }
-        ?.let { it.localToWindow(Offset(0f, it.size.height.toFloat())).y }
-        ?: windowHeight.toFloat()
-    val overlap = (WindowInsets.ime.getBottom(density) - (windowHeight - paneBottom))
-        .coerceAtLeast(0f)
+    val overlap = imeOverlapPx(paneCoordinates)
     val theme = LocalZedTheme.current
     Row(
         modifier = modifier
             .fillMaxWidth()
             .padding(bottom = with(density) { overlap.toDp() })
-            .height(38.dp)
+            .height(ACTION_ROW_HEIGHT)
             .background(theme.color("status_bar.background"))
             .horizontalScroll(rememberScrollState())
             .padding(horizontal = 4.dp),
@@ -1243,8 +1501,16 @@ private fun EditorActionRow(
             // session ends and the keyboard drops away under the finger.
             onActed()
         }
-        ActionKey("esc", act { state.cancel() })
+        // Escape means the newest thing on screen, as it does on a keyboard:
+        // the completion menu first, and only then the carets and selection.
+        ActionKey("esc", act { if (!menu.dismiss()) state.cancel() })
         ActionKey("tab", act { state.insertAtCursor(state.indentUnit()) })
+        // Zed's `editor::ShowCompletions` is `ctrl-space`
+        // (assets/keymaps/default-linux.json:591), and a soft keyboard has
+        // neither Ctrl nor a way to say Space without typing one — so the one
+        // route to asking for completions on a phone is this key. The menu it
+        // opens is then worked by touch: tap a row to accept it.
+        ActionKey("suggest", act { menu.showCompletions() })
         ActionKey("undo", act { state.undo() })
         ActionKey("redo", act { state.redo() })
         ActionKey("＋cur↑", act { state.addCaretVertically(-1) })
@@ -1462,6 +1728,9 @@ internal class EditorActions(
 private fun handleEditorKey(
     state: EditorState,
     actions: EditorActions,
+    menu: CompletionMenuState,
+    hover: HoverCardState,
+    definition: DefinitionState,
     event: KeyEvent,
     onSave: (() -> Unit)?,
 ): Boolean {
@@ -1469,6 +1738,28 @@ private fun handleEditorKey(
     val ctrl = event.isCtrlPressed
     val alt = event.isAltPressed
     val shift = event.isShiftPressed
+
+    // The completion menu's keys come first and win, exactly as Zed's
+    // `Editor && showing_completions` context outranks the editor's own
+    // bindings for the same keys (assets/keymaps/default-linux.json:823-880).
+    // Enter and Tab are the two that matter: with a menu open they confirm,
+    // and without one they are still a newline and an indent.
+    if (menu.isOpen) {
+        when {
+            event.key == Key.Escape -> return menu.dismiss()
+            event.key == Key.Enter || event.key == Key.NumPadEnter || event.key == Key.Tab ->
+                return menu.accept()
+            !alt && (event.key == Key.DirectionUp || (ctrl && event.key == Key.P)) ->
+                return menu.moveSelection(-1)
+            !alt && (event.key == Key.DirectionDown || (ctrl && event.key == Key.N)) ->
+                return menu.moveSelection(1)
+            // Zed's ContextMenuFirst / ContextMenuLast.
+            event.key == Key.PageUp -> return menu.moveSelection(-menu.selected)
+            event.key == Key.PageDown ->
+                return menu.moveSelection(menu.rows.lastIndex - menu.selected)
+            else -> {}
+        }
+    }
 
     // The second stroke of a pending `ctrl-k` chord, resolved before
     // anything else can eat the key. Zed spells FoldAll and UnfoldAll as
@@ -1493,6 +1784,13 @@ private fun handleEditorKey(
                         state.unfoldAllRows()
                         return true
                     }
+                    // Zed's `editor::Hover` (default-linux.json:557) — the
+                    // keyboard's way to the card the pointer gets by resting
+                    // and a finger gets by holding.
+                    Key.I -> {
+                        hover.invokeAt(state.cursorRow, state.cursorCol)
+                        return true
+                    }
                     else -> {}
                 }
             }
@@ -1512,6 +1810,10 @@ private fun handleEditorKey(
     }
     if (ctrl) {
         return when (event.key) {
+            // Zed's `editor::ShowCompletions` (default-linux.json:591). It
+            // asks even where the menu just answered "nothing here": the user
+            // pressing it is a question a cached no must not answer.
+            Key.Spacebar -> menu.showCompletions()
             Key.Z -> {
                 if (shift) state.redo() else state.undo()
                 true
@@ -1590,7 +1892,17 @@ private fun handleEditorKey(
         // whatever the platform wants it to mean in a file with no
         // diagnostics, rather than silently eating it.
         Key.F8 -> state.goToDiagnostic(forward = !shift)
-        Key.Escape -> state.cancel()
+        // Zed's `editor::GoToDefinition` (default-linux.json:566). Always
+        // handled: the answer arrives later, and reporting the key unhandled
+        // would leave it free to mean something else while the request is out.
+        Key.F12 -> {
+            definition.goToCaret()
+            true
+        }
+        // A hover card is the first thing Escape gives up, before the extra
+        // carets and the selection — it is the newest thing on screen, and
+        // Zed's Cancel works the same way outwards.
+        Key.Escape -> hover.clear() || state.cancel()
         Key.Backspace -> {
             state.backspace()
             true
@@ -1640,7 +1952,14 @@ private fun handleEditorKey(
         else -> {
             val codePoint = event.utf16CodePoint
             if (!alt && codePoint >= 32 && codePoint != 127) {
-                state.typeCharacter(String(Character.toChars(codePoint)))
+                val text = String(Character.toChars(codePoint))
+                state.typeCharacter(text)
+                // Report it for the completion menu. A character that opens a
+                // bracket pair never reaches `applyLineDiff` — it goes through
+                // the batch-edit path — so this is the only place a typed `(`
+                // or `<` is ever seen; for every other character the state has
+                // already reported it and the second report is dropped.
+                state.noteTyped(text)
                 true
             } else {
                 false

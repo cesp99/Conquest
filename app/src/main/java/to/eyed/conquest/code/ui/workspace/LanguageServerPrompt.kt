@@ -48,6 +48,7 @@ import androidx.compose.ui.unit.dp
 import to.eyed.conquest.code.core.LanguageServerInstaller
 import to.eyed.conquest.code.core.LanguageServers
 import to.eyed.conquest.code.core.ServerInstallState
+import to.eyed.conquest.code.core.targetOrNull
 import to.eyed.conquest.code.terminal.Userland
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 
@@ -113,6 +114,15 @@ fun LanguageServerPrompt(
     val unpackaged = remember(grammar) { LanguageServers.unpackagedMessage(grammar) }
 
     LaunchedEffect(requested) {
+        // Belt as well as braces: whatever route closed the prompt last time,
+        // a state left over for a *different* language is this one's to
+        // replace. `dismiss()` is a no-op while apt is actually running, so a
+        // live install still wins — which is the rule the doc comment above
+        // states.
+        val stale = LanguageServerInstaller.state.targetOrNull
+        if (requested != null && stale != null && stale != requested) {
+            LanguageServerInstaller.dismiss()
+        }
         if (requested != null && LanguageServerInstaller.state is ServerInstallState.Idle) {
             // Asking what it costs is not installing: the estimate answers
             // apt's own confirmation prompt with "no" and fetches nothing.
@@ -122,6 +132,18 @@ fun LanguageServerPrompt(
     LaunchedEffect(Unit) { focus.requestFocus() }
     LaunchedEffect(selected) {
         if (selected in LanguageServers.ALL.indices) listState.scrollToItem(selected)
+    }
+
+    /**
+     * Leaving. The installer's state outlives this composable on purpose —
+     * closing must not stop an apt that is already running — but a state
+     * that is *not* running is this prompt's, and leaving it behind means the
+     * next opening shows the last language's question and installs the last
+     * language's packages. `dismiss()` clears exactly the not-running case.
+     */
+    fun close() {
+        LanguageServerInstaller.dismiss()
+        onDismiss()
     }
 
     /** What Enter does, which is also what the rightmost button does. */
@@ -150,7 +172,7 @@ fun LanguageServerPrompt(
 
             ServerInstallState.Idle ->
                 if (unpackaged != null) {
-                    onDismiss()
+                    close()
                 } else {
                     LanguageServers.ALL.getOrNull(selected)?.let {
                         LanguageServerInstaller.offer(context, it)
@@ -175,7 +197,7 @@ fun LanguageServerPrompt(
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 when {
-                    event.key == Key.Escape -> { onDismiss(); true }
+                    event.key == Key.Escape -> { close(); true }
                     event.key == Key.Enter || event.key == Key.NumPadEnter -> {
                         primary()
                         true

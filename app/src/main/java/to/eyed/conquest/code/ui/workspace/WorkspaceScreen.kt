@@ -71,7 +71,9 @@ import to.eyed.conquest.code.ui.search.BufferSearchBar
 import to.eyed.conquest.code.ui.search.ProjectSearchPanel
 import to.eyed.conquest.code.ui.search.revealProjectSearchMatch
 import to.eyed.conquest.code.ui.editor.EditorPane
+import to.eyed.conquest.code.ui.editor.DefinitionTarget
 import to.eyed.conquest.code.ui.editor.EditorState
+import to.eyed.conquest.code.ui.editor.revealDefinitionTarget
 import to.eyed.conquest.code.ui.editor.SoftWrapMode
 import to.eyed.conquest.code.ui.editor.LspServer
 import to.eyed.conquest.code.ui.editor.rememberLspState
@@ -1133,6 +1135,27 @@ fun WorkspaceScreen(
                                     onOpenPath = { path -> project?.let { openFile(it, path) } },
                                     softWrap = settings.softWrap,
                                     showInlineBlame = settings.inlineBlame,
+                                    onOpenDefinition = { target ->
+                                        val open = project
+                                        val root = open?.rootPath
+                                        val relative =
+                                            if (root != null && target.path.startsWith("$root/")) {
+                                                target.path.removePrefix("$root/")
+                                            } else {
+                                                null
+                                            }
+                                        // A target outside the project — a
+                                        // header out of /usr/include — has no
+                                        // project-relative name, and this
+                                        // opener knows only those. Dropped
+                                        // rather than opened at a path the
+                                        // panel could never show.
+                                        if (open != null && relative != null) {
+                                            openFile(open, relative) { file ->
+                                                file.editor?.revealDefinitionTarget(target)
+                                            }
+                                        }
+                                    },
                                     modifier = Modifier.weight(1f),
                                 )
                             }
@@ -1571,6 +1594,12 @@ private fun EditorArea(
     onOpenPath: (String) -> Unit,
     softWrap: SoftWrapMode,
     showInlineBlame: Boolean,
+    /**
+     * A definition in another file. This pane has one buffer and no way to
+     * make a second, so the workspace opens the file and then puts the caret
+     * on the target — the same shape as a project-search hit.
+     */
+    onOpenDefinition: (DefinitionTarget) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val active = files.active
@@ -1671,6 +1700,7 @@ private fun EditorArea(
                 onSave = { onSave(active) },
                 softWrap = softWrap,
                 showInlineBlame = showInlineBlame,
+                onOpenDefinition = onOpenDefinition,
             )
         } else if (active.graph && diffProject != null) {
             GitGraphPane(
