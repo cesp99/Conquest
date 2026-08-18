@@ -50,7 +50,11 @@ internal fun EditorState.addCaretVertically(delta: Int) {
         return
     }
     val edge = if (direction < 0) carets.first() else carets.last()
-    val row = edge.headRow + direction
+    var row = edge.headRow + direction
+    if (row !in 0 until lineCount) return
+    // The neighbouring *visible* row: growing the column over a fold steps
+    // past it, the same as the arrows do.
+    row = if (direction < 0) displayMap.prevVisibleRow(row) else displayMap.nextVisibleRow(row)
     if (row !in 0 until lineCount) return
     val goal = if (addCaretDirection == 0) edge.headCol else addCaretGoalCol
     val added = Caret(row, goal.coerceAtMost(line(row).length))
@@ -201,6 +205,161 @@ private fun isWholeWord(text: String, start: Int, end: Int): Boolean {
     return true
 }
 
+// ---- Folding ---------------------------------------------------------------
+//
+// Zed's indent-based code folding, exactly the actions its Linux keymap binds:
+// editor::Fold (ctrl-shift-[), editor::UnfoldLines (ctrl-shift-]),
+// editor::FoldAll (ctrl-k ctrl-0) and editor::UnfoldAll (ctrl-k ctrl-j)
+// (assets/keymaps/default-linux.json:575-576,589-590). The range arithmetic is
+// [IndentFolds]; the fold set itself lives on [EditorState] with the rest of
+// the pane's view state.
+
+/**
+ * Buffer rows served in aligned chunks, so a fold scan — which walks rows the
+ * pane's line window has never held — costs a bridge call per couple of
+ * hundred rows instead of one per row. Chunks are *aligned* because the fold
+ * commands walk both ways: [EditorState.foldAtCarets] climbs towards row 0
+ * while every range it tries scans forward, and unaligned chunks would
+ * re-fetch on every step of that. Two slots, for exactly that pincer.
+ */
+private class ChunkedRows(private val state: EditorState) {
+    private val firsts = intArrayOf(-1, -1)
+    private val chunks = arrayOf<List<String>>(emptyList(), emptyList())
+    private var next = 0
+
+    fun line(row: Int): String {
+        val base = (row / SEARCH_CHUNK_ROWS) * SEARCH_CHUNK_ROWS
+        for (i in firsts.indices) {
+            if (firsts[i] == base) return chunks[i].getOrElse(row - base) { "" }
+        }
+        val last = (base + SEARCH_CHUNK_ROWS).coerceAtMost(state.lineCount)
+        val slot = next
+        next = (next + 1) % firsts.size
+        firsts[slot] = base
+        chunks[slot] = state.linesOf(base, last).split('\n')
+        return chunks[slot].getOrElse(row - base) { "" }
+    }
+}
+
+/**
+ * Whether [content] — a line with its indent already stripped — opens with
+ * one of the language's closing brackets: Zed's `closing_bracket_indent_len`
+ * test (display_map.rs:2294-2314), which decides that the blank rows in
+ * front of a `}` belong inside the fold.
+ */
+private fun EditorState.closesBlock(content: String): Boolean =
+    languageConfig.brackets.any { pair -> content.startsWith(pair.close) }
+
+/** The fold hanging off [row], or null — the gutter chevron's click target. */
+internal fun EditorState.foldableRangeAt(row: Int): FoldRange? {
+    val reader = ChunkedRows(this)
+    return IndentFolds.rangeAt(lineCount, row, reader::line) { content -> closesBlock(content) }
+}
+
+/**
+ * Whether [row] would show a fold chevron — [IndentFolds.startsIndent] with
+ * the scan bounded, because the gutter asks per visible row per frame and the
+ * rows it asks about sit in the pane's line window. A row whose deeper block
+ * only appears after sixty-odd blank lines misses its chevron until the
+ * chord or a click finds the fold anyway; that trade is recorded in the
+ * feature's deviations.
+ */
+internal fun EditorState.rowIsFoldable(row: Int): Boolean =
+    IndentFolds.startsIndent(lineCount, row, { r -> line(r) }, scanLimit = 64)
+
+/**
+ * Zed's `editor::Fold` (crates/editor/src/fold.rs:167-206): a selection that
+ * spans rows folds every foldable block inside it; a caret folds the
+ * innermost block that contains it, found exactly as Zed finds it — walk up
+ * from the caret's row and take the first fold that reaches back down to it.
+ */
+internal fun EditorState.foldAtCarets() {
+    val reader = ChunkedRows(this)
+    fun rangeAt(row: Int): FoldRange? =
+        IndentFolds.rangeAt(lineCount, row, reader::line) { content -> closesBlock(content) }
+
+    val toFold = ArrayList<FoldRange>()
+    for (caret in caretsInOrder()) {
+        if (caret.startRow != caret.endRow) {
+            var row = caret.startRow
+            var found = false
+            while (row <= caret.endRow) {
+                val range = rangeAt(row)
+                if (range != null) {
+                    toFold.add(range)
+                    row = range.endRow + 1
+                    found = true
+                } else {
+                    row++
+                }
+            }
+            if (found) continue
+        }
+        for (row in caret.startRow downTo 0) {
+            val range = rangeAt(row)
+            if (range != null && range.endRow >= caret.startRow) {
+                toFold.add(range)
+                break
+            }
+            // Stop at the first top-level row instead of walking to row 0.
+            // A block that reaches down to the caret has to start on a row
+            // indented less than the rows inside it, and nothing is indented
+            // less than a non-blank row at column zero — so once one of those
+            // has been tried and did not enclose the caret, nothing above it
+            // can. Blank rows are no evidence either way (their indent is the
+            // whole line) and are walked through. Zed's own walk has no such
+            // stop (fold.rs:195-204) because its creases come from a snapshot
+            // it already holds; ours reads the file to find them, and without
+            // this a press with the caret below the last block of a 20k-line
+            // file read every row above it.
+            val text = reader.line(row)
+            if (!IndentFolds.isBlank(text) && IndentFolds.indentOf(text) == 0) break
+        }
+    }
+    foldRanges(toFold)
+}
+
+/**
+ * Zed's `editor::UnfoldLines` (fold.rs:443-460): open every fold the carets'
+ * rows touch — and a caret on a chip row touches that chip's fold, which is
+ * how the same chord that folded a block opens it again.
+ */
+internal fun EditorState.unfoldAtCarets(): Boolean {
+    var changed = false
+    for (caret in caretsInOrder()) {
+        if (unfoldRowsTouching(caret.startRow..caret.endRow)) changed = true
+    }
+    return changed
+}
+
+/**
+ * Zed's `editor::FoldAll` (fold.rs:330-344): every foldable row in the file,
+ * nested blocks included — Zed pushes a crease per row without skipping the
+ * rows an earlier crease swallowed, which is what leaves the inner blocks
+ * folded when an outer one is opened by hand.
+ */
+internal fun EditorState.foldAllRows() {
+    val reader = ChunkedRows(this)
+    val ranges = ArrayList<FoldRange>()
+    for (row in 0 until lineCount - 1) {
+        IndentFolds.rangeAt(lineCount, row, reader::line) { content -> closesBlock(content) }
+            ?.let(ranges::add)
+    }
+    foldRanges(ranges)
+}
+
+/**
+ * The gutter chevron's click — Zed's toggle in `render_crease_toggle`
+ * (fold.rs:60-68): a folded row unfolds (`unfold_at`, fold.rs:498-518), a
+ * foldable one folds (`fold_at`, fold.rs:424-441).
+ */
+internal fun EditorState.toggleFoldAt(row: Int): Boolean {
+    if (foldStartingAt(row) != null) return unfoldRowsTouching(row..row)
+    val range = foldableRangeAt(row) ?: return false
+    foldRanges(listOf(range))
+    return true
+}
+
 // ---- Line operations -----------------------------------------------------
 
 /**
@@ -262,6 +421,13 @@ internal fun EditorState.moveLines(delta: Int) {
             if (caret == primary) newPrimary = moved
         }
         if (blocked) continue
+        // Zed unfolds what it is about to move (editor.rs:7417-7499,
+        // `unfold_ranges.push(range_to_move)`); its anchors would carry the
+        // neighbour's fold across the swap, ours cannot, so the neighbour
+        // row on either side is unfolded too. Without this a
+        // row-count-preserving swap would slide text out from under a
+        // fold's row numbers.
+        unfoldRowsTouching((rows.first - 1).coerceAtLeast(0)..rows.last + 1)
         val block = linesOf(rows)
         if (delta < 0) {
             val neighbour = line(rows.first - 1)
@@ -879,7 +1045,9 @@ fun EditorState.moveToLineEnd(extend: Boolean = false) = moveCarets(extend) { ca
 fun EditorState.moveToDocumentStart(extend: Boolean = false) = moveCarets(extend) { 0 to 0 }
 
 fun EditorState.moveToDocumentEnd(extend: Boolean = false) = moveCarets(extend) {
-    val last = (lineCount - 1).coerceAtLeast(0)
+    // The last *visible* row: a fold that runs to the end of the file would
+    // otherwise swallow the caret.
+    val last = displayMap.prevVisibleRow((lineCount - 1).coerceAtLeast(0))
     last to line(last).length
 }
 
@@ -913,7 +1081,9 @@ fun EditorState.moveByWord(forward: Boolean, extend: Boolean = false) = moveCare
     var col = caret.headCol.coerceIn(0, text.length)
     if (forward) {
         if (col >= text.length) {
-            val row = (caret.headRow + 1).coerceAtMost((lineCount - 1).coerceAtLeast(0))
+            // The next visible row, so the motion never enters a fold.
+            val next = displayMap.nextVisibleRow(caret.headRow + 1)
+            val row = if (next <= (lineCount - 1).coerceAtLeast(0)) next else caret.headRow
             return@moveCarets if (row == caret.headRow) caret.headRow to col else row to 0
         }
         val kind = characterClass(text[col])
@@ -921,7 +1091,7 @@ fun EditorState.moveByWord(forward: Boolean, extend: Boolean = false) = moveCare
         while (col < text.length && text[col].isWhitespace()) col++
     } else {
         if (col <= 0) {
-            val row = (caret.headRow - 1).coerceAtLeast(0)
+            val row = displayMap.prevVisibleRow((caret.headRow - 1).coerceAtLeast(0))
             return@moveCarets if (row == caret.headRow) caret.headRow to 0 else row to line(row).length
         }
         while (col > 0 && text[col - 1].isWhitespace()) col--

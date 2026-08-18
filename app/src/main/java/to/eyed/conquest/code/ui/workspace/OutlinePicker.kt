@@ -76,6 +76,9 @@ fun OutlinePicker(
     val original = remember(editor) {
         Triple(editor.caretsInOrder(), editor.primaryCaret(), editor.scrollY)
     }
+    // The folds too: browsing the list opens the block each symbol lives in,
+    // and a cancelled browse owes the file back exactly as it was.
+    val originalFolds = remember(editor) { editor.folds }
 
     LaunchedEffect(Unit) { focus.requestFocus() }
 
@@ -118,6 +121,9 @@ fun OutlinePicker(
         val row = entry.row.coerceIn(0, editor.lineCount - 1)
         val col = entry.col.coerceIn(0, editor.line(row).length)
         val caret = Caret(row, col)
+        // A symbol inside a folded block is exactly the symbol this picker is
+        // for; `setCarets` opens the fold over it ([HiddenCaret.Reveal])
+        // rather than leaving the caret on the chip row above it.
         editor.setCarets(listOf(caret), caret)
     }
 
@@ -132,6 +138,7 @@ fun OutlinePicker(
     fun restore() {
         val (carets, primary, scrollY) = original
         editor.setCarets(carets, primary)
+        editor.foldRanges(originalFolds)
         editor.scrollToY(scrollY)
     }
 

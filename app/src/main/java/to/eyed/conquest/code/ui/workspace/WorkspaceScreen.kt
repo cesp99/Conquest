@@ -215,6 +215,12 @@ fun WorkspaceScreen(
     // or a transfer finishes, rather than watched — projects change only when
     // the user changes them.
     var pickerOpen by remember { mutableStateOf(false) }
+    /** The tab bar's `+`, Ctrl+N, and the palette's `workspace: new file`. */
+    var newFileOpen by remember { mutableStateOf(false) }
+    /** Whether the project panel holds the keyboard — see [WorkspaceCommand.NewFile]. */
+    var projectPanelFocused by remember { mutableStateOf(false) }
+    /** Why the last new-file create failed, if it did. */
+    var newFileError by remember { mutableStateOf<String?>(null) }
     /** The picker opens straight into the clone form for Ctrl+Shift+G. */
     var pickerStartsInClone by remember { mutableStateOf(false) }
     var finderOpen by remember { mutableStateOf(false) }
@@ -274,6 +280,8 @@ fun WorkspaceScreen(
     fun openFile(
         project: ProjectSession,
         path: String,
+        /** Runs instead when the file could not be opened at all. */
+        onFailed: (() -> Unit)? = null,
         /** Runs once the tab exists — how a search hit puts the caret on itself. */
         onOpened: (suspend (OpenFile) -> Unit)? = null,
     ) {
@@ -285,7 +293,10 @@ fun WorkspaceScreen(
             return
         }
         scope.launch {
-            val absolutePath = project.absolutePathOf(path) ?: return@launch
+            val absolutePath = project.absolutePathOf(path) ?: run {
+                onFailed?.invoke()
+                return@launch
+            }
             // A picture never reaches the engine: opening one as text would
             // put a megabyte of mojibake in a CRDT and set tree-sitter on it.
             val media = MediaKind.of(path.substringAfterLast('/'))
@@ -296,7 +307,10 @@ fun WorkspaceScreen(
                 return@launch
             }
             val session = withContext(Dispatchers.IO) { BufferSession.openFile(absolutePath) }
-                ?: return@launch
+                ?: run {
+                    onFailed?.invoke()
+                    return@launch
+                }
             val opened = OpenFile(path, EditorState(session), absolutePath = absolutePath)
             files.open(opened)
             onOpened?.invoke(opened)
@@ -600,6 +614,37 @@ fun WorkspaceScreen(
     }
 
 
+    /**
+     * Zed's pane::GoBack / GoForward: [OpenFilesState.goBack] pops the entry
+     * and activates its tab when it is still open; a closed file is reopened
+     * through the same [openFile] the tabs' reopen uses. Either way the entry
+     * restores its caret and scroll once the editor exists.
+     */
+    fun navigateHistory(back: Boolean): Boolean {
+        val entry = (if (back) files.goBack() else files.goForward()) ?: return false
+        val index = files.indexOfPath(entry.path)
+        if (index >= 0) {
+            // goBack already made the tab active, outside the history's ears.
+            val tab = files.tabs[index]
+            scope.launch { entry.restoreIn(tab) }
+        } else {
+            val open = project
+            if (open == null) {
+                files.navigationFailed(entry, wasBack = back)
+                return false
+            }
+            // A file that will not open is not a move: put the entry back
+            // rather than lighting the opposite arrow for travel that never
+            // happened, and disarm the landing bracket.
+            openFile(
+                open,
+                entry.path,
+                onFailed = { files.navigationFailed(entry, wasBack = back) },
+            ) { tab -> entry.restoreIn(tab) }
+        }
+        return true
+    }
+
     fun runCommand(command: WorkspaceCommand): Boolean {
         val active = files.active
         when (command) {
@@ -641,6 +686,18 @@ fun WorkspaceScreen(
             }
             WorkspaceCommand.NextTab -> files.selectRelative(1)
             WorkspaceCommand.PreviousTab -> files.selectRelative(-1)
+            WorkspaceCommand.GoBack -> if (!navigateHistory(back = true)) return false
+            WorkspaceCommand.GoForward -> if (!navigateHistory(back = false)) return false
+            WorkspaceCommand.NewFile -> {
+                if (project == null) return false
+                // Zed binds ctrl-n to both `workspace::NewFile` and
+                // `project_panel::NewFile` and lets the panel's more specific
+                // context win while it has focus (default-linux.json:654,
+                // 965). Refusing here does the same: the preview pass falls
+                // through and the panel's own handler sees the chord.
+                if (projectPanelFocused) return false
+                newFileOpen = true
+            }
             WorkspaceCommand.ToggleProjectPanel -> togglePanel(WorkspacePanel.Project)
             WorkspaceCommand.ToggleLeftDock -> if (!toggleDock(DockSide.Left)) return false
             WorkspaceCommand.ToggleRightDock -> if (!toggleDock(DockSide.Right)) return false
@@ -1011,6 +1068,7 @@ fun WorkspaceScreen(
                         onOpenGraph = ::openGraph,
                         onEntryRemoved = ::closeTabsUnder,
                         onEntryMoved = ::retitleTabs,
+                        onPanelFocusChanged = { projectPanelFocused = it },
                         openedPath = files.active?.path,
                         onDismiss = {
                             docks.closeDock(fullScreen)
@@ -1038,6 +1096,13 @@ fun WorkspaceScreen(
                                     onSave = ::save,
                                     onReload = ::reload,
                                     onReopen = { runCommand(WorkspaceCommand.ReopenClosedTab) },
+                                    onNavigateBack = { runCommand(WorkspaceCommand.GoBack) },
+                                    onNavigateForward = { runCommand(WorkspaceCommand.GoForward) },
+                                    onNewFile = if (project != null) {
+                                        { runCommand(WorkspaceCommand.NewFile) }
+                                    } else {
+                                        null
+                                    },
                                     searchOpen = searchBarOpen,
                                     onSearchDismissed = {
                                         searchBarOpen = false
@@ -1093,6 +1158,7 @@ fun WorkspaceScreen(
                                         onOpenGraph = ::openGraph,
                                         onEntryRemoved = ::closeTabsUnder,
                                         onEntryMoved = ::retitleTabs,
+                        onPanelFocusChanged = { projectPanelFocused = it },
                                         openedPath = files.active?.path,
                                         onDismiss = {
                                             docks.closeDock(side)
@@ -1276,6 +1342,8 @@ fun WorkspaceScreen(
                 terminalCount = terminals.sessions.size,
                 canClone = GitClone.isSupported,
                 canPreview = canPreviewActiveFile(),
+                canGoBack = files.canGoBack,
+                canGoForward = files.canGoForward,
             ),
             onRun = { runCommand(it) },
             onDismiss = {
@@ -1378,6 +1446,53 @@ fun WorkspaceScreen(
             nameError = { name -> ProjectsRoot.nameError(context, name) },
         )
     }
+
+    val newFileProject = project
+    if (newFileOpen && newFileProject != null) {
+        EntryNameDialog(
+            title = "NEW FILE",
+            confirmLabel = "Create",
+            initial = "",
+            selectionEnd = 0,
+            placeholder = "Name, or a path like src/main.rs",
+            // A trailing slash is how one says "directory", and this dialog
+            // only makes files — refuse it rather than quietly making a file
+            // with a slash-shaped name that then blocks the directory.
+            errorFor = { name ->
+                if (name.trimEnd().endsWith('/')) {
+                    "This makes a file — drop the trailing slash"
+                } else {
+                    ProjectFiles.pathError(name, File(newFileProject.rootPath))
+                }
+            },
+            onConfirm = { name ->
+                newFileOpen = false
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        ProjectFiles.create(File(newFileProject.rootPath), "", name, isDir = false)
+                    }
+                    when (result) {
+                        is FileOpResult.Done -> openFile(newFileProject, result.path)
+                        // The validation runs before the create and the disk
+                        // can move underneath it; a create that fails has to
+                        // say so rather than closing on nothing.
+                        is FileOpResult.Failed -> newFileError = result.reason
+                    }
+                    rootFocus.requestFocus()
+                }
+            },
+            onDismiss = {
+                newFileOpen = false
+                rootFocus.requestFocus()
+            },
+        )
+    }
+    newFileError?.let { message ->
+        PanelErrorDialog(message = message) {
+            newFileError = null
+            rootFocus.requestFocus()
+        }
+    }
 }
 
 @Composable
@@ -1387,6 +1502,10 @@ private fun EditorArea(
     onSave: (OpenFile) -> Unit,
     onReload: (OpenFile) -> Unit,
     onReopen: () -> Unit,
+    onNavigateBack: () -> Unit,
+    onNavigateForward: () -> Unit,
+    /** Null with no project; the `+` group then stays hidden. */
+    onNewFile: (() -> Unit)?,
     searchOpen: Boolean,
     onSearchDismissed: () -> Unit,
     /** The toolbar magnifier — the touch twin of Ctrl+F. */
@@ -1405,7 +1524,14 @@ private fun EditorArea(
     val active = files.active
     Column(modifier = modifier.fillMaxSize()) {
         if (files.tabs.isNotEmpty()) {
-            EditorTabs(files, onSave = onSave, onReopen = onReopen)
+            EditorTabs(
+                files,
+                onSave = onSave,
+                onReopen = onReopen,
+                onNavigateBack = onNavigateBack,
+                onNavigateForward = onNavigateForward,
+                onNewFile = onNewFile,
+            )
             DockDivider()
         }
         // Zed's toolbar: breadcrumbs on the left — the file name, then the
@@ -1590,6 +1716,8 @@ private fun DockPanel(
     onOpenGraph: () -> Unit,
     onEntryRemoved: (String) -> Unit,
     onEntryMoved: (String, String) -> Unit,
+    /** The project panel reporting whether it holds the keyboard. */
+    onPanelFocusChanged: (Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
     when (panel) {
@@ -1600,6 +1728,7 @@ private fun DockPanel(
             gitignoredFiles = settings.gitignoredFiles,
             revealRequest = revealRequest,
             onRevealHandled = onRevealHandled,
+            onFocusChanged = onPanelFocusChanged,
             onEntryRemoved = onEntryRemoved,
             onEntryMoved = onEntryMoved,
         )

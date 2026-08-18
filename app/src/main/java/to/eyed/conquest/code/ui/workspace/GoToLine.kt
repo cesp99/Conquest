@@ -126,6 +126,10 @@ internal fun GoToLine(
     val original = remember(editor) {
         Triple(editor.caretsInOrder(), editor.primaryCaret(), editor.scrollY)
     }
+    // …and the folds, because the preview opens the one over the line it is
+    // showing. Nothing here is undoable, so a cancelled jump has to hand back
+    // the folds it opened along with the caret it moved.
+    val originalFolds = remember(editor) { editor.folds }
 
     LaunchedEffect(editor) { focus.requestFocus() }
 
@@ -133,14 +137,20 @@ internal fun GoToLine(
         val (row, column) = goToLinePosition(target, editor.lineCount) { editor.line(it).length }
         val caret = Caret(row, column)
         // `setCarets` is the one door: it drops the extra carets, clears the
-        // selection and scrolls the caret into view, which is the whole of
-        // what this command means.
+        // selection, opens the fold over the line asked for
+        // ([HiddenCaret.Reveal]) and scrolls the caret into view, which is
+        // the whole of what this command means. A jump that stopped at the
+        // fold's chip row would leave the caret on a line the panel never
+        // named, and the next character typed would go into it.
         editor.setCarets(listOf(caret), caret)
     }
 
     fun restore() {
         val (carets, primary, scrollY) = original
         editor.setCarets(carets, primary)
+        // The folds the preview opened close again; a pane that had none
+        // finds nothing to add and stops there.
+        editor.foldRanges(originalFolds)
         // …and the viewport with it. `setCarets` only scrolls far enough to
         // show the caret, which after a jump to line 4000 is not where the
         // reader was.

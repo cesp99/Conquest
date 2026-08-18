@@ -16,6 +16,56 @@ import kotlin.math.min
 /** One highlighted range on one row; columns are UTF-16 offsets. */
 data class HighlightSpan(val start: Int, val end: Int, val style: Int)
 
+/** One unbroken stretch of buffer rows, with the text and spans read for it. */
+internal class RowRun(
+    val first: Int,
+    val lines: List<String>,
+    val spans: List<List<HighlightSpan>>,
+) {
+    /** One past the last row this run holds. */
+    val last: Int get() = first + lines.size
+
+    /** Whether rows [from, to) are all in here. */
+    fun covers(from: Int, to: Int): Boolean = from >= first && to <= last
+}
+
+/**
+ * The text and highlight spans of the rows one frame draws, in the runs they
+ * form: one run for an ordinary pane, one per unbroken stretch of visible
+ * rows once something between them is folded.
+ *
+ * A fold is the whole reason this is not a list with a base row. The first
+ * and the last row of a frame are a screenful apart until a block is folded
+ * between them, and then they are as far apart as the block is long — so
+ * reading "the rows between them" would put the entire folded span (its
+ * text, its highlight query, one span list per row) on the UI thread of
+ * every keystroke. The runs are what is actually on screen, and what this
+ * costs is therefore the screen.
+ */
+internal class VisibleRows(private val runs: List<RowRun>) {
+
+    /** The text of buffer row [row]; "" for a row this frame does not draw. */
+    fun text(row: Int): String {
+        val run = runOf(row) ?: return ""
+        return run.lines.getOrElse(row - run.first) { "" }
+    }
+
+    /** Its highlight spans, in the same terms. */
+    fun spans(row: Int): List<HighlightSpan> {
+        val run = runOf(row) ?: return emptyList()
+        return run.spans.getOrElse(row - run.first) { emptyList() }
+    }
+
+    // Scanned rather than searched: a frame has one run, or the handful the
+    // folds on screen cut it into.
+    private fun runOf(row: Int): RowRun? {
+        for (run in runs) {
+            if (row >= run.first && row < run.last) return run
+        }
+        return null
+    }
+}
+
 /**
  * One caret and, when its two ends differ, the selection it drags behind it.
  * Columns are UTF-16 offsets within their row, as everywhere else in the
@@ -46,6 +96,35 @@ data class Caret(
 
 /** Document order by where a caret starts. */
 internal val CaretOrder = compareBy<Caret>({ it.startRow }, { it.startCol })
+
+/**
+ * What [EditorState.setCarets] does with a caret aimed at a row a fold has
+ * hidden — the one question every caller that moves a caret has to answer,
+ * and the reason it is asked here rather than at each of them.
+ *
+ * Zed never has to choose: a hidden buffer position keeps its place and only
+ * the *display* point clips into the fold (crates/editor/src/display_map.rs).
+ * Ours has a one-line IME shadow that can only follow a row on screen, so a
+ * caret either takes its fold open with it or is moved out of it — and which
+ * of the two is right depends entirely on what the user just did.
+ */
+internal enum class HiddenCaret {
+    /**
+     * Open the fold over the caret and leave it on the row that was asked
+     * for. What a *jump* means — go-to-line, the outline picker, a search
+     * hit, an edit that landed inside a block: the row asked for is the row
+     * the next keystroke must type into, so the file opens to show it.
+     */
+    Reveal,
+
+    /**
+     * Move the caret out to the end of the fold's own line, keeping the fold
+     * shut. Only right when the fold is what just changed: folding the block
+     * the caret stands in is a command to hide those rows, and revealing
+     * them again would undo it on the spot.
+     */
+    Snap,
+}
 
 /**
  * View state of one editor pane: scroll offsets, carets, and a cached
@@ -130,6 +209,15 @@ class EditorState private constructor(
     internal var addCaretDirection = 0
     internal var addCaretGoalCol = 0
     internal var selectNextWordwise = false
+
+    /**
+     * A `ctrl-k` waiting for its second half. Zed's Linux keymap spells
+     * FoldAll and UnfoldAll as two-stroke chords (`ctrl-k ctrl-0`,
+     * `ctrl-k ctrl-j` — assets/keymaps/default-linux.json:589-590), which a
+     * single-event key handler can only honour by remembering the prefix.
+     * A plain field: nothing draws it, and it lives exactly one keypress.
+     */
+    internal var pendingChordCtrlK = false
 
     internal fun endCommandRun() {
         addCaretDirection = 0
@@ -234,6 +322,13 @@ class EditorState private constructor(
     private var requestedFirst = 0
     private var requestedLast = 0
 
+    // The runs of visible rows a fold cuts off below the window above — see
+    // [visibleRows] and [foldRun]. Empty in a pane with nothing folded on
+    // screen, which is every pane most of the time.
+    private var extraRuns: List<RowRun> = emptyList()
+    private var extraRunsVersion = -1L
+    private var extraRunsHighlightVersion = -1L
+
     /**
      * What is on screen, as opposed to what is in the file. Every place that
      * used to multiply a row by the line height goes through it — see
@@ -248,8 +343,206 @@ class EditorState private constructor(
     /** Refilled by the draw pass every frame; see [DisplayWindow]. */
     internal val displayWindow = DisplayWindow()
 
+    // ---- Folds -----------------------------------------------------------
+
+    /**
+     * Every fold this pane holds, chip rows and all, sorted by start row —
+     * nested folds included, the way Zed's fold map keeps overlapping
+     * creases so unfolding an outer block reveals the inner ones still
+     * folded (crates/editor/src/display_map/fold_map.rs:715-727).
+     *
+     * Snapshot state because the gutter's chevrons and the "⋯" chips are
+     * drawn from it every frame. It lives here, on the pane's view state,
+     * for the same reason the scroll position does: an [EditorState] is kept
+     * per open file, so folds survive a tab switch and die with the tab —
+     * exactly the lifetime Zed's per-editor fold map has.
+     */
+    internal var folds: List<FoldRange> by mutableStateOf(emptyList())
+        private set
+
+    /** The fold whose chip sits on [row], or null. */
+    internal fun foldStartingAt(row: Int): FoldRange? {
+        // Sorted by start row; the draw pass asks once per visible row per
+        // frame, so this is a binary search rather than a scan.
+        var low = 0
+        var high = folds.size
+        while (low < high) {
+            val mid = (low + high) ushr 1
+            if (folds[mid].startRow < row) low = mid + 1 else high = mid
+        }
+        return folds.getOrNull(low)?.takeIf { it.startRow == row }
+    }
+
+    /** Whether [row] is inside a fold and off the screen. */
+    internal fun isRowFoldedAway(row: Int): Boolean = displayMap.isRowHidden(row)
+
+    /** Install a new fold list: sort it, hand the hidden union to the map. */
+    private fun installFolds(newFolds: List<FoldRange>) {
+        val sorted = newFolds.sortedWith(compareBy({ it.startRow }, { it.endRow }))
+        folds = sorted
+        displayMap.setFoldedRows(mergedHiddenRows(sorted))
+        bumpRevision()
+    }
+
+    /**
+     * The union of the folds' interiors as disjoint ranges that never touch,
+     * which is the only shape [DisplayMap.setFoldedRows] accepts — its
+     * neighbouring-row arithmetic depends on it.
+     */
+    private fun mergedHiddenRows(sorted: List<FoldRange>): List<IntRange> {
+        if (sorted.isEmpty()) return emptyList()
+        val merged = ArrayList<IntRange>()
+        for (fold in sorted) {
+            val first = fold.startRow + 1
+            if (first > fold.endRow) continue
+            val last = merged.lastOrNull()
+            if (last != null && first <= last.last + 1) {
+                if (fold.endRow > last.last) merged[merged.size - 1] = last.first..fold.endRow
+            } else {
+                merged.add(first..fold.endRow)
+            }
+        }
+        return merged
+    }
+
+    /**
+     * Fold [ranges], drop the carets that just vanished onto their chip
+     * rows, and keep the primary on screen — Zed's `fold_creases` with its
+     * autoscroll (crates/editor/src/fold.rs:578-600).
+     */
+    internal fun foldRanges(ranges: List<FoldRange>) {
+        val added = (folds + ranges.filter { it.endRow > it.startRow }).distinct()
+        if (added.size == folds.size) return
+        installFolds(added)
+        // The caret set re-enters through its one door. This is the one
+        // caller that asks for [HiddenCaret.Snap]: the user just folded the
+        // block the caret was standing in, so opening it again to keep the
+        // caret where it was would undo the command they gave — see
+        // [snappedOutOfFold].
+        setCarets(caretsInOrder(), primaryCaret(), hidden = HiddenCaret.Snap)
+        ensureCursorVisible()
+    }
+
+    /**
+     * Remove the folds that intersect [rows] — Zed's `unfold_intersecting`
+     * with `inclusive: true` (fold_map.rs, via fold.rs:603-614). With
+     * [hiddenOnly] the chip row does not count as an intersection, which is
+     * what revealing a search hit wants: landing *on* a chip row should not
+     * open the fold under it.
+     */
+    internal fun unfoldRowsTouching(rows: IntRange, hiddenOnly: Boolean = false): Boolean {
+        if (folds.isEmpty()) return false
+        val kept = folds.filterNot { fold ->
+            val from = if (hiddenOnly) fold.startRow + 1 else fold.startRow
+            rows.first <= fold.endRow && rows.last >= from
+        }
+        if (kept.size == folds.size) return false
+        installFolds(kept)
+        ensureCursorVisible()
+        return true
+    }
+
+    /** Zed's `editor::UnfoldAll` (crates/editor/src/fold.rs:520-534). */
+    internal fun unfoldAllRows(): Boolean {
+        if (folds.isEmpty()) return false
+        installFolds(emptyList())
+        ensureCursorVisible()
+        return true
+    }
+
+    /**
+     * Reconcile the folds with an edit that touched rows [fromRow, toRow]
+     * (measured before it ran) and changed the row count by [rowDelta].
+     * Returns true when anything changed, in which case every measured
+     * height in the display map is suspect.
+     *
+     * Zed carries folds through edits as buffer anchors and only drops the
+     * ones whose range collapses to nothing (fold_map.rs:562,
+     * `if fold_range.end > fold_range.start`). Row numbers cannot ride an
+     * edit the way an anchor can, so this does the honest flat version: an
+     * edit into a fold's hidden rows unfolds it, a structural edit on any of
+     * its rows unfolds it, folds past the edit shift by the row delta, and
+     * folds in front of it stand. Typing on the chip row itself leaves the
+     * fold alone — the hidden rows were not touched — which is also what
+     * Zed's anchors arrive at.
+     */
+    private fun adjustFoldsForEdit(fromRow: Int, toRow: Int, rowDelta: Int): Boolean {
+        if (folds.isEmpty()) return false
+        var changed = false
+        val kept = ArrayList<FoldRange>(folds.size)
+        for (fold in folds) {
+            val touchesHidden = fromRow <= fold.endRow && toRow >= fold.startRow + 1
+            val touchesAtAll = fromRow <= fold.endRow && toRow >= fold.startRow
+            when {
+                touchesHidden || (rowDelta != 0 && touchesAtAll) -> changed = true
+                rowDelta != 0 && fold.startRow > toRow -> {
+                    kept.add(FoldRange(fold.startRow + rowDelta, fold.endRow + rowDelta))
+                    changed = true
+                }
+                else -> kept.add(fold)
+            }
+        }
+        if (changed) installFolds(kept)
+        return changed
+    }
+
+    /**
+     * An empty caret standing on a folded-away row, moved to the end of the
+     * fold's own line — where Zed *draws* a caret whose buffer position is
+     * inside a fold (a hidden point clips to the fold's start). Zed keeps
+     * the underlying position; a one-line IME shadow cannot follow a row
+     * that is not on screen, so ours moves for real. Selection endpoints are
+     * left where they are: the selection spans the fold and paints across
+     * it, and any edit through it unfolds first.
+     *
+     * Moving the caret is only ever right when the *fold* is what changed —
+     * see [HiddenCaret], and [revealFoldsOver] for what happens the rest
+     * of the time.
+     */
+    private fun snappedOutOfFold(caret: Caret): Caret {
+        if (!displayMap.hasFolds || !caret.isEmpty) return caret
+        if (!displayMap.isRowHidden(caret.headRow)) return caret
+        val row = displayMap.prevVisibleRow(caret.headRow)
+        return Caret(row, line(row).length)
+    }
+
+    /**
+     * Open the folds hiding the rows [carets] are being put on, so that the
+     * caret can stay on the row the caller asked for.
+     *
+     * The chip row itself does not count (`hiddenOnly`): landing *on* a
+     * fold's own line is landing somewhere already visible, and opening the
+     * block under it would be a jump the user did not ask for — the same
+     * rule [selectRange] follows for a search hit. Only empty carets are
+     * revealed, because only they are otherwise moved.
+     *
+     * Per caret rather than over the span between the first and the last:
+     * two carets in two different folds must not open every fold between
+     * them.
+     */
+    private fun revealFoldsOver(carets: List<Caret>, primary: Caret) {
+        for (caret in carets) {
+            if (!caret.isEmpty || !displayMap.isRowHidden(caret.headRow)) continue
+            unfoldRowsTouching(caret.headRow..caret.headRow, hiddenOnly = true)
+        }
+        // The primary is normally a member of [carets]; a caller that hands
+        // over one it built separately still gets its fold opened.
+        if (primary.isEmpty && displayMap.isRowHidden(primary.headRow)) {
+            unfoldRowsTouching(primary.headRow..primary.headRow, hiddenOnly = true)
+        }
+    }
+
     private companion object {
         const val WINDOW_PADDING = 32
+
+        /**
+         * Hidden rows not worth cutting a frame's read in two for. Under
+         * this many, reading the folded rows and throwing them away costs
+         * less than a second bridge round trip and a second highlight query
+         * — the same trade [WINDOW_PADDING] makes for the rows either side
+         * of the viewport — so a screenful of small folds stays one read.
+         */
+        const val FOLD_GAP_ROWS = 16
 
         /**
          * Narrowest pane we will still wrap in. A pane thinner than this is
@@ -286,6 +579,15 @@ class EditorState private constructor(
     val gutterWidthPx: Float
         get() = (lineCount.toString().length.coerceAtLeast(MIN_GUTTER_DIGITS) +
             GUTTER_PADDING_CHARS) * charWidthPx
+
+    /**
+     * The gutter's fold column: Zed's `right_padding` is `em_width * 4` when
+     * folds and line numbers are both on (editor.rs:11758-11760) — the line
+     * numbers end where it begins, and the fold chevron lives in it. It is
+     * the right-hand share of the [GUTTER_PADDING_CHARS] the gutter already
+     * reserves, not extra width.
+     */
+    val gutterFoldColumnPx: Float get() = 4 * charWidthPx
 
     /** Zed's `px(2.)` for the cursor, in device pixels. Set from composition. */
     var cursorWidthPx: Float = 2f
@@ -413,18 +715,95 @@ class EditorState private constructor(
     }
 
     /**
+     * Text and highlight spans for the rows the draw pass will actually
+     * draw between [firstRow] and [lastRow], inclusive.
+     *
+     * The two rows are a screenful apart in an unfolded pane and this is
+     * [linesWindow] with one more object around it. With a block folded
+     * between them they are as far apart as the block is long, and the
+     * difference is the whole point: the rows are read in the runs the folds
+     * cut them into, so a frame costs the rows on screen rather than the
+     * rows the file happens to have between the top of the viewport and the
+     * bottom of it. See [VisibleRows].
+     */
+    internal fun visibleRows(firstRow: Int, lastRow: Int): VisibleRows {
+        val end = (lineCount - 1).coerceAtLeast(0)
+        val last = lastRow.coerceIn(0, end)
+        val first = firstRow.coerceIn(0, last)
+        val runs = ArrayList<RowRun>(1)
+        var row = first
+        while (row <= last) {
+            var runLast = row
+            while (true) {
+                val next = displayMap.nextVisibleRow(runLast + 1)
+                if (next > last || next - runLast - 1 > FOLD_GAP_ROWS) break
+                runLast = next
+            }
+            if (runs.isEmpty()) {
+                // The first run is the pane's own padded window, which is
+                // the cache `line`, `spansFor` and the display map's
+                // measuring all read through. Nothing about the frame's
+                // first rows has changed since before folds existed.
+                val lines = linesWindow(row, runLast + 1)
+                runs.add(RowRun(requestedFirst, lines, spansWindow()))
+            } else {
+                runs.add(foldRun(row, runLast + 1))
+            }
+            row = displayMap.nextVisibleRow(runLast + 1)
+        }
+        extraRuns = if (runs.size > 1) ArrayList(runs.subList(1, runs.size)) else emptyList()
+        return VisibleRows(runs)
+    }
+
+    /**
+     * A run of rows past the first one, from the small cache the frames
+     * below a fold share.
+     *
+     * Kept between frames because a caret blink is a frame too: without it a
+     * folded file would re-read every run twice a second. Thrown away whole
+     * when the buffer or its highlights move, which costs at most a
+     * viewport's worth of rows to rebuild.
+     */
+    private fun foldRun(first: Int, last: Int): RowRun {
+        if (buffer.version != extraRunsVersion || highlightVersion != extraRunsHighlightVersion) {
+            extraRuns = emptyList()
+            extraRunsVersion = buffer.version
+            extraRunsHighlightVersion = highlightVersion
+        }
+        extraRuns.firstOrNull { it.covers(first, last) }?.let { return it }
+        val lines = buffer.lines(first, last).split('\n')
+        return RowRun(first, lines, groupSpans(buffer.highlights(first, last), first, lines.size))
+    }
+
+    /**
      * Highlight spans for the window last returned by [linesWindow],
      * parallel to its returned lines.
      */
     fun spansWindow(): List<List<HighlightSpan>> =
         cachedSpans.subList(requestedFirst - cachedFirst, requestedLast - cachedFirst)
 
-    fun spansFor(row: Int): List<HighlightSpan> =
+    fun spansFor(row: Int): List<HighlightSpan> {
         if (row in cachedFirst until cachedLast && cachedVersion == buffer.version) {
-            cachedSpans.getOrElse(row - cachedFirst) { emptyList() }
-        } else {
-            emptyList()
+            return cachedSpans.getOrElse(row - cachedFirst) { emptyList() }
         }
+        if (highlightVersion != extraRunsHighlightVersion) return emptyList()
+        val run = rowFromRuns(row) ?: return emptyList()
+        return run.spans.getOrElse(row - run.first) { emptyList() }
+    }
+
+    /**
+     * The run holding [row] out of the ones a fold cut off below the window,
+     * or null. Worth trying before the bridge — a frame holds one or two of
+     * them — and it is what keeps the row *under* a fold (the caret's line,
+     * a chip's own line) from costing a read on every frame.
+     */
+    private fun rowFromRuns(row: Int): RowRun? {
+        if (extraRuns.isEmpty() || buffer.version != extraRunsVersion) return null
+        for (run in extraRuns) {
+            if (row >= run.first && row < run.last) return run
+        }
+        return null
+    }
 
     /** Flat [row, start, end, style] groups → per-row span lists. */
     private fun groupSpans(flat: IntArray?, firstRow: Int, rowCount: Int): List<List<HighlightSpan>> {
@@ -441,12 +820,13 @@ class EditorState private constructor(
         return grouped
     }
 
-    fun line(row: Int): String =
+    fun line(row: Int): String {
         if (row in cachedFirst until cachedLast && cachedVersion == buffer.version) {
-            cachedLines[row - cachedFirst]
-        } else {
-            buffer.lines(row, row + 1)
+            return cachedLines[row - cachedFirst]
         }
+        val run = rowFromRuns(row)
+        return if (run != null) run.lines[row - run.first] else buffer.lines(row, row + 1)
+    }
 
     /** Rows [firstRow, lastRow) straight from the buffer, past the window. */
     internal fun linesOf(firstRow: Int, lastRow: Int): String = buffer.lines(firstRow, lastRow)
@@ -489,6 +869,11 @@ class EditorState private constructor(
      */
     fun refreshLineCount() {
         lineCount = buffer.lineCount
+        // A reload or a history step moved text under every fold's row
+        // numbers, and there are no anchors here to carry them — Zed's folds
+        // ride an undo on theirs (fold_map anchors); ours honestly cannot,
+        // so the folds open rather than hide the wrong rows.
+        if (folds.isNotEmpty()) installFolds(emptyList())
         displayMap.invalidateAll()
         bumpRevision()
     }
@@ -501,8 +886,15 @@ class EditorState private constructor(
      * moved to a different index.
      */
     private fun refreshLineCount(fromRow: Int, toRow: Int) {
+        val rowDelta = buffer.lineCount - lineCount
         lineCount = buffer.lineCount
-        displayMap.invalidate(fromRow - 1, toRow + 1)
+        // Folds first: [adjustFoldsForEdit] resets the whole map when it
+        // changes anything, and rows an unfold just revealed can be far in
+        // front of the edit — a narrow invalidate would leave their blocks
+        // measured at zero.
+        if (!adjustFoldsForEdit(fromRow, toRow, rowDelta)) {
+            displayMap.invalidate(fromRow - 1, toRow + 1)
+        }
         bumpRevision()
     }
 
@@ -535,6 +927,11 @@ class EditorState private constructor(
      * replaces it, which is what every editor does here.
      */
     fun selectRange(range: SelectionRange) {
+        // A hit inside a fold has to be revealed before it can be shown —
+        // the same unfold the "⋯" chip runs, aimed by the navigation instead
+        // of the pointer. Chip rows themselves don't count: a hit on the
+        // fold's own line is already visible.
+        unfoldRowsTouching(range.startRow..range.endRow, hiddenOnly = true)
         setCarets(
             listOf(Caret(range.startRow, range.startCol, range.endRow, range.endCol)),
             Caret(range.startRow, range.startCol, range.endRow, range.endCol),
@@ -685,15 +1082,32 @@ class EditorState private constructor(
      * Carets that touch after the change are merged, because two carets in
      * one place would apply everything typed from then on twice. Whichever
      * of a merged pair was the primary stays the primary.
+     *
+     * [hidden] says what to do about a caret aimed at a row a fold has
+     * hidden; the default is the one every caller but [foldRanges] wants.
      */
-    internal fun setCarets(carets: List<Caret>, primary: Caret, notify: Boolean = true) {
+    internal fun setCarets(
+        carets: List<Caret>,
+        primary: Caret,
+        notify: Boolean = true,
+        hidden: HiddenCaret = HiddenCaret.Reveal,
+    ) {
         if (carets.isEmpty()) return
         endCommandRun()
-        val ordered = carets.sortedWith(CaretOrder)
+        // Through the one door every caret change takes: a caret can never
+        // settle on a row a fold has hidden. Revealing comes first so that
+        // the snap below finds nothing left to move — it stays as the last
+        // resort for the fold that was just created over a caret.
+        if (displayMap.hasFolds && hidden == HiddenCaret.Reveal) {
+            revealFoldsOver(carets, primary)
+        }
+        val visible = if (displayMap.hasFolds) carets.map(::snappedOutOfFold) else carets
+        val visiblePrimary = snappedOutOfFold(primary)
+        val ordered = visible.sortedWith(CaretOrder)
         val merged = ArrayList<Caret>(ordered.size)
         var primaryIndex = -1
         for (caret in ordered) {
-            val isPrimary = primaryIndex < 0 && caret == primary
+            val isPrimary = primaryIndex < 0 && caret == visiblePrimary
             val last = merged.lastOrNull()
             // Sorted by start, so an overlap can only be "this one starts at
             // or before the previous one ended".
@@ -1434,6 +1848,12 @@ class EditorState private constructor(
                 start = byteOffsetOf(caret.headRow, previous)
                 end = byteOffsetOf(caret.headRow, col)
             } else if (caret.headRow > 0) {
+                // Joining upward eats the newline of the row above — which,
+                // beside a fold, is the fold's own last hidden row. The
+                // batch's touched-row window is measured from the carets and
+                // cannot see that reach, so the fold is opened here instead
+                // of sliding over rearranged text.
+                unfoldRowsTouching(caret.headRow - 1..caret.headRow, hiddenOnly = true)
                 start = lineStartOffset(caret.headRow) - 1
                 end = start + 1
             } else {
@@ -1526,15 +1946,21 @@ class EditorState private constructor(
             if (col > 0) {
                 moved = text.offsetByCodePoints(col, -1)
             } else if (row > 0) {
-                row -= 1
+                // The neighbouring *visible* row: stepping over a fold's
+                // edge lands beside it, never inside it — Zed's motion runs
+                // in display coordinates and cannot express a hidden row.
+                row = displayMap.prevVisibleRow(row - 1)
                 moved = line(row).length
             }
         } else {
             if (col < text.length) {
                 moved = text.offsetByCodePoints(col, 1)
             } else if (row < lineCount - 1) {
-                row += 1
-                moved = 0
+                val next = displayMap.nextVisibleRow(row + 1)
+                if (next < lineCount) {
+                    row = next
+                    moved = 0
+                }
             }
         }
         return if (extend) Caret(caret.anchorRow, caret.anchorCol, row, moved) else Caret(row, moved)

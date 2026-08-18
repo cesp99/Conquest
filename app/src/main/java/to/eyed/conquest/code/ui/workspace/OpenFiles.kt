@@ -5,6 +5,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import to.eyed.conquest.code.core.BufferSession
 import to.eyed.conquest.code.ui.editor.EditorState
 import to.eyed.conquest.code.ui.git.DiffTarget
@@ -12,6 +13,151 @@ import to.eyed.conquest.code.ui.media.MediaKind
 
 /** How many closed files Ctrl+Shift+T can walk back through. */
 private const val REOPEN_HISTORY = 24
+
+/** Zed's `MAX_NAVIGATION_HISTORY_LEN` (workspace/src/pane.rs:322). */
+private const val MAX_NAVIGATION_HISTORY = 1024
+
+/**
+ * One place the user has been — what GoBack returns to.
+ *
+ * A path and a position, not a tab reference: Zed's entries hold a weak item
+ * handle exactly so a closed item doesn't keep the history alive, and falls
+ * back to the item's path to reopen it (workspace.rs:2846-2860). Ours are a
+ * path from the start, because closing a tab here releases the engine buffer
+ * and reopening always goes back through the workspace's own open path.
+ */
+class NavEntry(
+    /** Project-relative path — the same key the tab strip uses. */
+    val path: String,
+    /** Caret, 0-based — Zed pushes the cursor row with each entry (pane.rs:4664-4678). */
+    val row: Int = 0,
+    val col: Int = 0,
+    /** [EditorState.scrollY] at departure — the vertical anchor Zed's `NavigationData` keeps. */
+    val scroll: Float = 0f,
+    /**
+     * Whether the path can be opened again once its tab is gone. A diff or
+     * the graph is opened by a *view*, not by a path the file opener knows —
+     * the same reason [OpenFile.isReopenable] exists — so a stale entry for
+     * one is discarded rather than returned, mirroring how Zed's loop skips
+     * entries it has no path info for (workspace.rs:2845-2853).
+     */
+    val isReopenable: Boolean = true,
+) {
+    /**
+     * Put the caret and the view back where this entry says they were.
+     *
+     * Suspending for the same reason `revealProjectSearchMatch` is: a file
+     * this navigation has just reopened has no measured viewport yet, so the
+     * scroll restore waits two frames — one to compose the pane, one to
+     * measure it — before `ensureCursorVisible` clamps everything into range.
+     * Clamped against the file as it is *now*: the entry may describe a file
+     * that has shrunk since, and Zed treats stale anchors the same way —
+     * resolve what still resolves, never refuse.
+     */
+    suspend fun restoreIn(file: OpenFile) {
+        val editor = file.editor ?: return
+        val targetRow = row.coerceIn(0, (editor.lineCount - 1).coerceAtLeast(0))
+        val targetCol = col.coerceIn(0, editor.line(targetRow).length)
+        editor.selectRange(
+            EditorState.SelectionRange(targetRow, targetCol, targetRow, targetCol)
+        )
+        withFrameNanos { }
+        withFrameNanos { }
+        editor.scrollToY(scroll)
+        editor.ensureCursorVisible()
+    }
+}
+
+/**
+ * The jump list behind GoBack/GoForward — Zed's `NavHistory`
+ * (workspace/src/pane.rs:4707-4860), reduced to the two stacks.
+ *
+ * The rules are Zed's own, kept testable in one place:
+ * - a normal push lands on the backward stack and **clears the forward
+ *   stack** — new navigation after a GoBack throws the "forward" branch away,
+ *   as a browser does (pane.rs:4801-4815);
+ * - every push first drops older entries at the same place — same path, same
+ *   row, Zed's `is_same_location` (pane.rs:4795-4797) — so hopping between
+ *   two files doesn't fill the list with copies;
+ * - each stack is capped at [MAX_NAVIGATION_HISTORY], oldest dropped
+ *   (pane.rs:4806-4808);
+ * - going back pushes the departing location onto the forward stack, going
+ *   forward pushes it onto the backward stack, and neither clears anything
+ *   (pane.rs:4817-4846).
+ *
+ * The stacks are snapshot state so the tab bar's arrow buttons grey and
+ * ungrey themselves as the history changes, the way Zed's do
+ * (pane.rs:3407-3452).
+ */
+class NavHistory {
+    private val backward = mutableStateListOf<NavEntry>()
+    private val forward = mutableStateListOf<NavEntry>()
+
+    val canGoBack: Boolean get() = backward.isNotEmpty()
+    val canGoForward: Boolean get() = forward.isNotEmpty()
+
+    /** A place just departed, in Zed's `NavigationMode::Normal` (pane.rs:4801-4815). */
+    fun push(entry: NavEntry) {
+        pushOnto(backward, entry)
+        forward.clear()
+    }
+
+    /**
+     * Pop back to the nearest [usable] entry, discarding the dead ones on
+     * the way — Zed's `navigate_history_impl` loops exactly like this,
+     * popping until an entry actually navigates (workspace.rs:2822-2854).
+     * [from] is where the user is now; it goes onto the forward stack only
+     * when there is somewhere to go back *to*.
+     */
+    fun back(from: NavEntry?, usable: (NavEntry) -> Boolean): NavEntry? =
+        travel(source = backward, opposite = forward, from = from, usable = usable)
+
+    /** The mirror image, replaying what [back] set aside (pane.rs:4831-4846). */
+    fun forward(from: NavEntry?, usable: (NavEntry) -> Boolean): NavEntry? =
+        travel(source = forward, opposite = backward, from = from, usable = usable)
+
+    /** Put back an entry whose navigation could not be performed. */
+    fun restore(entry: NavEntry, toBackward: Boolean) {
+        val stack = if (toBackward) backward else forward
+        val opposite = if (toBackward) forward else backward
+        // The travel that spent it pushed the departure onto the opposite
+        // stack; unwind that too, or a failed GoBack would leave a forward
+        // entry pointing at a move that never happened.
+        opposite.removeLastOrNull()
+        stack.add(entry)
+    }
+
+    /** Forget everything — the paths belong to a project being left. */
+    fun clear() {
+        backward.clear()
+        forward.clear()
+    }
+
+    private fun travel(
+        source: MutableList<NavEntry>,
+        opposite: MutableList<NavEntry>,
+        from: NavEntry?,
+        usable: (NavEntry) -> Boolean,
+    ): NavEntry? {
+        while (source.isNotEmpty()) {
+            val entry = source.removeAt(source.lastIndex)
+            // An entry for the place the user is already standing navigates
+            // nowhere; Zed's loop notices `navigated` stayed false and keeps
+            // popping (workspace.rs:2837-2843).
+            val standingStill = from != null && entry.path == from.path && entry.row == from.row
+            if (standingStill || !usable(entry)) continue
+            if (from != null) pushOnto(opposite, from)
+            return entry
+        }
+        return null
+    }
+
+    private fun pushOnto(stack: MutableList<NavEntry>, entry: NavEntry) {
+        stack.removeAll { it.path == entry.path && it.row == entry.row }
+        if (stack.size >= MAX_NAVIGATION_HISTORY) stack.removeAt(0)
+        stack.add(entry)
+    }
+}
 
 /**
  * One open editor tab.
@@ -136,6 +282,31 @@ class OpenFilesState {
     /** Paths of tabs closed in this session, oldest first — Ctrl+Shift+T's stack. */
     private val closedPaths = mutableStateListOf<String>()
 
+    /**
+     * The jump list. Entries are recorded when the active tab *changes* — a
+     * tab click, Ctrl+Tab, a file being opened — which is Zed's
+     * "deactivated item pushes its position" (editor pushes on deactivate,
+     * items.rs via `push_to_nav_history(.., is_deactivate=true, ..)`). Zed
+     * also records large caret jumps inside one item
+     * (`MIN_NAVIGATION_HISTORY_ROW_DELTA` = 10, editor.rs:295,
+     * navigation.rs:1560-1566); that half waits until the editor can report
+     * them — noted in the class doc rather than half-built here.
+     */
+    private val nav = NavHistory()
+
+    /**
+     * A path GoBack/GoForward has asked the workspace to reopen. The reopen
+     * arrives later as an ordinary [open] call, and *that* open is the
+     * navigation itself, not new travel — pushing it would clear the forward
+     * stack and break the GoForward that should follow. Zed brackets the
+     * open in `NavigationMode::GoingBack` for exactly this
+     * (workspace.rs:2833-2835); this is the same bracket for an async open.
+     */
+    private var pendingNavPath: String? = null
+
+    val canGoBack: Boolean get() = nav.canGoBack
+    val canGoForward: Boolean get() = nav.canGoForward
+
     /** Tabs a close request is still working through, head first. */
     private val closing = mutableStateListOf<OpenFile>()
 
@@ -157,26 +328,101 @@ class OpenFilesState {
     fun indexOfPath(path: String): Int = _tabs.indexOfFirst { it.path == path }
 
     fun select(index: Int) {
-        if (index in _tabs.indices) activeIndex = index
+        if (index !in _tabs.indices || index == activeIndex) return
+        recordDeparture()
+        pendingNavPath = null
+        activeIndex = index
     }
 
     /** Move [delta] tabs along, wrapping — what Ctrl+Tab is expected to do. */
     fun selectRelative(delta: Int) {
         if (_tabs.isEmpty()) return
         val size = _tabs.size
-        activeIndex = ((activeIndex + delta) % size + size) % size
+        select(((activeIndex + delta) % size + size) % size)
     }
 
     /** Add a tab (or select the existing one) and make it active. */
     fun open(file: OpenFile) {
+        // The open GoBack/GoForward asked for — the navigation landing, not
+        // new travel, so it must not push (which would clear forward). Any
+        // *other* open supersedes a pending one, exactly as any keypress
+        // between GoBack and its async open would in Zed's synchronous world.
+        val navigated = file.path == pendingNavPath
+        pendingNavPath = null
         val existing = indexOfPath(file.path)
         if (existing >= 0) {
-            activeIndex = existing
+            if (existing != activeIndex) {
+                if (!navigated) recordDeparture()
+                activeIndex = existing
+            }
             return
         }
+        if (!navigated) recordDeparture()
         _tabs.add(file)
         activeIndex = _tabs.lastIndex
         closedPaths.remove(file.path)
+    }
+
+    /**
+     * Step back along the jump list — Zed's `pane::GoBack` (pane.rs:929-938).
+     *
+     * If the entry's tab is still open it becomes active here; either way the
+     * entry is returned so the caller can restore its caret and scroll
+     * ([NavEntry.restoreIn]) — or reopen the file first, through the same
+     * open path Ctrl+Shift+T uses, when [indexOfPath] says it is gone. Null
+     * when there is nowhere to go.
+     */
+    fun goBack(): NavEntry? = navigateHistory(back = true)
+
+    /** Zed's `pane::GoForward` (pane.rs:940-950) — replays what [goBack] left. */
+    fun goForward(): NavEntry? = navigateHistory(back = false)
+
+    private fun navigateHistory(back: Boolean): NavEntry? {
+        val from = active?.let(::locationOf)
+        // Usable = still on the strip, or reopenable by path. A dead diff or
+        // graph entry is skipped, as Zed skips entries with no path info
+        // (workspace.rs:2845-2853).
+        val usable = { entry: NavEntry -> indexOfPath(entry.path) >= 0 || entry.isReopenable }
+        val entry = (if (back) nav.back(from, usable) else nav.forward(from, usable))
+            ?: return null
+        val index = indexOfPath(entry.path)
+        if (index >= 0) {
+            // Straight to the index, not [select]: navigating is what Zed
+            // brackets in GoingBack/GoingForward mode so the activation it
+            // causes doesn't record as new travel (workspace.rs:2833-2835).
+            activeIndex = index
+        } else {
+            pendingNavPath = entry.path
+        }
+        return entry
+    }
+
+    /**
+     * A navigation that could not land — the file would not open at all.
+     *
+     * Without this the entry is spent and the arrow it lit stays lit for a
+     * move that never happened, and the [pendingNavPath] bracket stays armed
+     * so the user's *next* open of that path would be mistaken for the
+     * landing. Put the entry back where it came from and disarm.
+     */
+    fun navigationFailed(entry: NavEntry, wasBack: Boolean) {
+        if (pendingNavPath == entry.path) pendingNavPath = null
+        nav.restore(entry, toBackward = wasBack)
+    }
+
+    /** Where [file] is right now, as a history entry. */
+    private fun locationOf(file: OpenFile) = NavEntry(
+        path = file.path,
+        row = file.editor?.cursorRow ?: 0,
+        col = file.editor?.cursorCol ?: 0,
+        scroll = file.editor?.scrollY ?: 0f,
+        isReopenable = file.isReopenable,
+    )
+
+    /** The active tab is being left: remember where it was. */
+    private fun recordDeparture() {
+        val leaving = active ?: return
+        nav.push(locationOf(leaving))
     }
 
     /**
@@ -267,6 +513,11 @@ class OpenFilesState {
     /** Forget the reopen history — the paths belong to a project being left. */
     fun clearClosedHistory() {
         closedPaths.clear()
+        // The jump list goes with it, for the same reason: its paths are
+        // relative to a root that is about to change, which is Zed's
+        // `NavHistory::clear` on workspace teardown (pane.rs:4748-4768).
+        nav.clear()
+        pendingNavPath = null
     }
 
     fun refreshStatuses() {

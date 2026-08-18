@@ -4,6 +4,8 @@ import android.os.SystemClock
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.scrollable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -15,33 +17,41 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.structuralEqualityPolicy
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.key.Key
@@ -64,6 +74,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.DpOffset
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import java.io.File
 import kotlinx.coroutines.Dispatchers
@@ -110,6 +121,34 @@ private val IndentGuideOffset = 15.dp
  * `border_1().border_r_2()` in `panel.focused_border` (project_panel.rs:5793-5797).
  */
 private val ActiveRowRail = 2.dp
+
+/**
+ * A guide run stops 4px short of each of its real ends — `PADDING_Y`
+ * (project_panel.rs:7214, applied at 7231-7247). Ours reads those ends from
+ * the rows either side in the flattened tree, so only a run's true first and
+ * last rows inset their slice and a run cut off by the viewport keeps running
+ * where it is cut.
+ *
+ * **One deliberate deviation.** Zed decides this per *run*, not per end: a run
+ * that reaches the last row of the computed window is marked
+ * `continues_offscreen` (indent_guides.rs:490-498), and the single `offset` it
+ * yields moves the origin *and* shortens the length, so both ends lose their
+ * inset together (project_panel.rs:7231-7247). A run that starts on screen and
+ * continues past the viewport bottom therefore draws flush at its on-screen top
+ * in Zed, where ours still insets. Matching it would mean telling every row
+ * where the viewport ends — a per-row read of the layout on every scroll frame,
+ * on the main thread — to reproduce a 4px gap that only appears while a run is
+ * cut off, and that reads as an artefact rather than as an end.
+ */
+private val GuideEndInset = 4.dp
+
+/**
+ * The gradient shadow under the pinned stack: `h_1p5` (6px) hanging off the
+ * last sticky row, black at 10% fading downward to nothing
+ * (project_panel.rs:6893-6907). It belongs to that row, not the stack, so the
+ * push-off drags the shadow with it, exactly as Zed's does.
+ */
+private val StickyShadowHeight = 6.dp
 
 /** The end slot keeps `pr_3` (12px) from the row's right edge (project_panel.rs:6160). */
 private val StatusSlotEndPadding = 6.dp
@@ -191,6 +230,28 @@ private data class PanelMenu(
     /** Null for the panel header — the menu for the project root. */
     val entry: ProjectEntry?,
     val at: Offset,
+    /**
+     * Asked for on a pinned sticky row rather than the entry's real row. The
+     * two can be on screen at once (the real row half-scrolled under the
+     * stack), and only the one that was actually clicked should anchor the
+     * popup.
+     */
+    val sticky: Boolean = false,
+)
+
+/**
+ * Which ancestor rows are pinned over the list's top, and where.
+ *
+ * [indices] index into the flattened rows, outermost first. [driftPx] is ≤ 0:
+ * how far the last pinned row has been pushed up by the anchor row scrolling
+ * in under it — Zed's `drifting_y_offset`, which slides continuously with the
+ * scroll rather than swapping (sticky_items.rs:179-186, 250-257).
+ */
+private data class StickyStack(
+    val indices: List<Int>,
+    val driftPx: Int,
+    /** The measured height of one list row, so overlay and list agree in px. */
+    val rowHeightPx: Int,
 )
 
 /**
@@ -230,6 +291,17 @@ fun ProjectPanel(
     revealRequest: Boolean = false,
     /** Called once [revealRequest] has been acted on. */
     onRevealHandled: () -> Unit = {},
+    /**
+     * Whether the panel holds the keyboard.
+     *
+     * The workspace needs to know because two of its chords are the panel's
+     * too: Zed binds `ctrl-n` to `workspace::NewFile` *and* to
+     * `project_panel::NewFile` (default-linux.json:654, 965), and resolves
+     * them by context — the panel's context is the more specific one, so it
+     * wins while the panel has focus. Our workspace table is matched in a
+     * preview pass above the panel, so it has to be told to stand down.
+     */
+    onFocusChanged: (Boolean) -> Unit = {},
     /** A path that has stopped existing, so its tab can be closed. */
     onEntryRemoved: (String) -> Unit = {},
     /** A path that moved: renamed, or cut and pasted somewhere else. */
@@ -283,6 +355,9 @@ fun ProjectPanel(
                 selected = theme.color("element.selected"),
                 activeBorder = theme.color("panel.focused_border"),
                 indentGuide = theme.color("panel.indent_guide"),
+                indentGuideActive = theme.color("panel.indent_guide_active"),
+                stickyBackground = theme.color("panel.overlay_background"),
+                stickyHover = theme.color("panel.overlay_hover"),
                 selectedText = theme.color("text", onSurface),
             )
         }
@@ -294,6 +369,65 @@ fun ProjectPanel(
         var prompt by remember(project) { mutableStateOf<PanelPrompt?>(null) }
         var pending by remember(project) { mutableStateOf<PanelClipboard?>(null) }
         var expectChangeUntil by remember(project) { mutableLongStateOf(0L) }
+
+        // Zed's `sticky_scroll`, on by default (settings/default.json:871):
+        // once the list is scrolled, the ancestor directories of the topmost
+        // visible entry pin to the panel's top. The anchor row is
+        // `find_sticky_anchor` and the push-off is `drifting_y_offset`
+        // (sticky_items.rs:179-186, 285-316), both on our depth basis, which
+        // is one lower than Zed's because our root is a header above the list
+        // rather than the list's first row — [findStickyAnchor] spells out
+        // what that changes. The ancestors are `sticky_parents`
+        // (project_panel.rs:6824-6846).
+        //
+        // Kept as a State and read in [StickyOverlay], never in this scope:
+        // structural equality already drops the scroll frames that don't move
+        // the stack, but the drift slides a pixel at a time for the whole of a
+        // push-off, and a read here would invalidate the panel — handing
+        // `LazyColumn` a fresh content lambda, and so recomposing every
+        // visible row, once per frame on the main thread.
+        val stickyStack = remember(tree, listState) {
+            derivedStateOf(structuralEqualityPolicy()) {
+                if (listState.firstVisibleItemIndex == 0 &&
+                    listState.firstVisibleItemScrollOffset == 0
+                ) {
+                    // Not scrolled — Zed's `is_scrolled` gate
+                    // (project_panel.rs:6946-6951).
+                    return@derivedStateOf null
+                }
+                val rows = tree.rows
+                val visible = listState.layoutInfo.visibleItemsInfo
+                if (visible.isEmpty()) return@derivedStateOf null
+                val depths = ArrayList<Int>(visible.size)
+                for (item in visible) {
+                    // The rows and the layout can be one frame apart while the
+                    // tree reshapes; a stack computed across that gap is wrong
+                    // either way, and next frame recomputes.
+                    depths += rows.getOrNull(item.index)?.depth
+                        ?: return@derivedStateOf null
+                }
+                val anchor = findStickyAnchor(depths) ?: return@derivedStateOf null
+                val anchorItem = visible[anchor.localIndex]
+                val ancestors = stickyAncestorsOf(rows, anchorItem.index)
+                if (ancestors.isEmpty()) return@derivedStateOf null
+                val drift = stickyDriftPx(
+                    anchorOffsetPx = anchorItem.offset,
+                    rowHeightPx = anchorItem.size,
+                    pinnedCount = ancestors.size,
+                    drifting = anchor.drifting,
+                )
+                StickyStack(ancestors, drift, anchorItem.size)
+            }
+        }
+
+        // The guide run containing the selection, in `panel.indent_guide_active`
+        // (find_active_indent_guide, project_panel.rs:6724-6790). Derived from
+        // selection and shape only — nothing here runs per scroll frame.
+        val activeGuide by remember(tree) {
+            derivedStateOf(structuralEqualityPolicy()) {
+                activeGuideRun(tree.rows, tree.selected) { path -> tree.isExpanded(path) }
+            }
+        }
 
         // Re-flatten after a change to the tree's shape. The rebuild reads
         // through JNI and parses JSON, so it stays off the main thread, and it
@@ -614,7 +748,12 @@ fun ProjectPanel(
             val target = tree.pendingReveal ?: return@LaunchedEffect
             val index = tree.rows.indexOfFirst { it.entry.path == target }
             if (index < 0) return@LaunchedEffect
-            listState.scrollToItem(index)
+            // Land the row below the ancestors that will pin over the top —
+            // Zed offsets every autoscroll by the sticky count
+            // (project_panel.rs:3309-3317). A row's pinned ancestors are
+            // exactly its depth, and rows are fixed-height, so scrolling that
+            // many rows earlier puts it in the first uncovered slot.
+            listState.scrollToItem((index - tree.rows[index].depth).coerceAtLeast(0))
             tree.revealed()
         }
 
@@ -624,16 +763,37 @@ fun ProjectPanel(
         LaunchedEffect(tree.selected) {
             val path = tree.selected ?: return@LaunchedEffect
             if (tree.pendingReveal != null) return@LaunchedEffect
+            val pinned = stickyStack.value
+            // A row that is *in* the pinned stack is on screen — pinned at the
+            // top, selection colour and all. Its real row is by definition
+            // scrolled off or covered, so measuring that one would say "not
+            // visible" and animate the list back to it: right-clicking a
+            // pinned directory would throw away the scroll position it was
+            // pinned to preserve.
+            if (pinned != null &&
+                pinned.indices.any { tree.rows.getOrNull(it)?.entry?.path == path }
+            ) {
+                return@LaunchedEffect
+            }
             val info = listState.layoutInfo
             val visible = info.visibleItemsInfo.firstOrNull { it.key == path }
+            // A row under the pinned ancestor stack is covered, not visible,
+            // so the top of the usable viewport starts below it — the same
+            // allowance Zed's autoscroll makes with its sticky count
+            // (project_panel.rs:3309-3317).
+            val stackPx = pinned?.let { it.indices.size * it.rowHeightPx } ?: 0
             if (visible != null &&
-                visible.offset >= info.viewportStartOffset &&
+                visible.offset >= info.viewportStartOffset + stackPx &&
                 visible.offset + visible.size <= info.viewportEndOffset
             ) {
                 return@LaunchedEffect
             }
             val index = tree.rows.indexOfFirst { it.entry.path == path }
-            if (index >= 0) listState.animateScrollToItem(index)
+            if (index >= 0) {
+                // As in the reveal above: the row's own ancestors will pin, so
+                // aim `depth` rows earlier and it lands just under them.
+                listState.animateScrollToItem((index - tree.rows[index].depth).coerceAtLeast(0))
+            }
         }
 
         // Zed's `project_panel.auto_reveal_entries`, which is on by default:
@@ -675,6 +835,7 @@ fun ProjectPanel(
             modifier = Modifier
                 .fillMaxSize()
                 .focusRequester(panelFocus)
+                .onFocusChanged { onFocusChanged(it.hasFocus) }
                 .onPreviewKeyEvent(::handleKey)
                 .focusable()
         ) {
@@ -682,41 +843,125 @@ fun ProjectPanel(
                 error != null -> PanelMessage(error)
                 tree.rows.isEmpty() && !project.scanComplete -> PanelMessage("Scanning…")
                 tree.rows.isEmpty() -> PanelMessage("Empty project")
-                else -> LazyColumn(
-                    state = listState,
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(bottom = 12.dp),
-                ) {
-                    items(tree.rows, key = { it.entry.path }) { row ->
-                        ProjectRow(
-                            entry = row.entry,
-                            // One level in from the root row above, which is
-                            // where Zed puts a worktree's top-level entries
-                            // (project_panel.rs:5547).
-                            depth = row.depth + 1,
-                            status = row.status,
+                else -> {
+                    val rows = tree.rows
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        LazyColumn(
+                            state = listState,
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(bottom = 12.dp),
+                        ) {
+                            itemsIndexed(rows, key = { _, row -> row.entry.path }) { index, row ->
+                                val active = activeGuide
+                                ProjectRow(
+                                    entry = row.entry,
+                                    // One level in from the root row above, which is
+                                    // where Zed puts a worktree's top-level entries
+                                    // (project_panel.rs:5547).
+                                    depth = row.depth + 1,
+                                    status = row.status,
+                                    colours = colours,
+                                    iconColour = iconColour,
+                                    rowColours = rowColours,
+                                    isExpanded = tree.isExpanded(row.entry.path),
+                                    isOpen = row.entry.path == openedPath,
+                                    isSelected = row.entry.path == tree.selected,
+                                    isCut = pending?.isCut == true &&
+                                        pending?.path == row.entry.path,
+                                    dimIgnored = dimIgnored,
+                                    // Neighbour depths, for the 4px guide-run end
+                                    // insets: a run's slice is inset only where the
+                                    // next row over no longer draws that level. The
+                                    // root row above the list and the space below
+                                    // it draw nothing, hence 0 at both edges.
+                                    prevRenderedDepth = if (index == 0) {
+                                        0
+                                    } else {
+                                        rows[index - 1].depth + 1
+                                    },
+                                    nextRenderedDepth = if (index == rows.lastIndex) {
+                                        0
+                                    } else {
+                                        rows[index + 1].depth + 1
+                                    },
+                                    activeGuideLevel = if (
+                                        active != null && index >= active.first &&
+                                        index <= active.last
+                                    ) {
+                                        active.level
+                                    } else {
+                                        -1
+                                    },
+                                    onClick = {
+                                        panelFocus.requestFocus()
+                                        activate(row.entry)
+                                    },
+                                    onContextMenu = { at ->
+                                        panelFocus.requestFocus()
+                                        tree.select(row.entry.path)
+                                        menu = PanelMenu(row.entry, at)
+                                    },
+                                    menu = {
+                                        val open = menu
+                                        if (open != null && !open.sticky &&
+                                            open.entry?.path == row.entry.path
+                                        ) {
+                                            ProjectContextMenu(
+                                                entries = menuFor(row.entry),
+                                                offset = with(density) {
+                                                    DpOffset(open.at.x.toDp(), open.at.y.toDp())
+                                                },
+                                                onDismiss = { menu = null },
+                                            )
+                                        }
+                                    },
+                                )
+                            }
+                        }
+
+                        StickyOverlay(
+                            stack = stickyStack,
+                            rows = rows,
+                            tree = tree,
+                            listState = listState,
                             colours = colours,
                             iconColour = iconColour,
                             rowColours = rowColours,
-                            isExpanded = tree.isExpanded(row.entry.path),
-                            isOpen = row.entry.path == openedPath,
-                            isSelected = row.entry.path == tree.selected,
-                            isCut = pending?.isCut == true && pending?.path == row.entry.path,
                             dimIgnored = dimIgnored,
-                            onClick = {
-                                panelFocus.requestFocus()
-                                activate(row.entry)
+                            isCut = { path ->
+                                pending?.isCut == true && pending?.path == path
                             },
-                            onContextMenu = { at ->
+                            onClick = { row, index ->
                                 panelFocus.requestFocus()
-                                tree.select(row.entry.path)
-                                menu = PanelMenu(row.entry, at)
+                                // Zed scrolls the clicked directory to its own
+                                // sticky slot, so its ancestors stay pinned
+                                // above it (project_panel.rs:6087-6101); with
+                                // fixed-height rows that slot is `depth` rows
+                                // down. Selection follows once the scroll
+                                // lands, so the autoscroll effect finds it
+                                // already placed and stays put.
+                                scope.launch {
+                                    listState.scrollToItem(
+                                        (index - row.depth).coerceAtLeast(0)
+                                    )
+                                    tree.select(row.entry.path)
+                                }
                             },
-                            menu = {
+                            onContextMenu = { entry, at ->
+                                panelFocus.requestFocus()
+                                // Safe to move the selection without moving the
+                                // list: the autoscroll effect above leaves a
+                                // row that is pinned in the stack where it is.
+                                tree.select(entry.path)
+                                menu = PanelMenu(entry, at, sticky = true)
+                            },
+                            rowMenu = { entry ->
                                 val open = menu
-                                if (open?.entry?.path == row.entry.path) {
+                                if (open != null && open.sticky &&
+                                    open.entry?.path == entry.path
+                                ) {
                                     ProjectContextMenu(
-                                        entries = menuFor(row.entry),
+                                        entries = menuFor(entry),
                                         offset = with(density) {
                                             DpOffset(open.at.x.toDp(), open.at.y.toDp())
                                         },
@@ -812,6 +1057,122 @@ fun ProjectPanel(
 }
 
 /**
+ * The pinned ancestors, over the list's top.
+ *
+ * Each row is the ordinary row composable on the overlay colours; the last one
+ * alone drifts and carries the shadow, and the rest are painted over it so a
+ * push-off slides *under* the stack — Zed paints the drifting element first for
+ * the same reason (sticky_items.rs:110-132).
+ *
+ * A composable of its own, and the only place [stack] is read in composition:
+ * the drift moves with the scroll, so the value is different every frame of a
+ * push-off, and reading it in the panel's scope would rebuild the `LazyColumn`
+ * content lambda — and with it every visible row — once per frame on the main
+ * thread. Here that invalidation costs the two or three rows of the stack.
+ */
+@Composable
+private fun StickyOverlay(
+    stack: State<StickyStack?>,
+    rows: List<ProjectTreeRow>,
+    tree: ProjectTreeState,
+    listState: LazyListState,
+    colours: GitStatusColours,
+    iconColour: Color,
+    rowColours: RowColours,
+    dimIgnored: Boolean,
+    isCut: (String) -> Boolean,
+    /** A pinned row and where it sits in [rows]. */
+    onClick: (ProjectTreeRow, Int) -> Unit,
+    onContextMenu: (ProjectEntry, Offset) -> Unit,
+    rowMenu: @Composable (ProjectEntry) -> Unit,
+) {
+    val pinned = stack.value ?: return
+
+    @Composable
+    fun PinnedRow(stackIndex: Int) {
+        val index = pinned.indices[stackIndex]
+        val row = rows.getOrNull(index) ?: return
+        key(row.entry.path) {
+            // Zed's `block_mouse_except_scroll()`, on the sticky row itself
+            // (project_panel.rs:5798). A pinned row is the later sibling, so
+            // Compose hit-tests it first and stops there — hover and clicks
+            // stay on the pinned copy rather than reaching the row beneath,
+            // which is what we want, but it also means the list's own gesture
+            // never sees a wheel or a drag that starts on the stack. This
+            // hands those deltas to the list directly: one `scrollable` above
+            // the row, so a tap still lands on the row and only movement past
+            // touch slop becomes a scroll. It wraps the row alone, not the
+            // shadow below it, because Zed's shadow hangs outside its row's
+            // hitbox and blocks nothing.
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .scrollable(
+                        state = listState,
+                        orientation = Orientation.Vertical,
+                        // What a LazyColumn passes for itself when it isn't
+                        // reversed (ScrollableDefaults.reverseDirection): a
+                        // finger moves with the content, not the viewport.
+                        reverseDirection = true,
+                    )
+            ) {
+                ProjectRow(
+                    entry = row.entry,
+                    depth = row.depth + 1,
+                    status = row.status,
+                    colours = colours,
+                    iconColour = iconColour,
+                    rowColours = rowColours,
+                    // Pinned rows are ancestors of a visible row: expanded by
+                    // definition.
+                    isExpanded = true,
+                    isOpen = false,
+                    isSelected = row.entry.path == tree.selected,
+                    isCut = isCut(row.entry.path),
+                    dimIgnored = dimIgnored,
+                    isSticky = true,
+                    onClick = { onClick(row, index) },
+                    onContextMenu = { at -> onContextMenu(row.entry, at) },
+                    menu = { rowMenu(row.entry) },
+                )
+            }
+        }
+    }
+
+    val lastPos = pinned.indices.lastIndex
+    Box(modifier = Modifier.fillMaxWidth()) {
+        // The deepest pinned row, at its slot plus the push-off, with the
+        // shadow hanging below it.
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .offset { IntOffset(0, pinned.rowHeightPx * lastPos + pinned.driftPx) }
+        ) {
+            PinnedRow(lastPos)
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(StickyShadowHeight)
+                    .background(
+                        Brush.verticalGradient(
+                            // hsla(0,0,0,0.1) → clear
+                            // (project_panel.rs:6894-6895).
+                            listOf(
+                                Color.Black.copy(alpha = 0.10f),
+                                Color.Black.copy(alpha = 0f),
+                            )
+                        )
+                    )
+            )
+        }
+        // The rest of the stack, painted over it.
+        Column(modifier = Modifier.fillMaxWidth()) {
+            for (position in 0 until lastPos) PinnedRow(position)
+        }
+    }
+}
+
+/**
  * The worktree root — an ordinary row, not a header.
  *
  * Zed has no panel title: the project's own name is the first row of the tree
@@ -899,6 +1260,15 @@ private class RowColours(
     /** The 1px border marking the open file (project_panel.rs:5729-5743). */
     val activeBorder: Color,
     val indentGuide: Color,
+    /** The guide run the selection hangs from (project_panel.rs:7218-7222). */
+    val indentGuideActive: Color,
+    /**
+     * A pinned row's resting and hover colours — the `is_sticky` branch of
+     * `get_item_color`: `panel.overlay_background` / `panel.overlay_hover`
+     * (project_panel.rs:611-629). Marked and focused stay the shared colours.
+     */
+    val stickyBackground: Color,
+    val stickyHover: Color,
     /** `text` — what a marked row's plain name turns (items.rs:2177-2183). */
     val selectedText: Color,
 )
@@ -920,6 +1290,23 @@ private fun ProjectRow(
     onClick: () -> Unit,
     onContextMenu: (Offset) -> Unit,
     menu: @Composable () -> Unit,
+    /**
+     * The rendered depths of the rows above and below, deciding where each
+     * guide run really ends so its 4px end insets go there and nowhere else
+     * (PADDING_Y, project_panel.rs:7214). The defaults draw full-height
+     * slices — what a pinned sticky row wants, since Zed's sticky guide
+     * decoration has no insets (project_panel.rs:7280-7311).
+     */
+    prevRenderedDepth: Int = Int.MAX_VALUE,
+    nextRenderedDepth: Int = Int.MAX_VALUE,
+    /** Guide level painted `panel.indent_guide_active`, or -1 for none. */
+    activeGuideLevel: Int = -1,
+    /**
+     * A pinned copy of the row in the sticky stack: overlay colours instead
+     * of transparent-on-panel (`get_item_color`'s `is_sticky` branch,
+     * project_panel.rs:611-629); everything else renders identically.
+     */
+    isSticky: Boolean = false,
 ) {
     // Zed tints the *name* by git status and greys gitignored entries rather
     // than hiding them; "show" opts out of even that, for people who don't
@@ -944,11 +1331,14 @@ private fun ProjectRow(
     val isPressed by interaction.collectIsPressedAsState()
     // Zed's precedence: a marked row is `element.selected` even under the
     // pointer (bg_hover_color stays `marked` — project_panel.rs:5708-5711).
+    // A sticky row rests on `panel.overlay_background` and hovers to
+    // `panel.overlay_hover` (project_panel.rs:611-629); Zed gives it no
+    // pressed colour of its own, so the hover one stands in.
     val background = when {
         isSelected -> rowColours.selected
-        isPressed -> rowColours.pressed
-        hovered -> rowColours.hover
-        else -> Color.Transparent
+        isPressed -> if (isSticky) rowColours.stickyHover else rowColours.pressed
+        hovered -> if (isSticky) rowColours.stickyHover else rowColours.hover
+        else -> if (isSticky) rowColours.stickyBackground else Color.Transparent
     }
     // A long press has no coordinates of its own, so the last press is
     // remembered: the menu should open under the finger, not at the row's edge.
@@ -975,15 +1365,31 @@ private fun ProjectRow(
                     // 7212-7260). Drawn per row, they join into the same
                     // continuous runs the uniform-list decoration computes,
                     // because a guide at level ℓ spans exactly the contiguous
-                    // rows deeper than ℓ.
+                    // rows deeper than ℓ. A run's true ends pull in 4px
+                    // (PADDING_Y, project_panel.rs:7214): this row holds an
+                    // end of level ℓ's run exactly when its neighbour that way
+                    // no longer draws ℓ — the neighbours are the tree's, not
+                    // the viewport's, so a run cut off by the viewport edge
+                    // keeps running. Zed instead drops the inset at *both*
+                    // ends of a run that continues offscreen; see
+                    // [GuideEndInset] for why we don't.
+                    // The run under the selection is `panel.indent_guide_active`
+                    // (find_active_indent_guide, project_panel.rs:6724-6790).
                     val guide = IndentGuideWidth.toPx()
                     val step = IndentPerLevel.toPx()
                     val guideOffset = IndentGuideOffset.toPx()
+                    val endInset = GuideEndInset.toPx()
                     for (level in 0 until depth) {
+                        val topInset = if (prevRenderedDepth <= level) endInset else 0f
+                        val bottomInset = if (nextRenderedDepth <= level) endInset else 0f
                         drawRect(
-                            color = rowColours.indentGuide,
-                            topLeft = Offset(level * step + guideOffset, 0f),
-                            size = Size(guide, size.height),
+                            color = if (level == activeGuideLevel) {
+                                rowColours.indentGuideActive
+                            } else {
+                                rowColours.indentGuide
+                            },
+                            topLeft = Offset(level * step + guideOffset, topInset),
+                            size = Size(guide, size.height - topInset - bottomInset),
                         )
                     }
                     // The open file wears a 1px border with a 2px rail on the

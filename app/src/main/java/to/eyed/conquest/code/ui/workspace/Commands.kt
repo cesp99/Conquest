@@ -40,6 +40,10 @@ data class CommandContext(
     val canClone: Boolean,
     /** Whether the open file is one the preview can draw — Markdown or SVG. */
     val canPreview: Boolean = false,
+    /** Whether the navigation history has anywhere to go back to. */
+    val canGoBack: Boolean = false,
+    /** …or forward to, which only a GoBack can set up. */
+    val canGoForward: Boolean = false,
 )
 
 /** A command as the palette shows it. */

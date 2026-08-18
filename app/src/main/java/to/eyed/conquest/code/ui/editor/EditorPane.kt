@@ -45,6 +45,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEvent
@@ -231,6 +232,15 @@ fun EditorPane(
     val clipboard = LocalClipboardManager.current
     var paneCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
 
+    // Folding's two pointer states. Zed shows the unfolded chevrons for
+    // every foldable row while the pointer is over the gutter
+    // (`gutter_hovered`, crates/editor/src/fold.rs:57); the chip washes to
+    // `ghost_element.hover` under the pointer (fold_map.rs:68). Both are
+    // mouse affordances — touch gets the caret-row chevron and the chips
+    // regardless.
+    var gutterHovered by remember { mutableStateOf(false) }
+    var hoveredChipRow by remember { mutableStateOf(-1) }
+
     val actions = remember(state, clipboard, toolbar) {
         EditorActions(state, clipboard, toolbar) { paneCoordinates }
     }
@@ -305,6 +315,71 @@ fun EditorPane(
                         actions.hideToolbar()
                         state.addCaretAt(down.position, layoutForLine)
                         focusRequester.requestFocus()
+                    }
+                }
+                // Fold toggles: the chevron's column in the gutter and the
+                // "⋯" chip after a folded line. Claimed in the initial pass,
+                // like Alt+click above, so a tap on either never also moves
+                // the caret; touch and mouse arrive through the same press.
+                .pointerInput(state) {
+                    awaitEachGesture {
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        if (event.type != PointerEventType.Press) return@awaitEachGesture
+                        val down = event.changes.firstOrNull() ?: return@awaitEachGesture
+                        if (down.isConsumed) return@awaitEachGesture
+                        val position = down.position
+                        if (position.x < state.gutterWidthPx) {
+                            // Only the fold column folds; the rest of the
+                            // gutter keeps its caret-placing tap. The column
+                            // is 4 characters wide — comfortably past the
+                            // density decision's floor without inflating
+                            // anything.
+                            if (position.x < state.gutterWidthPx - state.gutterFoldColumnPx) {
+                                return@awaitEachGesture
+                            }
+                            val display =
+                                ((position.y + state.scrollY) / state.lineHeightPx).toInt()
+                            if (display < 0) return@awaitEachGesture
+                            val row = state.displayMap.bufferRowOf(display)
+                            // Zed's chevron: a folded row unfolds, a foldable
+                            // one folds (fold.rs:60-68). A row that is
+                            // neither lets the tap fall through untouched.
+                            if (state.toggleFoldAt(row)) down.consume()
+                            return@awaitEachGesture
+                        }
+                        val chipRow = foldChipRowAt(state, layoutCache, position)
+                        if (chipRow != null && state.unfoldRowsTouching(chipRow..chipRow)) {
+                            // Zed's placeholder unfolds on click
+                            // (editor.rs:1949-1961).
+                            down.consume()
+                        }
+                    }
+                }
+                // Hover, for the mouse: the gutter's chevrons and the chip's
+                // wash. Watched rather than composed because everything here
+                // is canvas-drawn.
+                .pointerInput(state) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            when (event.type) {
+                                PointerEventType.Move, PointerEventType.Enter -> {
+                                    val position = event.changes.firstOrNull()?.position
+                                    if (position != null) {
+                                        val overGutter = position.x < state.gutterWidthPx
+                                        if (gutterHovered != overGutter) gutterHovered = overGutter
+                                        val chip =
+                                            foldChipRowAt(state, layoutCache, position) ?: -1
+                                        if (hoveredChipRow != chip) hoveredChipRow = chip
+                                    }
+                                }
+                                PointerEventType.Exit -> {
+                                    if (gutterHovered) gutterHovered = false
+                                    if (hoveredChipRow >= 0) hoveredChipRow = -1
+                                }
+                                else -> {}
+                            }
+                        }
                     }
                 }
                 .pointerInput(state) {
@@ -390,12 +465,16 @@ fun EditorPane(
             val firstBufferRow = map.bufferRowOf(firstDisplay)
             val lastDisplay = state.lastDisplayRow(firstDisplay)
             val lastBufferRow = map.bufferRowOf((lastDisplay - 1).coerceAtLeast(firstDisplay))
-            val lines = state.linesWindow(firstBufferRow, lastBufferRow + 1)
-            val spans = state.spansWindow()
-            map.fillWindow(window, firstDisplay, lastDisplay, firstBufferRow, lines)
+            // Read the rows the frame *draws*, not the stretch of file
+            // between the first of them and the last: with a block folded on
+            // screen those two are as far apart as the block is long, and
+            // reading between them would put the whole fold on the UI thread
+            // of every keystroke. See [EditorState.visibleRows].
+            val rows = state.visibleRows(firstBufferRow, lastBufferRow)
+            map.fillWindow(window, firstDisplay, lastDisplay, firstBufferRow, rows::text)
             val textLeft = gutterWidth + state.textPaddingPx - scrollX
 
-            fun lineAt(row: Int): String = lines.getOrElse(row - firstBufferRow) { "" }
+            fun lineAt(row: Int): String = rows.text(row)
 
             /** The text this display row shows — the whole row when it fits. */
             fun textOf(i: Int): String {
@@ -411,11 +490,7 @@ fun EditorPane(
                 val row = window.bufferRow(i)
                 return layoutCache.layoutFor(
                     textOf(i),
-                    spansIn(
-                        spans.getOrElse(row - firstBufferRow) { emptyList() },
-                        window.startCol(i),
-                        window.endCol(i),
-                    ),
+                    spansIn(rows.spans(row), window.startCol(i), window.endCol(i)),
                 )
             }
 
@@ -542,8 +617,12 @@ fun EditorPane(
                             return@forEachIndexed
                         }
                         val color = if (index == state.activeMatch) active else match
-                        val rows = max(range.startRow, windowFirst)..min(range.endRow, windowLast)
-                        for (row in rows) {
+                        // Stepping by *visible* rows: a hit that spans a
+                        // folded block covers every row of it, and the frame
+                        // paints only the ones it drew.
+                        var row = max(range.startRow, windowFirst)
+                        val lastRow = min(range.endRow, windowLast)
+                        while (row <= lastRow) {
                             val line = lineAt(row)
                             val from = if (row == range.startRow) {
                                 range.startCol.coerceAtMost(line.length)
@@ -556,6 +635,7 @@ fun EditorPane(
                                 line.length
                             }
                             paintSpan(row, from, to, color, includeNewline = false, minWidth = 1f)
+                            row = map.nextVisibleRow(row + 1)
                         }
                     }
                 }
@@ -564,7 +644,13 @@ fun EditorPane(
                     val windowFirst = window.firstBufferRow()
                     val windowLast = window.lastBufferRow()
                     if (endRow < windowFirst || startRow > windowLast) return
-                    for (row in max(startRow, windowFirst)..min(endRow, windowLast)) {
+                    // Visible rows only, the same as the search hits above: a
+                    // selection is allowed to span a fold — it paints across
+                    // it — and a Ctrl+A on a folded file must not cost the
+                    // frame a row of work per row of the file.
+                    var row = max(startRow, windowFirst)
+                    val lastRow = min(endRow, windowLast)
+                    while (row <= lastRow) {
                         val line = lineAt(row)
                         val from = if (row == startRow) startCol.coerceAtMost(line.length) else 0
                         val to =
@@ -577,6 +663,7 @@ fun EditorPane(
                             includeNewline = row < endRow,
                             minWidth = 0f,
                         )
+                        row = map.nextVisibleRow(row + 1)
                     }
                 }
 
@@ -629,6 +716,45 @@ fun EditorPane(
                             topOf(i) + (lineHeight - layout.size.height) / 2f,
                         ),
                     )
+                }
+
+                // Fold chips: Zed's placeholder for a folded block — "⋯" in
+                // the buffer font, `text_placeholder` on
+                // `ghost_element_background`, `rounded_xs` (2px), washing to
+                // `ghost_element_hover` under the pointer
+                // (display_map/fold_map.rs:53-72); the editor's own
+                // placeholder adds the click that unfolds
+                // (editor.rs:1941-1963). Width is the glyph's, height the
+                // whole line — `size_full` of the inline slot.
+                if (state.folds.isNotEmpty()) {
+                    val chipLayout = layoutCache.layoutFor("⋯")
+                    val chipBg = theme.color("ghost_element.background", Color.Transparent)
+                    val chipHover = theme.color("ghost_element.hover", chipBg)
+                    val chipInk = theme.color("text.placeholder", theme.color("text.muted"))
+                    val chipRadius = CornerRadius(2.dp.toPx())
+                    for (i in 0 until window.size) {
+                        val row = window.bufferRow(i)
+                        if (state.foldStartingAt(row) == null) continue
+                        val line = lineAt(row)
+                        // Only the segment that carries the end of the text
+                        // carries the chip.
+                        if (min(window.endCol(i), line.length) < line.length) continue
+                        val x = leftOf(i) + layoutOf(i).size.width
+                        drawRoundRect(
+                            color = if (row == hoveredChipRow) chipHover else chipBg,
+                            topLeft = Offset(x, topOf(i)),
+                            size = Size(chipLayout.size.width.toFloat(), lineHeight),
+                            cornerRadius = chipRadius,
+                        )
+                        drawText(
+                            textLayoutResult = chipLayout,
+                            color = chipInk,
+                            topLeft = Offset(
+                                x,
+                                topOf(i) + (lineHeight - chipLayout.size.height) / 2f,
+                            ),
+                        )
+                    }
                 }
 
                 // Carets. The extra ones don't blink: a blinking column is hard
@@ -702,11 +828,76 @@ fun EditorPane(
                 drawText(
                     textLayoutResult = layout,
                     color = if (row == state.cursorRow) activeLineNumber else lineNumber,
+                    // The numbers end where the fold column begins — Zed's
+                    // `right_padding` of `em_width * 4` with folds on
+                    // (editor.rs:11758-11760), which is what keeps the
+                    // chevrons off the digits.
                     topLeft = Offset(
-                        gutterWidth - state.gutterPaddingPx - layout.size.width,
+                        gutterWidth - state.gutterFoldColumnPx - layout.size.width,
                         topOf(i) + (lineHeight - layout.size.height) / 2f,
                     ),
                 )
+            }
+
+            // Fold chevrons, centred in the gutter's fold column. Zed shows
+            // one on every folded row; an unfolded foldable row earns its
+            // chevron when the caret sits on it or the gutter is hovered
+            // (`render_crease_toggle`, fold.rs:57-73). The glyph is
+            // Disclosure's ChevronRight / ChevronDown at IconSize::Small in
+            // Color::Muted (ui/src/components/disclosure.rs:96-131), drawn
+            // here as two strokes because the canvas owns the gutter.
+            run {
+                val chevronInk = theme.color("text.muted")
+                val arm = 3.5.dp.toPx()
+                val stroke = 1.5.dp.toPx()
+                val cx = gutterWidth - state.gutterFoldColumnPx / 2f
+                for (i in 0 until window.size) {
+                    if (!window.isFirstSegment(i)) continue
+                    val row = window.bufferRow(i)
+                    val folded = state.foldStartingAt(row) != null
+                    if (!folded &&
+                        !(
+                            (row == state.cursorRow || gutterHovered) &&
+                                state.rowIsFoldable(row)
+                            )
+                    ) {
+                        continue
+                    }
+                    val cy = topOf(i) + lineHeight / 2f
+                    if (folded) {
+                        // ChevronRight: the block is closed.
+                        drawLine(
+                            color = chevronInk,
+                            start = Offset(cx - arm / 2f, cy - arm),
+                            end = Offset(cx + arm / 2f, cy),
+                            strokeWidth = stroke,
+                            cap = StrokeCap.Round,
+                        )
+                        drawLine(
+                            color = chevronInk,
+                            start = Offset(cx + arm / 2f, cy),
+                            end = Offset(cx - arm / 2f, cy + arm),
+                            strokeWidth = stroke,
+                            cap = StrokeCap.Round,
+                        )
+                    } else {
+                        // ChevronDown: the block is open and can close.
+                        drawLine(
+                            color = chevronInk,
+                            start = Offset(cx - arm, cy - arm / 2f),
+                            end = Offset(cx, cy + arm / 2f),
+                            strokeWidth = stroke,
+                            cap = StrokeCap.Round,
+                        )
+                        drawLine(
+                            color = chevronInk,
+                            start = Offset(cx, cy + arm / 2f),
+                            end = Offset(cx + arm, cy - arm / 2f),
+                            strokeWidth = stroke,
+                            cap = StrokeCap.Round,
+                        )
+                    }
+                }
             }
 
             // Who last touched the caret's line, after the end of it — Zed's
@@ -843,6 +1034,10 @@ private fun EditorActionRow(
         ActionKey("del line", act { state.deleteLines() })
         ActionKey("join", act { state.joinLines() })
         ActionKey("//", act { state.toggleComment() })
+        // Folding, reachable while the keyboard covers the gutter — the
+        // convention that nothing here is keyboard-only, in both directions.
+        ActionKey("fold", act { state.foldAtCarets() })
+        ActionKey("unfold", act { state.unfoldAtCarets() })
     }
 }
 
@@ -892,6 +1087,64 @@ private fun selectionHandles(
         return Offset(x, (display + 1) * state.lineHeightPx - state.scrollY)
     }
     return at(range.startRow, range.startCol) to at(range.endRow, range.endCol)
+}
+
+/**
+ * Pane-local bounds of the "⋯" chip on [row], or null when the row heads no
+ * fold. The chip sits immediately after the end of the row's text on the
+ * segment that carries it, exactly where Zed splices the placeholder into
+ * the line (the fold starts at the line's end — display_map.rs:2318-2320).
+ * One function feeds both the draw pass and the hit tests, so the pixels
+ * and the pointer can never disagree.
+ */
+private fun foldChipBounds(
+    state: EditorState,
+    layoutCache: TextLayoutCache,
+    row: Int,
+): Rect? {
+    if (state.foldStartingAt(row) == null) return null
+    val line = state.line(row)
+    val wrap = state.displayMap.wrapOf(line)
+    val segment = wrap.segmentCount - 1
+    val start = wrap.startOf(segment)
+    val layout = layoutCache.layoutFor(
+        state.segmentText(line, start, line.length),
+        spansIn(state.spansFor(row), start, if (wrap.wraps) line.length else Int.MAX_VALUE),
+    )
+    val indentPx = if (segment > 0) wrap.indentColumns * state.charWidthPx else 0f
+    val x = state.gutterWidthPx + state.textPaddingPx - state.effectiveScrollX + indentPx +
+        layout.size.width
+    val display = state.displayMap.displayRowOf(row) + segment
+    val top = display * state.lineHeightPx - state.scrollY
+    val chipWidth = layoutCache.layoutFor("⋯").size.width.toFloat()
+    return Rect(Offset(x, top), Size(chipWidth, state.lineHeightPx))
+}
+
+/**
+ * The fold whose chip is under [position], or null. The hit box grows
+ * sideways by half a line height — the chip is a glyph-sized target, and the
+ * density decision's answer to that is an invisible expansion, not a bigger
+ * chip.
+ */
+private fun foldChipRowAt(
+    state: EditorState,
+    layoutCache: TextLayoutCache,
+    position: Offset,
+): Int? {
+    if (state.folds.isEmpty()) return null
+    if (state.lineHeightPx <= 0f) return null
+    val display = ((position.y + state.scrollY) / state.lineHeightPx).toInt()
+    if (display < 0) return null
+    val row = state.displayMap.bufferRowOf(display)
+    val bounds = foldChipBounds(state, layoutCache, row) ?: return null
+    val slop = state.lineHeightPx / 2f
+    return if (position.x >= bounds.left - slop && position.x <= bounds.right + slop &&
+        position.y >= bounds.top && position.y < bounds.bottom
+    ) {
+        row
+    } else {
+        null
+    }
 }
 
 /**
@@ -987,6 +1240,35 @@ private fun handleEditorKey(
     val alt = event.isAltPressed
     val shift = event.isShiftPressed
 
+    // The second stroke of a pending `ctrl-k` chord, resolved before
+    // anything else can eat the key. Zed spells FoldAll and UnfoldAll as
+    // two-stroke chords in its Linux keymap: `ctrl-k ctrl-0` and
+    // `ctrl-k ctrl-j` (assets/keymaps/default-linux.json:589-590). The
+    // prefix waits through the modifier keys' own down events, is spent by
+    // whatever real key comes next, and an unrecognised second stroke then
+    // means what it always meant.
+    if (state.pendingChordCtrlK) {
+        val isModifier = event.key == Key.CtrlLeft || event.key == Key.CtrlRight ||
+            event.key == Key.ShiftLeft || event.key == Key.ShiftRight ||
+            event.key == Key.AltLeft || event.key == Key.AltRight
+        if (!isModifier) {
+            state.pendingChordCtrlK = false
+            if (ctrl && !shift && !alt) {
+                when (event.key) {
+                    Key.Zero -> {
+                        state.foldAllRows()
+                        return true
+                    }
+                    Key.J -> {
+                        state.unfoldAllRows()
+                        return true
+                    }
+                    else -> {}
+                }
+            }
+        }
+    }
+
     // Alt chords first: the Ctrl block below would otherwise swallow the
     // Ctrl+Alt+Shift twins before their Alt half was ever looked at.
     if (alt && (event.key == Key.DirectionUp || event.key == Key.DirectionDown)) {
@@ -1022,14 +1304,32 @@ private fun handleEditorKey(
             Key.D -> state.selectNextOccurrence()
             Key.L -> shift && state.selectAllOccurrences()
             Key.K -> {
-                if (shift) state.deleteLines()
-                shift
+                if (shift) {
+                    state.deleteLines()
+                } else {
+                    // Zed's `ctrl-k` chord prefix; the second stroke is
+                    // matched at the top of this function.
+                    state.pendingChordCtrlK = true
+                }
+                true
             }
             Key.J -> {
                 if (shift) state.joinLines()
                 shift
             }
             Key.Slash -> state.toggleComment()
+            // Zed's fold pair: `ctrl-{` is ctrl-shift-[ on the keyboards
+            // that reach this handler, and `ctrl-}` its twin
+            // (editor::Fold / editor::UnfoldLines,
+            // assets/keymaps/default-linux.json:575-576).
+            Key.LeftBracket -> {
+                if (shift) state.foldAtCarets()
+                shift
+            }
+            Key.RightBracket -> {
+                if (shift) state.unfoldAtCarets()
+                shift
+            }
             // Ctrl+arrow is word-wise; Ctrl+Home/End is the whole document.
             Key.DirectionLeft -> {
                 state.moveByWord(forward = false, extend = shift)

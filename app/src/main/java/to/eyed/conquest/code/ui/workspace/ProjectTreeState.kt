@@ -308,3 +308,170 @@ class ProjectTreeState(
         const val MAX_EXPANDED = 2_000
     }
 }
+
+/**
+ * The row Zed's sticky headers are computed *for*: the first visible row that
+ * is guaranteed to sit below the pinned stack of its own ancestors. The stack
+ * itself is that row's ancestor chain.
+ *
+ * [drifting] is the push-off: the anchor is the last row of the deepest pinned
+ * directory and is about to slide under the stack, so the stack's last row
+ * rides up with the anchor's bottom edge instead of sitting in its slot
+ * (`StickyAnchor.drifting`, ui/src/components/sticky_items.rs:279-283).
+ */
+internal data class StickyAnchor(
+    /** Index into the visible depths handed to [findStickyAnchor]. */
+    val localIndex: Int,
+    val drifting: Boolean,
+)
+
+/**
+ * Zed's `find_sticky_anchor` (ui/src/components/sticky_items.rs:285-316), on
+ * our depth basis: walk the visible rows from the top; a row whose depth is
+ * smaller than its position sits below a fully-formed stack of its ancestors,
+ * so it anchors. Before that, a row whose *next* sibling outdents by exactly
+ * one is the last child of the deepest pinned directory — it anchors at its
+ * own slot (`depth == ix`), or one slot early and still drifting
+ * (`depth == ix + 1`).
+ *
+ * [visibleDepths] are the flattened rows' [ProjectTreeRow.depth]s from the
+ * first visible row down.
+ *
+ * **The basis is one lower than Zed's, and that is not cosmetic.** Zed's list
+ * begins with the worktree root at depth 0, so a top-level entry is depth 1
+ * (`calculate_depth_and_difference` returns `depth + 1` for any entry whose
+ * parent is visible, and the root is visible — project_panel.rs:5529-5553),
+ * and the stack pinned for a row of depth `d` is `d` rows *including* that
+ * root. Ours holds the root out of the list entirely — it is the permanent
+ * header above it — so a top-level row is depth 0 and the stack for depth `d`
+ * is `d` rows *without* the root. Every comparison below is between a row's
+ * depth and its slot, and the stack covering those slots is shorter by the
+ * same one row, so the geometry — which slots the stack covers, when its
+ * deepest row starts drifting — comes out where Zed's does.
+ *
+ * What it costs is the choice of anchor. Fed the same viewport, this picks the
+ * state Zed reaches one scroll row earlier, because Zed's root row occupies a
+ * list slot that ours does not. At a fold boundary that shows: with rows `a/`,
+ * `a/b/`, two files, `a/c/`, three files, and the viewport starting at the
+ * first file, this pins `a` and `a/b` (drifting) over the two files they own,
+ * while Zed pins root, `a` and `a/c` and covers `a/c`'s own row with the pin.
+ * Feeding `depth + 1` here would buy Zed's choice and break the geometry that
+ * makes it work: the stack we can draw is one row shorter than Zed's, so its
+ * deepest pin would land one slot above the real row it is meant to cover, and
+ * the panel would show that directory twice.
+ */
+internal fun findStickyAnchor(visibleDepths: List<Int>): StickyAnchor? {
+    for (ix in visibleDepths.indices) {
+        val depth = visibleDepths[ix]
+        if (depth < ix) return StickyAnchor(ix, drifting = false)
+        val nextDepth = visibleDepths.getOrNull(ix + 1) ?: continue
+        if (nextDepth + 1 == depth && (depth == ix || depth == ix + 1)) {
+            return StickyAnchor(ix, drifting = depth == ix + 1)
+        }
+    }
+    return null
+}
+
+/**
+ * The rows that pin for [anchorIndex]: its ancestor directories, outermost
+ * first — Zed's `sticky_parents` (project_panel.rs:6824-6846). Zed rebuilds
+ * the chain from path prefixes; the flattened list makes it a backward walk,
+ * because the parent of a row at depth `d` is the nearest earlier row at depth
+ * `d − 1` (the flatten is a strict depth-first walk, so nothing shallower can
+ * intervene). One pass, integer compares only.
+ */
+internal fun stickyAncestorsOf(rows: List<ProjectTreeRow>, anchorIndex: Int): List<Int> {
+    val anchor = rows.getOrNull(anchorIndex) ?: return emptyList()
+    var want = anchor.depth - 1
+    if (want < 0) return emptyList()
+    val found = ArrayList<Int>(anchor.depth)
+    var i = anchorIndex - 1
+    while (i >= 0 && want >= 0) {
+        if (rows[i].depth <= want) {
+            found += i
+            want = rows[i].depth - 1
+        }
+        i--
+    }
+    found.reverse()
+    return found
+}
+
+/**
+ * The push-off: how far up the deepest pinned row has been pushed, in pixels,
+ * and never positive.
+ *
+ * Zed's `drifting_y_offset` (sticky_items.rs:179-186): while [drifting], the
+ * bottom of the stack is held to the bottom edge of the anchor row — the last
+ * child of the deepest pinned directory — so the stack slides out continuously
+ * with the scroll instead of swapping when the boundary passes. It is 0 while
+ * the anchor still sits in the stack's last slot, and goes negative as the
+ * anchor scrolls up past it.
+ *
+ * [anchorOffsetPx] is the anchor row's top in viewport coordinates and
+ * [rowHeightPx] the measured row pitch, so `offset + rowHeight` is Zed's
+ * `anchor_top - scroll_top` and `rowHeight * pinnedCount` its
+ * `sticky_area_height`.
+ */
+internal fun stickyDriftPx(
+    anchorOffsetPx: Int,
+    rowHeightPx: Int,
+    pinnedCount: Int,
+    drifting: Boolean,
+): Int {
+    if (!drifting) return 0
+    return (anchorOffsetPx + rowHeightPx - rowHeightPx * pinnedCount).coerceAtMost(0)
+}
+
+/**
+ * The indent-guide run the selection lights up, in `panel.indent_guide_active`.
+ *
+ * Zed's `find_active_indent_guide` (project_panel.rs:6724-6790): walk up from
+ * the selected entry to the nearest *expanded* directory — the selection
+ * itself when it is one — and the active guide is the one its children hang
+ * from. Every ancestor of a visible row is expanded by construction, so the
+ * walk here is one step: the row, else its parent, else the root — whose run
+ * is the whole list, exactly as Zed's worktree root is the expanded ancestor
+ * of a top-level selection.
+ *
+ * [level] is in the panel's rendered guide coordinates (a row at
+ * [ProjectTreeRow.depth] `d` draws levels `0..d`, being drawn one level in
+ * from the root row). Recomputed only when the selection or the tree's shape
+ * moves, never per frame.
+ */
+internal data class ActiveGuideRun(
+    val level: Int,
+    /** First and last row index (inclusive) the active run spans. */
+    val first: Int,
+    val last: Int,
+)
+
+internal fun activeGuideRun(
+    rows: List<ProjectTreeRow>,
+    selected: String?,
+    isExpanded: (String) -> Boolean,
+): ActiveGuideRun? {
+    if (selected == null) return null
+    val index = rows.indexOfFirst { it.entry.path == selected }
+    if (index < 0) return null
+    val row = rows[index]
+    val dirIndex: Int
+    if (row.entry.isDir && isExpanded(row.entry.path)) {
+        dirIndex = index
+    } else {
+        if (row.depth == 0) {
+            // The parent is the root row above the list: its run is every row.
+            return ActiveGuideRun(level = 0, first = 0, last = rows.lastIndex)
+        }
+        var i = index - 1
+        while (i >= 0 && rows[i].depth >= row.depth) i--
+        if (i < 0) return null
+        dirIndex = i
+    }
+    val dirDepth = rows[dirIndex].depth
+    var last = dirIndex
+    while (last < rows.lastIndex && rows[last + 1].depth > dirDepth) last++
+    // An expanded directory with nothing under it hangs no guide.
+    if (last == dirIndex) return null
+    return ActiveGuideRun(level = dirDepth + 1, first = dirIndex + 1, last = last)
+}

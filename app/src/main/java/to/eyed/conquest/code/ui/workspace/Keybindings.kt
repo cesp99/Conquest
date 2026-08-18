@@ -75,6 +75,22 @@ enum class WorkspaceCommand(
     NextTab("pane::ActivateNextItem", isAvailable = { it.tabCount > 1 }),
     PreviousTab("pane::ActivatePreviousItem", isAvailable = { it.tabCount > 1 }),
 
+    /**
+     * Back along the navigation history — the tab and place you were before.
+     * The tab bar's `←` is the same command with a mouse.
+     */
+    GoBack("pane::GoBack", isAvailable = { it.canGoBack }),
+
+    /** Forward again, replaying what GoBack stepped out of. */
+    GoForward("pane::GoForward", isAvailable = { it.canGoForward }),
+
+    /**
+     * Create a file in the project and open it — Zed's `workspace::NewFile`,
+     * which the tab bar's `+` leads with (pane.rs:4272). The file lands at
+     * the project root unless the name typed is a path.
+     */
+    NewFile("workspace::NewFile", isAvailable = { it.hasProject }),
+
     /** Close every other tab. Pinned ones survive, as in Zed. */
     CloseOtherTabs("pane::CloseOtherItems", isAvailable = { it.tabCount > 1 }),
 
@@ -198,10 +214,11 @@ data class Chord(
     /** True: Shift must be held. False: it must not be. Null: either. */
     val shift: Boolean? = false,
     /**
-     * Whether Alt must be held. Zed uses it for exactly one thing here —
-     * `ctrl-alt-b` for the right dock — and every other chord in this table
-     * requires it *not* to be, so an Alt chord bound by the IME or by a
-     * desktop shell cannot be swallowed by accident.
+     * Whether Alt must be held. Zed spends it sparingly here — `ctrl-alt-b`
+     * for the right dock, `ctrl-alt-minus` for the navigation history — and
+     * every other chord in this table requires it *not* to be, so an Alt
+     * chord bound by the IME or by a desktop shell cannot be swallowed by
+     * accident.
      */
     val alt: Boolean = false,
 ) {
@@ -301,6 +318,36 @@ private val BINDINGS: List<Binding> = listOf(
     Binding(
         WorkspaceCommand.PreviousTab,
         Chord(AndroidKeyEvent.KEYCODE_TAB, "Tab", shift = true),
+        InWorkspace,
+    ),
+    // Zed's Linux chords for the navigation history, exactly as the keymap
+    // writes them: `ctrl-alt--` is GoBack and `ctrl-alt-_` — the same key
+    // with Shift — is GoForward (default-linux.json:512-514). Alt chords on
+    // the minus key survive AltGr (see the note in `workspaceCommandFor`)
+    // because Zed ships these on Linux layouts unchanged. The keymap's other
+    // spellings, the mouse thumb buttons `back`/`forward`, have no Android
+    // key event to match. Workspace-only: `Alt+anything` belongs to the
+    // shell while a terminal has the keyboard.
+    Binding(
+        WorkspaceCommand.GoBack,
+        Chord(AndroidKeyEvent.KEYCODE_MINUS, "-", shift = false, alt = true),
+        InWorkspace,
+    ),
+    Binding(
+        WorkspaceCommand.GoForward,
+        Chord(AndroidKeyEvent.KEYCODE_MINUS, "-", shift = true, alt = true),
+        InWorkspace,
+    ),
+    // Zed's `ctrl-n` (default-linux.json:654). Shift is ignored like Save's,
+    // until something claims the twin (Zed spends it on the new *window*,
+    // which an Android app does not have). Workspace-only: in a shell
+    // `Ctrl+N` is readline's next-history.
+    Binding(
+        WorkspaceCommand.NewFile,
+        // `shift = false`, not "either": `Ctrl+Shift+N` is the project
+        // panel's new-folder chord, and a workspace binding that matched it
+        // too would kill it from above (the preview pass runs first).
+        Chord(AndroidKeyEvent.KEYCODE_N, "N", shift = false),
         InWorkspace,
     ),
     // Zed's own `ctrl-shift-t`. The rest of the tab commands (close others,
@@ -516,11 +563,12 @@ fun workspaceCommandFor(event: KeyEvent, focus: Focus = Focus.Workspace): Worksp
 /** As above, for callers holding an Android key event (the terminal view). */
 fun workspaceCommandFor(event: AndroidKeyEvent, focus: Focus): WorkspaceCommand? {
     if (event.action != AndroidKeyEvent.ACTION_DOWN || !event.isCtrlPressed) return null
-    // Alt is matched by the chord rather than refused outright, and every
-    // chord but one requires it *not* to be held: on European layouts AltGr
+    // Alt is matched by the chord rather than refused outright, and nearly
+    // every chord requires it *not* to be held: on European layouts AltGr
     // arrives as Ctrl+Alt, and a chord meant to type `@` or `[` must not run a
-    // command. The exception is `Ctrl+Alt+B` for the right dock, which is
-    // Zed's own binding and which no Latin layout puts a character on.
+    // command. The exceptions are `Ctrl+Alt+B` for the right dock and the
+    // navigation history's `Ctrl+Alt+Minus` pair — Zed's own Linux bindings,
+    // on keys no common Latin layout hangs a character on.
     return BINDINGS
         .firstOrNull { focus in it.scope && it.chord.matches(event) }
         ?.command

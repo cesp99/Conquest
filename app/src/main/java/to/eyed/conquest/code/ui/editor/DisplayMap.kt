@@ -1,5 +1,6 @@
 package to.eyed.conquest.code.ui.editor
 
+import kotlin.math.max
 import kotlin.math.min
 
 /**
@@ -223,6 +224,132 @@ internal object SoftWrap {
 }
 
 /**
+ * One folded block of the file: rows `startRow + 1..endRow` are hidden, and
+ * [startRow] — the line the block hangs off — stays visible with the "⋯"
+ * chip after its text.
+ *
+ * Zed's fold is a range from the *end* of the first line into the block
+ * (crates/editor/src/display_map.rs:2317-2426), anchored in the buffer so it
+ * rides through edits. This is the same fold flattened to whole rows, which
+ * is what a row-based renderer can hide; the one look this loses is the
+ * closing bracket joining the chip's own line, and that is recorded where
+ * [IndentFolds.rangeAt] decides the end row.
+ */
+internal data class FoldRange(val startRow: Int, val endRow: Int)
+
+/**
+ * Which rows a fold covers, computed from indentation alone — a port of
+ * Zed's indent-based crease logic, which is what Zed itself uses whenever a
+ * language server has not supplied folding ranges
+ * (`crease_for_buffer_row`, crates/editor/src/display_map.rs:2317-2430).
+ *
+ * Everything here reads lines through a `(Int) -> String` accessor and
+ * carries no state, so the whole of it runs on the host against plain
+ * strings — which is where its tests live.
+ */
+internal object IndentFolds {
+
+    /**
+     * Zed's `LineIndent::raw_len`: the *count* of leading tab and space
+     * characters, not their expanded width (crates/text/src/text.rs:706-708).
+     * Zed compares raw lengths when it walks a block's rows, so we do too.
+     */
+    fun indentOf(text: String): Int {
+        for (i in text.indices) {
+            if (text[i] != ' ' && text[i] != '\t') return i
+        }
+        return text.length
+    }
+
+    /** Zed's `is_line_blank`: nothing on the row but whitespace. */
+    fun isBlank(text: String): Boolean {
+        for (char in text) {
+            if (char != ' ' && char != '\t') return false
+        }
+        return true
+    }
+
+    /**
+     * Whether [row] hangs a deeper-indented block under itself — Zed's
+     * `starts_indent` (crates/editor/src/display_map.rs:2268-2292): the
+     * first non-blank row after it is indented further. The last row of the
+     * file never does, and a blank row never does.
+     *
+     * [scanLimit] bounds the walk over blank rows; Zed's walk is unbounded,
+     * but the gutter asks this once per visible row per frame and a file
+     * that is ten thousand blank lines should not make it pay for them.
+     * Callers that decide a *fold* rather than a chevron pass no limit.
+     */
+    fun startsIndent(
+        rowCount: Int,
+        row: Int,
+        line: (Int) -> String,
+        scanLimit: Int = Int.MAX_VALUE,
+    ): Boolean {
+        if (row < 0 || row >= rowCount - 1) return false
+        val text = line(row)
+        if (isBlank(text)) return false
+        val indent = indentOf(text)
+        val last = if (scanLimit >= rowCount - row) rowCount - 1 else row + scanLimit
+        for (next in row + 1..last) {
+            val nextText = line(next)
+            if (isBlank(nextText)) continue
+            return indentOf(nextText) > indent
+        }
+        return false
+    }
+
+    /**
+     * The fold hanging off [row], or null when it starts none.
+     *
+     * The shape is Zed's, step for step (display_map.rs:2355-2426): walk
+     * forward to the first non-blank row indented at or shallower than
+     * [row] — the closing row — then end the fold in front of it. When the
+     * closing row opens with one of the language's closing brackets
+     * (`closing_bracket_indent_len`, display_map.rs:2294-2314) the blank
+     * rows before it fold away with the block; otherwise they stay outside
+     * it (`last_non_blank_row`, display_map.rs:2400-2417).
+     *
+     * Two of Zed's refinements need the syntax tree and are deliberately
+     * not here: unindented rows *inside* a multi-line string or comment do
+     * not close a fold for Zed (display_map.rs:2380-2393), and Zed joins the
+     * closing bracket onto the chip's own display line rather than leaving
+     * it on the next one (display_map.rs:2408-2412). Both are listed in the
+     * feature's deviations.
+     */
+    fun rangeAt(
+        rowCount: Int,
+        row: Int,
+        line: (Int) -> String,
+        closesBlock: (String) -> Boolean,
+    ): FoldRange? {
+        if (!startsIndent(rowCount, row, line)) return null
+        val startIndent = indentOf(line(row))
+        var closingRow = -1
+        for (r in row + 1 until rowCount) {
+            val text = line(r)
+            if (!isBlank(text) && indentOf(text) <= startIndent) {
+                closingRow = r
+                break
+            }
+        }
+        val endRow = when {
+            closingRow < 0 -> lastNonBlank(rowCount - 1, row, line)
+            closesBlock(line(closingRow).substring(indentOf(line(closingRow)))) -> closingRow - 1
+            else -> lastNonBlank(closingRow - 1, row, line)
+        }
+        return if (endRow > row) FoldRange(row, endRow) else null
+    }
+
+    /** Zed's `last_non_blank_row`: back up over blanks, never past [floor]. */
+    private fun lastNonBlank(from: Int, floor: Int, line: (Int) -> String): Int {
+        var row = from
+        while (row > floor && isBlank(line(row))) row--
+        return row
+    }
+}
+
+/**
  * One frame's worth of display rows, as parallel arrays reused between
  * frames.
  *
@@ -334,7 +461,8 @@ internal class DisplayWindow {
  * block is measured — one batched read of its text, then [SoftWrap.wrap] over
  * each row — the first time a query lands in it, and not again until an edit
  * invalidates it. Blocks nobody has visited are *estimated* at one display
- * row per buffer row, so the document has a height from the first frame;
+ * row per buffer row it does not hide — the fold stage's answer is exact and
+ * costs no text at all — so the document has a height from the first frame;
  * visiting one replaces the estimate with the truth, which can only make the
  * document taller and therefore never moves anything already above the
  * viewport.
@@ -355,7 +483,7 @@ internal class DisplayMap(
         private set
 
     /** True while every buffer row is exactly one display row. */
-    val isIdentity: Boolean get() = wrapColumns <= 0
+    val isIdentity: Boolean get() = wrapColumns <= 0 && hiddenStarts.isEmpty()
 
     /**
      * Set the wrap width (0 turns wrapping off) and the tab width. Everything
@@ -369,6 +497,85 @@ internal class DisplayMap(
         rows = -1
         forgetWraps()
         if (!isIdentity) ensureShape()
+    }
+
+    // ---- Folds -----------------------------------------------------------
+    //
+    // The second client this map was built for: where soft wrap turns one
+    // buffer row into several display rows, a fold turns several into none.
+    // Both are the same question — how tall is this row on screen — so the
+    // fold stage is a height of zero fed into the very same block index the
+    // wrapper fills, and every query (displayRowOf, bufferRowOf, fillWindow)
+    // composes the two for free. Zed layers it the same way: FoldMap and
+    // WrapMap are successive coordinate spaces of one DisplayMap
+    // (crates/editor/src/display_map.rs:24-42).
+
+    /**
+     * The hidden rows, as sorted disjoint inclusive ranges that never touch —
+     * the *merged* interiors of the folds, not the folds themselves. The
+     * editor keeps the fold list (nested folds and all, the way Zed's fold
+     * map holds overlapping creases); this map only needs to know which rows
+     * are not on screen.
+     */
+    private var hiddenStarts = IntArray(0)
+    private var hiddenEnds = IntArray(0)
+
+    val hasFolds: Boolean get() = hiddenStarts.isNotEmpty()
+
+    /**
+     * Replace the hidden-row set. Everything measured is thrown away: every
+     * block's height depended on which of its rows were hidden. Folding is a
+     * command, not a keystroke, so the re-measure is paid where the user can
+     * see why.
+     */
+    fun setFoldedRows(ranges: List<IntRange>) {
+        val starts = IntArray(ranges.size) { ranges[it].first }
+        val ends = IntArray(ranges.size) { ranges[it].last }
+        if (starts.contentEquals(hiddenStarts) && ends.contentEquals(hiddenEnds)) return
+        hiddenStarts = starts
+        hiddenEnds = ends
+        rows = -1
+        if (!isIdentity) ensureShape()
+    }
+
+    /** Whether buffer row [row] is inside a fold and off the screen. */
+    fun isRowHidden(row: Int): Boolean {
+        val i = hiddenRangeBefore(row)
+        return i >= 0 && row <= hiddenEnds[i]
+    }
+
+    /**
+     * The nearest visible row at or before [row]. Always exists for a row
+     * that is in the buffer: a fold hides rows *after* its own first line,
+     * so row 0 is never hidden, and the merged ranges never touch — the row
+     * in front of one is visible by construction.
+     */
+    fun prevVisibleRow(row: Int): Int {
+        val at = row.coerceAtLeast(0)
+        val i = hiddenRangeBefore(at)
+        return if (i >= 0 && at <= hiddenEnds[i]) hiddenStarts[i] - 1 else at
+    }
+
+    /**
+     * The nearest visible row at or after [row] — which can be past the end
+     * of the buffer when a fold runs to it, so callers check the answer
+     * against their row count.
+     */
+    fun nextVisibleRow(row: Int): Int {
+        val at = row.coerceAtLeast(0)
+        val i = hiddenRangeBefore(at)
+        return if (i >= 0 && at <= hiddenEnds[i]) hiddenEnds[i] + 1 else at
+    }
+
+    /** Index of the last hidden range starting at or before [row], or -1. */
+    private fun hiddenRangeBefore(row: Int): Int {
+        var low = 0
+        var high = hiddenStarts.size
+        while (low < high) {
+            val mid = (low + high) ushr 1
+            if (hiddenStarts[mid] <= row) low = mid + 1 else high = mid
+        }
+        return low - 1
     }
 
     // ---- Remembered breaks -----------------------------------------------
@@ -460,13 +667,44 @@ internal class DisplayMap(
 
     private fun rowsIn(block: Int): Int = min(BLOCK_ROWS, rows - block * BLOCK_ROWS)
 
+    /**
+     * What [block] is worth before anyone has measured it: one display row
+     * per row of it a fold does not hide.
+     *
+     * The hidden ranges are exact and already installed by the time anything
+     * asks — [setFoldedRows] hands them over before it reshapes — so guessing
+     * a folded block's rows are on screen would be guessing against something
+     * this map already knows. It is the difference between a document that is
+     * the right height the moment a block folds and one that is the right
+     * height a frame later, and it is what lets [measureWindow] stop at the
+     * bottom of the viewport instead of walking a fold to get there.
+     *
+     * With nothing folded this is [rowsIn] and the walk below never runs,
+     * which is the shape every unfolded pane is in.
+     */
+    private fun estimateOf(block: Int): Int {
+        val count = rowsIn(block)
+        if (hiddenStarts.isEmpty()) return count
+        val start = block * BLOCK_ROWS
+        val end = start + count
+        var hidden = 0
+        var i = hiddenRangeBefore(start).coerceAtLeast(0)
+        while (i < hiddenStarts.size && hiddenStarts[i] < end) {
+            val from = max(hiddenStarts[i], start)
+            val to = min(hiddenEnds[i], end - 1)
+            if (to >= from) hidden += to - from + 1
+            i++
+        }
+        return count - hidden
+    }
+
     private fun ensureShape() {
         val count = rowCount().coerceAtLeast(1)
         if (count == rows) return
         rows = count
         blockCount = (count + BLOCK_ROWS - 1) / BLOCK_ROWS
         measured = arrayOfNulls(blockCount)
-        blockValue = IntArray(blockCount) { rowsIn(it) }
+        blockValue = IntArray(blockCount) { estimateOf(it) }
         rebuildTree()
     }
 
@@ -527,20 +765,27 @@ internal class DisplayMap(
      * Measure [block] if it has not been, and return the running display-row
      * count of its rows.
      *
-     * Measuring only ever makes a block taller — a row is at least one
-     * display row — so the prefix in front of it is untouched, and the query
-     * that asked for it stays valid without a second pass.
+     * Measuring only ever makes a block taller — a visible row is at least
+     * one display row and a hidden one is counted at none by [estimateOf]
+     * already — so anything above the viewport stays put. The walkers over
+     * this index still re-resolve rather than assume ([bufferRowOf]'s loop,
+     * [measureWindow]): the estimate is a floor, not a promise.
+     *
+     * A block a fold hides entirely is worth nothing and is not read at all,
+     * which is what keeps a folded file's blocks off the bridge.
      */
     private fun blockPrefix(block: Int): IntArray {
         measured[block]?.let { return it }
         val start = block * BLOCK_ROWS
         val count = rowsIn(block)
         val prefix = IntArray(count + 1)
-        val texts = textOfRows(start, start + count)
+        val texts = if (estimateOf(block) == 0) emptyList() else textOfRows(start, start + count)
         var sum = 0
         for (i in 0 until count) {
             prefix[i] = sum
-            sum += segmentCountOf(texts.getOrElse(i) { "" })
+            // A folded row is on no display row at all; its height is the
+            // fold stage's whole contribution to this index.
+            if (!isRowHidden(start + i)) sum += segmentCountOf(texts.getOrElse(i) { "" })
         }
         prefix[count] = sum
         measured[block] = prefix
@@ -576,7 +821,7 @@ internal class DisplayMap(
         for (block in first..last) {
             if (measured[block] == null) continue
             measured[block] = null
-            blockValue[block] = rowsIn(block)
+            blockValue[block] = estimateOf(block)
             changed = true
         }
         // One O(blocks) pass rather than a Fenwick update per block: it is a
@@ -602,7 +847,7 @@ internal class DisplayMap(
         rows = count
         blockCount = (count + BLOCK_ROWS - 1) / BLOCK_ROWS
         measured = arrayOfNulls(blockCount)
-        blockValue = IntArray(blockCount) { rowsIn(it) }
+        blockValue = IntArray(blockCount) { estimateOf(it) }
         for (block in 0 until min(keptBlocks, blockCount)) {
             val prefix = old.getOrNull(block) ?: continue
             // A block only keeps its measurement if it still holds the same
@@ -684,6 +929,10 @@ internal class DisplayMap(
             val mid = (low + high + 1) ushr 1
             if (prefix[mid] <= within) low = mid else high = mid - 1
         }
+        // The search takes the *last* row whose prefix fits, and a hidden
+        // row's prefix equals the prefix of the visible row that follows it
+        // — so a run of folded rows always loses the tie to the visible row
+        // after them, and the answer is never a row that is not on screen.
         return (block * BLOCK_ROWS + low).coerceIn(0, rows - 1)
     }
 
@@ -710,6 +959,27 @@ internal class DisplayMap(
         last: Int,
         firstBufferRow: Int,
         lines: List<String>,
+    ) = fillWindow(window, first, last, firstBufferRow) { row ->
+        lines.getOrElse(row - firstBufferRow) { "" }
+    }
+
+    /**
+     * The same, reading each row's text through [textOf] rather than out of
+     * one contiguous list.
+     *
+     * Which is what a folded pane needs: the rows a frame draws are not one
+     * stretch of the file once a block is folded — the first and the last of
+     * them can be a whole file apart — so the caller reads them in the runs
+     * they actually form and answers here per row. Nothing in this loop is
+     * allowed to depend on the distance between [firstBufferRow] and the
+     * bottom of the window.
+     */
+    fun fillWindow(
+        window: DisplayWindow,
+        first: Int,
+        last: Int,
+        firstBufferRow: Int,
+        textOf: (Int) -> String,
     ) {
         val count = (last - first).coerceAtLeast(0)
         window.reset(first, count)
@@ -727,7 +997,15 @@ internal class DisplayMap(
         var display = displayRowOf(firstBufferRow)
         var row = firstBufferRow
         while (display < last && row < rows) {
-            val text = lines.getOrElse(row - firstBufferRow) { "" }
+            // Folded rows are simply not there: they cost the window nothing,
+            // which is the whole fold feature from the renderer's side, and
+            // they cost the loop one step per *fold* rather than one per row
+            // — a window beside a ten-thousand-row fold must not walk it.
+            if (isRowHidden(row)) {
+                row = nextVisibleRow(row)
+                continue
+            }
+            val text = textOf(row)
             val wrapped = wrapOf(text)
             val segments = wrapped.segmentCount
             // Open at the segment the window starts on rather than walking
@@ -770,12 +1048,21 @@ internal class DisplayMap(
         var at = first.coerceAtLeast(0)
         while (at < last && at < total) {
             val block = blockAt(at)
+            val wasMeasured = measured[block] != null
             blockPrefix(block)
             val end = prefixOf(block) + blockValue[block]
-            // Measuring can only have made this block taller, so `end` is
-            // past `at`; the guard is for the empty-file shape, not for it.
-            if (end <= at) break
-            at = end
+            if (end > at) {
+                at = end
+            } else if (wasMeasured) {
+                // A measured block that still does not reach past `at` is
+                // the empty-file shape; nothing further to learn.
+                break
+            }
+            // Otherwise the block came out no taller than where `at` already
+            // stands. [estimateOf] counts a folded block at nothing, so this
+            // is the empty-file shape rather than a fold — but the walk is
+            // still written not to assume it: each turn either advances `at`
+            // or measures a block it had not, so it terminates either way.
         }
     }
 }

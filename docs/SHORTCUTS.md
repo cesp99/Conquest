@@ -51,6 +51,9 @@ editor.
 | `Ctrl` `PageDown` / `PageUp` | Next / previous tab |
 | `Ctrl` `1`…`8` | Jump to tab by position |
 | `Ctrl` `9` | Jump to the last tab |
+| `Ctrl` `Alt` `-` | Go back — the tab and place you were before |
+| `Ctrl` `Alt` `Shift` `-` | Go forward again |
+| `Ctrl` `N` | New file — type a name, or a path like `src/lib.rs`, and it opens |
 | `Ctrl` `B` | Show/hide the left dock |
 | `Ctrl` `O` | Open the project picker (switch, create, import, export) |
 | `Ctrl` `P` | Find a file by name (fuzzy) |
@@ -368,6 +371,23 @@ Every one of them moves all your cursors, not just the first.
 Undo and redo, copy, cut, paste and select-all are also in the `☰` menu in
 the title bar, with their shortcuts listed beside them.
 
+### Folding
+
+The chords are Zed's, from its Linux keymap; the gutter chevron and the `⋯`
+chip do the same by touch or mouse. Folding follows indentation, as Zed's
+does: a line folds away the deeper-indented block beneath it.
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl` `Shift` `[` | Fold the innermost block around each cursor |
+| `Ctrl` `Shift` `]` | Unfold at each cursor |
+| `Ctrl` `K`, then `Ctrl` `0` | Fold every block in the file |
+| `Ctrl` `K`, then `Ctrl` `J` | Unfold everything |
+
+Tapping the chevron in the gutter folds that block; tapping the `⋯` chip at
+the end of a folded line opens it again. Editing into a fold unfolds it, and
+a search hit inside one unfolds its way to the match.
+
 ### Multiple cursors
 
 The bindings are Zed's, from its Linux keymap.
@@ -482,6 +502,11 @@ edition the shell runs inside Debian once you install it — see
 - Click a tab to switch to it, its `✕` to close it, and its unsaved-changes
   dot to save — the dot is a save button, which matters because the soft
   keyboard covers the status bar while you type.
+- At the left end of the tab strip, `←` and `→` walk the navigation
+  history — every tab switch remembers where you were, going back returns
+  there (reopening the file if you closed it), and going forward replays the
+  jump. Greyed when there is nowhere to go. The `+` at the strip's right end
+  creates a new file.
 - In the status bar: the panel buttons sit with their docks — the left dock's
   at the left end, the right dock's and the terminal's at the right.
 - In the terminal: the wheel scrolls the scrollback, drag selects, and the

@@ -6,10 +6,12 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -21,6 +23,7 @@ import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -36,6 +39,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerIcon
@@ -80,6 +84,16 @@ private val MaxTabLabelWidth = 180.dp
 /** How far one notch of the wheel moves the strip. About one narrow tab. */
 private val WheelStep = 96.dp
 
+// The fixed groups at the strip's ends: Zed frames each in `px(Base06)` with
+// `gap(Base04)` between the buttons, bordered below and on the side facing
+// the tabs (tab_bar.rs:103-112 for the start group, 141-150 mirrored for the
+// end one).
+private val ToolGroupPadding = 6.dp
+private val ToolGroupGap = 4.dp
+
+/** Zed's IconButton at `ButtonSize::Default`: a 22px box (button_like.rs:469). */
+private val ToolButtonBox = 22.dp
+
 /**
  * Zed-style tab strip: one tab per open file, a dot for unsaved edits, a
  * close affordance on each, and pinned tabs held at the left.
@@ -96,6 +110,10 @@ private val WheelStep = 96.dp
  * Mouse and touch reach the same menu: right-click or long-press a tab.
  * Middle-click closes one, and the wheel scrolls the strip — a vertical wheel
  * on a horizontal strip, because that is the wheel most mice have.
+ *
+ * The strip sits between two fixed groups, as Zed's does: the navigation
+ * arrows at the left (tab_bar.rs:103-112) and the `+` at the right
+ * (tab_bar.rs:141-150) stay put while the tabs scroll between them.
  */
 @Composable
 fun EditorTabs(
@@ -104,6 +122,12 @@ fun EditorTabs(
     modifier: Modifier = Modifier,
     /** Wired by the workspace, which knows how to open a file again. */
     onReopen: (() -> Unit)? = null,
+    /** Zed's `pane::GoBack` — the workspace owns it, since going back can reopen a file. */
+    onNavigateBack: (() -> Unit)? = null,
+    /** Zed's `pane::GoForward`. */
+    onNavigateForward: (() -> Unit)? = null,
+    /** The workspace's new-file flow — what Zed's `+` leads with (pane.rs:4272). */
+    onNewFile: (() -> Unit)? = null,
 ) {
     val theme = LocalZedTheme.current
     val border = theme.color("border")
@@ -127,17 +151,108 @@ fun EditorTabs(
         }
     }
 
-    LazyRow(
-        state = strip,
+    Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = modifier
             .fillMaxWidth()
             .height(TabBarHeight)
-            .background(theme.color("tab_bar.background"))
-            // The strip's own bottom border, drawn *behind* the tabs so the
-            // selected one's background covers its share of it — which is what
-            // makes the active tab read as open into the editor below rather
-            // than as a label sitting on a line (tab_bar.rs:122-128).
+            .background(theme.color("tab_bar.background")),
+    ) {
+        // Zed's start group: back and forward, greyed when their stack is
+        // empty rather than hidden (pane.rs:3407-3452). The glyphs are text —
+        // sized like the tab's ✕ — since chrome here draws no new icons.
+        if (onNavigateBack != null || onNavigateForward != null) {
+            TabBarToolGroup(trailing = false) {
+                TabBarIconButton(
+                    glyph = "←",
+                    label = "Go back",
+                    enabled = files.canGoBack && onNavigateBack != null,
+                    onClick = { onNavigateBack?.invoke() },
+                )
+                TabBarIconButton(
+                    glyph = "→",
+                    label = "Go forward",
+                    enabled = files.canGoForward && onNavigateForward != null,
+                    onClick = { onNavigateForward?.invoke() },
+                )
+            }
+        }
+        LazyRow(
+            state = strip,
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+                // The strip's own bottom border, drawn *behind* the tabs so the
+                // selected one's background covers its share of it — which is
+                // what makes the active tab read as open into the editor below
+                // rather than as a label sitting on a line (tab_bar.rs:122-128).
+                // The end groups draw their own stretch, so the line runs
+                // unbroken across all three.
+                .drawBehind {
+                    val thickness = TabBorder.toPx()
+                    drawRect(
+                        color = border,
+                        topLeft = Offset(0f, size.height - thickness),
+                        size = Size(size.width, thickness),
+                    )
+                }
+                .pointerInput(wheelStep) {
+                    // A horizontally scrolling row ignores a vertical wheel,
+                    // which is the only wheel most mice have. Taken in the
+                    // initial pass and consumed, so it can't also scroll
+                    // something else.
+                    awaitPointerEventScope {
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            if (event.type != PointerEventType.Scroll) continue
+                            val delta = event.changes.fold(0f) { sum, change ->
+                                sum + change.scrollDelta.y + change.scrollDelta.x
+                            }
+                            if (delta == 0f) continue
+                            event.changes.forEach { it.consume() }
+                            scope.launch { strip.scrollBy(delta * wheelStep) }
+                        }
+                    }
+                },
+        ) {
+            tabItems(files, onSave, onReopen)
+        }
+        // Zed's end group holds `+`, split and zoom, and shows them only
+        // while the pane has focus (pane.rs:4244-4250). There are no splits
+        // here and a finger has no focus to speak of, so: just the `+`, shown
+        // while the pane has tabs.
+        if (onNewFile != null && files.tabs.isNotEmpty()) {
+            TabBarToolGroup(trailing = true) {
+                TabBarIconButton(
+                    glyph = "+",
+                    label = "New file",
+                    enabled = true,
+                    onClick = onNewFile,
+                )
+            }
+        }
+    }
+
+    UnsavedChangesDialog(files)
+}
+
+/**
+ * The frame of one fixed group: bordered below like the strip, and on the
+ * side facing the tabs — `border_b_1` + `border_r_1` leading,
+ * `border_b_1` + `border_l_1` trailing (tab_bar.rs:107-110, 145-148).
+ */
+@Composable
+private fun TabBarToolGroup(
+    trailing: Boolean,
+    content: @Composable RowScope.() -> Unit,
+) {
+    val border = LocalZedTheme.current.color("border")
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(ToolGroupGap),
+        modifier = Modifier
+            .fillMaxHeight()
             .drawBehind {
                 val thickness = TabBorder.toPx()
                 drawRect(
@@ -145,29 +260,74 @@ fun EditorTabs(
                     topLeft = Offset(0f, size.height - thickness),
                     size = Size(size.width, thickness),
                 )
+                val edge = if (trailing) 0f else size.width - thickness
+                drawRect(
+                    color = border,
+                    topLeft = Offset(edge, 0f),
+                    size = Size(thickness, size.height),
+                )
             }
-            .pointerInput(wheelStep) {
-                // A horizontally scrolling row ignores a vertical wheel, which
-                // is the only wheel most mice have. Taken in the initial pass
-                // and consumed, so it can't also scroll something else.
-                awaitPointerEventScope {
-                    while (true) {
-                        val event = awaitPointerEvent(PointerEventPass.Initial)
-                        if (event.type != PointerEventType.Scroll) continue
-                        val delta = event.changes.fold(0f) { sum, change ->
-                            sum + change.scrollDelta.y + change.scrollDelta.x
-                        }
-                        if (delta == 0f) continue
-                        event.changes.forEach { it.consume() }
-                        scope.launch { strip.scrollBy(delta * wheelStep) }
-                    }
-                }
-            },
-    ) {
-        tabItems(files, onSave, onReopen)
-    }
+            .padding(horizontal = ToolGroupPadding),
+        content = content,
+    )
+}
 
-    UnsavedChangesDialog(files)
+/**
+ * Zed's IconButton in its `Subtle` ghost style: a 22dp box, transparent at
+ * rest, `ghost_element.hover`/`.active` swapped instantly under the pointer
+ * (button_like.rs:298-303). Disabled keeps the box and greys the glyph to
+ * `text.disabled`, as a disabled `IconButton` does (Color::Disabled,
+ * ui/src/styles/color.rs) — present but inert, so the group never reflows.
+ */
+@Composable
+private fun TabBarIconButton(
+    glyph: String,
+    label: String,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val pressed by interaction.collectIsPressedAsState()
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .size(ToolButtonBox)
+            .clip(RoundedCornerShape(4.dp))
+            .background(
+                when {
+                    !enabled -> Color.Transparent
+                    pressed -> theme.color("ghost_element.active", Color.Transparent)
+                    hovered -> theme.color("ghost_element.hover", Color.Transparent)
+                    else -> Color.Transparent
+                }
+            )
+            .then(
+                if (enabled) {
+                    Modifier
+                        .pointerHoverIcon(PointerIcon.Hand)
+                        .clickable(
+                            interactionSource = interaction,
+                            indication = null,
+                            onClickLabel = label,
+                            onClick = onClick,
+                        )
+                } else {
+                    Modifier
+                }
+            ),
+    ) {
+        Text(
+            text = glyph,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (enabled) {
+                theme.color("icon", MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                theme.color("text.disabled", MaterialTheme.colorScheme.onSurfaceVariant)
+            },
+        )
+    }
 }
 
 /** Kept out of [EditorTabs] only so the lambda nesting stays readable. */
