@@ -51,6 +51,7 @@ import kotlinx.coroutines.withContext
 import to.eyed.conquest.code.core.AppSettings
 import to.eyed.conquest.code.core.BufferSession
 import to.eyed.conquest.code.core.CoreBridge
+import to.eyed.conquest.code.core.LanguageServerInstaller
 import to.eyed.conquest.code.core.DockSide
 import to.eyed.conquest.code.core.ProjectEntry
 import to.eyed.conquest.code.core.ProjectSession
@@ -72,6 +73,8 @@ import to.eyed.conquest.code.ui.search.revealProjectSearchMatch
 import to.eyed.conquest.code.ui.editor.EditorPane
 import to.eyed.conquest.code.ui.editor.EditorState
 import to.eyed.conquest.code.ui.editor.SoftWrapMode
+import to.eyed.conquest.code.ui.editor.LspServer
+import to.eyed.conquest.code.ui.editor.rememberLspState
 import to.eyed.conquest.code.ui.media.MediaKind
 import to.eyed.conquest.code.ui.git.DiffPane
 import to.eyed.conquest.code.ui.git.DiffTarget
@@ -219,6 +222,13 @@ fun WorkspaceScreen(
     var newFileOpen by remember { mutableStateOf(false) }
     /** Whether the project panel holds the keyboard — see [WorkspaceCommand.NewFile]. */
     var projectPanelFocused by remember { mutableStateOf(false) }
+    /**
+     * Whether the language-server prompt is on screen, and for which grammar
+     * (null = show the list). The install itself lives in
+     * [LanguageServerInstaller], so closing this does not stop apt.
+     */
+    var serverPromptOpen by remember { mutableStateOf(false) }
+    var serverPromptGrammar by remember { mutableStateOf<String?>(null) }
     /** Why the last new-file create failed, if it did. */
     var newFileError by remember { mutableStateOf<String?>(null) }
     /** The picker opens straight into the clone form for Ctrl+Shift+G. */
@@ -706,6 +716,13 @@ fun WorkspaceScreen(
                 transferError = null
                 pickerStartsInClone = false
                 pickerOpen = true
+            }
+            WorkspaceCommand.InstallLanguageServer -> {
+                if (!LanguageServerInstaller.isSupported) return false
+                // The open file names the language; with nothing open the
+                // prompt shows the list rather than guessing one.
+                serverPromptGrammar = files.active?.language
+                serverPromptOpen = true
             }
             WorkspaceCommand.CloneRepository -> {
                 if (!GitClone.isSupported) return false
@@ -1254,6 +1271,12 @@ fun WorkspaceScreen(
                         },
                     )
                 }
+            // One counter for everything this project's servers have said.
+            // Polling it is also what *starts* a server for a file that was
+            // open before its project, or before `apt install` put the binary
+            // in the userland — so it runs whenever a project is open, not
+            // only when the status bar has something to show.
+            val lsp = rememberLspState(project?.id)
             StatusBar(
                 cursorRow = active?.editor?.cursorRow ?: 0,
                 cursorCol = active?.editor?.cursorCol ?: 0,
@@ -1267,6 +1290,22 @@ fun WorkspaceScreen(
                 } else {
                     null
                 },
+                // Zed's diagnostic summary and its LSP button, both of which
+                // it registers as *left* items (zed.rs:640-641). Null with no
+                // project: there is nothing to summarise, and Zed hides the
+                // indicator in the same case.
+                diagnostics = if (project != null) lsp.summary else null,
+                servers = lsp.servers,
+                cursorDiagnostic = active?.editor?.diagnosticAtCursor(),
+                onGoToDiagnostic = active?.editor?.let { it::goToNextDiagnostic },
+                onInstallServer = { server: LspServer ->
+                    // The grammar the server is actually registered against
+                    // beats the table's first one: clangd opened from a .cpp
+                    // file should offer C++.
+                    serverPromptGrammar =
+                        server.languages.firstOrNull() ?: grammarForServer(server.name)
+                    serverPromptOpen = true
+                }.takeIf { LanguageServerInstaller.isSupported },
             )
         }
     }
@@ -1341,6 +1380,7 @@ fun WorkspaceScreen(
                 tabCount = files.tabs.size,
                 terminalCount = terminals.sessions.size,
                 canClone = GitClone.isSupported,
+                canInstallLanguageServer = LanguageServerInstaller.isSupported,
                 canPreview = canPreviewActiveFile(),
                 canGoBack = files.canGoBack,
                 canGoForward = files.canGoForward,
@@ -1444,6 +1484,18 @@ fun WorkspaceScreen(
             },
             onDismiss = { pickerOpen = false },
             nameError = { name -> ProjectsRoot.nameError(context, name) },
+        )
+    }
+
+    if (serverPromptOpen) {
+        LanguageServerPrompt(
+            grammar = serverPromptGrammar,
+            onDismiss = {
+                serverPromptOpen = false
+                // Compose hands focus nowhere when an overlay leaves, and the
+                // whole keymap goes with it.
+                rootFocus.requestFocus()
+            },
         )
     }
 

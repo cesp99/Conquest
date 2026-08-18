@@ -45,7 +45,10 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEvent
@@ -100,6 +103,17 @@ private const val HIGHLIGHT_POLL_MILLIS = 100L
 private const val CURSOR_BLINK_MILLIS = 530L
 
 /**
+ * How far a diagnostic fades once the buffer has moved under it.
+ *
+ * The bridge's instruction is "dim the underlines; do not move them", and it
+ * gives no number. This is Zed's `unnecessary_code_fade`, whose default is
+ * 0.3 (assets/settings/default.json:89) — the fade it
+ * already uses for code a server has marked as not mattering, which is the
+ * nearest thing it has to "still true, but not about this text".
+ */
+private const val STALE_DIAGNOSTIC_ALPHA = 0.3f
+
+/**
  * The editor surface: a custom canvas that draws only the visible window
  * of the engine buffer — no whole-buffer state on the UI side. Virtualized
  * line rendering with per-content-line layout caching, pixel-based
@@ -122,6 +136,46 @@ private fun indentLevels(text: String, tabSize: Int): Int {
         }
     }
     return 0
+}
+
+/**
+ * Zed's wavy diagnostic underline, at Zed's proportions.
+ *
+ * GPUI paints this in a fragment shader over a box `3 × thickness` tall,
+ * with `amplitude = 0.8 × thickness` and a frequency that works out — with
+ * `WAVE_FREQUENCY = 2.0` over that box height — to a period of exactly
+ * `9 × thickness` (gpui_wgpu/src/shaders.wgsl:1180-1210; the box height is
+ * set in gpui/src/window.rs:4097-4103). There is no shader to hand here, so
+ * the same wave is drawn as one path of quadratic arcs: a Bézier's midpoint
+ * is halfway between its ends and its control point, so a control point at
+ * `2 × peak − centre` puts the curve's crest exactly on the crest of the
+ * sine it is standing in for.
+ *
+ * [bottom] is the bottom of that `3 × thickness` box, not the text baseline.
+ */
+private fun DrawScope.drawDiagnosticUnderline(
+    x0: Float,
+    x1: Float,
+    bottom: Float,
+    thickness: Float,
+    color: Color,
+) {
+    if (x1 <= x0 || thickness <= 0f) return
+    val amplitude = 0.8f * thickness
+    val halfPeriod = 4.5f * thickness
+    val centre = bottom - 1.5f * thickness
+    val path = Path()
+    path.moveTo(x0, centre)
+    var x = x0
+    var up = true
+    while (x < x1) {
+        val next = min(x + halfPeriod, x1)
+        val peak = if (up) centre - amplitude else centre + amplitude
+        path.quadraticTo((x + next) / 2f, 2f * peak - centre, next, centre)
+        x = next
+        up = !up
+    }
+    drawPath(path, color, style = Stroke(width = thickness, cap = StrokeCap.Round))
 }
 
 /**
@@ -202,6 +256,11 @@ fun EditorPane(
     }
     val handleRadiusPx = with(density) { 6.dp.toPx() }
     val handleTouchRadiusPx = with(density) { 24.dp.toPx() }
+    // The diagnostic marks are a 2dp strip; 8dp of slop around them makes
+    // them tappable without reaching the fold chevron, whose right edge sits
+    // half the fold column minus its arm away — two characters, never less
+    // than 10dp at any font size the settings allow.
+    val diagnosticMarkTouchPx = with(density) { 8.dp.toPx() }
 
     // Syntax lags the text slightly by design (the reparse is off the
     // keystroke path), so watch for it landing and repaint when it does.
@@ -211,6 +270,12 @@ fun EditorPane(
             delay(HIGHLIGHT_POLL_MILLIS)
         }
     }
+
+    // What the language server has said about this buffer. Its own loop
+    // rather than a branch of the one above: the counter it watches moves on
+    // a *publish*, which is rare and unrelated to a reparse, and the payload
+    // it then reads is a JSON document rather than an integer.
+    LaunchedEffect(state) { pollBufferDiagnostics(state) }
 
     var cursorVisible by remember { mutableStateOf(true) }
     // `state.revision`, not the session's version: the engine's counter is a
@@ -329,6 +394,26 @@ fun EditorPane(
                         if (down.isConsumed) return@awaitEachGesture
                         val position = down.position
                         if (position.x < state.gutterWidthPx) {
+                            // The diagnostic marks own the last few pixels of
+                            // the gutter, and tapping one goes to the problem
+                            // it marks — the touch and mouse twin of `F8`,
+                            // aimed rather than sequential. Checked before the
+                            // fold chevron because the strip is inside the
+                            // fold column, and clear of it in practice: the
+                            // chevron is centred two characters further left.
+                            if (!state.diagnostics.isEmpty &&
+                                position.x >= state.gutterWidthPx - diagnosticMarkTouchPx
+                            ) {
+                                val display =
+                                    ((position.y + state.scrollY) / state.lineHeightPx).toInt()
+                                if (display >= 0 &&
+                                    state.goToDiagnosticOnRow(state.displayMap.bufferRowOf(display))
+                                ) {
+                                    down.consume()
+                                    focusRequester.requestFocus()
+                                    return@awaitEachGesture
+                                }
+                            }
                             // Only the fold column folds; the rest of the
                             // gutter keeps its caret-placing tap. The column
                             // is 4 characters wide — comfortably past the
@@ -542,6 +627,50 @@ fun EditorPane(
                 }
             }
 
+            /**
+             * The wavy underline for UTF-16 range [from, to) of one buffer
+             * row, across however many display rows it is spread over.
+             *
+             * A range that measures to nothing still gets a character's width
+             * of squiggle: a zero-width diagnostic — a server pointing at a
+             * position rather than at text — is the one thing on screen
+             * saying anything is wrong there, and an invisible one is a bug
+             * report nobody can act on.
+             */
+            fun paintDiagnosticRow(
+                row: Int,
+                from: Int,
+                to: Int,
+                color: Color,
+                thickness: Float,
+            ) {
+                var i = window.firstIndexOf(row)
+                if (i < 0) return
+                val line = lineAt(row)
+                while (i < window.size && window.bufferRow(i) == row) {
+                    val segmentStart = window.startCol(i)
+                    val segmentEnd = min(window.endCol(i), line.length)
+                    if (from <= segmentEnd && to >= segmentStart) {
+                        val left = max(from, segmentStart)
+                        val right = max(left, min(to, segmentEnd))
+                        val layout = layoutOf(i)
+                        val x0 = leftOf(i) +
+                            layout.getHorizontalPosition(left - segmentStart, true)
+                        val x1 = (
+                            leftOf(i) +
+                                layout.getHorizontalPosition(right - segmentStart, true)
+                            ).coerceAtLeast(x0 + state.charWidthPx)
+                        // The bottom of the glyph box, plus a hair, so the
+                        // wave rides under the descenders rather than through
+                        // them.
+                        val bottom = topOf(i) +
+                            (lineHeight + layout.size.height) / 2f + thickness
+                        drawDiagnosticUnderline(x0, x1, bottom, thickness, color)
+                    }
+                    i++
+                }
+            }
+
             // Current-line highlight, under everything else. It is the *one*
             // cursor's line: with a column of carets there is no single active
             // line, and striping half the screen would only be noise. Every
@@ -718,6 +847,58 @@ fun EditorPane(
                     )
                 }
 
+                // Diagnostic underlines. Zed underlines the diagnostic's own
+                // range, wavy, 1px thick, in the `status` colour for the
+                // severity (crates/editor/src/display_map.rs:1928-1941 and
+                // :2505-2513) — not a background wash, so the syntax
+                // highlighting underneath survives.
+                //
+                // Painted here, after the text, because the wave sits below
+                // the glyph box and the text must not cover it. One walk per
+                // severity, least severe first, which is Zed's own answer to
+                // two diagnostics on one range: it sorts by severity so the
+                // most severe paints last (element.rs:6165-6168).
+                val diagnostics = state.diagnostics
+                if (!diagnostics.isEmpty) {
+                    val windowFirst = window.firstBufferRow()
+                    val windowLast = window.lastBufferRow()
+                    // Zed's `thickness: 1.0` is one *density-independent*
+                    // pixel; the caret's own width is the pane's only other
+                    // stroke measured that way, and it is two of them.
+                    val thickness = state.cursorWidthPx / 2f
+                    // Stale rows describe text that has moved under them: the
+                    // bridge's instruction is to dim them rather than move
+                    // them, because the columns they name are the only ones
+                    // anybody knows and guessing new ones would be a lie
+                    // drawn in the right colour.
+                    val alpha = if (state.diagnosticsAreStale) STALE_DIAGNOSTIC_ALPHA else 1f
+                    for (severity in DiagnosticSeverity.entries.reversed()) {
+                        val ink = theme.color(severity.token).copy(alpha = alpha)
+                        diagnostics.forEachIn(windowFirst, windowLast) { diagnostic ->
+                            if (diagnostic.severity != severity) return@forEachIn
+                            // Visible rows only, like the search hits and the
+                            // selection above: a diagnostic may span a fold.
+                            var row = max(diagnostic.row, windowFirst)
+                            val lastRow = min(diagnostic.endRow, windowLast)
+                            while (row <= lastRow) {
+                                val line = lineAt(row)
+                                val from = if (row == diagnostic.row) {
+                                    diagnostic.colUtf16.coerceAtMost(line.length)
+                                } else {
+                                    0
+                                }
+                                val to = if (row == diagnostic.endRow) {
+                                    diagnostic.endColUtf16.coerceAtMost(line.length)
+                                } else {
+                                    line.length
+                                }
+                                paintDiagnosticRow(row, from, to, ink, thickness)
+                                row = map.nextVisibleRow(row + 1)
+                            }
+                        }
+                    }
+                }
+
                 // Fold chips: Zed's placeholder for a folded block — "⋯" in
                 // the buffer font, `text_placeholder` on
                 // `ghost_element_background`, `rounded_xs` (2px), washing to
@@ -811,6 +992,47 @@ fun EditorPane(
                         size = Size(pill * 2f, lineHeight),
                         cornerRadius = CornerRadius(lineHeight),
                     )
+                }
+            }
+
+            // Diagnostic marks down the *inner* edge of the gutter, mirroring
+            // git's strip on the outer one, in the same severity colours the
+            // underlines use.
+            //
+            // Zed marks its diagnostic rows on the scrollbar rather than in
+            // the gutter — `marker_quads_for_ranges` over the severity's
+            // status colour, most severe painted last
+            // (crates/editor/src/element.rs:6165-6193) — because its gutter is
+            // already carrying git, folds and breakpoints on a desktop-width
+            // strip. Ours has the room and its scrollbar is a thumb you scroll
+            // with rather than a map you read, so the mark moves to where the
+            // row actually is. The rule it keeps is Zed's: one mark per row a
+            // diagnostic touches, coloured by the worst of them.
+            if (!state.diagnostics.isEmpty) {
+                val markWidth = state.cursorWidthPx
+                val markLeft = gutterWidth - markWidth
+                val windowFirst = window.firstBufferRow()
+                val windowLast = window.lastBufferRow()
+                val alpha = if (state.diagnosticsAreStale) STALE_DIAGNOSTIC_ALPHA else 1f
+                for (severity in DiagnosticSeverity.entries.reversed()) {
+                    val ink = theme.color(severity.token).copy(alpha = alpha)
+                    state.diagnostics.forEachIn(windowFirst, windowLast) { diagnostic ->
+                        if (diagnostic.severity != severity) return@forEachIn
+                        var row = max(diagnostic.row, windowFirst)
+                        val lastRow = min(diagnostic.endRow, windowLast)
+                        while (row <= lastRow) {
+                            var i = window.firstIndexOf(row)
+                            while (i >= 0 && i < window.size && window.bufferRow(i) == row) {
+                                drawRect(
+                                    color = ink,
+                                    topLeft = Offset(markLeft, topOf(i)),
+                                    size = Size(markWidth, lineHeight),
+                                )
+                                i++
+                            }
+                            row = map.nextVisibleRow(row + 1)
+                        }
+                    }
                 }
             }
 
@@ -1038,6 +1260,14 @@ private fun EditorActionRow(
         // convention that nothing here is keyboard-only, in both directions.
         ActionKey("fold", act { state.foldAtCarets() })
         ActionKey("unfold", act { state.unfoldAtCarets() })
+        // The diagnostic motions, which are `F8` and `Shift` `F8` on a
+        // keyboard and nothing at all on a soft one. Listed only when the
+        // file has problems: a key that can never do anything is worse than
+        // no key, and this row is already long.
+        if (!state.diagnostics.isEmpty) {
+            ActionKey("prob↑", act { state.goToDiagnostic(forward = false) })
+            ActionKey("prob↓", act { state.goToDiagnostic(forward = true) })
+        }
     }
 }
 
@@ -1352,6 +1582,14 @@ private fun handleEditorKey(
     }
     val extend = shift
     return when (event.key) {
+        // Zed's `editor::GoToDiagnostic` and `GoToPreviousDiagnostic`, at
+        // Zed's chords (assets/keymaps/default-linux.json:563-564). Editor
+        // local, like every other motion here — the workspace table binds no
+        // F-key but `F1`, so this cannot be swallowed above us. Returning
+        // false when there is nothing to go to leaves `F8` free to mean
+        // whatever the platform wants it to mean in a file with no
+        // diagnostics, rather than silently eating it.
+        Key.F8 -> state.goToDiagnostic(forward = !shift)
         Key.Escape -> state.cancel()
         Key.Backspace -> {
             state.backspace()

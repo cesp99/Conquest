@@ -283,6 +283,10 @@ class EditorState private constructor(
 
     private fun bumpRevision() {
         revision++
+        // Every change to the text passes through here, which makes it the
+        // one place that can notice the diagnostics have gone stale without
+        // asking the engine anything. See [diagnosticsAreStale].
+        refreshDiagnosticsStale()
     }
 
     // Pixel metrics, set from composition (density-dependent).
@@ -936,6 +940,112 @@ class EditorState private constructor(
             listOf(Caret(range.startRow, range.startCol, range.endRow, range.endCol)),
             Caret(range.startRow, range.startCol, range.endRow, range.endCol),
         )
+    }
+
+    /**
+     * What the language server has said about this buffer, for the gutter,
+     * the underlines and the status bar.
+     *
+     * Snapshot state, like [searchMatches] and for the same reason: only the
+     * canvas can draw over the text, and it has to repaint when a publish
+     * lands. Replaced wholesale rather than merged — the engine's cache is
+     * the whole truth for this buffer, and a server's publish replaces its
+     * previous one.
+     */
+    var diagnostics: BufferDiagnostics by mutableStateOf(BufferDiagnostics.EMPTY)
+        private set
+
+    /**
+     * The buffer has moved since the server saw these rows, so the columns
+     * they name no longer point where the server meant.
+     *
+     * Derived here rather than read from the payload's `stale` flag, and that
+     * is the whole reason typing costs no JNI: the flag is only true from the
+     * moment of a *read*, so believing it would mean re-reading the rows on
+     * every keystroke — and `bufferDiagnosticsVersion` deliberately does not
+     * move on the user's own typing. The comparison the engine makes is
+     * `buffer_version != current`, and both halves are already here.
+     *
+     * A null `buffer_version` means the server dated the rows against text we
+     * no longer hold (a close and reopen, most often), which is stale by
+     * definition.
+     */
+    var diagnosticsAreStale: Boolean by mutableStateOf(false)
+        private set
+
+    /** Adopt a fresh read from `bufferDiagnostics`. */
+    fun showDiagnostics(fresh: BufferDiagnostics) {
+        diagnostics = fresh
+        refreshDiagnosticsStale()
+    }
+
+    private fun refreshDiagnosticsStale() {
+        val current = diagnostics
+        diagnosticsAreStale =
+            current.version != 0L && current.bufferVersion != buffer.version
+    }
+
+    /**
+     * The diagnostic the status bar describes: the one under the caret, most
+     * severe and then tightest — Zed's `current_diagnostic`
+     * (crates/diagnostics/src/items.rs:213-223).
+     */
+    fun diagnosticAtCursor(): Diagnostic? = diagnostics.at(cursorRow, cursorCol)
+
+    /**
+     * Zed's `editor::GoToDiagnostic` / `GoToPreviousDiagnostic` (`f8` and
+     * `shift-f8` in assets/keymaps/default-linux.json:563-564).
+     *
+     * Wraps at both ends, as Zed's does by chaining the diagnostics after the
+     * cursor with the ones before it (crates/editor/src/diagnostics.rs:220).
+     * False when there is nothing to go to, so a caller can leave the key
+     * unhandled rather than pretending.
+     */
+    fun goToDiagnostic(forward: Boolean): Boolean = revealDiagnostic(
+        if (forward) {
+            diagnostics.next(cursorRow, cursorCol)
+        } else {
+            diagnostics.previous(cursorRow, cursorCol)
+        }
+    )
+
+    /**
+     * The same, for a caller that wants no answer — the status bar's button
+     * and the action row's key, which are affordances rather than chords and
+     * have nothing to fall through to.
+     */
+    fun goToNextDiagnostic() {
+        goToDiagnostic(forward = true)
+    }
+
+    /**
+     * The worst diagnostic on [row] — what tapping that row's gutter mark
+     * goes to, since the mark is coloured by that same one.
+     */
+    fun goToDiagnosticOnRow(row: Int): Boolean = revealDiagnostic(diagnostics.onRow(row))
+
+    /**
+     * Land on a diagnostic the way Zed's `activate_diagnostic` does: unfold
+     * anything hiding it *first*, then put a bare caret on its start — not a
+     * selection over it, because Zed selects `start..start`
+     * (crates/editor/src/diagnostics.rs:186-192). [setCarets] does the
+     * scrolling, and would reveal the row on its own; the unfold here is the
+     * whole range, so a diagnostic that reaches out of a folded block opens
+     * all of it rather than just its first line.
+     */
+    private fun revealDiagnostic(target: Diagnostic?): Boolean {
+        if (target == null) return false
+        // Stale rows are allowed to point past the end of a buffer that has
+        // shrunk since the server saw it — they are dimmed, not corrected —
+        // so the caret they produce has to be clamped before it is set. The
+        // underlines are drawn against the visible window and clamp
+        // themselves; navigation is the one path that could land off the end.
+        val row = target.row.coerceIn(0, (lineCount - 1).coerceAtLeast(0))
+        val col = target.colUtf16.coerceIn(0, line(row).length)
+        unfoldRowsTouching(row..target.endRow.coerceAtLeast(row), hiddenOnly = true)
+        val at = Caret(row, col)
+        setCarets(listOf(at), at)
+        return true
     }
 
     /** Track line widths seen during drawing to bound horizontal scroll. */

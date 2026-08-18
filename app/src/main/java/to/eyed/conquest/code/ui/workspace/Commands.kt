@@ -38,6 +38,13 @@ data class CommandContext(
     val terminalCount: Int,
     /** Whether this build has a Linux userland to run git in. */
     val canClone: Boolean,
+    /**
+     * Whether this build has a Linux userland to install a language server
+     * into. The same answer as [canClone] today and a different question: apt
+     * and git are separately absent-able, and the day one is true without the
+     * other they must not have shared a field.
+     */
+    val canInstallLanguageServer: Boolean = false,
     /** Whether the open file is one the preview can draw — Markdown or SVG. */
     val canPreview: Boolean = false,
     /** Whether the navigation history has anywhere to go back to. */

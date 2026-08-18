@@ -148,6 +148,20 @@ enum class WorkspaceCommand(
     CloneRepository("git::Clone", isOffered = { it.canClone }),
 
     /**
+     * Install a language server from apt — Zed asks before installing the
+     * extension for a language (extension_suggest.rs:176) and so do we;
+     * nothing here ever downloads on its own.
+     *
+     * No chord, for CloneRepository's reason: it is done once per language,
+     * and the two ways in are the palette and the status bar saying a server
+     * is missing. Absent, not greyed, where there is no userland to run apt.
+     */
+    InstallLanguageServer(
+        "conquest::InstallLanguageServer",
+        isOffered = { it.canInstallLanguageServer },
+    ),
+
+    /**
      * Wrap long lines, or stop — Zed's `editor::ToggleSoftWrap`, which it
      * binds to `ctrl-k ctrl-z`, a two-key sequence this table cannot express
      * yet. It writes the setting, so it survives a restart the way Zed's does.

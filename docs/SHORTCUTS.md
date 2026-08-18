@@ -66,6 +66,7 @@ editor.
 | `Ctrl` `Shift` `G` | Show/hide the git panel |
 | `Ctrl` `,` | Open settings |
 | — | Pick a theme (`theme selector: toggle` in the palette, or the ☰ menu) |
+| — | Install a language server (`conquest: install language server` in the palette) |
 | ``Ctrl` ` `` | Show/hide the terminal |
 | ``Ctrl` `Shift` ` `` | Open another terminal |
 
@@ -82,6 +83,17 @@ the command palette, the `☰` menu and the project picker's own footer. It also
 exists only in the `full` edition — cloning runs the git inside the Linux
 userland, so the edition with no userland leaves the command and its menu entry
 out entirely rather than showing them greyed — see [USERLAND.md](USERLAND.md).
+
+**Install a language server** has no chord either, and for the same reason: it
+is done once per language. The two ways in are the command palette and the
+status bar, which says `clangd is not installed` when a project needs a server
+the userland has not got — click that. In the prompt, `Enter` installs (and,
+once it has, closes), `Esc` closes without stopping an install that is already
+running, and `↑` `↓` `Tab` `Shift` `Tab` move through the list of languages.
+Nothing is ever installed without being asked for, and the question says what
+the download will cost. Like cloning, it exists only in the `full` edition —
+apt lives inside the Linux userland — so the edition without one leaves the
+command out entirely rather than showing it greyed.
 
 ## Git in the editor
 
@@ -387,6 +399,24 @@ does: a line folds away the deeper-indented block beneath it.
 Tapping the chevron in the gutter folds that block; tapping the `⋯` chip at
 the end of a folded line opens it again. Editing into a fold unfolds it, and
 a search hit inside one unfolds its way to the match.
+
+### Problems
+
+The chords are Zed's, from its Linux keymap. A language server has to be
+installed and running for there to be anything to go to; the status bar says
+which ones are not.
+
+| Shortcut | Action |
+|---|---|
+| `F8` | Go to the next problem in the file |
+| `Shift` `F8` | Go to the previous one |
+
+The squiggle under a problem is Zed's, in Zed's severity colours, and it fades
+while the file has edits the server has not seen yet — a diagnostic describes
+the text the server last read, so it dims rather than pretending to have
+moved. The gutter carries a mark for every affected row; tapping it goes
+there. The status bar counts the project's errors and warnings and shows the
+message under the caret.
 
 ### Multiple cursors
 

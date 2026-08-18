@@ -40,19 +40,17 @@ import java.util.concurrent.TimeUnit
  *    `destroyForcibly()` sends SIGKILL, which proot never sees: its tracees
  *    (git, and whatever git forked) are orphaned and keep downloading into a
  *    directory we are about to delete. proot *does* handle SIGQUIT — it kills
- *    its tracees and exits — so [terminate] sends that first and keeps
- *    SIGKILL as the last resort. Getting the pid is its own small mess:
+ *    its tracees and exits — so [GuestProcess.terminate] sends that first and
+ *    keeps SIGKILL as the last resort. Getting the pid is its own small mess:
  *    `Process.pid()` is API 33 and minSdk is 31.
+ *
+ * Lessons 1 and 3 are not git's alone — `apt-get` is driven from a program the
+ * same way, and cancelling it has the same proot problem — so they live in
+ * [GuestProcess], which this object and `LanguageServerInstaller` share.
  */
 object GitClone {
 
     private const val TAG = "conquest-clone"
-
-    /** How long to give proot to take its tracees down after SIGQUIT. */
-    private const val QUIT_GRACE_MS = 3_000L
-
-    /** ~10 Hz. Progress arrives far faster than that and a phone need not care. */
-    private const val PROGRESS_INTERVAL_NS = 100_000_000L
 
     /** Keep the tail of git's own words for the error message. */
     private const val TRANSCRIPT_LINES = 12
@@ -197,55 +195,9 @@ object GitClone {
     private fun terminate(doomed: Attempt? = null) {
         val current = doomed ?: attempt ?: return
         if (doomed == null) attempt = null
-        val process = current.process
-        if (process.isAlive) {
-            val pid = pidOf(process)
-            if (pid != null) {
-                runCatching { Os.kill(pid, OsConstants.SIGQUIT) }
-                    .onFailure { Log.w(TAG, "SIGQUIT to $pid failed", it) }
-                runCatching { process.waitFor(QUIT_GRACE_MS, TimeUnit.MILLISECONDS) }
-            } else {
-                Log.w(TAG, "no pid for the clone process; going straight to SIGKILL")
-            }
-            if (process.isAlive) {
-                // proot did not go, so its tracees are about to be orphaned.
-                // Nothing better is left than killing what we can reach.
-                process.destroyForcibly()
-                runCatching { process.waitFor(QUIT_GRACE_MS, TimeUnit.MILLISECONDS) }
-            }
-        }
+        GuestProcess.terminate(current.process)
         // Only after the writer is gone, or we would race it and leave files.
         current.destination?.let { SafeDelete.deleteTree(it) }
-    }
-
-    /**
-     * The child's pid, defensively.
-     *
-     * `Process.pid()` is API 33 and this app runs from 31 — and it is not even
-     * in the SDK stubs this module compiles against, so it has to be reached
-     * by name. Where it is missing, the platform's own `ProcessImpl` has
-     * always carried the pid in a field. Both paths can fail, and the caller
-     * degrades to `destroyForcibly()` when they do.
-     */
-    private fun pidOf(process: Process): Int? {
-        runCatching {
-            val method = process.javaClass.getMethod("pid")
-            method.isAccessible = true
-            return (method.invoke(process) as Long).toInt()
-        }.onFailure { Log.w(TAG, "Process.pid() unavailable, trying the field", it) }
-
-        var type: Class<*>? = process.javaClass
-        while (type != null) {
-            val field = runCatching { type.getDeclaredField("pid") }.getOrNull()
-            if (field != null) {
-                return runCatching {
-                    field.isAccessible = true
-                    field.getInt(process)
-                }.getOrNull()
-            }
-            type = type.superclass
-        }
-        return null
     }
 
     // --- the clone itself ----------------------------------------------------
@@ -317,7 +269,9 @@ object GitClone {
             // apt is chatty; the same 10 Hz ceiling as the clone's progress.
             val now = System.nanoTime()
             // Never resurrect a state a cancel has already moved past.
-            if (now - lastStep >= PROGRESS_INTERVAL_NS && state is CloneState.InstallingGit) {
+            if (now - lastStep >= GuestProcess.PROGRESS_INTERVAL_NS &&
+                state is CloneState.InstallingGit
+            ) {
                 lastStep = now
                 state = CloneState.InstallingGit(record.take(120))
             }
@@ -367,57 +321,38 @@ object GitClone {
     }
 
     /**
-     * Start [command], stream its output through the progress reader, and
-     * return its exit status. Every completed record is handed to [onRecord],
-     * so callers can keep a transcript; the [state] updates are throttled to
-     * [PROGRESS_INTERVAL_NS] because git redraws far faster than a screen.
+     * [GuestProcess.run] with the clone's own reporting on top: the process is
+     * remembered as the cancellable [Attempt], every completed record is
+     * handed to [onRecord] so callers can keep a transcript, and the [state]
+     * updates are throttled to [GuestProcess.PROGRESS_INTERVAL_NS] because git
+     * redraws far faster than a screen.
      */
     private fun run(
         command: ShellCommand,
         destination: File?,
         onRecord: (String) -> Unit,
     ): Int {
-        // ProcessBuilder cannot set argv[0] apart from the executable, and
-        // proot does not care what it is called, so the .so path stands in.
-        val builder = ProcessBuilder(listOf(command.executable) + command.argv.drop(1))
-            // git writes progress to stderr and almost nothing to stdout;
-            // merging keeps the ordering and gives one stream to read.
-            .redirectErrorStream(true)
-        builder.environment().apply {
-            clear()
-            for (entry in command.environment) {
-                val split = entry.indexOf('=')
-                if (split > 0) put(entry.substring(0, split), entry.substring(split + 1))
-            }
-        }
-
-        val process = builder.start()
-        attempt = Attempt(process, destination)
-        val reader = GitProgressReader()
         var lastEmit = 0L
         var lastPhase: String? = null
-
-        process.inputStream.reader(Charsets.UTF_8).use { source ->
-            val buffer = CharArray(4096)
-            while (true) {
-                val read = source.read(buffer)
-                if (read < 0) break
-                for (record in reader.feed(String(buffer, 0, read))) {
-                    onRecord(record)
-                    val progress = GitProgress.parse(record) ?: continue
-                    val now = System.nanoTime()
-                    // Always show a new phase at once — that is the part the
-                    // user reads — and rate-limit only the percentages.
-                    if (progress.phase != lastPhase || now - lastEmit >= PROGRESS_INTERVAL_NS) {
-                        lastPhase = progress.phase
-                        lastEmit = now
-                        if (state is CloneState.Working) state = CloneState.Working(progress)
-                    }
+        return GuestProcess.run(
+            command,
+            onStart = { process -> attempt = Attempt(process, destination) },
+        ) { record ->
+            onRecord(record)
+            val progress = GitProgress.parse(record)
+            if (progress != null) {
+                val now = System.nanoTime()
+                // Always show a new phase at once — that is the part the user
+                // reads — and rate-limit only the percentages.
+                if (progress.phase != lastPhase ||
+                    now - lastEmit >= GuestProcess.PROGRESS_INTERVAL_NS
+                ) {
+                    lastPhase = progress.phase
+                    lastEmit = now
+                    if (state is CloneState.Working) state = CloneState.Working(progress)
                 }
             }
         }
-        for (record in reader.flush()) onRecord(record)
-        return process.waitFor()
     }
 
     /**
@@ -473,6 +408,133 @@ object GitClone {
 
             else -> "git could not clone that repository"
         }
+    }
+}
+
+/**
+ * Running one program inside the userland, reading everything it says, and
+ * stopping it when the user changes their mind.
+ *
+ * Extracted from [GitClone] when installing a language server needed the same
+ * three things (see the doc comment there for what each one cost to learn):
+ * the environment has to be built by hand because the pty shim clears it, the
+ * output has to be split on `\r` as well as `\n` because a program that thinks
+ * it is on a terminal redraws one line, and cancelling has to go through
+ * SIGQUIT because proot ignores SIGTERM and never sees SIGKILL.
+ *
+ * Nothing here touches state or the UI: callers own their own reporting, so
+ * git can throttle a percentage and apt can show its last line.
+ */
+internal object GuestProcess {
+
+    private const val TAG = "conquest-guest"
+
+    /** How long to give proot to take its tracees down after SIGQUIT. */
+    private const val QUIT_GRACE_MS = 3_000L
+
+    /** ~10 Hz. Progress arrives far faster than that and a phone need not care. */
+    const val PROGRESS_INTERVAL_NS = 100_000_000L
+
+    /**
+     * Start [command], hand the process to [onStart] so a caller can cancel
+     * it, feed every completed record to [onRecord], and return its exit
+     * status. Blocking: call it off the main thread.
+     *
+     * [onStart] runs before the first byte is read, which is the only ordering
+     * that matters — a cancel arriving in that window must find the process.
+     */
+    fun run(
+        command: ShellCommand,
+        onStart: (Process) -> Unit = {},
+        onRecord: (String) -> Unit,
+    ): Int {
+        val process = start(command)
+        onStart(process)
+        val reader = GitProgressReader()
+        process.inputStream.reader(Charsets.UTF_8).use { source ->
+            val buffer = CharArray(4096)
+            while (true) {
+                val read = source.read(buffer)
+                if (read < 0) break
+                for (record in reader.feed(String(buffer, 0, read))) onRecord(record)
+            }
+        }
+        for (record in reader.flush()) onRecord(record)
+        return process.waitFor()
+    }
+
+    /** The process, started with a clean environment and one merged stream. */
+    private fun start(command: ShellCommand): Process {
+        // ProcessBuilder cannot set argv[0] apart from the executable, and
+        // proot does not care what it is called, so the .so path stands in.
+        val builder = ProcessBuilder(listOf(command.executable) + command.argv.drop(1))
+            // git writes its progress to stderr and almost nothing to stdout,
+            // and apt splits itself the same way; merging keeps the ordering
+            // and gives one stream to read.
+            .redirectErrorStream(true)
+        builder.environment().apply {
+            clear()
+            for (entry in command.environment) {
+                val split = entry.indexOf('=')
+                if (split > 0) put(entry.substring(0, split), entry.substring(split + 1))
+            }
+        }
+        return builder.start()
+    }
+
+    /**
+     * Stop [process] and its tracees: SIGQUIT, a grace period, then SIGKILL.
+     *
+     * SIGKILL alone would orphan whatever proot was supervising — git still
+     * downloading, dpkg still unpacking — which is why the polite signal goes
+     * first even though it costs three seconds in the worst case.
+     */
+    fun terminate(process: Process) {
+        if (!process.isAlive) return
+        val pid = pidOf(process)
+        if (pid != null) {
+            runCatching { Os.kill(pid, OsConstants.SIGQUIT) }
+                .onFailure { Log.w(TAG, "SIGQUIT to $pid failed", it) }
+            runCatching { process.waitFor(QUIT_GRACE_MS, TimeUnit.MILLISECONDS) }
+        } else {
+            Log.w(TAG, "no pid for the guest process; going straight to SIGKILL")
+        }
+        if (process.isAlive) {
+            // proot did not go, so its tracees are about to be orphaned.
+            // Nothing better is left than killing what we can reach.
+            process.destroyForcibly()
+            runCatching { process.waitFor(QUIT_GRACE_MS, TimeUnit.MILLISECONDS) }
+        }
+    }
+
+    /**
+     * The child's pid, defensively.
+     *
+     * `Process.pid()` is API 33 and this app runs from 31 — and it is not even
+     * in the SDK stubs this module compiles against, so it has to be reached
+     * by name. Where it is missing, the platform's own `ProcessImpl` has
+     * always carried the pid in a field. Both paths can fail, and the caller
+     * degrades to `destroyForcibly()` when they do.
+     */
+    private fun pidOf(process: Process): Int? {
+        runCatching {
+            val method = process.javaClass.getMethod("pid")
+            method.isAccessible = true
+            return (method.invoke(process) as Long).toInt()
+        }.onFailure { Log.w(TAG, "Process.pid() unavailable, trying the field", it) }
+
+        var type: Class<*>? = process.javaClass
+        while (type != null) {
+            val field = runCatching { type.getDeclaredField("pid") }.getOrNull()
+            if (field != null) {
+                return runCatching {
+                    field.isAccessible = true
+                    field.getInt(process)
+                }.getOrNull()
+            }
+            type = type.superclass
+        }
+        return null
     }
 }
 
