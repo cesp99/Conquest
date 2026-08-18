@@ -84,7 +84,12 @@ Samsung DeX.
 | Images, audio and video | ✅ opened as media, never as a text buffer |
 | Soft wrap | ✅ `soft_wrap`, off by default as in Zed |
 | Go to line | ✅ `Ctrl+G`, `42:8`, Escape puts everything back |
-| LSP on-device | ⬜ planned |
+| Code folding | ✅ from the language's own syntax tree, gutter chevrons and chords |
+| Breadcrumbs & outline | ✅ the symbol path at the caret, `Ctrl+Shift+O` for the picker |
+| Sticky headers in the project panel | ✅ ancestors pin above the list, as in Zed |
+| Navigation history | ✅ back and forward across the places you jumped from |
+| Language servers on-device | ✅ diagnostics, completions, hover, go-to-definition; servers installed with `apt` (`full` edition) |
+| Interface size | ✅ `Ctrl+=` / `Ctrl+-` / `Ctrl+0`, and a settings row — all the chrome scales |
 | ACP agent panel | ⬜ planned |
 
 ## Editions
