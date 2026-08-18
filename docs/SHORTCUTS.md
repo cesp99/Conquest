@@ -220,12 +220,28 @@ screen and leaving the editor a character wide.
 `Ctrl` `Alt` `A` opens a conversation with an ACP agent working on the open
 project. Pressing it again puts the keyboard back in the composer.
 
+**Threads.** Each conversation is a thread, as in Zed: **+ New** in the
+panel's bar starts another for the open project, and **Threads** lists every
+thread grouped by project, searchable, with the other projects shown so you
+can see where threads would live. Tap a thread to return to it — its whole
+transcript is kept — and **Close** to end it. Threads live with the agent
+process: they survive the panel closing, not the app.
+
+**The composer speaks the protocol.** Type `/` at the start for the agent's
+own slash commands (it advertises them; the strip completes them), and `@`
+anywhere for a file mention — the file travels with the prompt as context,
+embedded when the agent takes embedded context and as a link otherwise.
+Under the conversation sit the agent's session controls, straight off the
+wire: its mode, and every config option it advertises (model, effort,
+toggles), each a tap-to-pick chip.
+
 | Shortcut | Action |
 |---|---|
 | `Ctrl` `Alt` `A` | Show/hide the agent panel |
 | `Enter` | Send the message |
 | `Shift` `Enter` | Start a new line instead |
-| `Esc` | Stop the agent mid-turn |
+| `Tab` | Take the first suggestion while the `/` or `@` strip is up |
+| `Esc` | Put the suggestion strip away; with none up, stop the agent mid-turn |
 
 On a phone `Enter` inserts a newline and **Send** is the button beside the box:
 a soft keyboard's Enter arrives as text rather than as a keystroke, so it

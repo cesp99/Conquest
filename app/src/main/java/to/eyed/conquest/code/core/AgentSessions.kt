@@ -12,7 +12,30 @@ import kotlinx.coroutines.launch
 import to.eyed.conquest.code.terminal.Userland
 
 /**
- * The agent session the panel is showing, and which agent it is with.
+ * One conversation with the agent — Zed's thread. The engine session behind
+ * it holds the transcript; this is the identity the thread list renders.
+ */
+class AgentThread internal constructor(
+    val sessionId: Long,
+    val projectId: Long,
+    val projectName: String,
+    /** Creation order, newest last — the list shows newest first. */
+    val ordinal: Int,
+) {
+    /**
+     * The agent's own name for the conversation, once it sends one
+     * (`SessionInfoUpdate`); stamped by the panel while the thread is
+     * showing, so the history list can name it after it stops being active.
+     */
+    var title by mutableStateOf<String?>(null)
+        internal set
+
+    /** What the history list prints. */
+    val listTitle: String get() = title ?: "Thread $ordinal"
+}
+
+/**
+ * The agent threads the panel is showing, and which agent they are with.
  *
  * Outside the composition on purpose, the same way
  * [to.eyed.conquest.code.terminal.UserlandInstaller] and `GitClone` are:
@@ -20,10 +43,13 @@ import to.eyed.conquest.code.terminal.Userland
  * conversation or kill the agent process behind it. Reopening the panel finds
  * the conversation where it was left.
  *
- * One session at a time, which follows from the engine holding one agent
- * process at a time; opening a project's panel while another project's session
- * is live closes that one first, because the agent's working directory is the
- * project it was started in.
+ * **Threads, plural, within one project** — Zed's shape: the panel shows one
+ * thread, `+` starts another, and the history view lists them per project.
+ * They share the one agent process the engine holds (a session is a protocol
+ * object, not a process). Threads in *different* projects cannot share it —
+ * the guest binds the project directory at spawn — so opening a thread in a
+ * new project closes every thread of the old one, exactly as the engine
+ * replaces the agent underneath.
  */
 object AgentSessions {
 
@@ -39,13 +65,20 @@ object AgentSessions {
     var agent by mutableStateOf<AgentDefinition?>(null)
         private set
 
-    /** The live session, or -1. */
-    var sessionId by mutableStateOf(-1L)
+    /** Every live thread, in creation order. */
+    val threads = androidx.compose.runtime.mutableStateListOf<AgentThread>()
+
+    /** The thread the conversation view is showing. */
+    var active by mutableStateOf<AgentThread?>(null)
         private set
 
-    /** Which project [sessionId] belongs to. */
-    var projectId by mutableStateOf(-1L)
-        private set
+    private var nextOrdinal = 1
+
+    /** The active thread's session, or -1 — what the panel polls. */
+    val sessionId: Long get() = active?.sessionId ?: -1L
+
+    /** Which project [active] belongs to, or -1. */
+    val projectId: Long get() = active?.projectId ?: -1L
 
     /** A session is being asked for; the engine call blocks on a spawn. */
     var isStarting by mutableStateOf(false)
@@ -88,15 +121,34 @@ object AgentSessions {
     }
 
     /**
-     * Open a session for [project] with the chosen agent, unless one is
-     * already open for it. Returns at once; watch [sessionId] and then
+     * Make sure [project] has a thread showing: select its most recent, or
+     * start its first. Returns at once; watch [active] and then
      * [rememberAgentSession].
      */
-    fun open(project: Long) {
+    fun open(project: Long, projectName: String) {
+        if (active?.projectId == project) return
+        val existing = threads.lastOrNull { it.projectId == project }
+        if (existing != null) {
+            active = existing
+            return
+        }
+        newThread(project, projectName)
+    }
+
+    /**
+     * Start another thread for [project] — Zed's `+`. The new thread becomes
+     * the one showing; the others stay live in [threads].
+     */
+    fun newThread(project: Long, projectName: String) {
         val agent = agent ?: return
         if (job?.isActive == true) return
-        if (sessionId >= 0 && projectId == project) return
-        if (sessionId >= 0) close()
+        // A thread in another project cannot share the agent process — the
+        // guest binds the project directory at spawn — so the engine replaces
+        // the agent underneath and those sessions die. Close them here too,
+        // or the list would show threads whose transcripts are gone.
+        if (threads.any { it.projectId != project }) {
+            closeThreadsExcept(project)
+        }
 
         isStarting = true
         startError = null
@@ -122,27 +174,52 @@ object AgentSessions {
                 isStarting = false
                 return@launch
             }
-            projectId = project
-            sessionId = id
+            val thread = AgentThread(id, project, projectName, nextOrdinal++)
+            threads.add(thread)
+            active = thread
             isStarting = false
         }
     }
 
+    /** Show [thread] — the history view's tap. */
+    fun select(thread: AgentThread) {
+        if (thread in threads) active = thread
+    }
+
     /**
-     * End the session and, with the last one, the agent process — through the
-     * engine, which takes proot down the careful way.
+     * End one thread. The engine closes its session and, with the last one,
+     * the agent process — through the engine, which takes proot down the
+     * careful way.
      */
+    fun closeThread(thread: AgentThread) {
+        threads.remove(thread)
+        if (active == thread) {
+            active = threads.lastOrNull { it.projectId == thread.projectId }
+        }
+        scope.launch { runCatching { CoreBridge.acpCloseSession(thread.sessionId) } }
+    }
+
+    private fun closeThreadsExcept(project: Long) {
+        val doomed = threads.filter { it.projectId != project }
+        threads.removeAll(doomed)
+        if (active?.projectId != project) active = null
+        for (thread in doomed) {
+            scope.launch { runCatching { CoreBridge.acpCloseSession(thread.sessionId) } }
+        }
+    }
+
+    /** End every thread and the agent process behind them. */
     fun close() {
-        val doomed = sessionId
-        sessionId = -1L
-        projectId = -1L
+        val doomed = threads.toList()
+        threads.clear()
+        active = null
         startError = null
         isStarting = false
         generation++
         job?.cancel()
         job = null
-        if (doomed >= 0) {
-            scope.launch { runCatching { CoreBridge.acpCloseSession(doomed) } }
+        for (thread in doomed) {
+            scope.launch { runCatching { CoreBridge.acpCloseSession(thread.sessionId) } }
         }
     }
 
@@ -166,8 +243,12 @@ object AgentSessions {
         lastRefusal = null
     }
 
-    /** Send a prompt; [onRefused] runs when the engine would not take it. */
-    fun prompt(text: String, onRefused: () -> Unit) {
+    /**
+     * Send a prompt; [onRefused] runs when the engine would not take it.
+     * [mentions] are the project-relative paths the user @-mentioned; the
+     * engine turns each into a resource block beside the text.
+     */
+    fun prompt(text: String, mentions: List<String>, onRefused: () -> Unit) {
         val session = sessionId
         if (session < 0) {
             onRefused()
@@ -175,12 +256,23 @@ object AgentSessions {
             return
         }
         lastRefusal = null
+        val mentionsJson = org.json.JSONArray(mentions).toString()
         scope.launch {
-            val sent = runCatching { CoreBridge.acpPrompt(session, text) }.getOrDefault(false)
+            val sent = runCatching { CoreBridge.acpPrompt(session, text, mentionsJson) }
+                .getOrDefault(false)
             if (!sent) {
                 onRefused()
                 lastRefusal = "The agent did not take that message; the session may have ended."
             }
+        }
+    }
+
+    /** Change one of the agent's config options — model, effort, a toggle. */
+    fun setConfigOption(configId: String, valueJson: String) {
+        val session = sessionId.takeIf { it >= 0 } ?: return
+        lastRefusal = null
+        scope.launch {
+            runCatching { CoreBridge.acpSetConfigOption(session, configId, valueJson) }
         }
     }
 

@@ -263,6 +263,43 @@ data class AgentModes(val currentId: String, val available: List<AgentMode>) {
     val current: AgentMode? get() = available.firstOrNull { it.id == currentId }
 }
 
+/** A slash command the agent advertised — `/plan`, `/init`, whatever it has. */
+data class AgentCommand(val name: String, val description: String, val inputHint: String?)
+
+/** One value a select config option can take. */
+data class AgentConfigValue(val id: String, val name: String, val description: String?)
+
+/**
+ * One of the agent's session configuration options — model, effort, thinking:
+ * whatever it advertises. ACP's `SessionConfigOption`, flattened for the
+ * panel: a `select` carries its values (grouped options are flattened — a
+ * phone popup has no room for group headers), a `boolean` carries a flag.
+ */
+data class AgentConfigOption(
+    val id: String,
+    val name: String,
+    val description: String?,
+    /** `"select"` or `"boolean"` — ACP's `type` field. */
+    val kind: String,
+    /** The current value id (select) — [current]'s id. */
+    val currentValueId: String?,
+    /** The current flag (boolean). */
+    val currentBool: Boolean?,
+    val values: List<AgentConfigValue>,
+) {
+    val current: AgentConfigValue? get() = values.firstOrNull { it.id == currentValueId }
+
+    /** What the selector chip prints: the value's name, or On/Off. */
+    val currentLabel: String
+        get() = current?.name
+            ?: currentValueId
+            ?: when (currentBool) {
+                true -> "On"
+                false -> "Off"
+                null -> name
+            }
+}
+
 /** A way to sign in, as the agent advertised it. */
 data class AgentAuthMethod(val id: String, val name: String, val description: String?)
 
@@ -295,6 +332,10 @@ data class AgentSessionState(
     val plan: List<AgentPlanEntry>,
     val usage: AgentUsage?,
     val modes: AgentModes?,
+    /** Slash commands, for the composer's `/` popup. */
+    val commands: List<AgentCommand>,
+    /** Config options, for the selector chips under the composer. */
+    val configOptions: List<AgentConfigOption>,
     val agent: AgentInfo?,
 ) {
     val isBusy: Boolean get() = phase == AgentPhase.Running
@@ -315,6 +356,8 @@ data class AgentSessionState(
             plan = emptyList(),
             usage = null,
             modes = null,
+            commands = emptyList(),
+            configOptions = emptyList(),
             agent = null,
         )
 
@@ -356,6 +399,8 @@ data class AgentSessionState(
                         },
                     )
                 },
+                commands = parseCommands(root.optJSONArray("commands")),
+                configOptions = parseConfigOptions(root.optJSONArray("configOptions")),
                 agent = agent?.let {
                     val methods = it.optJSONArray("auth_methods") ?: JSONArray()
                     AgentInfo(
@@ -379,6 +424,81 @@ data class AgentSessionState(
                 },
             )
         }.getOrDefault(NONE)
+
+        private fun parseCommands(json: JSONArray?): List<AgentCommand> {
+            if (json == null) return emptyList()
+            return List(json.length()) { index ->
+                val command = json.optJSONObject(index) ?: return@List null
+                val name = command.optString("name").takeIf { it.isNotEmpty() }
+                    ?: return@List null
+                AgentCommand(
+                    name = name,
+                    description = command.optString("description"),
+                    // ACP's `input` is `{ "hint": … }` for unstructured input.
+                    inputHint = command.optJSONObject("input")?.stringOrNull("hint"),
+                )
+            }.filterNotNull()
+        }
+
+        private fun parseConfigOptions(json: JSONArray?): List<AgentConfigOption> {
+            if (json == null) return emptyList()
+            return List(json.length()) { index ->
+                val option = json.optJSONObject(index) ?: return@List null
+                val id = option.optString("id").takeIf { it.isNotEmpty() } ?: return@List null
+                val kind = option.optString("type")
+                when (kind) {
+                    "select" -> {
+                        // Options come flat or grouped; a group is flattened,
+                        // because the popup has no room for headers and the
+                        // ids are what matter.
+                        val raw = option.optJSONArray("options") ?: JSONArray()
+                        val values = mutableListOf<AgentConfigValue>()
+                        for (i in 0 until raw.length()) {
+                            val entry = raw.optJSONObject(i) ?: continue
+                            val grouped = entry.optJSONArray("options")
+                            if (grouped != null) {
+                                for (j in 0 until grouped.length()) {
+                                    val value = grouped.optJSONObject(j) ?: continue
+                                    parseConfigValue(value)?.let(values::add)
+                                }
+                            } else {
+                                parseConfigValue(entry)?.let(values::add)
+                            }
+                        }
+                        AgentConfigOption(
+                            id = id,
+                            name = option.optString("name"),
+                            description = option.stringOrNull("description"),
+                            kind = "select",
+                            currentValueId = option.stringOrNull("currentValue"),
+                            currentBool = null,
+                            values = values,
+                        )
+                    }
+                    "boolean" -> AgentConfigOption(
+                        id = id,
+                        name = option.optString("name"),
+                        description = option.stringOrNull("description"),
+                        kind = "boolean",
+                        currentValueId = null,
+                        currentBool = option.optBoolean("currentValue"),
+                        values = emptyList(),
+                    )
+                    // A kind this build cannot render is left out rather than
+                    // drawn as a chip that cannot work.
+                    else -> null
+                }
+            }.filterNotNull()
+        }
+
+        private fun parseConfigValue(json: JSONObject): AgentConfigValue? {
+            val id = json.optString("value").takeIf { it.isNotEmpty() } ?: return null
+            return AgentConfigValue(
+                id = id,
+                name = json.optString("name").ifEmpty { id },
+                description = json.stringOrNull("description"),
+            )
+        }
     }
 }
 

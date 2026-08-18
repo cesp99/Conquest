@@ -72,6 +72,55 @@ class AgentSessionTest {
      * engine's JSON, so this is the difference between an empty title and the
      * word "null" on screen.
      */
+    /**
+     * The composer's `/` popup and the selector chips are drawn from these —
+     * ACP's own wire shapes, as the engine relays them: `commands` from
+     * `available_commands_update`, `configOptions` from `session/new` and
+     * `config_option_update` (`type` tags the kind, a select's `options`
+     * may arrive flat or grouped).
+     */
+    @Test
+    fun readsCommandsAndConfigOptions() {
+        val state = AgentSessionState.parse(
+            """
+            {
+              "version": 3, "phase": "ready",
+              "commands": [
+                {"name": "plan", "description": "Show a plan"},
+                {"name": "echo", "description": "Repeat", "input": {"hint": "text"}},
+                {"description": "nameless is dropped"}
+              ],
+              "configOptions": [
+                {"id": "model", "name": "Model", "type": "select",
+                 "currentValue": "two",
+                 "options": [
+                   {"value": "one", "name": "One"},
+                   {"name": "Group", "options": [{"value": "two", "name": "Two"}]}
+                 ]},
+                {"id": "verbose", "name": "Verbose", "type": "boolean", "currentValue": true},
+                {"id": "odd", "name": "Odd", "type": "slider", "currentValue": 3}
+              ]
+            }
+            """.trimIndent()
+        )
+
+        assertEquals(listOf("plan", "echo"), state.commands.map { it.name })
+        assertEquals("text", state.commands[1].inputHint)
+        assertEquals(null, state.commands[0].inputHint)
+
+        // The slider this build cannot render is left out, not drawn broken.
+        assertEquals(listOf("model", "verbose"), state.configOptions.map { it.id })
+        val model = state.configOptions[0]
+        assertEquals("select", model.kind)
+        // Grouped options flatten; the current value resolves through them.
+        assertEquals(listOf("one", "two"), model.values.map { it.id })
+        assertEquals("Two", model.currentLabel)
+        val verbose = state.configOptions[1]
+        assertEquals("boolean", verbose.kind)
+        assertEquals(true, verbose.currentBool)
+        assertEquals("On", verbose.currentLabel)
+    }
+
     @Test
     fun aJsonNullIsANullAndNotTheWordNull() {
         val state = AgentSessionState.parse(
