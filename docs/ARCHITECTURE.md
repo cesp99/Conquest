@@ -141,8 +141,10 @@ stdio — the same model Zed uses, via the same
 crate. The engine spawns and supervises agent processes and maintains
 thread state (messages, tool calls, plans, permission requests); the
 Compose agent panel renders that state. Node-based agents (Claude Code,
-Gemini CLI) additionally require a bundled Node runtime — see the
-roadmap.
+Gemini CLI) need Node, which comes from the Linux userland's own package
+manager like any other tool — so the agent panel belongs to the `full`
+edition, and the `play` edition leaves it out rather than showing it
+broken.
 
 ## Privacy
 
