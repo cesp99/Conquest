@@ -23,7 +23,7 @@ in our CI instead of trusting a binary.
 Both modules were verified independent of the rest of the Termux app: they
 import nothing from `com.termux.shared` or `com.termux.app`, and their
 manifests are empty. `termux-shared` is deliberately **not** vendored — see
-`agent-docs/research/termux-analysis.md`.
+`agent-docs/archive/research/termux-analysis.md`.
 
 ### License
 

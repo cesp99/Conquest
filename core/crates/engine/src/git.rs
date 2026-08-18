@@ -4,7 +4,7 @@
 //! out to a `git` binary, and ours lives inside the proot guest — Android will
 //! not execute anything that arrived after install, so the only reachable git
 //! is the one `apt` put in the rootfs, and the only way to reach it is through
-//! proot (agent-docs/research/proot-spike.md, "Open items", item 4).
+//! proot (agent-docs/archive/research/proot-spike.md, "Open items", item 4).
 //!
 //! Getting *into* the guest is not this module's job — `guest.rs` owns the
 //! proot command line, and git's own share of it is the argv below and two

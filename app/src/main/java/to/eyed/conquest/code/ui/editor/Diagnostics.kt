@@ -471,7 +471,8 @@ data class LspState(
  * The "seen" version lives beside the loop rather than in the effect's keys.
  * That is not a style choice — a `produceState` keyed on a counter that
  * starts at zero and is corrected a frame later runs its body twice, and the
- * hours that cost are written down in `agent-docs/ZED-PARITY.md`.
+ * hours that cost are written down in `agent-docs/CONVENTIONS.md`,
+ * under the traps ("a guest command is a process, not a getter").
  *
  * The loop must keep running even while the counter sits at 0: the bridge
  * documents polling `lspVersion` as what *starts* servers for files that

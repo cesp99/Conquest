@@ -3,7 +3,7 @@
 //! Everything the engine executes outside its own process goes through here.
 //! Android will not run anything that arrived after install, so the only
 //! binaries we can reach are the ones `apt` put in the rootfs, and the only
-//! way to reach them is proot (agent-docs/research/proot-spike.md, "Open
+//! way to reach them is proot (agent-docs/archive/research/proot-spike.md, "Open
 //! items", item 4). The flag block below is fiddly enough — and its failures
 //! quiet enough — that a second copy of it would mean a second behaviour, so
 //! `git status` (git.rs) and, from P5-1, the language servers share this one.
@@ -68,7 +68,7 @@ pub(crate) const PROCESSES_PER_RUN: usize = 2;
 
 /// Android's cap on an app's background processes, on the devices that enforce
 /// it: 32 (Android 12+'s phantom-process limit, `settings global
-/// max_phantom_processes`; agent-docs/research/proot-spike.md, "Open items",
+/// max_phantom_processes`; agent-docs/archive/research/proot-spike.md, "Open items",
 /// item 3). Some OEMs disable it and some raise it; nothing may *rely* on that,
 /// so 32 is the number we budget against.
 ///

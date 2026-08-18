@@ -110,7 +110,7 @@ Tier 0:
   the library that `util_macros` consumes).
 
 Tier 1 — Android support, from the P3-1 spike
-(`agent-docs/research/p3-1-spike-artifacts/android-cfg-patches.diff`):
+(`agent-docs/archive/research/p3-1-spike-artifacts/android-cfg-patches.diff`):
 
 - `gpui/src/gpui.rs`: two cfg lists gain `target_os = "android"` so the
   `queue` module and its `PriorityQueueSender/Receiver` exports exist on

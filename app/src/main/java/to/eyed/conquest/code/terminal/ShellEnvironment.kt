@@ -12,7 +12,7 @@ import java.io.File
  * Android forbids executing anything from writable storage, so bundled
  * programs ride in the APK as `lib<name>_exec.so` and are executed from
  * `nativeLibraryDir`. Two consequences shape everything here, both measured on
- * device (agent-docs research/android-exec-policy.md):
+ * device (agent-docs/archive/research/android-exec-policy.md):
  *
  * 1. That directory's path contains a per-install random hash and changes on
  *    every app update, so it can never be baked into a program or a script.

@@ -12,7 +12,7 @@
 #   proot   github.com/termux/proot — Termux's fork, not proot-me/proot.
 #           Upstream proot builds fine for Android but its guests are killed
 #           with SIGSYS on Android 17; the fork carries the fixes. Verified on
-#           a Galaxy Z Fold: see agent-docs/research/proot-spike.md.
+#           a Galaxy Z Fold: see agent-docs/archive/research/proot-spike.md.
 #   talloc  samba.org — proot's only library dependency. Built from a
 #           hand-written config.h instead of its waf build system, which does
 #           not cross-compile pleasantly; bionic satisfies everything talloc

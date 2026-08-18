@@ -34,7 +34,7 @@ android {
             dimension = "distribution"
             // The old SELinux domain still permits executing files from app
             // storage, which is what a Debian userland under proot needs.
-            // Measured on Android 17; see research/android-exec-policy.md.
+            // Measured on Android 17; see agent-docs/archive/research/android-exec-policy.md.
             targetSdk = 28
             versionNameSuffix = "-full"
             buildConfigField("boolean", "USERLAND", "true")
