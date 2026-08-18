@@ -169,6 +169,16 @@ enum class WorkspaceCommand(
     ToggleSoftWrap("editor::ToggleSoftWrap"),
 
     /**
+     * The UI font size, which is Zed's rem: `window.rem_size = ui_font_size`
+     * (theme_settings/src/settings.rs:619), so these grow and shrink the whole
+     * chrome — rows, bars, gaps and icons — not only the text. Zed's own
+     * chords (default-linux.json:1402-1405).
+     */
+    IncreaseUiFontSize("zed::IncreaseUiFontSize"),
+    DecreaseUiFontSize("zed::DecreaseUiFontSize"),
+    ResetUiFontSize("zed::ResetUiFontSize"),
+
+    /**
      * The commit graph — Zed's `git::OpenGraph`, which it opens as a pane item
      * and so does this: it is a view of the repository, read and scrolled.
      */
@@ -307,6 +317,27 @@ private val BINDINGS: List<Binding> = listOf(
         InWorkspace,
     ),
     Binding(WorkspaceCommand.FindFile, Chord(AndroidKeyEvent.KEYCODE_P, "P"), InWorkspace),
+    // Zed's ctrl-= / ctrl-+ / ctrl-- / ctrl-0 (default-linux.json:1402-1405).
+    // `shift = null` on the grow chord because `ctrl-+` *is* the shifted `=`
+    // on most layouts, and Zed binds both to the same action.
+    Binding(
+        WorkspaceCommand.IncreaseUiFontSize,
+        Chord(AndroidKeyEvent.KEYCODE_EQUALS, "=", shift = null),
+        InWorkspace,
+    ),
+    Binding(
+        WorkspaceCommand.DecreaseUiFontSize,
+        // Not the shifted twin: `Ctrl+Shift+-` and `Ctrl+Alt+-` are the
+        // navigation history's, and a chord that grew the font instead of
+        // going back would be maddening.
+        Chord(AndroidKeyEvent.KEYCODE_MINUS, "-", shift = false),
+        InWorkspace,
+    ),
+    Binding(
+        WorkspaceCommand.ResetUiFontSize,
+        Chord(AndroidKeyEvent.KEYCODE_0, "0", shift = false),
+        InWorkspace,
+    ),
     // Ctrl+F is free in the editor — it moves nothing there — and this is
     // where every editor puts find. In a terminal it is readline's "forward
     // one character", so the bar is not offered while a shell has the keys.

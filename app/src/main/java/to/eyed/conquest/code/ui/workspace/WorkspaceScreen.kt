@@ -66,6 +66,7 @@ import to.eyed.conquest.code.terminal.Userland
 import to.eyed.conquest.code.terminal.UserlandInstaller
 import to.eyed.conquest.code.terminal.UserlandState
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
+import to.eyed.conquest.code.ui.theme.ThemeStore
 import to.eyed.conquest.code.core.ProjectSearchMatch
 import to.eyed.conquest.code.ui.search.BufferSearchBar
 import to.eyed.conquest.code.ui.search.ProjectSearchPanel
@@ -742,6 +743,18 @@ fun WorkspaceScreen(
                 if (!canPreviewActiveFile()) return false
                 togglePanel(WorkspacePanel.Preview)
             }
+            // Zed's rem is `ui_font_size`, so these three resize the whole
+            // chrome. They persist, unlike Zed's own (`persist: false`),
+            // because a phone has no window to remember the size for: the
+            // next launch is the same window.
+            WorkspaceCommand.IncreaseUiFontSize ->
+                ThemeStore.adjustUiFontSize(context, ThemeStore.FONT_SIZE_STEP)
+
+            WorkspaceCommand.DecreaseUiFontSize ->
+                ThemeStore.adjustUiFontSize(context, -ThemeStore.FONT_SIZE_STEP)
+
+            WorkspaceCommand.ResetUiFontSize -> ThemeStore.resetUiFontSize(context)
+
             WorkspaceCommand.ToggleSoftWrap -> {
                 val next = if (settings.softWrap.wraps) SoftWrapMode.None else SoftWrapMode.EditorWidth
                 scope.launch {

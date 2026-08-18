@@ -29,9 +29,19 @@ import to.eyed.conquest.code.core.DockSide
 import to.eyed.conquest.code.ui.editor.SoftWrapMode
 import to.eyed.conquest.code.core.GitignoredFiles
 import to.eyed.conquest.code.core.ThemeMode
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.collectAsState
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
+import to.eyed.conquest.code.ui.theme.ThemeStore
 
 private val FONT_SIZES = listOf(10f, 12f, 14f, 16f, 18f, 22f, 28f)
+
+/**
+ * The interface sizes offered, inside `ThemeStore`'s own 10..32 clamp. 16 is
+ * Zed's default and therefore the size every chrome number in this app is
+ * written against (assets/settings/default.json:71).
+ */
+private val UI_FONT_SIZES = listOf(12f, 14f, 16f, 18f, 20f, 24f)
 private val TAB_SIZES = listOf(2, 4, 8)
 
 /**
@@ -54,6 +64,11 @@ fun SettingsScreen(
     onDismiss: () -> Unit,
 ) {
     val theme = LocalZedTheme.current
+    // The interface size lives in ThemeStore (a preference, not settings.json)
+    // because it is the rem every composable here is measured in — it has to
+    // be readable without parsing a file on every frame.
+    val context = LocalContext.current
+    val uiFontSize = ThemeStore.choices.collectAsState().value.uiFontSize
     Dialog(onDismissRequest = onDismiss) {
         Surface(
             shape = RoundedCornerShape(12.dp),
@@ -111,6 +126,21 @@ fun SettingsScreen(
                             kotlin.math.abs(it - settings.bufferFontSize)
                         } ?: 14f,
                         onSelect = { onSet(AppSettings.KEY_FONT_SIZE, it.toInt().toString()) },
+                    )
+                    // Zed's rem *is* `ui_font_size`
+                    // (theme_settings/src/settings.rs:619), so this row
+                    // resizes the whole chrome — rows, bars, gaps, icons —
+                    // rather than only its text. The chords are Ctrl+= /
+                    // Ctrl+- / Ctrl+0, but a phone has no keyboard to reach
+                    // them with, which is why the row is the real route.
+                    ChoiceRow(
+                        label = "Interface size",
+                        detail = "Zed's ui_font_size — the whole chrome scales with it",
+                        options = UI_FONT_SIZES.map { it to it.toInt().toString() },
+                        selected = UI_FONT_SIZES.minByOrNull {
+                            kotlin.math.abs(it - uiFontSize)
+                        } ?: ThemeStore.DEFAULT_UI_FONT_SIZE,
+                        onSelect = { ThemeStore.setUiFontSize(context, it) },
                     )
                     ChoiceRow(
                         label = "Tab width",

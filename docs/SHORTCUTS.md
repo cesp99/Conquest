@@ -65,6 +65,8 @@ editor.
 | `Ctrl` `Shift` `E` | Reveal the open file in the project panel |
 | `Ctrl` `Shift` `G` | Show/hide the git panel |
 | `Ctrl` `,` | Open settings |
+| `Ctrl` `=` / `Ctrl` `-` | Make the interface bigger / smaller |
+| `Ctrl` `0` | Back to the default size |
 | — | Pick a theme (`theme selector: toggle` in the palette, or the ☰ menu) |
 | — | Install a language server (`conquest: install language server` in the palette) |
 | ``Ctrl` ` `` | Show/hide the terminal |
@@ -94,6 +96,12 @@ Nothing is ever installed without being asked for, and the question says what
 the download will cost. Like cloning, it exists only in the `full` edition —
 apt lives inside the Linux userland — so the edition without one leaves the
 command out entirely rather than showing it greyed.
+
+**The interface size is Zed's `ui_font_size`, and it is the unit the whole
+chrome is measured in** — rows, bars, gaps and icons grow with it, not just
+the text, which is what Zed does and why the chords are worth having. On a
+phone the same setting is **Settings → Interface size**, which is the route
+that matters when there is no keyboard.
 
 ## Git in the editor
 
