@@ -269,6 +269,7 @@ internal val ZED_ICON_DRAWABLE: Map<String, String> = mapOf(
 
 
 UI_ICONS = (
+    "ai_zed.svg",
     "eye.svg",
     "eye_off.svg",
     "file_tree.svg",

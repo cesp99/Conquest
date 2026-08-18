@@ -315,14 +315,47 @@ impl AgentShared {
         !matches!(*self.init.lock().unwrap(), InitPhase::Starting)
     }
 
-    /// The last of stderr appended to a message — the lsp module's pattern
-    /// for saying *why*, not only *that*.
-    fn with_stderr(&self, base: &str) -> String {
+    /// The one line of stderr worth showing a user, if there is one.
+    ///
+    /// **Not simply the last line, and the device is why.** proot reports a
+    /// missing program in two lines — `proot error: 'claude-code-acp' not
+    /// found (root = …)` and then `fatal error: see \`libproot_exec.so
+    /// --help\`` — so taking the last one put a pointer to proot's own usage
+    /// message in front of the user and, worse, threw away the only words that
+    /// say what is wrong. The panel reads these sentences too: it offers to
+    /// install Node exactly when one of them says something was not found, so
+    /// picking the wrong line also silently removed the way out.
+    ///
+    /// So: the first line that names a missing thing, and otherwise the last
+    /// non-empty one — which for an agent that started and then crashed is the
+    /// end of its own traceback, the useful end.
+    fn stderr_hint(&self) -> Option<String> {
         let stderr = self.stderr.lock().unwrap();
-        match stderr.lines().last() {
-            Some(line) if !line.trim().is_empty() => format!("{base}: {}", line.trim()),
-            _ => base.to_owned(),
-        }
+        let named_missing = stderr.lines().find(|line| {
+            let line = line.to_ascii_lowercase();
+            line.contains("not found") || line.contains("no such file")
+        });
+        named_missing
+            .or_else(|| {
+                stderr
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .next_back()
+            })
+            .map(|line| trim_proot_detail(line.trim()))
+            .filter(|line| !line.is_empty())
+    }
+
+    /// What the agent said about itself, or `base` when it said nothing.
+    ///
+    /// The agent's own words win outright rather than being appended: the
+    /// caller's `base` is a description of the *transport* giving up — "the
+    /// connection closed", with the SDK's multi-line JSON in it — and beside
+    /// "'claude-code-acp' not found" it is noise. The lsp module made the same
+    /// call for the same reason (lsp.rs's `start_server`, which shows the
+    /// captured line and falls back to the error only when there is none).
+    fn with_stderr(&self, base: &str) -> String {
+        self.stderr_hint().unwrap_or_else(|| base.to_owned())
     }
 
     /// One of *our* sessions. A session belonging to an agent that has since
@@ -535,6 +568,24 @@ impl AgentShared {
             }
         }
     }
+}
+
+/// Drop the machine detail proot puts after its own message.
+///
+/// `proot error: 'claude-code-acp' not found (root = /data/user/0/…, cwd =
+/// /data/user/0/…, $PATH=/usr/local/sbin:…)` — the sentence is the first
+/// clause and the parenthetical is three absolute paths, which on a phone is
+/// six wrapped lines of panel pushing the way out of trouble off the screen.
+/// It is in logcat either way. Only proot's own shape is trimmed, and only
+/// when the sentence survives it: an agent's message is never touched.
+fn trim_proot_detail(line: &str) -> String {
+    let Some(head) = line.split(" (root = ").next() else {
+        return line.to_owned();
+    };
+    if head.len() < line.len() && !head.trim().is_empty() {
+        return head.trim().to_owned();
+    }
+    line.to_owned()
 }
 
 /// `line` (1-based) and `limit` applied the way the protocol describes them.
@@ -1676,6 +1727,79 @@ mod tests {
         let index = index.lock().unwrap();
         assert!(!index.contains_key(&acp::SessionId::new("old-1")));
         assert!(index.contains_key(&acp::SessionId::new("new-1")));
+    }
+
+    /// The sentence a user is shown when an agent will not start.
+    ///
+    /// Found on the emulator, not in a test: proot says a missing program in
+    /// two lines and the *second* is a pointer to its own usage message, so
+    /// taking the last line showed "fatal error: see `libproot_exec.so
+    /// --help`" — which tells the user nothing and, because the panel decides
+    /// whether to offer the Node install by looking for "not found" in this
+    /// very sentence, also took away the way out.
+    #[test]
+    fn the_sentence_for_a_missing_agent_is_the_one_that_names_it() {
+        let sessions: Sessions = Arc::default();
+        let index: Index = Arc::default();
+        let shared = shared_for_test(&sessions, &index);
+
+        // Verbatim from the device (logcat, 2026-08-18).
+        *shared.stderr.lock().unwrap() = concat!(
+            "proot error: 'claude-code-acp' not found (root = /data/.../debian, ",
+            "cwd = /data/.../projects/Spoon-Knife, $PATH=/usr/local/sbin:/usr/bin)\n",
+            "fatal error: see `libproot_exec.so --help`.\n",
+        )
+        .to_owned();
+
+        let sentence = shared.with_stderr("the agent failed to initialize: transport closed");
+        assert!(
+            sentence.contains("'claude-code-acp' not found"),
+            "the sentence must name what is missing: {sentence}"
+        );
+        assert!(
+            !sentence.contains("--help"),
+            "and must not be proot's own usage pointer: {sentence}"
+        );
+        // The panel keys the "install Node" offer off exactly this.
+        assert!(sentence.to_ascii_lowercase().contains("not found"));
+        // proot's parenthetical — three absolute paths — is six wrapped lines
+        // of panel on a phone and says nothing the user can act on.
+        assert_eq!(sentence, "proot error: 'claude-code-acp' not found");
+    }
+
+    /// The trim knows exactly one shape — proot's — and leaves everything else
+    /// alone, an agent's own parentheses included.
+    #[test]
+    fn only_proots_own_detail_is_trimmed() {
+        assert_eq!(
+            trim_proot_detail("proot error: 'x' not found (root = /a, cwd = /b, $PATH=/c)"),
+            "proot error: 'x' not found"
+        );
+        let agents_own = "Error: config invalid (expected an object) at line 3";
+        assert_eq!(trim_proot_detail(agents_own), agents_own);
+        assert_eq!(trim_proot_detail(""), "");
+    }
+
+    /// An agent that started and then died says something useful at the *end*
+    /// of its own output, so that is what a hint falls back to.
+    #[test]
+    fn a_crashing_agent_is_quoted_from_the_end_of_its_traceback() {
+        let sessions: Sessions = Arc::default();
+        let index: Index = Arc::default();
+        let shared = shared_for_test(&sessions, &index);
+        *shared.stderr.lock().unwrap() =
+            "Traceback:\n  at thing (index.js:4)\nError: no API key configured\n".to_owned();
+        assert_eq!(
+            shared.with_stderr("the agent exited"),
+            "Error: no API key configured"
+        );
+
+        // And with nothing on stderr at all, the caller's own words stand.
+        *shared.stderr.lock().unwrap() = "  \n\n".to_owned();
+        assert_eq!(
+            shared.with_stderr("the agent exited (1)"),
+            "the agent exited (1)"
+        );
     }
 
     /// A message still in flight on the old wire names a session id the new

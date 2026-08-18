@@ -124,7 +124,7 @@ fun DiffPane(
 }
 
 @Composable
-private fun DiffBody(files: List<FileDiff>, onOpenFile: (String) -> Unit) {
+internal fun DiffBody(files: List<FileDiff>, onOpenFile: (String) -> Unit) {
     val theme = LocalZedTheme.current
     val settings = LocalAppSettings.current
     val code = remember(settings.bufferFontSize) {
@@ -294,7 +294,7 @@ private fun FileHeader(file: FileDiff, onOpenFile: (String) -> Unit) {
 }
 
 @Composable
-private fun DiffLineRow(
+internal fun DiffLineRow(
     line: PatchLine,
     code: TextStyle,
     across: androidx.compose.foundation.ScrollState,
@@ -331,7 +331,7 @@ private fun DiffLineRow(
 }
 
 @Composable
-private fun LineNumber(text: String, code: TextStyle) {
+internal fun LineNumber(text: String, code: TextStyle) {
     val theme = LocalZedTheme.current
     Text(
         text = text,

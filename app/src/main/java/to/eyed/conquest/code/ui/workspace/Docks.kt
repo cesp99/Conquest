@@ -28,7 +28,8 @@ enum class WorkspacePanel(
     Project("project_panel", "Project panel", R.drawable.ic_ui_file_tree),
     Git("git_panel", "Git panel", R.drawable.ic_ui_git_branch),
     Search("project_search", "Project search", R.drawable.ic_ui_magnifying_glass),
-    Preview("preview", "Preview", R.drawable.ic_ui_eye);
+    Preview("preview", "Preview", R.drawable.ic_ui_eye),
+    Agent("agent_panel", "Agent panel", R.drawable.ic_ui_ai_zed);
 
     /** Which side this panel is docked on right now. */
     fun sideIn(settings: AppSettings): DockSide = settings.panel(settingsKey).dock

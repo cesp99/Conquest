@@ -90,7 +90,7 @@ Samsung DeX.
 | Navigation history | ✅ back and forward across the places you jumped from |
 | Language servers on-device | ✅ diagnostics, completions, hover, go-to-definition; servers installed with `apt` (`full` edition) |
 | Interface size | ✅ `Ctrl+=` / `Ctrl+-` / `Ctrl+0`, and a settings row — all the chrome scales |
-| ACP agent panel | ⬜ planned |
+| ACP agent panel | 🚧 built, unproven — the panel, the client and the permission gating are in; a conversation needs an agent you install yourself with `npm` (`full` edition) |
 
 ## Editions
 

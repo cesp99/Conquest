@@ -52,6 +52,8 @@ import to.eyed.conquest.code.core.AppSettings
 import to.eyed.conquest.code.core.BufferSession
 import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.core.LanguageServerInstaller
+import to.eyed.conquest.code.ui.agent.AgentPanel
+import to.eyed.conquest.code.ui.agent.isAgentPanelSupported
 import to.eyed.conquest.code.core.DockSide
 import to.eyed.conquest.code.core.ProjectEntry
 import to.eyed.conquest.code.core.ProjectSession
@@ -262,6 +264,7 @@ fun WorkspaceScreen(
     var projectSearchFocus by remember { mutableIntStateOf(0) }
     /** Ctrl+Shift+G, the same way: press it again to put focus back on the list. */
     var gitPanelFocus by remember { mutableIntStateOf(0) }
+    var agentPanelFocus by remember { mutableIntStateOf(0) }
     /**
      * Whether the dock is drawn over the whole work area rather than beside
      * the editor. Decided during layout, where the width is known, and read by
@@ -768,6 +771,11 @@ fun WorkspaceScreen(
                 if (project == null) return false
                 openGraph()
             }
+            WorkspaceCommand.ToggleAgentPanel -> {
+                if (!isAgentPanelSupported) return false
+                if (togglePanel(WorkspacePanel.Agent)) agentPanelFocus++
+            }
+
             WorkspaceCommand.ToggleGitPanel -> {
                 if (project == null) return false
                 if (togglePanel(WorkspacePanel.Git)) gitPanelFocus++
@@ -1065,6 +1073,9 @@ fun WorkspaceScreen(
             fun panelHasSubject(panel: WorkspacePanel): Boolean = when (panel) {
                 WorkspacePanel.Preview -> canPreviewActiveFile()
                 WorkspacePanel.Search, WorkspacePanel.Git -> project != null
+                // An agent runs in the userland and works on a project, so a
+                // build without one never shows this panel at all.
+                WorkspacePanel.Agent -> project != null && isAgentPanelSupported
                 WorkspacePanel.Project -> true
             }
             val plan = planDocks(
@@ -1091,6 +1102,7 @@ fun WorkspaceScreen(
                         settings = settings,
                         searchFocus = projectSearchFocus,
                         gitFocus = gitPanelFocus,
+                        agentFocus = agentPanelFocus,
                         revealRequest = revealInPanel,
                         onRevealHandled = { revealInPanel = false },
                         onOpenEntry = onOpenEntry,
@@ -1202,6 +1214,7 @@ fun WorkspaceScreen(
                                         settings = settings,
                                         searchFocus = projectSearchFocus,
                                         gitFocus = gitPanelFocus,
+                                        agentFocus = agentPanelFocus,
                                         revealRequest = revealInPanel,
                                         onRevealHandled = { revealInPanel = false },
                                         onOpenEntry = onOpenEntry,
@@ -1287,6 +1300,7 @@ fun WorkspaceScreen(
                 .filter { it != WorkspacePanel.Preview || canPreviewActiveFile() }
                 .filter { it != WorkspacePanel.Project || project != null }
                 .filter { it !in setOf(WorkspacePanel.Search, WorkspacePanel.Git) || project != null }
+                .filter { it != WorkspacePanel.Agent || (project != null && isAgentPanelSupported) }
                 .map { panel ->
                     PanelButton(
                         panel = panel,
@@ -1303,6 +1317,8 @@ fun WorkspaceScreen(
                                     runCommand(WorkspaceCommand.TogglePreview)
                                 WorkspacePanel.Project ->
                                     runCommand(WorkspaceCommand.ToggleProjectPanel)
+                                WorkspacePanel.Agent ->
+                                    runCommand(WorkspaceCommand.ToggleAgentPanel)
                             }
                         },
                     )
@@ -1417,6 +1433,7 @@ fun WorkspaceScreen(
                 terminalCount = terminals.sessions.size,
                 canClone = GitClone.isSupported,
                 canInstallLanguageServer = LanguageServerInstaller.isSupported,
+                canUseAgent = isAgentPanelSupported,
                 canPreview = canPreviewActiveFile(),
                 canGoBack = files.canGoBack,
                 canGoForward = files.canGoForward,
@@ -1801,6 +1818,7 @@ private fun DockPanel(
     settings: AppSettings,
     searchFocus: Int,
     gitFocus: Int,
+    agentFocus: Int,
     revealRequest: Boolean,
     openedPath: String?,
     onRevealHandled: () -> Unit,
@@ -1846,6 +1864,11 @@ private fun DockPanel(
             onOpenDiff = onOpenDiff,
             onOpenGraph = onOpenGraph,
             onDismiss = onDismiss,
+        )
+        WorkspacePanel.Agent -> AgentPanel(
+            project = project ?: return,
+            focusToken = agentFocus,
+            onOpenPath = onOpenPath,
         )
     }
 }

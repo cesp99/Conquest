@@ -1,5 +1,6 @@
 package to.eyed.conquest.code.ui.preview
 
+import android.os.SystemClock
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -620,6 +621,69 @@ private fun previewStyle(): PreviewStyle {
         )
     }
 }
+
+/**
+ * A markdown *string*, rendered the way the file preview renders a document.
+ *
+ * The preview proper is buffer-bound — it follows an [EditorState] and polls
+ * the engine's version — but the agent panel's messages are markdown that
+ * never becomes a file, so this is the same renderer over a plain string.
+ * Zed does exactly this: an agent's reply is a `Markdown` element with the
+ * same style as everything else (agent_ui renders `Entity<Markdown>` per
+ * chunk), which is why an agent's tables and fences look like the editor's.
+ *
+ * [source] may change on every frame of a streaming reply, and parsing it is
+ * not free — each fence is a tree-sitter parse behind the engine's buffer
+ * mutex — so the work is debounced and done off the main thread, and the last
+ * good render stays on screen meanwhile. That is the same trade the preview
+ * makes, for the same reason.
+ */
+@Composable
+internal fun MarkdownText(
+    source: String,
+    modifier: Modifier = Modifier,
+    onLink: (String) -> Unit = {},
+) {
+    val style = previewStyle()
+    var document by remember { mutableStateOf(PreviewDocument.EMPTY) }
+    var lastParsed by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(source) {
+        // Throttled, **not** debounced, and the difference is the whole
+        // feature. A plain `delay(DEBOUNCE)` at the top of an effect keyed on
+        // the text never fires at all while the text keeps changing faster
+        // than the delay — and a streaming reply changes every 120 ms against
+        // a 180 ms debounce, so the panel would have shown an empty bubble
+        // until the agent stopped talking. Waiting only for the *remainder*
+        // since the last parse bounds how stale the view can be instead of
+        // starving it.
+        val wait = parseDelay(SystemClock.uptimeMillis() - lastParsed)
+        if (wait > 0) delay(wait)
+        document = withContext(Dispatchers.Default) { PreviewDocument.of(source) }
+        lastParsed = SystemClock.uptimeMillis()
+    }
+    Column(modifier = modifier) {
+        for (block in document.blocks) {
+            BlockView(block, document, style, onLink)
+        }
+    }
+}
+
+/**
+ * How long to wait before re-parsing, given how long ago the last parse was.
+ *
+ * Pure so the policy can be tested: the property that matters is that it is
+ * bounded above by the interval — text arriving forever cannot postpone a
+ * parse forever — and that a first parse, or one after a quiet spell, is
+ * immediate.
+ */
+internal fun parseDelay(sinceLastParse: Long, interval: Long = PREVIEW_REPARSE_DEBOUNCE_MS): Long =
+    when {
+        // A clock that went backwards (or a first parse) is not a reason to
+        // stall; parse now.
+        sinceLastParse < 0 -> 0
+        sinceLastParse >= interval -> 0
+        else -> interval - sinceLastParse
+    }
 
 /**
  * Tailwind's scale, which is what Zed's `text_3xl`…`text_sm` resolve to

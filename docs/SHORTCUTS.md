@@ -64,6 +64,7 @@ editor.
 | `Ctrl` `Shift` `T` | Reopen the tab you closed last |
 | `Ctrl` `Shift` `E` | Reveal the open file in the project panel |
 | `Ctrl` `Shift` `G` | Show/hide the git panel |
+| `Ctrl` `Alt` `A` | Show/hide the agent panel |
 | `Ctrl` `,` | Open settings |
 | `Ctrl` `=` / `Ctrl` `-` | Make the interface bigger / smaller |
 | `Ctrl` `0` | Back to the default size |
@@ -163,7 +164,8 @@ to the ends of the *line*, not of the screen row.
 
 Every panel lives in a dock — left or right — and each one's side is a setting,
 as in Zed: **Settings** → *Project panel* / *Git panel* / *Project search* /
-*Preview*, or `project_panel.dock` and friends in settings.json. Its button in
+*Preview* / *Agent panel*, or `project_panel.dock` and friends in
+settings.json. Its button in
 the status bar moves with it, so the button is always on the side the panel
 will appear.
 
@@ -211,6 +213,40 @@ On a wide screen it docks beside the editor; on a phone it takes the work area.
 The dock shows one panel at a time — git, project search or the preview — which
 is a dock's rule in Zed too, and is what stops three of them sharing a phone
 screen and leaving the editor a character wide.
+
+## Agent panel
+
+`Ctrl` `Alt` `A` opens a conversation with an ACP agent — Claude Code, Gemini
+CLI, or anything else that speaks the protocol — working on the open project.
+Pressing it again puts the keyboard back in the composer.
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl` `Alt` `A` | Show/hide the agent panel |
+| `Enter` | Send the message |
+| `Shift` `Enter` | Start a new line instead |
+| `Esc` | Stop the agent mid-turn |
+
+On a phone `Enter` inserts a newline and **Send** is the button beside the box:
+a soft keyboard's Enter arrives as text rather than as a keystroke, so it
+cannot mean two things at once.
+
+**The panel does not take the keyboard the way the terminal does.** Every
+workspace chord keeps working while the composer has focus — it is a text box
+in a dock, like the git panel's commit message — so `Ctrl` `S`, `Ctrl` `P` and
+the rest still reach the editor. The reverse also holds: `Ctrl` `Alt` `A` is an
+Alt chord, so while the *terminal* has focus it belongs to the shell, and the
+`☰` menu or the command palette is the way to the panel from there.
+
+**Nothing the agent writes lands without a decision.** When it asks to change a
+file the turn stops, the diff appears in the conversation, and **Allow** and
+**Deny** sit underneath it — the change and the choice on one screen. Diffs are
+unified, never side by side.
+
+The agent runs inside the Linux userland, so this panel is absent from the Play
+edition entirely. It needs Node, which the panel offers to install with apt the
+way a language server is installed, and an agent, which you install yourself:
+the panel shows the `npm install -g …` line to run in the terminal.
 
 ## Find in file
 

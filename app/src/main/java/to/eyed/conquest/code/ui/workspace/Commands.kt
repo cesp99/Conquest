@@ -45,6 +45,13 @@ data class CommandContext(
      * other they must not have shared a field.
      */
     val canInstallLanguageServer: Boolean = false,
+    /**
+     * Whether this build can run an ACP agent at all — it needs the userland,
+     * because that is where Node and the agent live. Its own field for the
+     * same reason [canInstallLanguageServer] is: these are three separately
+     * absent-able features that happen to share an answer today.
+     */
+    val canUseAgent: Boolean = false,
     /** Whether the open file is one the preview can draw — Markdown or SVG. */
     val canPreview: Boolean = false,
     /** Whether the navigation history has anywhere to go back to. */

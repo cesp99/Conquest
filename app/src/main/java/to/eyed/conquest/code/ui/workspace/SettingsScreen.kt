@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import to.eyed.conquest.code.core.AppSettings
 import to.eyed.conquest.code.core.DockSide
+import to.eyed.conquest.code.ui.agent.isAgentPanelSupported
 import to.eyed.conquest.code.ui.editor.SoftWrapMode
 import to.eyed.conquest.code.core.GitignoredFiles
 import to.eyed.conquest.code.core.ThemeMode
@@ -168,7 +169,15 @@ fun SettingsScreen(
                     )
                     // Where each panel lives. Zed's own setting, one per
                     // panel, and the buttons in the status bar follow it.
-                    for (panel in WorkspacePanel.entries) {
+                    //
+                    // A panel this edition cannot show gets no row: the agent
+                    // panel needs the Linux userland, and offering to choose a
+                    // side for something that will never appear is the sort of
+                    // dead setting the "absent, not failing" rule exists to
+                    // prevent.
+                    for (panel in WorkspacePanel.entries.filter {
+                        it != WorkspacePanel.Agent || isAgentPanelSupported
+                    }) {
                         ChoiceRow(
                             label = panel.title,
                             detail = if (panel == WorkspacePanel.Project) "Which side it docks on" else null,

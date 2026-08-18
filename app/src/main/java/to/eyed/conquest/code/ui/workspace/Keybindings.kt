@@ -191,6 +191,20 @@ enum class WorkspaceCommand(
     ToggleGitPanel("git_panel::ToggleFocus", isAvailable = { it.hasProject }),
 
     /**
+     * Show or hide the agent panel — Zed's `agent::ToggleFocus`, on the chord
+     * Zed gives it (default-linux.json: `ctrl-?`, which a phone keyboard
+     * cannot reach, so this takes Zed's *other* agent chord `ctrl-alt-a`).
+     *
+     * Offered only where an agent could run at all: the `play` edition has no
+     * userland, so it has no agent panel and is not shown one greyed out.
+     */
+    ToggleAgentPanel(
+        "agent::ToggleFocus",
+        isOffered = { it.canUseAgent },
+        isAvailable = { it.hasProject },
+    ),
+
+    /**
      * Show or hide the left and right docks — Zed's `workspace::ToggleLeftDock`
      * on `ctrl-b` and `ToggleRightDock` on `ctrl-alt-b`
      * (default-linux.json:668-669).
@@ -420,6 +434,19 @@ private val BINDINGS: List<Binding> = listOf(
         WorkspaceCommand.ToggleGitPanel,
         Chord(AndroidKeyEvent.KEYCODE_G, "G", shift = true),
         Everywhere,
+    ),
+    // `ctrl-alt-a`, which is what Zed binds `agent::ToggleFocus` to besides
+    // `ctrl-?` — the question mark needs a shift on every layout a phone
+    // keyboard has, and the chord table cannot express that.
+    //
+    // `InWorkspace`, like the dock toggles it sits beside: an Alt chord
+    // belongs to the pty while the terminal has focus, and the workspace keeps
+    // only its ``Ctrl+` `` and the Ctrl+Shift twins there. Taking this one
+    // everywhere would break Alt+A in vi to save a keystroke.
+    Binding(
+        WorkspaceCommand.ToggleAgentPanel,
+        Chord(AndroidKeyEvent.KEYCODE_A, "A", alt = true),
+        InWorkspace,
     ),
     Binding(
         WorkspaceCommand.ToggleTerminal,
