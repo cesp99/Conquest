@@ -453,7 +453,31 @@ impl AgentShared {
             return;
         };
         let tool_call_id = request.tool_call.tool_call_id.0.to_string();
-        handle.update(|thread| thread.begin_permission(request.tool_call, request.options));
+        // A request that arrives after the turn was cancelled — or with no
+        // turn running at all — is answered `cancelled` right now, as the
+        // spec requires of a cancelling client. Parking it deadlocked the
+        // turn: the agent blocks on this answer while the engine waits for
+        // its `PromptResponse`, and a ghost permission dialog surfaced after
+        // the user had already pressed Stop. Found by a skeptic pass with a
+        // live agent; the window is the agent's whole streaming phase.
+        let late = handle.update(|thread| {
+            if thread.turn_cancelled || thread.phase != Phase::Running {
+                // Still recorded, as cancelled: the transcript should say
+                // what the agent was trying when the stop landed.
+                thread.begin_permission(request.tool_call.clone(), Vec::new());
+                thread.finish_permission(&tool_call_id, PermissionDecision::Cancel);
+                true
+            } else {
+                thread.begin_permission(request.tool_call.clone(), request.options.clone());
+                false
+            }
+        });
+        if late {
+            let _ = responder.respond(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Cancelled,
+            ));
+            return;
+        }
         // Two live requests for one tool call cannot both be answered; the
         // newer one is the agent's current question, so the older is answered
         // `cancelled` on its way out.
@@ -1007,7 +1031,11 @@ async fn create_session(shared: Arc<AgentShared>, cx: ConnectionTo<Agent>, our_i
     match result {
         Ok(response) => {
             let acp_id = response.session_id.clone();
-            shared.index.lock().unwrap().insert(acp_id.clone(), our_id);
+            if let Some(displaced) = shared.index.lock().unwrap().insert(acp_id.clone(), our_id) {
+                // The protocol requires unique session ids; an agent that
+                // reuses one has just stolen the older session's updates.
+                log::warn!("acp: agent reused session id {acp_id:?}; session {displaced} loses it");
+            }
             handle.update(|thread| thread.ready(acp_id.clone(), response.modes));
             // Updates that raced the response are still in arrival order.
             let early: Vec<acp::SessionUpdate> = {
@@ -1340,9 +1368,15 @@ impl crate::Engine {
             Route::Queue => true,
             Route::Interrupt(acp_id) => {
                 // The running turn ends with `cancelled`; `run_prompt` then
-                // takes the queued text and sends it.
+                // takes the queued text and sends it. Same ordering rule as
+                // `acp_cancel`: through the task queue.
+                handle.update(|thread| thread.turn_cancelled = true);
                 if let Some(cx) = shared.connection() {
-                    let _ = cx.send_notification(acp::CancelNotification::new(acp_id));
+                    let notify = cx.clone();
+                    let _ = cx.spawn(async move {
+                        let _ = notify.send_notification(acp::CancelNotification::new(acp_id));
+                        Ok(())
+                    });
                 }
                 true
             }
@@ -1372,12 +1406,24 @@ impl crate::Engine {
             // a transcript must not show a message the agent never received.
             thread.discard_queued_prompt();
             thread.cancel_pending_tool_calls();
+            if thread.phase == Phase::Running {
+                thread.turn_cancelled = true;
+            }
             thread.acp_id.clone()
         });
         handle.cancel_permissions();
         if let (Some(acp_id), Some(shared)) = (acp_id, self.acp.agent.lock().unwrap().clone()) {
             if let Some(cx) = shared.connection() {
-                let _ = cx.send_notification(acp::CancelNotification::new(acp_id));
+                // Through the task queue, not enqueued inline: the prompt
+                // itself goes out from a spawned task, and a notification
+                // enqueued directly here could overtake a prompt whose task
+                // has not run yet — the agent would then see the cancel as
+                // stale and run the whole turn anyway.
+                let notify = cx.clone();
+                let _ = cx.spawn(async move {
+                    let _ = notify.send_notification(acp::CancelNotification::new(acp_id));
+                    Ok(())
+                });
             }
         }
         true
@@ -2119,6 +2165,63 @@ mod tests {
         assert_eq!(kinds, vec!["user", "assistant", "tool_call"]);
     }
 
+    /// The ghost-dialog deadlock, pinned: the user presses Stop while the
+    /// agent is still streaming, and the agent's `session/request_permission`
+    /// arrives *after* the cancel. Parking it deadlocked the turn — the agent
+    /// blocks on the answer while the engine waits for its `PromptResponse` —
+    /// and surfaced a permission dialog for a turn the user had already
+    /// killed. The spec's rule is the fix: a cancelling client answers
+    /// `cancelled` immediately.
+    #[test]
+    fn a_permission_request_after_cancel_is_answered_not_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let file = root.join("notes.txt");
+        std::fs::write(&file, "old\n").unwrap();
+
+        let rig = rig(&root, &file);
+        let Rig { shared, handle } = &rig;
+        wait_for("the session to be ready", || {
+            handle.thread.lock().unwrap().phase == Phase::Ready
+        });
+
+        let cx = shared.connection().expect("connection is up");
+        handle.update(|thread| thread.push_user_message("edit the file"));
+        // The cancel lands before the agent's permission request can — set
+        // the flag first, exactly as `acp_cancel` does, so the ordering is
+        // deterministic rather than a race the test usually wins.
+        handle.update(|thread| thread.turn_cancelled = true);
+        start_prompt(shared, &cx, 7, "edit the file".to_owned(), false);
+
+        // The turn settles by itself: the agent's permission request was
+        // answered `cancelled` on arrival, so it proceeds and responds.
+        wait_for("the turn to settle without anyone answering", || {
+            let thread = handle.thread.lock().unwrap();
+            thread.phase == Phase::Ready && thread.stop_reason.is_some()
+        });
+
+        // No dialog: the responder was consumed, not parked.
+        assert!(
+            handle.permissions.lock().unwrap().is_empty(),
+            "a cancelled turn leaves no permission waiting"
+        );
+        // And the transcript says what the agent was trying when the stop
+        // landed — a cancelled tool call, not a question with live options.
+        let thread = handle.thread.lock().unwrap();
+        let call = thread
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.body {
+                EntryBody::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .expect("the tool call is recorded");
+        assert_eq!(call.status, ToolStatus::Canceled);
+        assert!(call.options.is_empty(), "no options are offered to answer");
+        // Denied means denied: nothing was written.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+    }
+
     #[test]
     fn a_write_outside_the_project_is_refused_at_the_wire() {
         let dir = tempfile::tempdir().unwrap();
@@ -2283,6 +2386,205 @@ mod tests {
 
         shutdown_agent(&new);
         wait_for("the new agent to stop", || new.dead.load(Ordering::Acquire));
+        assert_eq!(guest::RESERVED_FOR_AGENT.load(Ordering::Relaxed), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // The conformance agent: a real external process, over real pipes,
+    // through the production spawn path. `tools/conformance-agent.py` is the
+    // same file the device runs (configured through `agent_servers`), so a
+    // wire-shape mistake in it — or a serde mismatch in us — is a red test
+    // here rather than a device session.
+    // -------------------------------------------------------------------
+
+    #[cfg(unix)]
+    fn conformance_script() -> Option<std::path::PathBuf> {
+        // CARGO_MANIFEST_DIR is core/crates/engine; the script lives at the
+        // repository root's tools/.
+        std::fs::canonicalize(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tools/conformance-agent.py"),
+        )
+        .ok()
+    }
+
+    #[cfg(unix)]
+    fn tool_call_status(handle: &SessionHandle, id: &str) -> Option<ToolStatus> {
+        let thread = handle.thread.lock().unwrap();
+        thread
+            .entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.body {
+                EntryBody::ToolCall(call) if call.id == id => Some(call.status),
+                _ => None,
+            })
+    }
+
+    #[cfg(unix)]
+    fn answer_permission(handle: &SessionHandle, id: &str, option: &str) {
+        // The body of Engine::acp_respond_permission, without an Engine.
+        let responder = handle.permissions.lock().unwrap().remove(id).unwrap();
+        let decision = if option.starts_with("allow") || option == "allow" {
+            PermissionDecision::Allow
+        } else {
+            PermissionDecision::Reject
+        };
+        handle.update(|thread| {
+            thread.finish_permission(id, decision);
+        });
+        responder
+            .respond(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                    acp::PermissionOptionId::new(option.to_owned()),
+                )),
+            ))
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_python_conformance_agent_survives_the_whole_flow() {
+        // The guest ships python3; the host is only guaranteed to when the
+        // developer installed it. Skipping is honest — the in-process wire
+        // test above still covers the client — but say so loudly.
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: no python3 on this host");
+            return;
+        }
+        let Some(script) = conformance_script() else {
+            panic!("tools/conformance-agent.py is missing");
+        };
+
+        let _guard = budget_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let userland = Arc::new(guest::testing::fake_userland(dir.path()));
+        let project = dir.path().join("proj");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("notes.md"), "first line\n").unwrap();
+        let project = std::fs::canonicalize(&project).unwrap();
+
+        let sessions: Sessions = Arc::default();
+        let index: Index = Arc::default();
+        let spec = AgentSpec {
+            name: "Conformance".to_owned(),
+            argv: vec!["python3".to_owned(), script.to_string_lossy().into_owned()],
+            env: HashMap::new(),
+        };
+        let shared = AgentShared::new(
+            &spec,
+            sessions.clone(),
+            index,
+            Arc::new(WrittenFiles::default()),
+            Arc::default(),
+        );
+        let handle = Arc::new(SessionHandle::new(
+            shared.id,
+            SessionThread::new(1, project.clone()),
+        ));
+        sessions.lock().unwrap().insert(1, handle.clone());
+        shared.pending_sessions.lock().unwrap().push(1);
+        assert!(start_agent(shared.clone(), userland, &spec, &project));
+
+        // initialize and session/new run over the real pipes; fake_proot does
+        // not honour the workdir, which is fine — the script takes its cwd
+        // from session/new, exactly as it must under the real proot too.
+        wait_for("the python agent to reach ready", || {
+            handle.thread.lock().unwrap().phase == Phase::Ready
+        });
+
+        // ---- turn one: an allowed edit of an existing file ----------------
+        let cx = shared.connection().expect("connection is up");
+        handle.update(|thread| thread.push_user_message("please edit notes.md"));
+        start_prompt(&shared, &cx, 1, "please edit notes.md".to_owned(), false);
+
+        wait_for("the permission prompt", || {
+            handle.permissions.lock().unwrap().contains_key("t-1")
+        });
+        assert_eq!(
+            tool_call_status(&handle, "t-1"),
+            Some(ToolStatus::WaitingForConfirmation)
+        );
+        answer_permission(&handle, "t-1", "allow");
+
+        wait_for("the turn to end", || {
+            let thread = handle.thread.lock().unwrap();
+            thread.phase == Phase::Ready && thread.stop_reason.as_deref() == Some("end_turn")
+        });
+
+        // The write went through the client's fs capability into the project.
+        let notes = std::fs::read_to_string(project.join("notes.md")).unwrap();
+        assert!(
+            notes.starts_with("first line\n") && notes.contains("Edited by the conformance agent"),
+            "the file carries the agent's edit: {notes:?}"
+        );
+        assert_eq!(shared.written.json(0)["total"], 1);
+
+        // The completed call carries diff rows the git renderer can draw:
+        // a context row from the old text and a '+' row for the new line.
+        {
+            let thread = handle.thread.lock().unwrap();
+            let diff = thread
+                .entries
+                .iter()
+                .find_map(|entry| match &entry.body {
+                    EntryBody::ToolCall(call) if call.id == "t-1" => {
+                        assert_eq!(call.status, ToolStatus::Completed);
+                        call.content.iter().find_map(|content| match content {
+                            crate::acp_thread::ToolContent::Diff { diff } => Some(diff.clone()),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                })
+                .expect("the completed call carries a diff");
+            assert_eq!(diff.path, "notes.md", "project-relative, like a git diff");
+            let kinds: Vec<char> = diff
+                .hunks
+                .iter()
+                .flat_map(|hunk| hunk.lines.iter().map(|line| line.kind))
+                .collect();
+            assert!(kinds.contains(&'+'), "an added row: {kinds:?}");
+            assert!(kinds.contains(&' '), "old-text context rows: {kinds:?}");
+            // The plan progressed to done, and the panel chrome has it.
+            assert!(
+                thread
+                    .plan
+                    .iter()
+                    .all(|entry| entry.status == acp::PlanEntryStatus::Completed),
+                "the plan finished"
+            );
+        }
+
+        // ---- turn two: a rejected creation writes nothing ------------------
+        handle.update(|thread| thread.push_user_message("add AGENT_NOTE.md please"));
+        start_prompt(
+            &shared,
+            &cx,
+            1,
+            "add AGENT_NOTE.md please".to_owned(),
+            false,
+        );
+        wait_for("the second permission prompt", || {
+            handle.permissions.lock().unwrap().contains_key("t-2")
+        });
+        answer_permission(&handle, "t-2", "reject");
+        wait_for("the second turn to end", || {
+            let thread = handle.thread.lock().unwrap();
+            thread.phase == Phase::Ready && thread.stop_reason.as_deref() == Some("end_turn")
+        });
+        assert!(
+            !project.join("AGENT_NOTE.md").exists(),
+            "a rejected call writes nothing"
+        );
+        assert_eq!(tool_call_status(&handle, "t-2"), Some(ToolStatus::Rejected));
+
+        // ---- shutdown: EOF on its stdin is how the python process learns ---
+        shutdown_agent(&shared);
+        wait_for("the agent to exit", || shared.dead.load(Ordering::Acquire));
         assert_eq!(guest::RESERVED_FOR_AGENT.load(Ordering::Relaxed), 0);
     }
 }

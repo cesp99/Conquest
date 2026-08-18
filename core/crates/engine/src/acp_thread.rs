@@ -242,6 +242,14 @@ pub struct SessionThread {
     pub revision: u64,
     /// The session wants `authenticate` before `session/new` will work.
     pub needs_auth: bool,
+    /// The running turn has been cancelled and its answer is still on its
+    /// way. While this is set, a `session/request_permission` that arrives is
+    /// **answered `cancelled` immediately** rather than parked: the user has
+    /// already said stop, and parking it deadlocks the turn — the agent waits
+    /// for the answer while the engine waits for the agent's `PromptResponse`,
+    /// and a ghost permission dialog appears after the Stop was pressed.
+    /// Cleared when a new turn starts and when the cancelled one settles.
+    pub turn_cancelled: bool,
 }
 
 impl SessionThread {
@@ -262,6 +270,7 @@ impl SessionThread {
             queued_prompt: None,
             revision: 1,
             needs_auth: false,
+            turn_cancelled: false,
         }
     }
 
@@ -293,6 +302,7 @@ impl SessionThread {
         self.stop_reason = None;
         self.error = None;
         self.phase = Phase::Running;
+        self.turn_cancelled = false;
         self.push_entry(EntryBody::User {
             markdown: text.to_owned(),
             chunks: vec![text.to_owned()],
@@ -348,6 +358,7 @@ impl SessionThread {
         self.phase = Phase::Running;
         self.stop_reason = None;
         self.error = None;
+        self.turn_cancelled = false;
         self.bump();
         Some(text)
     }
@@ -640,6 +651,7 @@ impl SessionThread {
     pub fn end_turn(&mut self, stop_reason: acp::StopReason) -> Option<String> {
         self.phase = Phase::Ready;
         self.stop_reason = Some(stop_reason_name(stop_reason).to_owned());
+        self.turn_cancelled = false;
         self.bump();
         match stop_reason {
             acp::StopReason::Cancelled => self.cancel_pending_tool_calls(),
@@ -666,6 +678,7 @@ impl SessionThread {
     pub fn fail_turn(&mut self, message: String) {
         self.phase = Phase::Ready;
         self.error = Some(message);
+        self.turn_cancelled = false;
         self.discard_queued_prompt();
         self.cancel_pending_tool_calls();
         self.bump();
@@ -1052,6 +1065,36 @@ mod tests {
 
     fn tool_call(id: &str, title: &str) -> acp::ToolCall {
         acp::ToolCall::new(acp::ToolCallId::new(id.to_owned()), title)
+    }
+
+    /// `turn_cancelled` gates `session/request_permission` answers in
+    /// `acp::on_permission`; a flag that outlives its turn would swallow the
+    /// *next* turn's real permission question, so every way a turn starts or
+    /// settles must drop it.
+    #[test]
+    fn the_cancel_flag_dies_with_its_turn() {
+        let mut thread = thread();
+
+        thread.turn_cancelled = true;
+        thread.push_user_message("a new turn");
+        assert!(!thread.turn_cancelled, "a new prompt starts uncancelled");
+
+        thread.turn_cancelled = true;
+        thread.end_turn(acp::StopReason::Cancelled);
+        assert!(!thread.turn_cancelled, "a settled turn clears it");
+
+        thread.push_user_message("again");
+        thread.turn_cancelled = true;
+        thread.fail_turn("the wire broke".to_owned());
+        assert!(!thread.turn_cancelled, "a failed turn clears it");
+
+        thread.queue_prompt("queued while running");
+        thread.turn_cancelled = true;
+        assert!(thread.take_queued_prompt().is_some());
+        assert!(
+            !thread.turn_cancelled,
+            "a queued follow-up is its own turn, not the cancelled one"
+        );
     }
 
     #[test]
