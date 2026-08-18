@@ -165,10 +165,7 @@ impl crate::Engine {
 /// path or an option.
 fn checked_sha(sha: &str) -> Result<String, String> {
     let trimmed = sha.trim();
-    if trimmed.len() < 4
-        || trimmed.len() > 64
-        || !trimmed.chars().all(|c| c.is_ascii_hexdigit())
-    {
+    if trimmed.len() < 4 || trimmed.len() > 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!("{sha:?} is not a commit hash"));
     }
     Ok(trimmed.to_owned())
@@ -306,7 +303,10 @@ def456\0\0Someone Else\0them@example.com\01699999999\0First commit\0\x1e";
     fn a_truncated_record_is_dropped() {
         assert!(parse_log("").is_empty());
         assert!(parse_log("\x1e\x1e").is_empty());
-        assert_eq!(parse_log("abc\0\0A\0a@b\0notanumber\0s\0\x1e")[0].author_time, 0);
+        assert_eq!(
+            parse_log("abc\0\0A\0a@b\0notanumber\0s\0\x1e")[0].author_time,
+            0
+        );
         assert!(parse_name_status("R100\0only-one-name\0").is_empty());
     }
 

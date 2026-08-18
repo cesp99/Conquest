@@ -240,7 +240,9 @@ pub(crate) fn parse_patch(output: &str) -> Vec<FileDiff> {
             });
             continue;
         }
-        let Some(file) = files.last_mut() else { continue };
+        let Some(file) = files.last_mut() else {
+            continue;
+        };
 
         if let Some(rest) = line.strip_prefix("--- ") {
             let rest = rest.strip_suffix('\r').unwrap_or(rest);
@@ -297,7 +299,9 @@ pub(crate) fn parse_patch(output: &str) -> Vec<FileDiff> {
             });
             continue;
         }
-        let Some(hunk) = file.hunks.last_mut() else { continue };
+        let Some(hunk) = file.hunks.last_mut() else {
+            continue;
+        };
         // Inside a hunk. `\ No newline at end of file` is a note about the
         // line above, not a line of its own.
         if line.starts_with('\\') {
@@ -433,13 +437,28 @@ mod tests {
     #[test]
     fn every_line_carries_its_number_on_the_side_it_exists_on() {
         let lines = &parse_patch(&patch())[0].hunks[0].lines;
-        assert_eq!((lines[0].kind, lines[0].old_line, lines[0].new_line), (' ', 1, 1));
-        assert_eq!((lines[1].kind, lines[1].old_line, lines[1].new_line), ('-', 2, 0));
-        assert_eq!((lines[2].kind, lines[2].old_line, lines[2].new_line), ('+', 0, 2));
-        assert_eq!((lines[3].kind, lines[3].old_line, lines[3].new_line), ('+', 0, 3));
+        assert_eq!(
+            (lines[0].kind, lines[0].old_line, lines[0].new_line),
+            (' ', 1, 1)
+        );
+        assert_eq!(
+            (lines[1].kind, lines[1].old_line, lines[1].new_line),
+            ('-', 2, 0)
+        );
+        assert_eq!(
+            (lines[2].kind, lines[2].old_line, lines[2].new_line),
+            ('+', 0, 2)
+        );
+        assert_eq!(
+            (lines[3].kind, lines[3].old_line, lines[3].new_line),
+            ('+', 0, 3)
+        );
         // Context after the change: the old side has advanced by one line and
         // the new side by two.
-        assert_eq!((lines[4].kind, lines[4].old_line, lines[4].new_line), (' ', 3, 4));
+        assert_eq!(
+            (lines[4].kind, lines[4].old_line, lines[4].new_line),
+            (' ', 3, 4)
+        );
     }
 
     #[test]
@@ -496,22 +515,43 @@ Binary files a/logo.png and b/logo.png differ\n",
         assert_eq!(quoted[0].path, "caffè.txt");
 
         let awkward = parse_patch(
-            &["diff --git a/x b/y b/x b/y", "--- a/x b/y", "+++ b/x b/y", "@@ -1 +1 @@", "-a", "+b"]
-                .join("\n"),
+            &[
+                "diff --git a/x b/y b/x b/y",
+                "--- a/x b/y",
+                "+++ b/x b/y",
+                "@@ -1 +1 @@",
+                "-a",
+                "+b",
+            ]
+            .join("\n"),
         );
         assert_eq!(awkward[0].path, "x b/y");
 
         let created = parse_patch(
-            &["diff --git a/new.txt b/new.txt", "new file mode 100644", "--- /dev/null", "+++ b/new.txt", "@@ -0,0 +1 @@", "+hello"]
-                .join("\n"),
+            &[
+                "diff --git a/new.txt b/new.txt",
+                "new file mode 100644",
+                "--- /dev/null",
+                "+++ b/new.txt",
+                "@@ -0,0 +1 @@",
+                "+hello",
+            ]
+            .join("\n"),
         );
         assert_eq!(created[0].path, "new.txt");
         assert!(created[0].original.is_none(), "a new file was not renamed");
         assert_eq!(created[0].hunks[0].lines[0].new_line, 1);
 
         let deleted = parse_patch(
-            &["diff --git a/gone.txt b/gone.txt", "deleted file mode 100644", "--- a/gone.txt", "+++ /dev/null", "@@ -1 +0,0 @@", "-bye"]
-                .join("\n"),
+            &[
+                "diff --git a/gone.txt b/gone.txt",
+                "deleted file mode 100644",
+                "--- a/gone.txt",
+                "+++ /dev/null",
+                "@@ -1 +0,0 @@",
+                "-bye",
+            ]
+            .join("\n"),
         );
         assert_eq!(deleted[0].path, "gone.txt");
         assert!(deleted[0].original.is_none());
@@ -522,8 +562,15 @@ Binary files a/logo.png and b/logo.png differ\n",
     #[test]
     fn crlf_content_keeps_its_carriage_return() {
         let files = parse_patch(
-            &["diff --git a/a.txt b/a.txt", "--- a/a.txt", "+++ b/a.txt", "@@ -1 +1 @@", "-one\r", "+two\r"]
-                .join("\n"),
+            &[
+                "diff --git a/a.txt b/a.txt",
+                "--- a/a.txt",
+                "+++ b/a.txt",
+                "@@ -1 +1 @@",
+                "-one\r",
+                "+two\r",
+            ]
+            .join("\n"),
         );
         assert_eq!(files[0].hunks[0].lines[0].text, "one\r");
         assert_eq!(files[0].hunks[0].lines[1].text, "two\r");
@@ -533,7 +580,14 @@ Binary files a/logo.png and b/logo.png differ\n",
     #[test]
     fn a_hunk_header_without_counts_still_parses() {
         let files = parse_patch(
-            &["diff --git a/a b/a", "--- a/a", "+++ b/a", "@@ -7 +9 @@", " ctx"].join("\n"),
+            &[
+                "diff --git a/a b/a",
+                "--- a/a",
+                "+++ b/a",
+                "@@ -7 +9 @@",
+                " ctx",
+            ]
+            .join("\n"),
         );
         assert_eq!(files[0].hunks[0].old_start, 7);
         assert_eq!(files[0].hunks[0].new_start, 9);

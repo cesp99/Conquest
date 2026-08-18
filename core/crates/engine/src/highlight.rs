@@ -126,32 +126,33 @@ fn registry() -> &'static HashMap<&'static str, LanguageEntry> {
                     }
                 }
             });
-            let outline = queries.outline.and_then(|source| {
-                match Query::new(&language, source.as_ref()) {
-                    Ok(query) => {
-                        let index = |wanted: &str| {
-                            query
-                                .capture_names()
-                                .iter()
-                                .position(|name| *name == wanted)
-                                .map(|i| i as u32)
-                        };
-                        match (index("item"), index("name")) {
-                            (Some(item), Some(name)) => Some(OutlineQuery {
-                                item,
-                                name,
-                                context: index("context"),
-                                query,
-                            }),
-                            _ => None,
+            let outline =
+                queries
+                    .outline
+                    .and_then(|source| match Query::new(&language, source.as_ref()) {
+                        Ok(query) => {
+                            let index = |wanted: &str| {
+                                query
+                                    .capture_names()
+                                    .iter()
+                                    .position(|name| *name == wanted)
+                                    .map(|i| i as u32)
+                            };
+                            match (index("item"), index("name")) {
+                                (Some(item), Some(name)) => Some(OutlineQuery {
+                                    item,
+                                    name,
+                                    context: index("context"),
+                                    query,
+                                }),
+                                _ => None,
+                            }
                         }
-                    }
-                    Err(err) => {
-                        log::warn!("failed to compile outline query for {name}: {err}");
-                        None
-                    }
-                }
-            });
+                        Err(err) => {
+                            log::warn!("failed to compile outline query for {name}: {err}");
+                            None
+                        }
+                    });
             map.insert(
                 name,
                 LanguageEntry {
@@ -437,8 +438,7 @@ impl HighlightState {
         let mut items: Vec<(usize, usize, String)> = Vec::new();
         let mut cursor = QueryCursor::new();
         cursor.set_byte_range(offset.saturating_sub(1)..offset.saturating_add(1));
-        let mut matches =
-            cursor.matches(&outline.query, tree.root_node(), RopeTextProvider(text));
+        let mut matches = cursor.matches(&outline.query, tree.root_node(), RopeTextProvider(text));
         while let Some(match_) = matches.next() {
             let Some(item) = match_
                 .captures
@@ -495,8 +495,7 @@ impl HighlightState {
         }
         let mut raw: Vec<Raw> = Vec::new();
         let mut cursor = QueryCursor::new();
-        let mut matches =
-            cursor.matches(&outline.query, tree.root_node(), RopeTextProvider(text));
+        let mut matches = cursor.matches(&outline.query, tree.root_node(), RopeTextProvider(text));
         while let Some(match_) = matches.next() {
             let Some(item) = match_
                 .captures
@@ -563,10 +562,8 @@ impl HighlightState {
                 let range = capture.node.byte_range();
                 // Clip a multi-line capture to its first line, as Zed does.
                 let start_point = text.offset_to_point(range.start);
-                let line_end = text.point_to_offset(Point::new(
-                    start_point.row,
-                    text.line_len(start_point.row),
-                ));
+                let line_end = text
+                    .point_to_offset(Point::new(start_point.row, text.line_len(start_point.row)));
                 range.start..range.end.min(line_end).max(range.start)
             })
             .collect();

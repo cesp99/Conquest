@@ -1391,7 +1391,12 @@ impl crate::Engine {
     /// the userland's `~/.ssh` works.
     ///
     /// **Blocking**: it talks to the network.
-    pub fn git_push(&self, id: ProjectId, branch: &str, set_upstream: bool) -> Result<String, String> {
+    pub fn git_push(
+        &self,
+        id: ProjectId,
+        branch: &str,
+        set_upstream: bool,
+    ) -> Result<String, String> {
         let branch = checked_branch(branch)?;
         let repo = self.repo_for(id)?;
         // The remote the branch actually tracks, when it tracks one: pushing
@@ -1401,7 +1406,11 @@ impl crate::Engine {
             .with_git(id, |git| git.branch.clone())
             .flatten()
             .and_then(|branch| branch.upstream)
-            .and_then(|upstream| upstream.split_once('/').map(|(remote, _)| remote.to_owned()))
+            .and_then(|upstream| {
+                upstream
+                    .split_once('/')
+                    .map(|(remote, _)| remote.to_owned())
+            })
             .unwrap_or_else(|| "origin".to_owned());
         let mut args: Vec<OsString> = vec![OsString::from("push")];
         if set_upstream {
@@ -1435,7 +1444,11 @@ impl crate::Engine {
     pub fn git_identity(&self, id: ProjectId) -> Result<(String, String), String> {
         let repo = self.repo_for(id)?;
         let read = |key: &str| -> String {
-            let args = [OsString::from("config"), OsString::from("--get"), OsString::from(key)];
+            let args = [
+                OsString::from("config"),
+                OsString::from("--get"),
+                OsString::from(key),
+            ];
             run_git(
                 &repo.userland,
                 &repo.repo_root,
@@ -1472,7 +1485,9 @@ impl crate::Engine {
         // later passes this through a shell.
         for value in [name, email] {
             if value.contains('\n') || value.contains('\r') || value.starts_with('-') {
-                return Err("A name or email cannot start with '-' or contain a line break".to_owned());
+                return Err(
+                    "A name or email cannot start with '-' or contain a line break".to_owned(),
+                );
             }
         }
         if !email.contains('@') {
@@ -2866,8 +2881,14 @@ mod tests {
         );
         let userland = engine.userland().unwrap();
         let outcome = status_for(1, &userland, &root);
-        assert!(outcome.repo_root.is_some(), "the .git directory is right there");
-        assert!(!outcome.ran, "no git ran, so the empty change list means nothing");
+        assert!(
+            outcome.repo_root.is_some(),
+            "the .git directory is right there"
+        );
+        assert!(
+            !outcome.ran,
+            "no git ran, so the empty change list means nothing"
+        );
         assert!(outcome.changes.is_empty());
     }
 

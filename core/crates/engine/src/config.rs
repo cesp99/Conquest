@@ -126,7 +126,10 @@ pub struct PanelSettings {
 
 impl PanelSettings {
     const fn new(dock: DockSide, default_width: f32) -> Self {
-        Self { dock, default_width }
+        Self {
+            dock,
+            default_width,
+        }
     }
 }
 
@@ -431,8 +434,7 @@ mod tests {
     /// — silently, since a bad parse is defaults.
     #[test]
     fn the_default_file_is_the_default_settings() {
-        let parsed: Settings =
-            settings_json::parse_json_with_comments(DEFAULT_FILE).unwrap();
+        let parsed: Settings = settings_json::parse_json_with_comments(DEFAULT_FILE).unwrap();
         assert_eq!(parsed, Settings::default());
     }
 
@@ -482,7 +484,11 @@ mod tests {
             assert_eq!(updated.soft_wrap, SoftWrap::EditorWidth);
             // A value that is not one of the two leaves the setting alone
             // rather than turning wrapping off under the user.
-            assert!(engine.set_setting(&["soft_wrap"], json!("bounded")).is_err());
+            assert!(
+                engine
+                    .set_setting(&["soft_wrap"], json!("bounded"))
+                    .is_err()
+            );
             assert_eq!(engine.settings().soft_wrap, SoftWrap::EditorWidth);
         });
     }

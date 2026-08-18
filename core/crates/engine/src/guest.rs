@@ -44,9 +44,9 @@
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -56,6 +56,28 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// How long proot gets to take its tracees down after SIGQUIT, before we
 /// resort to SIGKILL. The same grace the Kotlin side gives it.
 const QUIT_GRACE: Duration = Duration::from_secs(3);
+
+/// How many processes Android counts against us for one guest run.
+///
+/// proot is not a wrapper that execs and disappears: it stays, as the tracer,
+/// and the program runs as its tracee. Both are our descendants and both are
+/// counted, so **every** way into the guest — [`capture`], [`spawn`], and the
+/// [`invocation`] a language server is started from — costs two, before the
+/// guest program forks anything of its own.
+pub(crate) const PROCESSES_PER_RUN: usize = 2;
+
+/// Android's cap on an app's background processes, on the devices that enforce
+/// it: 32 (Android 12+'s phantom-process limit, `settings global
+/// max_phantom_processes`; agent-docs/research/proot-spike.md, "Open items",
+/// item 3). Some OEMs disable it and some raise it; nothing may *rely* on that,
+/// so 32 is the number we budget against.
+///
+/// It is one budget for the whole app, shared by everything that leaves our
+/// address space: the terminal's shells, `git status` and clone, `apt install`,
+/// and the language servers. Who reserves what is written down beside the
+/// language-server cap in lsp.rs, which is the only consumer that runs
+/// long-lived children in an unbounded number.
+pub(crate) const PROCESS_BUDGET: usize = 32;
 
 /// Where the guest lives. The engine never guesses any of this: Kotlin knows
 /// the flavour, the install state and the paths, and hands them over through
@@ -437,12 +459,17 @@ pub(crate) fn capture(
 /// all belong to the vendored crate rather than to us. See lsp.rs.
 ///
 /// So this stays for the next resident guest program that is not an LSP server
-/// — an ACP agent, most likely — and it still owes its caller two things it
-/// does not do: noticing that the child died (the handle below only knows when
-/// asked), and a budget. Android caps background child processes — 32 where it
-/// is enforced — and that cap is already shared with the terminal's shells, the
-/// git status runs and now one proot per language server, each adding tracees
-/// of its own.
+/// — an ACP agent, most likely — and it still owes its caller one thing it does
+/// not do: noticing that the child died (the handle below only knows when
+/// asked).
+///
+/// It does **not** owe a budget any more, but it does not enforce one either.
+/// P5-4 put the budget where the unbounded number of resident children actually
+/// is — one language server per language per project, capped and swept in
+/// lsp.rs — and left the arithmetic here, in [`PROCESSES_PER_RUN`] and
+/// [`PROCESS_BUDGET`], because this is the module that knows what entering the
+/// guest costs. A second kind of resident guest program must budget itself
+/// against the same two constants rather than inventing a number.
 #[allow(
     dead_code,
     reason = "the resident-process seam outlived its first expected caller; see above"

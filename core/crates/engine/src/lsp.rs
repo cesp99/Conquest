@@ -8,7 +8,7 @@
 //! document is opened, changed, saved and closed, and how the answers get to a
 //! UI that must never block.
 //!
-//! Four things shape it.
+//! Five things shape it.
 //!
 //! **The server is started by Zed's own code.** `LanguageServer::new`
 //! (vendor/lsp/src/lsp.rs:429) spawns `binary.path` with `binary.arguments`,
@@ -39,13 +39,26 @@
 //! are "this buffer has no language intelligence", never an error and never a
 //! panic. It is the contract `git.rs` already has, and it is the normal state
 //! of a fresh Debian.
+//!
+//! **Processes are rationed, and this is what rations them** (P5-4). A desktop
+//! editor may start a server per language and forget about it; a phone may not.
+//! Android caps an app's background processes at 32 where it enforces the cap,
+//! one guest run is proot *plus* its tracee, and that one budget is shared with
+//! the terminal's shells, `git`, and `apt`. So this module is the only thing in
+//! the engine that starts an unbounded number of long-lived children, and it
+//! carries three rules the rest of the file exists around: a **cap** on how
+//! many servers run at once ([`MAX_RUNNING_SERVERS`], arithmetic below), an
+//! **idle sweep** that stops the ones not earning their processes ([`retire`]),
+//! and a **refusal that is visible** — a server the cap turns away is reported
+//! `unavailable` with a sentence, exactly like one that is not installed, so
+//! there is nothing new for the UI to render and nothing silently missing.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{AsyncApp, Task};
 use lsp::{
@@ -74,6 +87,109 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(4);
 const HOVER_TIMEOUT: Duration = Duration::from_secs(4);
 const DEFINITION_TIMEOUT: Duration = Duration::from_secs(8);
+
+// ---------------------------------------------------------------------------
+// The process budget (P5-4)
+// ---------------------------------------------------------------------------
+
+/// What one running server costs, in processes Android counts against the app.
+///
+/// A guest run is two — proot and the program it traces
+/// ([`guest::PROCESSES_PER_RUN`]) — and a language server is not a leaf: it
+/// forks for the work that produces most of its diagnostics. rust-analyzer runs
+/// `cargo check` on save (cargo, then a rustc per crate); gopls shells out to
+/// `go list`; pylsp forks pyflakes; clangd forks nothing at all. The `+ 1` is
+/// that burst averaged over the servers we ship a mapping for — it is not a
+/// limit on it, which is what the spare in the arithmetic below is for.
+const PROCESSES_PER_SERVER: usize = guest::PROCESSES_PER_RUN + 1;
+
+/// What the rest of the app must be able to take from the same budget, at a
+/// peak, without the language servers having spent it first.
+///
+/// - **8, the terminal.** A session is proot + bash = 2, and a session is
+///   opened to *run* something, which is at least one more; two sessions with a
+///   build in one of them is 8. The terminal is the feature the user is looking
+///   at when it dies, so it is reserved generously.
+/// - **6, git.** `git status` is debounced to one run in flight per project (2),
+///   and a clone is proot + git + git-remote-https + index-pack = 4. They
+///   overlap: the panel refreshes while a clone runs.
+/// - **6, apt.** P5-2's install is proot + apt + dpkg + the maintainer scripts
+///   dpkg runs, and it is the one thing here the user explicitly waits for.
+///
+/// Android counts *processes*, not threads, so the JVM, the engine's gpui
+/// runtime and every worker thread in this crate cost nothing here.
+const RESERVED_PROCESSES: usize = 8 + 6 + 6;
+
+/// How many language servers may run at once, **across every open project** —
+/// because the budget is one app's, not one project's.
+///
+/// `(32 − 20) / 3 = 4`. Four servers hold 8 processes between them and can burst
+/// to 12 without touching what the terminal, git and apt have reserved; a fifth
+/// would put the peak over the cap, and going over the cap does not mean a
+/// failed spawn — it means Android killing *something of ours*, most likely the
+/// shell the user is watching, because the phantom-process killer picks its
+/// victim and we do not.
+///
+/// Four is also more languages than a phone screen holds tabs for: a project
+/// mixing Rust, C++, Go, Python and TypeScript *at once* is real but rare, and
+/// what it gets is the fifth language without intelligence and a sentence
+/// saying so — not a killed terminal.
+///
+/// Deliberately not a setting. A number the user can raise is a number the user
+/// can use to break the terminal, and the honest fix for wanting a fifth server
+/// is closing the tabs that hold the fourth.
+const MAX_RUNNING_SERVERS: usize =
+    (guest::PROCESS_BUDGET - RESERVED_PROCESSES) / PROCESSES_PER_SERVER;
+
+/// What a server refused by the cap reports as its `error`.
+///
+/// It rides the contract that already exists — `lspServers[].state =
+/// unavailable` with an `error` sentence — so the status bar says it with no UI
+/// change (the Kotlin side renders "<name> could not start: <error>";
+/// ui/editor/Diagnostics.kt:401-411). Never a crash, and never a silent
+/// nothing: a language that quietly had no intelligence would look exactly like
+/// a language whose server is not installed, and the two want different
+/// answers from the user.
+const CAP_REACHED: &str = "too many language servers running";
+
+/// How long a server with no open documents is kept before it is stopped.
+///
+/// Zed stops nothing here: closing the last buffer drops the *registration*
+/// (`unregister_buffer_from_language_servers`, lsp_store.rs:3156-3173, reached
+/// when the refcount hits zero at lsp_store.rs:4964-4986) while the server
+/// itself runs until the project closes or a setting changes
+/// (`stop_local_language_server`, lsp_store.rs:11696). We send the same
+/// `didClose` — and then, unlike Zed, we stop the process, because on a phone
+/// the two processes it holds are the ones the next language needs.
+///
+/// The grace is what makes it bearable: closing a tab and reopening it, or
+/// closing the last `.rs` tab on the way to another one, must not cost a
+/// rust-analyzer restart. Half a minute covers that and nothing longer.
+const IDLE_WITHOUT_DOCUMENTS: Duration = Duration::from_secs(30);
+
+/// The backstop Zed does not need and we do: a server that has not exchanged a
+/// byte with us in ten minutes is stopped even though its documents are open.
+///
+/// A desktop can afford a rust-analyzer sitting on an open tab all afternoon.
+/// A phone cannot: the app is backgrounded far more than it is used, and it is
+/// *while backgrounded* that Android counts our children and kills them by its
+/// own rules. Ten minutes is chosen to be far longer than any pause in editing
+/// (a server is touched by every keystroke, save, completion, hover and
+/// diagnostic publish) and far shorter than "the user has gone".
+///
+/// A stopped server is not gone for good: its documents are marked dormant, and
+/// the next edit, save or request in one of them starts it again — see
+/// [`Engine::wake_server`].
+const IDLE_WITHOUT_TRAFFIC: Duration = Duration::from_secs(10 * 60);
+
+/// How often the sweep runs when nothing is polling us.
+///
+/// The foreground sweep rides `lsp_version`, which is the poll the UI already
+/// makes — but a backgrounded app polls nothing, and background is exactly when
+/// the budget is enforced. So one timer on the runtime's background executor
+/// (not a thread of its own) ticks this, from the moment the first server
+/// starts.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Which server serves which language
@@ -638,6 +754,16 @@ struct OpenDoc {
     /// initializing: edits before that only move `lsp_version` forward, and the
     /// `didOpen` that eventually goes out carries the current text.
     opened: bool,
+    /// Its server was stopped by the idle sweep while this document was still
+    /// open, so the document is still ours but nothing is watching it.
+    ///
+    /// It exists to break a loop: polling is what starts servers
+    /// ([`Engine::start_pending_servers`]), so a server stopped for silence
+    /// would be restarted by the very next poll and the sweep would be a
+    /// stutter rather than a budget. Dormant documents are skipped there, and
+    /// woken by *activity* instead — an edit, a save, a completion — which is
+    /// the only evidence that the user is back.
+    dormant: bool,
 }
 
 /// One server instance for one project.
@@ -654,16 +780,230 @@ struct Slot {
     /// Kept so the `publishDiagnostics` handler is removed with the server
     /// rather than left dangling on a shared map.
     subscriptions: Vec<lsp::Subscription>,
+    /// The last time anything crossed this server's pipes, in either
+    /// direction: a `didOpen`/`didChange`/`didSave` or a request going out, a
+    /// `publishDiagnostics` coming back. What [`retire`] measures silence
+    /// against.
+    ///
+    /// Also, for a slot with no documents left, the moment the last one
+    /// closed — which is the same thing, because closing sends `didClose`.
+    last_activity: Instant,
+    /// This slot holds no process: it is the *record* of a server the cap
+    /// refused, kept so the status bar can say so and so the next poll does
+    /// not try again while the budget is still spent.
+    ///
+    /// Distinct from every other `Unavailable` — "not installed", above all —
+    /// because those must never be retried on a timer (a retry is a proot
+    /// spawn per poll for a package that will still not be there), and this one
+    /// must be retried the moment a slot frees up.
+    capped: bool,
 }
+
+impl Slot {
+    fn starting(project: ProjectId, server: Server) -> Self {
+        Self {
+            project,
+            server,
+            state: ServerState::Starting,
+            error: None,
+            handle: None,
+            sync: TextDocumentSyncKind::INCREMENTAL,
+            wants_save: false,
+            subscriptions: Vec::new(),
+            last_activity: Instant::now(),
+            capped: false,
+        }
+    }
+
+    /// The record of a server the cap turned away.
+    fn refused(project: ProjectId, server: Server) -> Self {
+        Self {
+            state: ServerState::Unavailable,
+            error: Some(CAP_REACHED.to_owned()),
+            capped: true,
+            ..Self::starting(project, server)
+        }
+    }
+
+    /// Whether this slot is spending processes — which is what the cap counts,
+    /// and what the sweep can free. A `Starting` slot has a proot and a tracee,
+    /// or is a moment away from having them, which for a budget is the same
+    /// thing; an `Unavailable` one has neither and never will.
+    fn holds_processes(&self) -> bool {
+        matches!(self.state, ServerState::Starting | ServerState::Running)
+    }
+}
+
+type SlotMap = HashMap<(ProjectId, &'static str), Slot>;
 
 /// The server registry, shared so a runtime job can install the server it
 /// finished starting without holding a borrow on the engine.
-type Slots = Arc<Mutex<HashMap<(ProjectId, &'static str), Slot>>>;
+type Slots = Arc<Mutex<SlotMap>>;
+
+type DocMap = HashMap<BufferId, OpenDoc>;
 
 /// The open-document table, shared for the same reason: the `didOpen` for a
 /// document registered while its server was still initializing is sent by that
 /// server's own start job.
-type Docs = Arc<Mutex<HashMap<BufferId, OpenDoc>>>;
+type Docs = Arc<Mutex<DocMap>>;
+
+// ---------------------------------------------------------------------------
+// The two decisions the budget comes down to, as functions of nothing but
+// numbers. Everything above them is policy and everything below them is
+// plumbing; these are the part worth a test that cannot spawn a process.
+// ---------------------------------------------------------------------------
+
+/// What asking for a server gets you.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    /// There is already a slot for it — running, starting, or a refusal from
+    /// earlier. Nothing to do.
+    Taken,
+    /// Room in the budget: start it.
+    Room,
+    /// The budget is spent. Say so; do not start it, and above all do not stop
+    /// somebody else's server to make room (see [`sweep`]).
+    Full,
+}
+
+/// Ask the registry for a slot, and take it when the budget allows.
+///
+/// Counting and inserting under one lock, deliberately: a count that is already
+/// stale by the time it is acted on is not a cap.
+fn claim(servers: &mut SlotMap, project: ProjectId, server: Server) -> Claim {
+    if servers.contains_key(&(project, server.name)) {
+        return Claim::Taken;
+    }
+    if running_servers(servers) >= MAX_RUNNING_SERVERS {
+        return Claim::Full;
+    }
+    servers.insert((project, server.name), Slot::starting(project, server));
+    Claim::Room
+}
+
+fn running_servers(servers: &SlotMap) -> usize {
+    servers
+        .values()
+        .filter(|slot| slot.holds_processes())
+        .count()
+}
+
+/// Why a server should stop, or that it should not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retire {
+    Keep,
+    /// Every document it was serving has closed. Zed's rule, one step further:
+    /// Zed drops the registration, we drop the process too.
+    NoDocuments,
+    /// Nothing has crossed its pipes in [`IDLE_WITHOUT_TRAFFIC`], though
+    /// documents are still open. Ours alone; a phone's budget is real.
+    Silent,
+}
+
+/// The whole of the idle policy, as a function of three numbers.
+///
+/// `under_pressure` is a start being refused right now. It only shortens the
+/// no-documents grace, and it shortens it to nothing: that grace exists because
+/// processes were free at the time, and the moment they are not, a server whose
+/// last tab closed has no claim on them at all. It deliberately does **not**
+/// shorten the silence limit — a server with a document open is one the user
+/// may still be reading, and evicting it to start another would mean two
+/// servers each paying a cold index to serve one file apiece.
+fn retire(documents: usize, idle_for: Duration, under_pressure: bool) -> Retire {
+    if documents == 0 {
+        if under_pressure || idle_for >= IDLE_WITHOUT_DOCUMENTS {
+            return Retire::NoDocuments;
+        }
+        return Retire::Keep;
+    }
+    if idle_for >= IDLE_WITHOUT_TRAFFIC {
+        return Retire::Silent;
+    }
+    Retire::Keep
+}
+
+/// Stop every server the policy retires, and hand the caller their slots to
+/// drop where a shutdown handshake can run.
+///
+/// A free function over the shared maps rather than a method, because the
+/// background timer that runs it while the app is not being polled holds those
+/// `Arc`s and nothing else — no `Engine`, no borrow, no lifetime.
+///
+/// Locks in the declared order (servers, then docs, then the store) and holds
+/// none of them across the drop: dropping a [`Slot`] runs Zed's `shutdown`/
+/// `exit` handshake (vendor/lsp/src/lsp.rs:1750-1755), which is work, and work
+/// under our locks is how a UI thread ends up waiting for a language server.
+fn sweep(
+    slots: &Slots,
+    docs: &Docs,
+    store: &DiagnosticStore,
+    now: Instant,
+    under_pressure: bool,
+) -> Vec<Slot> {
+    let mut stopped: Vec<(ProjectId, Slot)> = Vec::new();
+    let mut orphaned: Vec<PathBuf> = Vec::new();
+    {
+        let mut servers = slots.lock().unwrap();
+        let mut docs = docs.lock().unwrap();
+
+        let mut documents: HashMap<(ProjectId, &'static str), usize> = HashMap::new();
+        for doc in docs.values() {
+            *documents.entry((doc.project, doc.server)).or_insert(0) += 1;
+        }
+
+        let doomed: Vec<((ProjectId, &'static str), Retire)> = servers
+            .iter()
+            .filter(|(_, slot)| slot.holds_processes())
+            .filter_map(|(key, slot)| {
+                let verdict = retire(
+                    documents.get(key).copied().unwrap_or(0),
+                    // Saturating: `now` is passed in so tests can name it, and
+                    // a caller naming one before a slot was created should get
+                    // "no time has passed", not a panic.
+                    now.saturating_duration_since(slot.last_activity),
+                    under_pressure,
+                );
+                (verdict != Retire::Keep).then_some((*key, verdict))
+            })
+            .collect();
+
+        for (key, verdict) in doomed {
+            let Some(slot) = servers.remove(&key) else {
+                continue;
+            };
+            log::info!(
+                "lsp: stopping {} for project {} ({verdict:?})",
+                key.1,
+                key.0
+            );
+            // Its documents stay ours — the user still has them on screen — but
+            // nothing is watching them until something wakes the server.
+            for doc in docs
+                .values_mut()
+                .filter(|doc| (doc.project, doc.server) == key)
+            {
+                doc.opened = false;
+                doc.dormant = true;
+                orphaned.push(doc.path.clone());
+            }
+            stopped.push((key.0, slot));
+        }
+    }
+
+    // What the server said stands — the same reasoning as `lsp_did_close` —
+    // but it can no longer be dated against a buffer version, so the rows read
+    // as stale until a restarted server publishes again. Which is honest:
+    // nothing is watching that file at this moment.
+    for path in orphaned {
+        store.undate(&path);
+    }
+    for (project, _) in &stopped {
+        // A server leaving the list changes what `lsp_servers` answers, and the
+        // status bar only re-reads when this counter moves.
+        store.bump(*project);
+    }
+    stopped.into_iter().map(|(_, slot)| slot).collect()
+}
 
 /// Lock order, wherever two of these are wanted at once: **servers, then docs,
 /// then the store**. Nothing here takes them in the other order, and nothing
@@ -676,6 +1016,10 @@ pub(crate) struct LspState {
     requests: Arc<Mutex<Requests>>,
     next_request_id: AtomicU64,
     next_server_id: AtomicU64,
+    /// The idle sweep's timer has been started. Set once, when the first server
+    /// starts; there is nothing to sweep before that and the `play` flavour
+    /// never gets here at all.
+    sweeping: AtomicBool,
     /// True once a server has actually been started for something. Read on the
     /// keystroke path by [`Engine::edit`], where even a hash lookup per edit is
     /// a cost the `play` flavour has no reason to pay — and it never sets this,
@@ -968,6 +1312,7 @@ impl crate::Engine {
                 language_id,
                 lsp_version: 1,
                 opened: false,
+                dormant: false,
             },
         );
         self.ensure_server(project, server);
@@ -1009,6 +1354,13 @@ impl crate::Engine {
                 // `didOpen` that eventually goes out carries the current text,
                 // so the change is already in it — only the version has to keep
                 // moving, and it just did.
+                let dormant = doc.dormant.then_some((doc.project, doc.grammar));
+                drop(docs);
+                // Typing in a file whose server we stopped is the clearest
+                // evidence there is that the user wants it back.
+                if let Some((project, grammar)) = dormant {
+                    self.wake_server(project, grammar);
+                }
                 return;
             }
             (
@@ -1059,6 +1411,11 @@ impl crate::Engine {
             .filter(|doc| doc.opened)
             .map(|doc| (doc.project, doc.server, doc.uri.clone()))
         else {
+            // A save is the one event a stopped server most wants: it is where
+            // rust-analyzer's `cargo check` — most of its diagnostics — runs.
+            if let Some((project, grammar)) = self.dormant_server(buffer) {
+                self.wake_server(project, grammar);
+            }
             return;
         };
         if !self.wants_save(project, server) {
@@ -1193,20 +1550,27 @@ impl crate::Engine {
             .is_some_and(|slot| slot.wants_save)
     }
 
+    /// The live server for a document, **and the note that we are about to talk
+    /// to it**.
+    ///
+    /// Every caller of this is a caller that is about to send something —
+    /// `didOpen`, `didChange`, `didSave`, `didClose`, a request — so taking a
+    /// handle is exactly the event [`Slot::last_activity`] means to record, and
+    /// recording it here rather than at four call sites is what keeps the fifth
+    /// one from forgetting. It costs one mutex the caller was taking anyway.
     fn server_handle(
         &self,
         project: ProjectId,
         server: &'static str,
     ) -> Option<Arc<LanguageServer>> {
-        self.lsp
-            .servers
-            .lock()
-            .unwrap()
-            .get(&(project, server))
-            .and_then(|slot| slot.handle.clone())
+        let mut servers = self.lsp.servers.lock().unwrap();
+        let slot = servers.get_mut(&(project, server))?;
+        slot.last_activity = Instant::now();
+        slot.handle.clone()
     }
 
-    /// Start the server for `project` unless it is already there.
+    /// Start the server for `project` unless it is already there — or say why
+    /// it cannot be started, which on a phone is a thing that happens.
     fn ensure_server(&self, project: ProjectId, server: Server) {
         let Some(userland) = self.userland() else {
             return;
@@ -1217,29 +1581,30 @@ impl crate::Engine {
         let Some(root) = self.project_root(project) else {
             return;
         };
-        {
-            let mut servers = self.lsp.servers.lock().unwrap();
-            if servers.contains_key(&(project, server.name)) {
+
+        // The budget, in three steps: ask; if the answer is no, stop what is
+        // not earning its processes and ask once more; if it is still no,
+        // record the refusal where the user can read it.
+        let mut claimed = claim(&mut self.lsp.servers.lock().unwrap(), project, server);
+        if claimed == Claim::Full && self.sweep_idle_servers(true) > 0 {
+            claimed = claim(&mut self.lsp.servers.lock().unwrap(), project, server);
+        }
+        match claimed {
+            Claim::Taken => return,
+            Claim::Full => {
+                self.refuse_server(project, server);
                 return;
             }
-            servers.insert(
-                (project, server.name),
-                Slot {
-                    project,
-                    server,
-                    state: ServerState::Starting,
-                    error: None,
-                    handle: None,
-                    sync: TextDocumentSyncKind::INCREMENTAL,
-                    wants_save: false,
-                    subscriptions: Vec::new(),
-                },
-            );
+            // The slot is ours, and it is `starting` from this moment — so a
+            // second caller arriving during the spawn below finds it taken
+            // rather than starting a second rust-analyzer.
+            Claim::Room => {}
         }
         // Only now is anything actually going to talk to a server, so only now
         // does `Engine::edit` need to do any work at all. The `play` flavour
         // never reaches this line.
         self.lsp.live.store(true, Ordering::Relaxed);
+        self.ensure_sweeper();
         self.lsp.store.bump(project);
 
         let id = LanguageServerId(self.lsp.next_server_id.fetch_add(1, Ordering::Relaxed) as usize);
@@ -1268,6 +1633,153 @@ impl crate::Engine {
         });
     }
 
+    // -----------------------------------------------------------------------
+    // The process budget: refusing, sweeping, waking
+    // -----------------------------------------------------------------------
+
+    /// Record that the cap turned a server away, so the status bar says so.
+    ///
+    /// The slot holds no process and never will; it is a message. It also stops
+    /// the next poll from asking again — [`Engine::retry_capped_servers`] is
+    /// what removes it, and only once there is somewhere for the server to go.
+    fn refuse_server(&self, project: ProjectId, server: Server) {
+        {
+            let mut servers = self.lsp.servers.lock().unwrap();
+            if servers.contains_key(&(project, server.name)) {
+                return;
+            }
+            log::info!(
+                "lsp: not starting {} for project {project}: {} already running (cap {MAX_RUNNING_SERVERS})",
+                server.name,
+                running_servers(&servers),
+            );
+            servers.insert((project, server.name), Slot::refused(project, server));
+        }
+        self.lsp.store.bump(project);
+    }
+
+    /// Give the servers this project had refused another go, now that the sweep
+    /// may have freed something.
+    ///
+    /// Only as many as there is room for, and only from the polled project.
+    /// Freeing more than that would refuse them again on the same pass, and
+    /// each refusal bumps the version counter the UI polls — a status bar that
+    /// redraws twice a second is how a budget becomes a flicker.
+    fn retry_capped_servers(&self, project: ProjectId) {
+        let retried: Vec<(ProjectId, &'static str)> = {
+            let mut servers = self.lsp.servers.lock().unwrap();
+            let room = MAX_RUNNING_SERVERS.saturating_sub(running_servers(&servers));
+            if room == 0 {
+                return;
+            }
+            let keys: Vec<(ProjectId, &'static str)> = servers
+                .iter()
+                .filter(|((id, _), slot)| *id == project && slot.capped)
+                .map(|(key, _)| *key)
+                .take(room)
+                .collect();
+            for key in &keys {
+                servers.remove(key);
+            }
+            keys
+        };
+        if !retried.is_empty() {
+            // Removing the refusal is itself news: the status bar's sentence
+            // goes away here, and the server appears as `starting` a moment
+            // later when the caller gets to it.
+            self.lsp.store.bump(project);
+        }
+    }
+
+    /// Stop the servers that are no longer earning their processes; answer how
+    /// many were stopped.
+    ///
+    /// The handshake is handed to the runtime rather than run here, both
+    /// because that is where `lsp_close_project` already sends it and because
+    /// this is called from `lsp_version` — a poll on the UI's thread, which
+    /// must not wait for a server to say goodbye. The consequence, stated
+    /// plainly: for a second or two after a pressure sweep the stopped server's
+    /// processes and the started one's overlap. That is what the spare in
+    /// [`RESERVED_PROCESSES`] absorbs.
+    fn sweep_idle_servers(&self, under_pressure: bool) -> usize {
+        let stopped = sweep(
+            &self.lsp.servers,
+            &self.lsp.docs,
+            &self.lsp.store,
+            Instant::now(),
+            under_pressure,
+        );
+        let count = stopped.len();
+        if count > 0 {
+            self.runtime().spawn(move |_| drop(stopped));
+        }
+        count
+    }
+
+    /// Start the timer that sweeps while nothing is polling us.
+    ///
+    /// One task on the runtime's background executor, not a thread: the
+    /// foreground sweep (`lsp_version` → [`Engine::start_pending_servers`])
+    /// covers the app the user is looking at, and this covers the app they have
+    /// switched away from — which is the case that matters, because a
+    /// backgrounded app is exactly what Android's phantom-process killer goes
+    /// looking through. Started once, from the first server that starts, and
+    /// runs for the life of the process.
+    fn ensure_sweeper(&self) {
+        if self.lsp.sweeping.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let slots = self.lsp.servers.clone();
+        let docs = self.lsp.docs.clone();
+        let store = self.lsp.store.clone();
+        self.runtime().spawn(move |cx| {
+            let executor = cx.background_executor().clone();
+            let ticker = executor.clone();
+            executor
+                .spawn(async move {
+                    loop {
+                        ticker.timer(SWEEP_INTERVAL).await;
+                        // Dropped here, on a background thread: the handshake
+                        // wants an executor, and this *is* one.
+                        drop(sweep(&slots, &docs, &store, Instant::now(), false));
+                    }
+                })
+                .detach();
+        });
+    }
+
+    /// The user came back to a document whose server the sweep stopped.
+    ///
+    /// Clearing dormancy is what lets the poll consider it again; starting it
+    /// here is what makes the return immediate rather than a poll away. If the
+    /// cap refuses it now, that refusal is what the status bar shows — the
+    /// document is awake either way, and asking again is free.
+    fn wake_server(&self, project: ProjectId, grammar: &'static str) {
+        let Some((server, _)) = server_for(grammar) else {
+            return;
+        };
+        {
+            let mut docs = self.lsp.docs.lock().unwrap();
+            for doc in docs
+                .values_mut()
+                .filter(|doc| doc.project == project && doc.server == server.name)
+            {
+                doc.dormant = false;
+            }
+        }
+        log::info!("lsp: waking {} for project {project}", server.name);
+        self.ensure_server(project, server);
+    }
+
+    /// The `(project, server)` of a buffer's document when its server has been
+    /// stopped for idleness — and nothing when it has not, which is the normal
+    /// case and costs one field read.
+    fn dormant_server(&self, buffer: BufferId) -> Option<(ProjectId, &'static str)> {
+        let docs = self.lsp.docs.lock().unwrap();
+        let doc = docs.get(&buffer)?;
+        doc.dormant.then_some((doc.project, doc.grammar))
+    }
+
     /// Servers for languages already open in a project that has none yet — the
     /// `apt install` that happened while the editor was running.
     fn start_pending_servers(&self, project: ProjectId) {
@@ -1275,6 +1787,11 @@ impl crate::Engine {
             return;
         }
         self.adopt_open_buffers(project);
+        // Free before spending: a server whose tabs all closed is stopped here,
+        // and a server that was refused when the budget was full is given the
+        // room that just appeared.
+        self.sweep_idle_servers(false);
+        self.retry_capped_servers(project);
         let known: Vec<&'static str> = self
             .lsp
             .servers
@@ -1290,7 +1807,11 @@ impl crate::Engine {
             .lock()
             .unwrap()
             .values()
-            .filter(|doc| doc.project == project && !known.contains(&doc.server))
+            // Dormant is deliberate, not pending: its server was stopped by the
+            // sweep *while this document was open*, so starting it again from
+            // the poll would undo the sweep on the next frame. Only activity
+            // wakes it — see `Engine::wake_server`.
+            .filter(|doc| doc.project == project && !doc.dormant && !known.contains(&doc.server))
             .filter_map(|doc| server_for(doc.grammar).map(|(server, _)| server))
             .collect();
         for server in wanted {
@@ -1357,6 +1878,12 @@ impl crate::Engine {
             .filter(|doc| doc.opened)
             .map(|doc| (doc.project, doc.server, doc.uri.clone()));
         let Some((project, server, uri)) = doc else {
+            // Nothing can answer *this* request — but if the reason is a server
+            // the sweep stopped, asking is exactly the evidence that starts it
+            // again, and the next request will have somewhere to go.
+            if let Some((project, grammar)) = self.dormant_server(buffer) {
+                self.wake_server(project, grammar);
+            }
             pending.settle(RequestState::Unavailable, serde_json::Value::Null);
             return id;
         };
@@ -1464,8 +1991,17 @@ async fn start_server(request: StartRequest, cx: &mut AsyncApp) {
     // otherwise have them logged as unhandled and thrown away.
     let subscription = {
         let store = store.clone();
+        let slots = slots.clone();
         server_handle.on_notification::<lsp::notification::PublishDiagnostics, _>(
             move |params: PublishDiagnosticsParams, _cx: &mut AsyncApp| {
+                // The only traffic that arrives *from* a server without us
+                // asking, and therefore the only proof of life the idle sweep
+                // would otherwise miss: a rust-analyzer chewing through a
+                // workspace check is working, not idle. Taken before the store,
+                // which is the module's lock order (servers, docs, store).
+                if let Some(slot) = slots.lock().unwrap().get_mut(&(project, server.name)) {
+                    slot.last_activity = Instant::now();
+                }
                 let Ok(path) = params.uri.to_file_path() else {
                     return;
                 };
@@ -1538,6 +2074,9 @@ async fn start_server(request: StartRequest, cx: &mut AsyncApp) {
         slot.sync = sync;
         slot.wants_save = wants_save;
         slot.subscriptions.push(subscription);
+        // Initializing can take a minute on a cold rust-analyzer, and it is the
+        // opposite of idle: the clock starts here, not when we spawned it.
+        slot.last_activity = Instant::now();
     }
     // Every buffer of this language that was opened while we were starting.
     open_pending_docs(&handle, project, server.name, &docs, &buffers, &store);
@@ -1565,6 +2104,9 @@ fn open_pending_docs(
             .filter(|(_, doc)| doc.project == project && doc.server == name && !doc.opened)
             .map(|(buffer, doc)| {
                 doc.opened = true;
+                // A document whose server the sweep stopped is being watched
+                // again, by this one: dormancy ends where `didOpen` begins.
+                doc.dormant = false;
                 (
                     *buffer,
                     doc.uri.clone(),
@@ -2022,6 +2564,322 @@ mod tests {
         // which is a normal state and not a hole.
         assert!(server_for("markdown").is_none());
         assert!(server_for("yaml").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // The process budget (P5-4)
+    // -----------------------------------------------------------------------
+
+    /// The arithmetic, pinned. Everything about the cap is a judgement call
+    /// about a number, so the number is the test: a later change to what the
+    /// terminal or apt reserve should be a deliberate edit here and a red test
+    /// if it is not.
+    #[test]
+    fn the_budget_leaves_room_for_four_servers() {
+        // Two processes per guest run — proot and its tracee — plus one for the
+        // checker a server forks (cargo, go list, pyflakes).
+        assert_eq!(guest::PROCESSES_PER_RUN, 2);
+        assert_eq!(PROCESSES_PER_SERVER, 3);
+        // 8 for the terminal, 6 for git, 6 for apt.
+        assert_eq!(RESERVED_PROCESSES, 20);
+        // (32 - 20) / 3.
+        assert_eq!(guest::PROCESS_BUDGET, 32);
+        assert_eq!(MAX_RUNNING_SERVERS, 4);
+        // And four servers at their peak still fit inside what is left, which
+        // is the property the division is standing in for. Checked at compile
+        // time, because a reservation edited to something that does not fit
+        // should not build at all.
+        const {
+            assert!(
+                MAX_RUNNING_SERVERS * PROCESSES_PER_SERVER + RESERVED_PROCESSES
+                    <= guest::PROCESS_BUDGET
+            )
+        };
+    }
+
+    fn fake_server(name: &'static str) -> Server {
+        Server { name, argv: &[] }
+    }
+
+    /// The cap counts *processes*, not entries — and it counts them across
+    /// every project, because the budget belongs to the app.
+    #[test]
+    fn the_cap_counts_running_servers_across_every_project() {
+        let mut servers = SlotMap::new();
+        for name in ["one", "two", "three", "four"] {
+            assert_eq!(claim(&mut servers, 1, fake_server(name)), Claim::Room);
+        }
+        assert_eq!(claim(&mut servers, 1, fake_server("five")), Claim::Full);
+        // A second project does not get a budget of its own.
+        assert_eq!(claim(&mut servers, 2, fake_server("five")), Claim::Full);
+
+        // A refusal is a record, not a process: it does not count against the
+        // cap, and it is not claimed twice.
+        servers.insert((1, "five"), Slot::refused(1, fake_server("five")));
+        assert_eq!(claim(&mut servers, 1, fake_server("five")), Claim::Taken);
+        assert_eq!(running_servers(&servers), MAX_RUNNING_SERVERS);
+
+        // One stops; the room it frees is anybody's.
+        servers.remove(&(1, "one"));
+        assert_eq!(claim(&mut servers, 2, fake_server("six")), Claim::Room);
+    }
+
+    fn running_slot(project: ProjectId, server: Server, last_activity: Instant) -> Slot {
+        Slot {
+            state: ServerState::Running,
+            last_activity,
+            ..Slot::starting(project, server)
+        }
+    }
+
+    fn open_doc(project: ProjectId, server: &'static str, path: &Path) -> OpenDoc {
+        OpenDoc {
+            project,
+            server,
+            path: path.to_path_buf(),
+            uri: Uri::from_file_path(path).unwrap(),
+            grammar: "rust",
+            language_id: "rust",
+            lsp_version: 1,
+            opened: true,
+            dormant: false,
+        }
+    }
+
+    /// The cap, and what it costs the user: a sentence, never a crash and never
+    /// a silently missing feature.
+    #[test]
+    fn a_server_past_the_cap_is_refused_with_a_sentence_and_retried_when_there_is_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_with_userland(dir.path());
+        let file = project_with_file(dir.path(), "main.rs", "fn main() {}\n");
+        let project = engine.open_project(file.parent().unwrap());
+
+        // The budget is already spent, and every server holding it has a
+        // document open — so the pressure sweep has nothing it is allowed to
+        // take. (Fake servers: what is under test is the accounting, and a real
+        // one would need a rootfs.)
+        let names = ["one", "two", "three", "four"];
+        assert_eq!(names.len(), MAX_RUNNING_SERVERS);
+        for (index, name) in names.iter().enumerate() {
+            let path = dir.path().join(format!("{name}.rs"));
+            engine.lsp.servers.lock().unwrap().insert(
+                (project, name),
+                running_slot(project, fake_server(name), Instant::now()),
+            );
+            engine
+                .lsp
+                .docs
+                .lock()
+                .unwrap()
+                .insert(1000 + index as u64, open_doc(project, name, &path));
+        }
+
+        // Opening a Rust file now asks for a fifth server.
+        let buffer = engine.open_file(&file).unwrap();
+        assert!(engine.lsp.docs.lock().unwrap().contains_key(&buffer));
+
+        let status = engine
+            .lsp_servers(project)
+            .into_iter()
+            .find(|status| status.name == "rust-analyzer")
+            .expect("the refusal is reported, not swallowed");
+        assert_eq!(status.state, ServerState::Unavailable);
+        assert_eq!(status.error.as_deref(), Some(CAP_REACHED));
+        // Nothing was started and — the part that matters on a phone — nothing
+        // that was already running was killed to make room.
+        assert_eq!(
+            running_servers(&engine.lsp.servers.lock().unwrap()),
+            MAX_RUNNING_SERVERS
+        );
+
+        // Their tabs close. Inside the grace nothing happens: closing the last
+        // `.rs` tab on the way to opening another one must not cost a restart.
+        engine.lsp.docs.lock().unwrap().retain(|id, _| *id < 1000);
+        assert_eq!(engine.sweep_idle_servers(false), 0);
+
+        // Past it, they go, and the refusal is withdrawn. (`retry_capped_servers`
+        // rather than a poll, because a poll would go on to start a real
+        // rust-analyzer against a rootfs this test does not have.)
+        let aged = Instant::now()
+            .checked_sub(IDLE_WITHOUT_DOCUMENTS + Duration::from_secs(1))
+            .expect("the machine has been up for a minute");
+        for slot in engine.lsp.servers.lock().unwrap().values_mut() {
+            slot.last_activity = aged;
+        }
+        assert_eq!(engine.sweep_idle_servers(false), MAX_RUNNING_SERVERS);
+        engine.retry_capped_servers(project);
+        assert!(
+            !engine
+                .lsp
+                .servers
+                .lock()
+                .unwrap()
+                .contains_key(&(project, "rust-analyzer")),
+            "with room in the budget the refusal is dropped, so the next poll starts it"
+        );
+    }
+
+    /// The whole idle policy, as a table.
+    #[test]
+    fn retire_stops_the_docless_and_the_silent_and_nothing_else() {
+        let moment = Duration::from_secs(1);
+
+        // Documents open and traffic recently: the normal state of a server
+        // being used, and it must survive every sweep.
+        assert_eq!(retire(1, moment, false), Retire::Keep);
+        assert_eq!(retire(1, IDLE_WITHOUT_DOCUMENTS, false), Retire::Keep);
+
+        // The last document closed. Zed drops the registration here; we drop
+        // the process too, but only after the grace.
+        assert_eq!(retire(0, moment, false), Retire::Keep);
+        assert_eq!(
+            retire(0, IDLE_WITHOUT_DOCUMENTS, false),
+            Retire::NoDocuments
+        );
+
+        // Under pressure — somebody is being refused right now — the grace is
+        // over at once.
+        assert_eq!(retire(0, Duration::ZERO, true), Retire::NoDocuments);
+
+        // The backstop Zed does not have: documents open, but nothing has
+        // crossed the pipes in ten minutes.
+        assert_eq!(retire(2, IDLE_WITHOUT_TRAFFIC, false), Retire::Silent);
+        assert_eq!(
+            retire(2, IDLE_WITHOUT_TRAFFIC - moment, false),
+            Retire::Keep
+        );
+        // And pressure does not shorten *that* one: a document on screen is a
+        // server the user may still be reading, and evicting it to start
+        // another would leave two cold indexes serving one file each.
+        assert_eq!(retire(2, moment, true), Retire::Keep);
+    }
+
+    /// The sweep itself: which slots go, what happens to their documents, and
+    /// what the UI is told.
+    #[test]
+    fn the_sweep_stops_the_idle_and_leaves_their_documents_dormant() {
+        let slots: Slots = Slots::default();
+        let docs: Docs = Docs::default();
+        let store = DiagnosticStore::default();
+
+        // Times are built forwards from a base and handed to `sweep`, so the
+        // test names every duration and no clock is consulted twice.
+        let base = Instant::now();
+        let now = base + IDLE_WITHOUT_TRAFFIC + Duration::from_secs(60);
+        {
+            let mut servers = slots.lock().unwrap();
+            servers.insert((7, "busy"), running_slot(7, fake_server("busy"), now));
+            servers.insert((7, "quiet"), running_slot(7, fake_server("quiet"), base));
+            servers.insert(
+                (7, "empty"),
+                running_slot(7, fake_server("empty"), now - IDLE_WITHOUT_DOCUMENTS),
+            );
+            // A slot holding no process is not something the sweep can free.
+            let mut refused = Slot::refused(7, fake_server("refused"));
+            refused.last_activity = base;
+            servers.insert((7, "refused"), refused);
+
+            let mut open = docs.lock().unwrap();
+            open.insert(1, open_doc(7, "busy", Path::new("/p/a.rs")));
+            open.insert(2, open_doc(7, "quiet", Path::new("/p/b.rs")));
+        }
+
+        let stopped = sweep(&slots, &docs, &store, now, false);
+        assert_eq!(stopped.len(), 2, "the silent one and the docless one");
+
+        let servers = slots.lock().unwrap();
+        assert!(servers.contains_key(&(7, "busy")), "in use, so untouched");
+        assert!(servers.contains_key(&(7, "refused")), "nothing to stop");
+        assert!(!servers.contains_key(&(7, "quiet")));
+        assert!(!servers.contains_key(&(7, "empty")));
+        drop(servers);
+
+        // The silent server's document is still the user's — it is on screen —
+        // but nothing is watching it, and it must not be resurrected by the
+        // next poll.
+        let open = docs.lock().unwrap();
+        assert!(open[&2].dormant);
+        assert!(!open[&2].opened);
+        assert!(
+            !open[&1].dormant,
+            "a server still running keeps its documents"
+        );
+        drop(open);
+
+        // And the status bar is told, because a server leaving the list changes
+        // what `lsp_servers` answers.
+        assert!(store.version(7) > 0);
+    }
+
+    /// Pressure shortens the grace for a server with nothing open, and does not
+    /// touch one that is in use — the rule that keeps the cap from turning into
+    /// two servers taking turns to index.
+    #[test]
+    fn pressure_takes_the_docless_and_never_the_busy() {
+        let slots: Slots = Slots::default();
+        let docs: Docs = Docs::default();
+        let store = DiagnosticStore::default();
+        let now = Instant::now();
+        {
+            slots
+                .lock()
+                .unwrap()
+                .insert((1, "idle"), running_slot(1, fake_server("idle"), now));
+            slots
+                .lock()
+                .unwrap()
+                .insert((1, "busy"), running_slot(1, fake_server("busy"), now));
+            docs.lock()
+                .unwrap()
+                .insert(1, open_doc(1, "busy", Path::new("/p/a.rs")));
+        }
+
+        assert!(
+            sweep(&slots, &docs, &store, now, false).is_empty(),
+            "inside the grace, an unpressed sweep takes nothing"
+        );
+        let stopped = sweep(&slots, &docs, &store, now, true);
+        assert_eq!(stopped.len(), 1);
+        let servers = slots.lock().unwrap();
+        assert!(servers.contains_key(&(1, "busy")));
+        assert!(!servers.contains_key(&(1, "idle")));
+    }
+
+    /// A stopped server comes back when the user comes back — and *only* then.
+    /// Polling starting it again would undo the sweep on the very next frame,
+    /// which is the loop `dormant` exists to break.
+    #[test]
+    fn a_dormant_document_is_woken_by_typing_rather_than_by_polling() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_with_userland(dir.path());
+        let file = project_with_file(dir.path(), "main.rs", "fn main() {}\n");
+        let project = engine.open_project(file.parent().unwrap());
+        let buffer = engine.open_file(&file).unwrap();
+        engine.lsp.live.store(true, Ordering::Relaxed);
+
+        // As the sweep leaves things: the slot gone, the document still open on
+        // screen and marked dormant.
+        engine.lsp.servers.lock().unwrap().clear();
+        {
+            let mut docs = engine.lsp.docs.lock().unwrap();
+            let doc = docs.get_mut(&buffer).expect("the document is registered");
+            doc.opened = false;
+            doc.dormant = true;
+        }
+
+        engine.lsp_version(project);
+        assert!(
+            engine.lsp.docs.lock().unwrap()[&buffer].dormant,
+            "a poll must not restart a server the sweep just stopped"
+        );
+        assert!(engine.lsp.servers.lock().unwrap().is_empty());
+
+        engine.edit(buffer, 0, 0, "// ").unwrap();
+        assert!(
+            !engine.lsp.docs.lock().unwrap()[&buffer].dormant,
+            "typing in the file is the evidence that the user wants it back"
+        );
     }
 
     // -----------------------------------------------------------------------
