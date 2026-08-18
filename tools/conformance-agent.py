@@ -78,7 +78,6 @@ class Cancelled(Exception):
 
 class Agent:
     def __init__(self):
-        self.cwd = None
         self.cancelled = False
         self.next_request = 0
         self.tool_calls = 0
@@ -86,46 +85,56 @@ class Agent:
         # constant would collide the moment a client opened a second session
         # on the same process.
         self.sessions = 0
-        self.session_id = None
-        # Config options, the panel's selector chips: a model select and a
-        # verbose toggle, remembered so set_config_option visibly sticks.
-        self.model = "conf-one"
-        self.verbose = False
+        # **State per session, keyed by id.** One client process holds several
+        # threads against one agent — the panel does exactly that — and every
+        # one of them is a separate ACP session over the same pipes. Holding a
+        # single `self.session_id` meant a prompt for conf-1 emitted updates
+        # tagged conf-2, so a whole turn (chunks, plan, tool call, permission
+        # request) landed in the wrong thread's transcript.
+        self.state = {}
 
-    def config_options(self):
+    def session(self, session_id):
+        """The state for `session_id`, created on first sight."""
+        return self.state.setdefault(
+            session_id,
+            {"cwd": os.getcwd(), "model": "conf-one", "verbose": False},
+        )
+
+    def config_options(self, session_id):
+        state = self.session(session_id)
         return [
             {"id": "model", "name": "Model", "type": "select",
-             "category": "model", "currentValue": self.model,
+             "category": "model", "currentValue": state["model"],
              "options": [
                  {"value": "conf-one", "name": "Conformance One"},
                  {"value": "conf-two", "name": "Conformance Two"},
              ]},
             {"id": "verbose", "name": "Verbose", "type": "boolean",
-             "currentValue": self.verbose},
+             "currentValue": state["verbose"]},
         ]
 
     # -- outbound ------------------------------------------------------------
 
-    def update(self, update):
+    def update(self, session_id, update):
         send({
             "jsonrpc": "2.0",
             "method": "session/update",
-            "params": {"sessionId": self.session_id, "update": update},
+            "params": {"sessionId": session_id, "update": update},
         })
 
-    def chunk(self, kind, text):
+    def chunk(self, session_id, kind, text):
         if self.cancelled:
             raise Cancelled()
-        self.update({
+        self.update(session_id, {
             "sessionUpdate": kind,
             "content": {"type": "text", "text": text},
         })
         time.sleep(CHUNK_PAUSE_SECONDS)
 
-    def plan(self, *entries):
+    def plan(self, session_id, *entries):
         # The whole plan every time — the protocol's rule is that the client
         # replaces it, so a partial send would erase the rest.
-        self.update({
+        self.update(session_id, {
             "sessionUpdate": "plan",
             "entries": [
                 {"content": content, "priority": "medium", "status": status}
@@ -196,18 +205,17 @@ class Agent:
                 },
             })
         elif method == "session/new":
-            self.cwd = params.get("cwd") or os.getcwd()
             self.sessions += 1
-            self.session_id = "conf-%d" % self.sessions
-            self.model = "conf-one"
-            self.verbose = False
-            log("session %s in %s" % (self.session_id, self.cwd))
+            session_id = "conf-%d" % self.sessions
+            state = self.session(session_id)
+            state["cwd"] = params.get("cwd") or os.getcwd()
+            log("session %s in %s" % (session_id, state["cwd"]))
             send({"jsonrpc": "2.0", "id": request_id,
-                  "result": {"sessionId": self.session_id,
-                             "configOptions": self.config_options()}})
+                  "result": {"sessionId": session_id,
+                             "configOptions": self.config_options(session_id)}})
             # Slash commands arrive as an update, the way live agents send
             # them (the panel's / popup completes from these).
-            self.update({
+            self.update(session_id, {
                 "sessionUpdate": "available_commands_update",
                 "availableCommands": [
                     {"name": "plan", "description": "Show a plan and stop"},
@@ -217,6 +225,8 @@ class Agent:
                 ],
             })
         elif method == "session/set_config_option":
+            session_id = params.get("sessionId")
+            state = self.session(session_id)
             config = params.get("configId")
             # A select's value id arrives as a bare string; a boolean arrives
             # tagged ({"type": "boolean", "value": …}). Take both.
@@ -224,11 +234,11 @@ class Agent:
             if isinstance(value, dict):
                 value = value.get("value")
             if config == "model" and value in ("conf-one", "conf-two"):
-                self.model = value
+                state["model"] = value
             elif config == "verbose":
-                self.verbose = bool(value)
+                state["verbose"] = bool(value)
             send({"jsonrpc": "2.0", "id": request_id,
-                  "result": {"configOptions": self.config_options()}})
+                  "result": {"configOptions": self.config_options(session_id)}})
         elif method == "session/prompt":
             stop_reason = self.run_turn(params)
             send({
@@ -243,6 +253,11 @@ class Agent:
 
     def run_turn(self, params):
         self.cancelled = False
+        # Every reply is stamped with the session the prompt came in on —
+        # never a remembered one, or a second thread's turn would land in the
+        # first thread's transcript.
+        session_id = params.get("sessionId")
+        state = self.session(session_id)
         blocks = params.get("prompt", [])
         prompt = " ".join(
             block.get("text", "")
@@ -261,30 +276,36 @@ class Agent:
                 context.append(block.get("name", "?") + " (link)")
         try:
             if context:
-                self.chunk("agent_message_chunk",
+                self.chunk(session_id, "agent_message_chunk",
                            "Context received: %s. " % ", ".join(context))
             if prompt.startswith("/echo"):
-                self.chunk("agent_message_chunk",
-                           "Echo [%s]: %s" % (self.model, prompt[5:].strip()))
+                self.chunk(session_id, "agent_message_chunk",
+                           "Echo [%s]: %s" % (state["model"], prompt[5:].strip()))
                 return "end_turn"
             if prompt.startswith("/plan"):
-                self.plan(("Look around", "in_progress"), ("Report back", "pending"))
-                self.chunk("agent_message_chunk", "That is the plan; say more when ready.")
-                self.plan(("Look around", "completed"), ("Report back", "completed"))
+                self.plan(session_id,
+                          ("Look around", "in_progress"), ("Report back", "pending"))
+                self.chunk(session_id, "agent_message_chunk",
+                           "That is the plan; say more when ready.")
+                self.plan(session_id,
+                          ("Look around", "completed"), ("Report back", "completed"))
                 return "end_turn"
         except Cancelled:
             log("turn cancelled")
             return "cancelled"
         target = self.pick_target(prompt)
-        path = os.path.join(self.cwd or os.getcwd(), target)
+        path = os.path.join(state["cwd"], target)
         try:
-            self.chunk("agent_thought_chunk", "The user wants an edit; %s is the file to touch." % target)
-            self.chunk("agent_message_chunk", "I'll make a small edit to `%s`. " % target)
-            self.plan(("Read the file", "in_progress"), ("Write the change", "pending"))
+            self.chunk(session_id, "agent_thought_chunk",
+                       "The user wants an edit; %s is the file to touch." % target)
+            self.chunk(session_id, "agent_message_chunk",
+                       "I'll make a small edit to `%s`. " % target)
+            self.plan(session_id,
+                      ("Read the file", "in_progress"), ("Write the change", "pending"))
 
             self.tool_calls += 1
             tool_id = "t-%d" % self.tool_calls
-            self.update({
+            self.update(session_id, {
                 "sessionUpdate": "tool_call",
                 "toolCallId": tool_id,
                 "title": "Edit " + target,
@@ -292,7 +313,7 @@ class Agent:
                 "status": "pending",
             })
             outcome = self.request("session/request_permission", {
-                "sessionId": self.session_id,
+                "sessionId": session_id,
                 "toolCall": {
                     "toolCallId": tool_id,
                     "title": "Edit " + target,
@@ -308,41 +329,49 @@ class Agent:
             if self.cancelled or decision.get("outcome") == "cancelled":
                 raise Cancelled()
             if decision.get("optionId") != "allow":
-                self.plan(("Read the file", "completed"), ("Write the change", "completed"))
-                self.chunk("agent_message_chunk", "Understood — leaving %s alone." % target)
+                self.plan(session_id,
+                          ("Read the file", "completed"),
+                          ("Write the change", "completed"))
+                self.chunk(session_id, "agent_message_chunk", "Understood — leaving %s alone." % target)
                 return "end_turn"
 
-            self.update({"sessionUpdate": "tool_call_update", "toolCallId": tool_id,
-                         "status": "in_progress"})
-            read = self.request("fs/read_text_file", {"sessionId": self.session_id, "path": path})
+            self.update(session_id, {"sessionUpdate": "tool_call_update",
+                                     "toolCallId": tool_id,
+                                     "status": "in_progress"})
+            read = self.request("fs/read_text_file", {"sessionId": session_id, "path": path})
             old_text = None if read is None else read.get("content", "")
             # A cancel that arrived while the read was in flight stops the
             # turn *here* — a cancelled turn must not write.
             if self.cancelled:
                 raise Cancelled()
-            self.plan(("Read the file", "completed"), ("Write the change", "in_progress"))
+            self.plan(session_id,
+                      ("Read the file", "completed"),
+                      ("Write the change", "in_progress"))
 
             new_text = (old_text or "") + "Edited by the conformance agent: %s\n" % prompt
             wrote = self.request("fs/write_text_file", {
-                "sessionId": self.session_id, "path": path, "content": new_text,
+                "sessionId": session_id, "path": path, "content": new_text,
             })
             if wrote is None:
-                self.update({"sessionUpdate": "tool_call_update", "toolCallId": tool_id,
-                             "status": "failed"})
-                self.chunk("agent_message_chunk", "The editor refused that write.")
+                self.update(session_id, {"sessionUpdate": "tool_call_update",
+                                         "toolCallId": tool_id,
+                                         "status": "failed"})
+                self.chunk(session_id, "agent_message_chunk", "The editor refused that write.")
                 return "end_turn"
 
             diff = {"type": "diff", "path": path, "newText": new_text}
             if old_text is not None:
                 diff["oldText"] = old_text
-            self.update({
+            self.update(session_id, {
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": tool_id,
                 "status": "completed",
                 "content": [diff],
             })
-            self.plan(("Read the file", "completed"), ("Write the change", "completed"))
-            self.chunk("agent_message_chunk", "Done — `%s` updated." % target)
+            self.plan(session_id,
+                          ("Read the file", "completed"),
+                          ("Write the change", "completed"))
+            self.chunk(session_id, "agent_message_chunk", "Done — `%s` updated." % target)
             return "end_turn"
         except Cancelled:
             log("turn cancelled")

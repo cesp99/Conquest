@@ -486,6 +486,14 @@ impl SessionThread {
                 // "The full set of configuration options and their current
                 // values" — replacement, never a merge.
                 self.config_options = update.config_options;
+                // And it *must* bump: the panel polls the revision and only
+                // re-reads the state when it moves, so a config change that
+                // arrives while the session is idle — an agent dropping the
+                // model after a rate limit, or confirming its own `/model`
+                // — would otherwise leave the selector chips showing the old
+                // value for ever. Worse than cosmetic: the boolean toggle
+                // computes what to send from the snapshot it can see.
+                self.bump();
             }
             acp::SessionUpdate::SessionInfoUpdate(update) => {
                 // `MaybeUndefined`: absent means "unchanged", null means
@@ -1101,6 +1109,34 @@ mod tests {
 
     fn tool_call(id: &str, title: &str) -> acp::ToolCall {
         acp::ToolCall::new(acp::ToolCallId::new(id.to_owned()), title)
+    }
+
+    /// Every mutating update must move the revision, because the panel polls
+    /// it and only re-reads when it moves. `ConfigOptionUpdate` did not, so a
+    /// model the agent changed on its own — a rate-limit downgrade, its own
+    /// `/model` — left the selector chip showing the old value for ever, and
+    /// the boolean toggle then computed what to send from that stale value.
+    #[test]
+    fn a_config_option_update_moves_the_revision() {
+        let mut thread = thread();
+        let before = thread.revision;
+        thread.apply_update(acp::SessionUpdate::ConfigOptionUpdate(
+            serde_json::from_value(serde_json::json!({
+                "configOptions": [{
+                    "id": "model",
+                    "name": "Model",
+                    "type": "select",
+                    "currentValue": "haiku",
+                    "options": [{"value": "haiku", "name": "Haiku"}],
+                }],
+            }))
+            .unwrap(),
+        ));
+        assert_eq!(thread.config_options.len(), 1);
+        assert!(
+            thread.revision > before,
+            "the panel never re-reads a revision that did not move",
+        );
     }
 
     /// `turn_cancelled` gates `session/request_permission` answers in

@@ -2,6 +2,7 @@ package to.eyed.conquest.code.core
 
 import android.util.Log
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.CoroutineScope
@@ -32,6 +33,19 @@ class AgentThread internal constructor(
 
     /** What the history list prints. */
     val listTitle: String get() = title ?: "Thread $ordinal"
+
+    /**
+     * The unsent message, and the paths @-mentioned in it.
+     *
+     * Held on the thread rather than inside the composer because the
+     * composer is a *branch* of the panel's `when`: opening the threads
+     * view, or a `+ New` that flips the panel to "starting", disposes it and
+     * would take an unsent prompt with it. Per thread, so each conversation
+     * keeps its own draft — which is what Zed does too.
+     */
+    var draft by mutableStateOf("")
+
+    val draftMentions = mutableStateListOf<String>()
 }
 
 /**
@@ -141,7 +155,14 @@ object AgentSessions {
      */
     fun newThread(project: Long, projectName: String) {
         val agent = agent ?: return
-        if (job?.isActive == true) return
+        // A start already in flight is **superseded, never ignored**. It used
+        // to `return` here without bumping the generation, so a project
+        // switch during the (blocking) spawn published the old project's
+        // thread as active: the panel showed project B while every prompt and
+        // @-mention resolved against project A's tree, silently. Bumping the
+        // generation below is what makes the in-flight start close its own
+        // session instead of publishing it.
+        job?.cancel()
         // A thread in another project cannot share the agent process — the
         // guest binds the project directory at spawn — so the engine replaces
         // the agent underneath and those sessions die. Close them here too,
@@ -180,6 +201,9 @@ object AgentSessions {
             isStarting = false
         }
     }
+
+    /** Whether [project] has any thread at all — the panel's empty state. */
+    fun hasThreadFor(project: Long): Boolean = threads.any { it.projectId == project }
 
     /** Show [thread] — the history view's tap. */
     fun select(thread: AgentThread) {

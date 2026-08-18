@@ -1166,6 +1166,23 @@ async fn run_prompt(
     }
 }
 
+/// A `file://` URI for `path`, percent-encoded.
+///
+/// Not `format!("file://{}", path.display())`, which was the bug: a project
+/// with `docs/RFC#42.md` in it produced a URI whose `#` starts a fragment, so
+/// every agent that parses it with a real URL library reads the path as
+/// `docs/RFC` — the mention silently contributes nothing, and on the embedded
+/// branch a write-back targets the wrong file. `?` and `%` are the same
+/// story. `Url::from_file_path` does the encoding and wants an absolute path,
+/// which every path here is (it is `root.join(mention)` under a canonical
+/// root); the fallback keeps the old shape rather than dropping the mention.
+fn file_uri(path: &Path) -> String {
+    match url::Url::from_file_path(path) {
+        Ok(url) => url.to_string(),
+        Err(()) => format!("file://{}", path.display()),
+    }
+}
+
 /// A mentioned file bigger than this travels as a link even to an agent that
 /// takes embedded context: the whole prompt goes down one pipe, and a huge
 /// paste starves the turn.
@@ -1189,7 +1206,7 @@ fn prompt_blocks(root: &Path, embedded: bool, prompt: &PromptInput) -> Vec<acp::
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| mention.clone());
-        let uri = format!("file://{}", path.display());
+        let uri = file_uri(&path);
         let small_enough = std::fs::metadata(&path)
             .map(|meta| meta.len() <= MAX_EMBEDDED_MENTION_BYTES)
             .unwrap_or(false);
@@ -1880,6 +1897,36 @@ mod tests {
         let blocks = prompt_blocks(&root, false, &prompt);
         assert!(matches!(&blocks[1], acp::ContentBlock::ResourceLink(link)
                 if link.name == "notes.md" && link.uri.starts_with("file://")));
+    }
+
+    /// A `#` in a filename is a fragment separator in a URI, so a raw
+    /// `format!("file://{}")` handed the agent a path ending at the `#` —
+    /// the mention silently contributed nothing, and on the embedded branch a
+    /// write-back would have targeted the wrong file. `?` and `%` are the
+    /// same story.
+    #[test]
+    fn a_mention_uri_is_percent_encoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("RFC#42.md"), "the rfc\n").unwrap();
+        let prompt = PromptInput {
+            text: "read it".to_owned(),
+            mentions: vec!["RFC#42.md".to_owned()],
+        };
+
+        let blocks = prompt_blocks(&root, false, &prompt);
+        let acp::ContentBlock::ResourceLink(link) = &blocks[1] else {
+            panic!("expected a resource link, got {:?}", blocks[1]);
+        };
+        assert!(
+            !link.uri.contains('#'),
+            "the # must be escaped, not left to start a fragment: {}",
+            link.uri
+        );
+        assert!(link.uri.ends_with("RFC%2342.md"), "got {}", link.uri);
+        // And it still round-trips to the file it names.
+        let parsed = url::Url::parse(&link.uri).unwrap();
+        assert_eq!(parsed.to_file_path().unwrap(), root.join("RFC#42.md"));
     }
 
     fn shared_for_test(sessions: &Sessions, index: &Index) -> Arc<AgentShared> {

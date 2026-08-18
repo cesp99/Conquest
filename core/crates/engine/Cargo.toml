@@ -42,6 +42,10 @@ tree-sitter.workspace = true
 # For `paths::PathMatcher`, so include/exclude globs behave exactly as they do
 # in Zed. Already in the tree as a dependency of `worktree`.
 util.workspace = true
+# `Url::from_file_path`, to percent-encode the `file://` URIs an @-mention
+# travels under — a `#` in a filename otherwise becomes a fragment and the
+# agent reads the wrong path. Already in the tree; Zed depends on it too.
+url.workspace = true
 worktree.workspace = true
 
 [dev-dependencies]

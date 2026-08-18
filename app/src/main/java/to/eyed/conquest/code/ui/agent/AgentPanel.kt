@@ -251,7 +251,21 @@ fun AgentPanel(
                 isError = true,
             )
 
-            sessionId == null || AgentSessions.isStarting -> Notice("Starting the agent…")
+            AgentSessions.isStarting -> Notice("Starting the agent…")
+
+            // Every thread closed. Saying "starting" here was simply untrue —
+            // nothing was starting, and the panel sat on that lie until the
+            // user happened to press New. An empty state that says so, with
+            // the way out in it.
+            sessionId == null -> Column(
+                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Notice("No thread open. Start one to talk to ${agent?.name ?: "the agent"}.")
+                PanelButton("+ New Thread", isPrimary = true, onClick = {
+                    AgentSessions.newThread(project.id, project.rootName)
+                })
+            }
 
             else -> {
                 Conversation(
@@ -273,6 +287,7 @@ fun AgentPanel(
                     isBusy = state.isBusy,
                     focus = composer,
                     project = project,
+                    thread = activeThread,
                     commands = state.commands,
                     onSend = { text, mentions, onRefused ->
                         AgentSessions.prompt(text, mentions, onRefused)
@@ -1136,6 +1151,28 @@ private val CommandToken = Regex("^/([\\w-]*)$")
 /** A trailing `@path` being typed — the mention token, completed from files. */
 private val MentionToken = Regex("(?:^|\\s)@([^\\s@]*)$")
 
+/** Every complete `@path` token in a message — what actually gets sent. */
+private val MentionTokens = Regex("(?:^|\\s)@([^\\s@]+)")
+
+/**
+ * The `@path` tokens actually standing in [message].
+ *
+ * Whole tokens, which is the whole point: a substring test matched a path
+ * that is a *prefix* of another, so a mention the user had deleted and
+ * replaced went out anyway and the engine embedded its contents.
+ */
+internal fun mentionTokensIn(message: String): Set<String> =
+    MentionTokens.findAll(message).map { it.groupValues[1] }.toSet()
+
+/**
+ * The completion token being typed at the caret — `"/plan"`, `"@src/lib"` —
+ * or null when there is none. Used both to open the strip and to decide when
+ * an Esc dismissal has expired.
+ */
+private fun tokenIn(text: String): String? =
+    CommandToken.matchEntire(text)?.groupValues?.get(1)?.let { "/" + it }
+        ?: MentionToken.find(text)?.groupValues?.get(1)?.let { "@" + it }
+
 /** The composer. */
 @Composable
 private fun Composer(
@@ -1143,6 +1180,8 @@ private fun Composer(
     isBusy: Boolean,
     focus: FocusRequester,
     project: ProjectSession,
+    /** Whose draft this is; null while there is no thread to draft into. */
+    thread: AgentThread?,
     /** The agent's slash commands, for the `/` popup. */
     commands: List<AgentCommand>,
     /** Send it, and put it back in the box if the engine would not take it. */
@@ -1154,22 +1193,54 @@ private fun Composer(
     // code, and the caret must land at the end of what was inserted — with a
     // bare String the IME keeps its old offset and the next keystroke lands
     // mid-word, which is exactly what happened on the device.
-    var field by remember { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue("")) }
+    //
+    // Seeded from the thread's own draft and written back on every change,
+    // keyed by thread: this composable is a branch of the panel's `when`, so
+    // opening the threads view disposes it, and without the write-back an
+    // unsent prompt died there. Per thread, so each conversation keeps its
+    // own — Zed's behaviour too.
+    var field by remember(thread) {
+        val draft = thread?.draft.orEmpty()
+        mutableStateOf(
+            androidx.compose.ui.text.input.TextFieldValue(
+                text = draft,
+                selection = androidx.compose.ui.text.TextRange(draft.length),
+            )
+        )
+    }
     val text = field.text
     /** Paths completed through the `@` popup, candidates for the send. */
-    val mentioned = remember { mutableStateListOf<String>() }
-    /** The text a popup was dismissed on, so Esc means no until it changes. */
-    var dismissedFor by remember { mutableStateOf<String?>(null) }
+    val mentioned = thread?.draftMentions ?: remember { mutableStateListOf() }
+    /**
+     * The *token* a popup was dismissed on — not the whole text, and cleared
+     * the moment the token changes or the message is sent. Keyed on the whole
+     * text it never cleared, so one Esc on a bare `@` killed the file strip
+     * for every later bare `@` in that composition: the feature's own entry
+     * point looked broken with no way back.
+     */
+    var dismissedToken by remember(thread) { mutableStateOf<String?>(null) }
+
+    fun setField(value: androidx.compose.ui.text.input.TextFieldValue) {
+        field = value
+        thread?.draft = value.text
+        // A dismissal lasts exactly as long as the token it was for.
+        // Backspace past the `@` and the strip is armed again — otherwise
+        // Esc on a bare `@` suppressed every later bare `@` too, and the
+        // feature's own entry point looked broken.
+        if (tokenIn(value.text) == null) dismissedToken = null
+    }
 
     fun replaceText(newText: String) {
-        field = androidx.compose.ui.text.input.TextFieldValue(
-            text = newText,
-            selection = androidx.compose.ui.text.TextRange(newText.length),
+        setField(
+            androidx.compose.ui.text.input.TextFieldValue(
+                text = newText,
+                selection = androidx.compose.ui.text.TextRange(newText.length),
+            )
         )
     }
 
     val commandQuery = CommandToken.matchEntire(text)?.groupValues?.get(1)
-        ?.takeIf { text != dismissedFor && enabled }
+        ?.takeIf { enabled && "/$it" != dismissedToken }
     val commandChoices = if (commandQuery == null) {
         emptyList()
     } else {
@@ -1177,7 +1248,7 @@ private fun Composer(
     }
 
     val mentionQuery = MentionToken.find(text)?.groupValues?.get(1)
-        ?.takeIf { text != dismissedFor && enabled }
+        ?.takeIf { enabled && "@$it" != dismissedToken }
     var fileChoices by remember { mutableStateOf(emptyList<String>()) }
     LaunchedEffect(mentionQuery) {
         fileChoices = if (mentionQuery == null) {
@@ -1204,12 +1275,23 @@ private fun Composer(
         if (message.isEmpty() || !enabled) return
         // Only mentions still standing in the text count: one deleted after
         // completion was deleted on purpose.
-        val mentions = mentioned.filter { message.contains("@" + it) }
+        //
+        // **Whole tokens, not substrings.** `contains("@" + it)` matched a
+        // path that is a *prefix* of another, so completing `.env` by
+        // mistake, deleting it and completing `.env.example` sent both — and
+        // the engine then embedded `.env`'s contents in the prompt. Every
+        // real project has such pairs (`Dockerfile`/`Dockerfile.dev`,
+        // `index.js`/`index.js.map`), so this was a live way to hand an
+        // agent a file the user had explicitly taken back.
+        val present = mentionTokensIn(message)
+        val mentions = mentioned.filter { it in present }
         // Cleared optimistically, because the transcript shows the message the
         // instant the engine takes it and two copies would be worse than a
         // moment's blank. Restored if it turns out nothing took it.
         replaceText("")
         mentioned.clear()
+        // The strip was dismissed for a message that no longer exists.
+        dismissedToken = null
         onSend(message, mentions) {
             replaceText(message)
             mentioned.addAll(mentions)
@@ -1246,7 +1328,7 @@ private fun Composer(
     ) {
         BasicTextField(
             value = field,
-            onValueChange = { field = it },
+            onValueChange = ::setField,
             enabled = enabled,
             textStyle = MaterialTheme.typography.bodyMedium.copy(color = theme.color("text")),
             cursorBrush = SolidColor(theme.color("editor.foreground")),
@@ -1282,7 +1364,10 @@ private fun Composer(
                         event.key == Key.Escape -> {
                             when {
                                 commandChoices.isNotEmpty() || fileChoices.isNotEmpty() -> {
-                                    dismissedFor = text
+                                    dismissedToken = commandChoices
+                                        .firstOrNull()
+                                        ?.let { "/" + (commandQuery ?: "") }
+                                        ?: "@" + (mentionQuery ?: "")
                                     true
                                 }
                                 isBusy -> {
