@@ -730,4 +730,174 @@ object CoreBridge {
      * read. False if the id was already gone.
      */
     external fun lspRequestCancel(requestId: Long): Boolean
+
+    // -----------------------------------------------------------------------
+    // ACP agents. The engine runs an agent inside the Debian userland — one
+    // process at a time, budgeted against the same 32 the terminal, git, apt
+    // and the language servers share — and keeps a state machine per session.
+    // It speaks the Agent Client Protocol; we do not implement the protocol on
+    // either side of this boundary.
+    //
+    // Two shapes, both already here:
+    //
+    //  * **The conversation is pushed and polled.** The agent streams whenever
+    //    it likes and the engine folds each update into the session, bumping a
+    //    revision. Poll [acpSessionVersion] — a single load — and only when it
+    //    moves read [acpSessionState] for the chrome and [acpEntriesSince] for
+    //    the rows that changed. Exactly the [lspVersion] contract.
+    //  * **Everything the user does returns at once.** [acpPrompt],
+    //    [acpCancel] and [acpRespondPermission] hand work to the engine's
+    //    connection thread and come straight back; what happened shows up
+    //    behind the counter.
+    //
+    // The only position anything here carries is inside a tool call's diff,
+    // and those are 1-based rows in the shape [gitPatch] already speaks — so
+    // an agent's edit renders with the same view a commit does.
+    //
+    // Absent, not failing, without a userland: the `play` flavour never has
+    // one, and a `full` build before Debian is installed gets a session that
+    // reports itself unavailable with that sentence.
+    // -----------------------------------------------------------------------
+
+    /**
+     * Starts (or joins) the agent described by [specJson] and opens a session
+     * on [projectId]. Returns a session id to poll.
+     *
+     * [specJson] is `{"name":…,"argv":[program,…],"env":{…}}` —
+     * [AgentDefinition.toSpecJson] builds it. The argv is the **guest** command
+     * line, so the program must be on the userland's PATH, which is what
+     * `npm install -g` puts it there for.
+     *
+     * A spec different from the running agent's replaces that agent; the same
+     * spec joins it, so a second session costs no second process.
+     *
+     * Returns -1 only when the request was malformed — bad JSON, no command,
+     * an unknown project — which is a bug on this side with nothing to show a
+     * user. Everything a user can act on comes back as a real session whose
+     * state is `unavailable` and whose `error` is the sentence to show.
+     *
+     * **Blocking** — it spawns a process. Call it off the main thread.
+     */
+    external fun acpStartSession(projectId: Long, specJson: String): Long
+
+    /**
+     * Generation counter for a session; it moves whenever anything about the
+     * conversation does. 0 means one thing only: an id the engine has
+     * forgotten. Poll it exactly like [projectSearchVersion].
+     */
+    external fun acpSessionVersion(sessionId: Long): Long
+
+    /**
+     * Everything about a session except its rows, as JSON:
+     *
+     *     {"version":12, "project":1, "phase":"ready", "error":null,
+     *      "needs_auth":false, "title":"Fixing the parser",
+     *      "stop_reason":"end_turn", "entry_count":9,
+     *      "plan":[{"content":…,"priority":…,"status":…}],
+     *      "usage":{"used":1200,"size":200000},
+     *      "modes":{"currentModeId":"default","availableModes":[…]},
+     *      "commands":[…],
+     *      "agent":{"name":"Claude Code","agent_name":…,"agent_version":…,
+     *               "auth_methods":[…]}}
+     *
+     * `phase` is `starting`, `ready`, `running` or `unavailable`. `error`
+     * carries the sentence to show — an agent's own last line of stderr when
+     * it would not start, which is usually why. `needs_auth` means
+     * [acpAuthenticate] with one of `agent.auth_methods` is the way forward.
+     * `plan`, `modes` and `commands` are ACP's own shapes, camelCase and all.
+     *
+     * `"null"` for a forgotten id. Reads a cache; never blocks.
+     */
+    external fun acpSessionState(sessionId: Long): String
+
+    /**
+     * The conversation rows whose revision is newer than [since], as JSON:
+     *
+     *     {"revision":12, "total":9, "entries":[{"index":8, "rev":12, …}]}
+     *
+     * Each entry carries the `index` it sits at, so a caller merges in place
+     * rather than re-reading the transcript; pass back the `revision` you were
+     * last given. When `total` is smaller than what you hold, a refusal has
+     * removed rows and the whole thing should be re-read from 0.
+     *
+     * `kind` says what a row is, and the rest depends on it:
+     *
+     *  * `user` — `{markdown}`.
+     *  * `assistant` — `{chunks:[{thought,markdown}]}`. A `thought` chunk is
+     *    the agent's reasoning and is worth folding away by default.
+     *  * `tool_call` — `{id, title, tool_kind, status, options, content,
+     *    locations}`. `tool_kind` is `read`/`edit`/`execute`/… — an icon, not
+     *    the row's kind. `status` is `pending`, `waiting_for_confirmation`,
+     *    `in_progress`, `completed`, `failed`, `rejected` or `canceled`.
+     *    `options` is non-empty only while waiting, and each option is
+     *    `{optionId,name,kind}` with `kind` in `allow_once`/`allow_always`/
+     *    `reject_once`/`reject_always` — answer with [acpRespondPermission].
+     *    `content` is a list of `{"type":"markdown","markdown":…}` and
+     *    `{"type":"diff","diff":{path,original,is_binary,hunks}}`, the diff
+     *    being exactly [FileDiff], so [gitPatch]'s renderer draws it.
+     *    `locations` is `[{path,line}]`, project-relative where it can be.
+     *
+     * Never null except for a forgotten id, which gives `"null"`.
+     */
+    external fun acpEntriesSince(sessionId: Long, since: Long): String
+
+    /**
+     * Sends a prompt. Returns at once; the turn arrives behind the counter.
+     *
+     * A prompt sent while the agent is still starting, or still answering, is
+     * queued **and shown immediately** — the running turn is cancelled and
+     * this one follows it, which is Zed's follow-up behaviour. False for a
+     * forgotten id or a session that is over.
+     */
+    external fun acpPrompt(sessionId: Long, text: String): Boolean
+
+    /**
+     * Stops the running turn and any prompt queued behind it. Tool calls still
+     * in flight report `canceled`, and every open permission request is
+     * answered `cancelled`, as the protocol requires. False for a forgotten id.
+     */
+    external fun acpCancel(sessionId: Long): Boolean
+
+    /**
+     * Answers a permission request. [optionId] must be one of the ids that
+     * tool call's `options` offered — anything else is refused rather than
+     * guessed at, and the request stays open. False when nothing was waiting.
+     */
+    external fun acpRespondPermission(
+        sessionId: Long,
+        toolCallId: String,
+        optionId: String,
+    ): Boolean
+
+    /**
+     * Switches the session's mode — Claude Code's `default` / `acceptEdits` /
+     * `plan`, say. The change lands when the agent confirms it, so watch the
+     * counter rather than assuming. False when the session has no modes.
+     */
+    external fun acpSetMode(sessionId: Long, modeId: String): Boolean
+
+    /**
+     * Runs one of the agent's advertised auth methods (`agent.auth_methods` in
+     * [acpSessionState]), then retries the sessions that were waiting on it.
+     * False when there is no agent to authenticate with.
+     */
+    external fun acpAuthenticate(sessionId: Long, methodId: String): Boolean
+
+    /**
+     * Closes a session and forgets it. Closing the last one stops the agent —
+     * SIGQUIT first, as proot needs, so no tracee is orphaned against
+     * Android's process cap. False if the id was already gone.
+     */
+    external fun acpCloseSession(sessionId: Long): Boolean
+
+    /**
+     * Files the agent has written, from [since] onwards:
+     * `{"total":n,"paths":[absolute,…]}`.
+     *
+     * The engine already flags any open buffer among them the way it flags any
+     * other external change; this says *which*, so the UI can reload them with
+     * [reloadBuffer] — undoably, and with highlighting and the language server
+     * kept in step. Pass back the `total` you were last given.
+     */
+    external fun acpWrittenFiles(since: Long): String
 }

@@ -1644,3 +1644,216 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspRequestCanc
         JNI_FALSE
     }
 }
+
+// ---------------------------------------------------------------------------
+// ACP agents (phase 6)
+//
+// The engine runs an agent inside the Debian userland and keeps one state
+// machine per session; this is the coarse read/write surface over it. Two
+// shapes, both already on this boundary:
+//
+//  * **The conversation is pushed and polled.** The agent streams whenever it
+//    likes; the engine folds each update into the session and bumps a
+//    revision. Poll `acpSessionVersion`, then read `acpSessionState` for the
+//    chrome and `acpEntriesSince` for the rows that actually moved — the same
+//    counter-then-payload contract as `lspVersion`, and for the same reason.
+//  * **Everything the user does returns at once.** Prompting, cancelling and
+//    answering a permission request all hand work to the connection thread and
+//    come straight back; what happened shows up behind the counter.
+//
+// Positions inside a tool call's diff are 1-based rows in the shape `gitPatch`
+// already speaks, so an agent's edit renders with the diff view the git panel
+// uses. Nothing else here carries a position.
+//
+// The `play` flavour has no userland, so it has no agent: `acpStartSession`
+// answers with a session that reports itself unavailable, and the panel is
+// absent rather than broken.
+// ---------------------------------------------------------------------------
+
+/// Start (or join) the agent described by `specJson` and open a session on
+/// `projectId`.
+///
+/// `specJson` is `{"name": …, "argv": [program, …], "env": {…}}` — the argv is
+/// the *guest* command line, so the program must be on the userland's PATH.
+///
+/// Returns a session id to poll, or -1 when the request itself was malformed
+/// (bad JSON, no command, unknown project) — a caller's bug, with nothing to
+/// show a user. Everything a user can act on arrives as a session instead: no
+/// userland and an agent that will not start both come back as a real id whose
+/// state is `unavailable` with a sentence.
+///
+/// **Blocking** — it spawns a process. Call it off the main thread.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpStartSession(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    spec_json: JString,
+) -> jlong {
+    let spec = get_string(&mut env, &spec_json);
+    match engine().acp_start_session(project_id as u64, &spec) {
+        Ok(id) => id as jlong,
+        Err(err) => {
+            log::warn!("acpStartSession refused: {err}");
+            -1
+        }
+    }
+}
+
+/// Generation counter for a session: it moves whenever anything about the
+/// conversation does. 0 means one thing only — an id the engine has forgotten.
+/// Poll it exactly like `projectSearchVersion`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpSessionVersion(
+    _env: JNIEnv,
+    _class: JClass,
+    session_id: jlong,
+) -> jlong {
+    engine().acp_session_version(session_id as u64) as jlong
+}
+
+/// Everything about a session except its rows, as JSON — see the Kotlin
+/// declaration for the shape. `"null"` for a forgotten id. Reads a cache;
+/// never blocks.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpSessionState(
+    env: JNIEnv,
+    _class: JClass,
+    session_id: jlong,
+) -> jstring {
+    to_jstring(&env, engine().acp_session_state(session_id as u64))
+}
+
+/// The conversation rows whose revision is newer than `since`, as JSON:
+/// `{revision, total, entries: [{index, rev, kind, …}]}`.
+///
+/// Only what moved comes back, with the index it sits at, so a caller merges
+/// in place and pays for the whole transcript once. `total` is how many rows
+/// there are now — when it is smaller than what the caller holds, a refusal
+/// has removed some and the caller re-reads from 0.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpEntriesSince(
+    env: JNIEnv,
+    _class: JClass,
+    session_id: jlong,
+    since: jlong,
+) -> jstring {
+    let entries = engine().acp_entries_since(session_id as u64, since.max(0) as u64);
+    to_jstring(&env, entries)
+}
+
+/// Send a prompt. Returns at once; the turn arrives behind the counter. False
+/// for a forgotten id or a session that is over.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpPrompt(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_id: jlong,
+    text: JString,
+) -> jboolean {
+    let text = get_string(&mut env, &text);
+    if engine().acp_prompt(session_id as u64, &text) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Stop the running turn. False for a forgotten id.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpCancel(
+    _env: JNIEnv,
+    _class: JClass,
+    session_id: jlong,
+) -> jboolean {
+    if engine().acp_cancel(session_id as u64) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Answer a permission request: `optionId` is one of the ids the tool call's
+/// `options` offered. False when nothing was waiting under that tool call, or
+/// the option is not one it offered.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpRespondPermission(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_id: jlong,
+    tool_call_id: JString,
+    option_id: JString,
+) -> jboolean {
+    let tool_call = get_string(&mut env, &tool_call_id);
+    let option = get_string(&mut env, &option_id);
+    if engine().acp_respond_permission(session_id as u64, &tool_call, &option) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Switch the session's mode. The change lands when the agent confirms it, so
+/// watch the counter rather than assuming. False when the session has no modes.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpSetMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_id: jlong,
+    mode_id: JString,
+) -> jboolean {
+    let mode = get_string(&mut env, &mode_id);
+    if engine().acp_set_mode(session_id as u64, &mode) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Run one of the agent's advertised auth methods, then retry the sessions
+/// that were waiting on it. False when there is no agent to authenticate with.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpAuthenticate(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_id: jlong,
+    method_id: JString,
+) -> jboolean {
+    let method = get_string(&mut env, &method_id);
+    if engine().acp_authenticate(session_id as u64, &method) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Close a session and forget it. Closing the last one stops the agent, the
+/// careful way proot needs. False if the id was already gone.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpCloseSession(
+    _env: JNIEnv,
+    _class: JClass,
+    session_id: jlong,
+) -> jboolean {
+    if engine().acp_close_session(session_id as u64) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Files the agent has written through the client, from `since` onwards:
+/// `{"total": n, "paths": [absolute, …]}`.
+///
+/// The engine flags any open buffer among them the way it flags any other
+/// external change; this is how the UI learns *which* ones, so it can reload
+/// them through `reloadBuffer` — undoably, and with highlighting and the
+/// language server kept in step. Pass the `total` you were last given.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpWrittenFiles(
+    env: JNIEnv,
+    _class: JClass,
+    since: jlong,
+) -> jstring {
+    to_jstring(&env, engine().acp_written_files(since.max(0) as u64))
+}

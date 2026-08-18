@@ -1077,21 +1077,37 @@ impl crate::Engine {
     ///
     /// `spec_json` is an [`AgentSpec`]. A spec different from the running
     /// agent's replaces it — one agent process at a time, by budget.
+    ///
+    /// **`Err` means the caller is wrong, not that the agent is missing.** A
+    /// spec that is not JSON or a project that does not exist is a bug on the
+    /// Kotlin side and has nothing to show a user; everything the *user* can
+    /// act on — no userland, an agent that will not spawn — comes back as a
+    /// session id whose state carries the sentence, so the panel has one code
+    /// path for "here is what went wrong" and never a second kind of failure
+    /// to render.
     pub fn acp_start_session(&self, project: ProjectId, spec_json: &str) -> Result<u64, String> {
         let spec: AgentSpec =
             serde_json::from_str(spec_json).map_err(|err| format!("bad agent spec: {err}"))?;
         if spec.argv.is_empty() {
             return Err("the agent has no command".to_owned());
         }
-        let Some(userland) = self.userland().filter(|userland| userland.is_installed()) else {
-            return Err("the Linux userland is not installed".to_owned());
-        };
         let Some(root) = self.project_root(project) else {
             return Err("unknown project".to_owned());
         };
         let root = std::fs::canonicalize(&root).unwrap_or(root);
 
         let id = self.acp.next_session.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // No guest to run an agent in: a `full` build before Debian is
+        // installed, or the `play` flavour, which has no agent panel at all.
+        // Owner 0, because no agent owns it and none ever will — agent ids
+        // start at 1.
+        let Some(userland) = self.userland().filter(|userland| userland.is_installed()) else {
+            let handle = Arc::new(SessionHandle::new(0, SessionThread::new(project, root)));
+            handle.update(|thread| thread.fail("the Linux userland is not installed".to_owned()));
+            self.acp.sessions.lock().unwrap().insert(id, handle);
+            return Ok(id);
+        };
 
         // One agent at a time: reuse it when the spec matches, replace it
         // when it does not. A dying agent is not reusable — `shutdown` is set
@@ -1122,7 +1138,12 @@ impl crate::Engine {
                     self.buffers.clone(),
                 );
                 if !start_agent(shared.clone(), userland, &spec, &root) {
-                    return Err("the agent could not be started".to_owned());
+                    drop(slot);
+                    let handle = Arc::new(SessionHandle::new(0, SessionThread::new(project, root)));
+                    handle
+                        .update(|thread| thread.fail("the agent could not be started".to_owned()));
+                    self.acp.sessions.lock().unwrap().insert(id, handle);
+                    return Ok(id);
                 }
                 *slot = Some(shared.clone());
                 shared
