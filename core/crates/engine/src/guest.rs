@@ -19,13 +19,16 @@
 //! translation is a whole class of bug. With an identity bind there is nothing
 //! to translate.
 //!
-//! **One-shot and resident are different problems.** [`capture`] runs a
-//! program to completion under a deadline and hands back its stdout: it is
-//! what a query wants, and nothing is delivered until the program exits.
-//! [`spawn`] leaves the program running with all three pipes open and gives
-//! the caller the handle: it is what a language server is, and a deadline
-//! would kill a healthy one. They share the flags, the binds and the guest
-//! environment, and nothing else.
+//! **There are three ways out of here, and they share one command line.**
+//! [`capture`] runs a program to completion under a deadline and hands back its
+//! stdout: it is what a query wants, and nothing is delivered until the program
+//! exits. [`spawn`] leaves the program running with all three pipes open and
+//! gives the caller the handle. [`invocation`] hands over the command line
+//! *itself* — program, argv, environment — for a caller that does its own
+//! spawning, which is how language servers go out: Zed's `LanguageServer::new`
+//! spawns them, so proot is the binary it is given (see lsp.rs). All three are
+//! built from the same [`invocation`], which is the point: a dropped flag can
+//! only be dropped once.
 //!
 //! **This is not the terminal's proot command line, on purpose.** Kotlin's
 //! `DebianUserland.inside` builds its own and differs in three ways, each of
@@ -149,6 +152,11 @@ pub(crate) struct GuestCommand {
     binds: Vec<PathBuf>,
     /// Added on top of the guest environment every run gets.
     env: Vec<(OsString, OsString)>,
+    /// The guest working directory. `/` unless a caller says otherwise, which
+    /// git never needs (it carries `-C`) and a language server usually does:
+    /// a server started somewhere else resolves `Cargo.toml`, `compile_commands.json`
+    /// and relative paths in its own configuration against the wrong tree.
+    workdir: Option<PathBuf>,
 }
 
 impl GuestCommand {
@@ -158,7 +166,18 @@ impl GuestCommand {
             argv,
             binds: Vec::new(),
             env: Vec::new(),
+            workdir: None,
         }
+    }
+
+    /// Start the program in `dir` rather than in `/`.
+    ///
+    /// Safe to pass a host path: binds are identities, so the directory exists
+    /// inside the guest under the same name — but only if it is bound, which
+    /// is why this also binds it.
+    pub(crate) fn workdir(mut self, dir: &Path) -> Self {
+        self.workdir = Some(dir.to_path_buf());
+        self.bind(dir)
     }
 
     /// Make a host directory reachable inside the guest, at its own path.
@@ -191,52 +210,82 @@ impl GuestCommand {
     }
 }
 
+/// One proot command line, taken apart: what to exec, what to pass it, and
+/// what environment to hand it.
+///
+/// It exists because two very different consumers need the *same* command line.
+/// [`capture`] and [`spawn`] want a [`Command`] they can configure and run;
+/// `lsp.rs` wants Zed's `LanguageServerBinary { path, arguments, env }`, whose
+/// spawning is upstream code we do not get to touch. Both are built from this,
+/// so there is exactly one description of how to enter the guest — the thing
+/// this module's doc comment says a second copy of would mean a second
+/// behaviour.
+pub(crate) struct Invocation {
+    /// The proot executable.
+    pub program: PathBuf,
+    /// proot's own flags, then the guest argv. `proot_command` and
+    /// `LanguageServerBinary::arguments` take this verbatim.
+    pub args: Vec<OsString>,
+    /// Added on top of the *inherited* environment, which is how both
+    /// consumers apply it — `Command::env` and `LanguageServer::new`'s
+    /// `command.envs(binary.env)` alike.
+    pub env: Vec<(OsString, OsString)>,
+}
+
 /// The proot invocation for a command: flags, binds, guest environment, argv.
 ///
 /// Assembled in one place so the tests can pin it literally. A dropped flag
 /// here does not fail loudly — it fails as a guest that cannot see a
 /// directory, or a git that decides the repository has dubious ownership —
 /// which is why the argv is a test rather than a comment.
-fn proot_command(userland: &Userland, command: &GuestCommand) -> Command {
-    let mut proot = Command::new(&userland.proot);
-    proot
+pub(crate) fn invocation(userland: &Userland, command: &GuestCommand) -> Invocation {
+    let mut args: Vec<OsString> = [
         // The guest must believe it is root. Besides matching how the rootfs
         // was unpacked, proot's fake_id0 also reports files as owned by root,
         // which is what keeps git's "dubious ownership" check quiet.
-        .arg("-0")
+        "-0",
         // Don't leave a guest process behind if we have to kill proot;
         // Android's phantom-process killer counts them against us.
-        .arg("--kill-on-exit")
+        "--kill-on-exit",
         // The rootfs was unpacked with this on, and dpkg keeps using it, so
         // the guest's own files are only presented correctly with it on here
         // too. Nothing here creates a link, so it costs a translation and
         // nothing else.
-        .arg("--link2symlink")
+        "--link2symlink",
         // Debian's binaries are happy on any kernel, but the guest asking
         // uname is one less thing to differ from the terminal's environment.
-        .args(["-k", "6.2.1"])
-        .arg("-r")
-        .arg(&userland.rootfs)
-        // The same three the terminal binds; without /proc, sub-processes
-        // misbehave in ways that are tedious to diagnose.
-        .args(["-b", "/dev", "-b", "/proc", "-b", "/sys"]);
-
-    for dir in bind_dirs(userland, &command.binds) {
-        proot.arg("-b").arg(identity_bind(&dir));
+        "-k",
+        "6.2.1",
+        "-r",
+    ]
+    .map(OsString::from)
+    .into();
+    args.push(userland.rootfs.as_os_str().to_owned());
+    // The same three the terminal binds; without /proc, sub-processes misbehave
+    // in ways that are tedious to diagnose.
+    for dir in ["/dev", "/proc", "/sys"] {
+        args.push(OsString::from("-b"));
+        args.push(OsString::from(dir));
     }
 
-    proot
-        // `/` always exists inside the guest, and with identity binds a
-        // program that cares about its directory says so itself (git's `-C`).
-        .args(["-w", "/"])
-        .args(&command.argv);
-    log::debug!(
-        "{}: binds {:?}",
-        command.label,
-        bind_dirs(userland, &command.binds)
-    );
+    let binds = bind_dirs(userland, &command.binds);
+    for dir in &binds {
+        args.push(OsString::from("-b"));
+        args.push(OsString::from(identity_bind(dir)));
+    }
+    log::debug!("{}: binds {binds:?}", command.label);
 
-    proot
+    // `/` always exists inside the guest, and with identity binds a program
+    // that cares about its directory either says so itself (git's `-C`) or
+    // asked for `workdir`.
+    args.push(OsString::from("-w"));
+    args.push(match &command.workdir {
+        Some(dir) => dir.as_os_str().to_owned(),
+        None => OsString::from("/"),
+    });
+    args.extend(command.argv.iter().cloned());
+
+    let mut env: Vec<(OsString, OsString)> = vec![
         // A scratch directory of this run's own.
         //
         // proot builds its bind scaffolding under `PROOT_TMP_DIR`, and the
@@ -245,21 +294,35 @@ fn proot_command(userland: &Userland, command: &GuestCommand) -> Command {
         // panel intermittently came back "cannot change to <the project>: No
         // such file or directory" — the bind was simply not there. Separate
         // directories, and the interaction cannot happen.
-        .env("PROOT_TMP_DIR", scratch_dir(userland))
+        ("PROOT_TMP_DIR".into(), scratch_dir(userland).into()),
         // The child inherits *our* environment, in which PATH points at
         // /system/bin — a directory that does not exist inside the fake root,
         // which is why the spike saw "command not found" for everything. Give
         // the guest a guest PATH.
-        .env(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        )
-        .env("HOME", "/root")
-        .env("LANG", "C.UTF-8")
+        (
+            "PATH".into(),
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+        ),
+        ("HOME".into(), "/root".into()),
+        ("LANG".into(), "C.UTF-8".into()),
         // Machine-readable output is not localised, but *errors* are, and we
         // log them.
-        .env("LC_ALL", "C");
-    for (key, value) in &command.env {
+        ("LC_ALL".into(), "C".into()),
+    ];
+    env.extend(command.env.iter().cloned());
+
+    Invocation {
+        program: userland.proot.clone(),
+        args,
+        env,
+    }
+}
+
+fn proot_command(userland: &Userland, command: &GuestCommand) -> Command {
+    let invocation = invocation(userland, command);
+    let mut proot = Command::new(&invocation.program);
+    proot.args(&invocation.args);
+    for (key, value) in &invocation.env {
         proot.env(key, value);
     }
     proot
@@ -366,20 +429,24 @@ pub(crate) fn capture(
 /// same deadlock [`capture`] spawns two threads to avoid. A server that logs
 /// as it works, which is most of them, will hit it.
 ///
-/// **P5-1 still has to add**, and this deliberately does not:
+/// **Language servers do not come through here**, and it is worth saying why,
+/// because this was written expecting them to. P5-1 took the route that costs
+/// no vendor patch: Zed's `LanguageServer::new` spawns the process itself, so
+/// what it needs is the *command line* — [`invocation`] — and not a process
+/// somebody else already started. Framing, restart and the request tables then
+/// all belong to the vendored crate rather than to us. See lsp.rs.
 ///
-/// * *Framing.* `Content-Length` headers off a live stdout, parsed as bytes
-///   arrive. Not [`capture`]'s accumulate-until-EOF, which for a server that
-///   never exits delivers the first reply never.
-/// * *Restart.* A server that dies takes its client's state with it; somebody
-///   has to notice (the handle below only knows when asked), decide whether to
-///   restart, and give up rather than loop.
-/// * *A registry, and the budget it enforces.* Android caps background child
-///   processes — 32 where it is enforced — and that cap is already shared with
-///   the terminal's shells and the git status runs, with every proot adding
-///   tracees of its own. One handle per server per project is a decision that
-///   needs a number attached to it, which is P5-4's.
-#[allow(dead_code, reason = "the seam exists before its first caller, in P5-1")]
+/// So this stays for the next resident guest program that is not an LSP server
+/// — an ACP agent, most likely — and it still owes its caller two things it
+/// does not do: noticing that the child died (the handle below only knows when
+/// asked), and a budget. Android caps background child processes — 32 where it
+/// is enforced — and that cap is already shared with the terminal's shells, the
+/// git status runs and now one proot per language server, each adding tracees
+/// of its own.
+#[allow(
+    dead_code,
+    reason = "the resident-process seam outlived its first expected caller; see above"
+)]
 pub(crate) fn spawn(userland: &Userland, command: &GuestCommand) -> Option<GuestProcess> {
     if !userland.is_installed() {
         return None;
@@ -424,7 +491,7 @@ pub(crate) struct GuestProcess {
     exited: Option<std::process::ExitStatus>,
 }
 
-#[allow(dead_code, reason = "the seam exists before its first caller, in P5-1")]
+#[allow(dead_code, reason = "see the note on `spawn`")]
 impl GuestProcess {
     /// The write half. Taken rather than borrowed because the caller will want
     /// it behind its own lock, away from whatever owns the read half.
@@ -720,6 +787,59 @@ mod tests {
         );
     }
 
+    /// `-w` is `/` unless a caller says otherwise, and a caller that does gets
+    /// the directory bound as well — otherwise proot starts the program in a
+    /// directory that does not exist inside the fake root and it exits before
+    /// it has said anything.
+    #[test]
+    fn a_workdir_is_bound_as_well_as_entered() {
+        let userland = userland();
+        let command = GuestCommand::new("test", vec![OsString::from("true")])
+            .workdir(Path::new("/elsewhere/repo"));
+        let argv = argv_of(&proot_command(&userland, &command));
+
+        assert!(argv.contains(&"/elsewhere/repo:/elsewhere/repo".to_owned()));
+        let w = argv.iter().position(|arg| arg == "-w").expect("a -w");
+        assert_eq!(argv[w + 1], "/elsewhere/repo");
+        // And the program still follows it, which is what `fake_proot` relies
+        // on and what makes the guest argv the tail of the command line.
+        assert_eq!(argv[w + 2], "true");
+    }
+
+    /// The pieces a caller that spawns for itself needs — the route language
+    /// servers take, where Zed's `LanguageServer::new` does the spawning and
+    /// only ever sees this.
+    #[test]
+    fn an_invocation_is_the_same_command_line_taken_apart() {
+        let userland = userland();
+        let command = GuestCommand::new("test", vec![OsString::from("true")]);
+        let invocation = invocation(&userland, &command);
+
+        assert_eq!(invocation.program, PathBuf::from("/lib/libproot_exec.so"));
+        assert_eq!(
+            invocation.args,
+            argv_of(&proot_command(&userland, &command))
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        let env: BTreeMap<String, String> = invocation
+            .env
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(env.get("HOME"), Some(&"/root".to_owned()));
+        assert_eq!(
+            env.get("PATH"),
+            Some(&"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned())
+        );
+    }
+
     #[test]
     fn a_caller_bind_reaches_the_command_line() {
         let command = GuestCommand::new("test", vec![OsString::from("true")])
@@ -747,6 +867,34 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // ETXTBSY, and why this is not just a write followed by a spawn.
+        //
+        // Writing a program and immediately exec'ing it races with every other
+        // thread in this process that forks — and the suite has several, here
+        // and in git.rs. Between a fork and its exec the child still holds our
+        // *write* descriptor, and Linux refuses to exec a file anybody has open
+        // for writing: "Text file busy". It surfaced as roughly one run in
+        // eight of `cargo test -p engine`, as a capture that returned `None`
+        // for no reason the assertions could explain.
+        //
+        // The window closes on its own, so probe until it has: once one exec
+        // of this path succeeds, no writer holds it and none can appear — this
+        // is the only code that ever writes it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let ok = Command::new(&path)
+                .args(["-w", "/", "/bin/sh", "-c", ":"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if ok || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
         path
     }
 

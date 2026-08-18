@@ -1386,3 +1386,261 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferText(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Language servers.
+//
+// The engine has no LSP client of its own: it drives Zed's, over the same
+// proot the git calls above go through, so a server is whatever `apt` put in
+// the Debian rootfs. That makes every call here degrade the way the git ones
+// do — no userland, no server installed, or a language nobody packages one for
+// all report "nothing to show" rather than an error.
+//
+// Two shapes, both already used elsewhere on this boundary:
+//
+// * **Diagnostics are pushed and polled.** The server sends them when it feels
+//   like it; the engine caches them and bumps a counter. Poll `lspVersion` per
+//   project and `bufferDiagnosticsVersion` per open buffer, exactly as the
+//   panel polls `projectVersion` — and read the JSON only when one moves.
+//   Polling `lspVersion` is also what *starts* servers for files that were
+//   already open when the userland appeared, so a project view must poll it.
+// * **Requests are started and polled.** `lspRequestCompletion` and friends
+//   return an id at once and never block. Poll `lspRequestVersion` (1 while in
+//   flight, 2 once settled, 0 once forgotten) and then read
+//   `lspRequestResult`. Starting a request cancels the previous one *of the
+//   same kind*, which is what a completion popup re-asking on every keystroke
+//   wants; `lspRequestCancel` frees the slot when the popup closes.
+//
+// Positions are UTF-16 columns in both directions, like every other position
+// on this boundary (`bufferHighlights`, `bufferOutlinePath`).
+// ---------------------------------------------------------------------------
+
+/// Generation counter for everything a project's language servers have said:
+/// diagnostics for any of its files, and the servers' own state. 0 until
+/// something has. Poll it exactly like `projectVersion`.
+///
+/// Polling also schedules server startup for files that were already open when
+/// the userland arrived — `apt install clangd` in the terminal while the editor
+/// is running. It never waits for a server.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspVersion(
+    _env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jlong {
+    engine().lsp_version(project_id as u64) as jlong
+}
+
+/// What each of the project's servers is doing, as a JSON array of
+/// `{name, state, error, languages}`. `state` is `starting`, `running` or
+/// `unavailable`; `error` carries the server's own last line of stderr when it
+/// could not be started, which is usually "command not found" and is the user's
+/// cue to install it. Versioned by `lspVersion`. Never blocks, never null,
+/// `[]` when there is nothing running.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspServers(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    let servers = engine().lsp_servers(project_id as u64);
+    let json = serde_json::to_string(&servers).unwrap_or_else(|err| {
+        log::warn!("lspServers failed to serialize: {err}");
+        "[]".to_owned()
+    });
+    to_jstring(&env, json)
+}
+
+/// Diagnostic totals for a project, as JSON:
+/// `{version, errors, warnings, infos, hints, files: [{path, errors, warnings,
+/// infos, hints}]}`. Paths are project-relative and `/`-separated — the same
+/// spelling `projectEntries` and `gitChanges` use — except for a file outside
+/// the project, which keeps its absolute path. Versioned by `lspVersion`.
+/// Never blocks, never null.
+///
+/// Diagnostics are **project-wide**, as Zed's are: closing a tab does not
+/// retract what a server said about that file, because a workspace-wide
+/// analysis (rust-analyzer's `cargo check`) is still right about it. Only an
+/// empty publish from the server, or `closeProject`, clears them.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspDiagnostics(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    let diagnostics = engine().lsp_diagnostics(project_id as u64);
+    let json = serde_json::to_string(&diagnostics).unwrap_or_else(|err| {
+        log::warn!("lspDiagnostics failed to serialize: {err}");
+        "{}".to_owned()
+    });
+    to_jstring(&env, json)
+}
+
+/// Generation counter for one buffer's diagnostics; 0 until a server has
+/// published for its file. Poll this per open tab — it is a hash lookup, where
+/// `bufferDiagnostics` clones and serializes every row.
+///
+/// It does **not** move when the buffer is edited: a UI must not be woken by
+/// its own typing. `bufferDiagnostics().stale` is what says the rows have
+/// drifted.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferDiagnosticsVersion(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+) -> jlong {
+    engine().buffer_diagnostics_version(buffer_id as u64) as jlong
+}
+
+/// Everything a server has said about this buffer's file, as JSON:
+/// `{version, buffer_version, stale, rows: [{row, col_utf16, end_row,
+/// end_col_utf16, severity, message, source, code}]}`.
+///
+/// `severity` is `error`, `warning`, `info` or `hint` — never absent, because a
+/// diagnostic the server left unrated is treated as a warning. `source` and
+/// `code` may be null. Rows are sorted by position, so painting a visible
+/// window is one walk.
+///
+/// `buffer_version` is the buffer version the rows describe, or null when the
+/// server dated them against text we no longer have; `stale` is true when the
+/// buffer has moved since — dim the underlines rather than moving them.
+///
+/// Reads a cache: never blocks, never null, empty for a buffer with no file, no
+/// server, or nothing wrong with it.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferDiagnostics(
+    env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+) -> jstring {
+    let diagnostics = engine().buffer_diagnostics(buffer_id as u64);
+    let json = serde_json::to_string(&diagnostics).unwrap_or_else(|err| {
+        log::warn!("bufferDiagnostics failed to serialize: {err}");
+        "{}".to_owned()
+    });
+    to_jstring(&env, json)
+}
+
+/// A caret, clamped the way `bufferOutlinePath` clamps one.
+fn caret(row: jlong, col_utf16: jlong) -> (u32, u32) {
+    (
+        row.max(0).min(u32::MAX as jlong) as u32,
+        col_utf16.max(0).min(u32::MAX as jlong) as u32,
+    )
+}
+
+/// Ask for completions at a caret. Returns a request id to poll with — never
+/// blocks and never fails: a buffer with no server behind it gets an id that
+/// reports `unavailable` immediately, so the UI has one code path.
+///
+/// Cancels whatever completion request was already in flight, including at the
+/// server, so a popup may call this on every keystroke.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspRequestCompletion(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+    row: jlong,
+    col_utf16: jlong,
+) -> jlong {
+    let (row, col) = caret(row, col_utf16);
+    engine().lsp_request_completion(buffer_id as u64, row, col) as jlong
+}
+
+/// Hover documentation at a caret. Same contract as `lspRequestCompletion`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspRequestHover(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+    row: jlong,
+    col_utf16: jlong,
+) -> jlong {
+    let (row, col) = caret(row, col_utf16);
+    engine().lsp_request_hover(buffer_id as u64, row, col) as jlong
+}
+
+/// Where the symbol under the caret is defined. Same contract as
+/// `lspRequestCompletion`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspRequestDefinition(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+    row: jlong,
+    col_utf16: jlong,
+) -> jlong {
+    let (row, col) = caret(row, col_utf16);
+    engine().lsp_request_definition(buffer_id as u64, row, col) as jlong
+}
+
+/// Generation counter for a request: 1 while it is in flight, 2 once it has
+/// settled, 0 for an id the engine has forgotten (superseded, cancelled, or its
+/// buffer closed). Poll it like `projectSearchVersion`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspRequestVersion(
+    _env: JNIEnv,
+    _class: JClass,
+    request_id: jlong,
+) -> jlong {
+    engine().lsp_request_version(request_id as u64) as jlong
+}
+
+/// A request's answer, as JSON:
+/// `{id, kind, state, version, buffer_id, row, col_utf16, buffer_version,
+/// payload}`.
+///
+/// `kind` is `completion`, `hover` or `definition`. `state` is `pending`,
+/// `done`, `timeout`, `unavailable` or `cancelled` — `done` with an empty
+/// payload is a real answer ("no completions here"), the other three are not,
+/// and a UI should not cache them. `row`, `col_utf16` and `buffer_version` echo
+/// where and when it was asked, so a late answer can be dropped by a caller
+/// whose caret has moved.
+///
+/// `payload` is null until it settles, and then depends on `kind`:
+///
+/// * `completion` — `{is_incomplete, items: [{label, detail, kind, insert_text,
+///   is_snippet, filter_text, sort_text, documentation, deprecated, preselect,
+///   edit}]}`. `insert_text`, `filter_text` and `sort_text` are never null
+///   (they fall back to the label); `is_snippet` means `insert_text` carries
+///   `${1:placeholder}` syntax; `edit` is `{row, col_utf16, end_row,
+///   end_col_utf16}` — the range to replace — or null, meaning the UI picks the
+///   word around the caret itself.
+/// * `hover` — `{contents, range}`. `contents` is markdown and is `""` when the
+///   server had nothing to say; `range` is the same shape as `edit`, or null.
+/// * `definition` — `{targets: [{path, row, col_utf16, end_row,
+///   end_col_utf16}]}`. `path` is absolute and openable with `openFile`;
+///   targets in URIs that are not files are dropped rather than handed over.
+///
+/// Never null. A forgotten id reports itself `cancelled` with a null payload;
+/// every other field of that answer is a placeholder, `kind` included — the
+/// caller is the one that knows what it asked for.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspRequestResult(
+    env: JNIEnv,
+    _class: JClass,
+    request_id: jlong,
+) -> jstring {
+    let result = engine().lsp_request_result(request_id as u64);
+    let json = serde_json::to_string(&result).unwrap_or_else(|err| {
+        log::warn!("lspRequestResult failed to serialize: {err}");
+        "{}".to_owned()
+    });
+    to_jstring(&env, json)
+}
+
+/// Stop a request and forget it — how a closed completion popup frees its slot,
+/// and how the server is told to stop working on an answer nobody will read.
+/// False if the id was already gone.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspRequestCancel(
+    _env: JNIEnv,
+    _class: JClass,
+    request_id: jlong,
+) -> jboolean {
+    if engine().lsp_cancel_request(request_id as u64) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}

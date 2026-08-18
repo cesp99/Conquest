@@ -565,4 +565,169 @@ object CoreBridge {
      * is megabytes — so a panel that closes must cancel.
      */
     external fun projectSearchCancel(searchId: Long): Boolean
+
+    // -----------------------------------------------------------------------
+    // Language servers. The engine has no LSP client of its own — it drives
+    // Zed's, over the same proot the git calls go through — so a server is
+    // whatever `apt` put in the Debian rootfs. Every call below therefore
+    // degrades the way the git ones do: no userland, no server installed, or a
+    // language nobody packages one for all report "nothing to show" rather than
+    // an error, and the `play` flavour never has one at all.
+    //
+    // Two shapes, both already on this boundary:
+    //
+    //  * **Diagnostics are pushed and polled.** The server publishes when it
+    //    likes; the engine caches and bumps a counter. Poll [lspVersion] per
+    //    project and [bufferDiagnosticsVersion] per open tab, exactly as the
+    //    panel polls [projectVersion], and read the JSON only when one moves.
+    //    Polling [lspVersion] is also what starts servers for files that were
+    //    already open when the userland appeared, so a project view must poll
+    //    it.
+    //  * **Requests are started and polled.** [lspRequestCompletion] and its
+    //    two siblings return an id at once and never block. Poll
+    //    [lspRequestVersion] — 1 in flight, 2 settled, 0 forgotten — then read
+    //    [lspRequestResult]. Starting a request cancels the previous one *of
+    //    the same kind*, which is what a completion popup re-asking on every
+    //    keystroke wants; [lspRequestCancel] frees the slot when it closes.
+    //
+    // Positions are UTF-16 columns in both directions, like every other
+    // position here ([bufferHighlights], [bufferOutlinePath]).
+    // -----------------------------------------------------------------------
+
+    /**
+     * Generation counter for everything a project's language servers have
+     * said: diagnostics for any of its files, and the servers' own state. 0
+     * until something has. Poll it exactly like [projectVersion].
+     *
+     * Polling also schedules server startup for files that were already open
+     * when the userland arrived — `apt install clangd` in the terminal, with
+     * the editor running. It never waits for a server.
+     */
+    external fun lspVersion(projectId: Long): Long
+
+    /**
+     * What each of the project's servers is doing, as a JSON array of
+     * `{name, state, error, languages}`. `state` is `starting`, `running` or
+     * `unavailable`; `error` carries the server's own last line of stderr when
+     * it could not be started — usually "command not found", which is the
+     * user's cue to install it. Versioned by [lspVersion]. Never blocks, never
+     * null, `[]` when nothing is running.
+     */
+    external fun lspServers(projectId: Long): String
+
+    /**
+     * Diagnostic totals for a project, as JSON: `{version, errors, warnings,
+     * infos, hints, files: [{path, errors, warnings, infos, hints}]}`. Paths
+     * are project-relative and `/`-separated — the spelling [projectEntries]
+     * and [gitChanges] use — except for a file outside the project, which keeps
+     * its absolute path. Versioned by [lspVersion]. Never blocks, never null.
+     *
+     * Diagnostics are **project-wide**, as Zed's are: closing a tab does not
+     * retract what a server said about that file, because a workspace-wide
+     * analysis (rust-analyzer's `cargo check`) is still right about it. Only an
+     * empty publish from the server, or [closeProject], clears them.
+     */
+    external fun lspDiagnostics(projectId: Long): String
+
+    /**
+     * Generation counter for one buffer's diagnostics; 0 until a server has
+     * published for its file. Poll this per open tab: it is a hash lookup,
+     * where [bufferDiagnostics] clones and serializes every row.
+     *
+     * It does **not** move when the buffer is edited — a UI must not be woken
+     * by its own typing. `stale` in [bufferDiagnostics] is what says the rows
+     * have drifted.
+     */
+    external fun bufferDiagnosticsVersion(bufferId: Long): Long
+
+    /**
+     * Everything a server has said about this buffer's file, as JSON:
+     * `{version, buffer_version, stale, rows: [{row, col_utf16, end_row,
+     * end_col_utf16, severity, message, source, code}]}`.
+     *
+     * `severity` is `error`, `warning`, `info` or `hint`, never absent — a
+     * diagnostic the server left unrated counts as a warning. `source` and
+     * `code` may be null. Rows are sorted by position, so painting a visible
+     * window is one walk and "go to next diagnostic" is a scan.
+     *
+     * `buffer_version` is the buffer version the rows describe, or null when
+     * the server dated them against text we no longer hold; `stale` is true
+     * when the buffer has moved since. Dim the underlines rather than moving
+     * them: only the server knows where they belong now.
+     *
+     * Reads a cache — never blocks, never null, empty for a buffer with no
+     * file, no server, or nothing wrong with it.
+     */
+    external fun bufferDiagnostics(bufferId: Long): String
+
+    /**
+     * Asks for completions at a caret. Returns a request id to poll with; never
+     * blocks and never fails — a buffer with no server behind it gets an id
+     * that reports `unavailable` straight away, so the UI has one code path
+     * whether or not language intelligence is installed.
+     *
+     * Cancels whatever completion request was already in flight, at the server
+     * too, so a popup may call this on every keystroke.
+     */
+    external fun lspRequestCompletion(bufferId: Long, row: Long, colUtf16: Long): Long
+
+    /** Hover documentation at a caret. Same contract as [lspRequestCompletion]. */
+    external fun lspRequestHover(bufferId: Long, row: Long, colUtf16: Long): Long
+
+    /**
+     * Where the symbol under the caret is defined. Same contract as
+     * [lspRequestCompletion].
+     */
+    external fun lspRequestDefinition(bufferId: Long, row: Long, colUtf16: Long): Long
+
+    /**
+     * Generation counter for a request: 1 while in flight, 2 once settled, 0
+     * for an id the engine has forgotten (superseded, cancelled, or its buffer
+     * closed). Poll it exactly like [projectSearchVersion].
+     */
+    external fun lspRequestVersion(requestId: Long): Long
+
+    /**
+     * A request's answer, as JSON: `{id, kind, state, version, buffer_id, row,
+     * col_utf16, buffer_version, payload}`.
+     *
+     * `kind` is `completion`, `hover` or `definition`. `state` is `pending`,
+     * `done`, `timeout`, `unavailable` or `cancelled` — `done` with an empty
+     * payload is a real answer ("no completions here"); the other three are
+     * not, and must not be cached as one. `row`, `col_utf16` and
+     * `buffer_version` echo where and when it was asked, so a late answer can
+     * be dropped by a caller whose caret has moved.
+     *
+     * `payload` is null until it settles, and then depends on `kind`:
+     *
+     *  * `completion` — `{is_incomplete, items: [{label, detail, kind,
+     *    insert_text, is_snippet, filter_text, sort_text, documentation,
+     *    deprecated, preselect, edit}]}`. `insert_text`, `filter_text` and
+     *    `sort_text` are never null (they fall back to the label);
+     *    `is_snippet` means `insert_text` carries `${1:placeholder}` syntax;
+     *    `edit` is `{row, col_utf16, end_row, end_col_utf16}` — the range to
+     *    replace — or null, meaning the UI picks the word around the caret.
+     *  * `hover` — `{contents, range}`. `contents` is markdown, `""` when the
+     *    server had nothing to say; `range` has the same shape as `edit`, or is
+     *    null.
+     *  * `definition` — `{targets: [{path, row, col_utf16, end_row,
+     *    end_col_utf16}]}`. `path` is absolute and openable with [openFile];
+     *    targets in URIs that are not files are dropped rather than handed over
+     *    as paths that do not exist.
+     *
+     * Never null: a forgotten id reports itself `cancelled` with a null
+     * payload — and every other field of *that* answer is a placeholder,
+     * `kind` included, since the caller is the one that knows what it asked
+     * for. It serializes the whole answer, which for a completion list is
+     * tens of kilobytes — read it when [lspRequestVersion] moves, not on a
+     * timer.
+     */
+    external fun lspRequestResult(requestId: Long): String
+
+    /**
+     * Stops a request and forgets it — how a closed completion popup frees its
+     * slot, and how the server is told to stop working on an answer nobody will
+     * read. False if the id was already gone.
+     */
+    external fun lspRequestCancel(requestId: Long): Boolean
 }

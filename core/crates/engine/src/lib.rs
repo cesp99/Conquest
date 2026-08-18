@@ -48,6 +48,7 @@ mod guest;
 mod highlight;
 mod highlight_worker;
 mod language_config;
+mod lsp;
 mod platform;
 mod project;
 mod project_search;
@@ -60,6 +61,12 @@ pub use git::{BranchInfo, ChangedFile, GitChanges, GitStatus};
 pub use git_diff::{BlameEntry, Hunk, HunkKind};
 pub use highlight::{HighlightSpan, OutlineItem, STYLE_NAMES, language_for_path};
 pub use language_config::config_json as language_config_json;
+// `crate::` spelled out: the module and the vendored crate it wraps share a
+// name, and an unqualified `lsp::` here would be ambiguous.
+pub use crate::lsp::{
+    BufferDiagnostics, Counts, DiagnosticRow, ProjectDiagnostics, RequestKind, RequestResult,
+    RequestState, ServerState, ServerStatus, Severity,
+};
 pub use project::{ProjectId, TreeEntry};
 pub use project_search::{FileMatches, LineMatch, SearchId, SearchResults, SearchState};
 pub use search::{BufferMatch, BufferSearch, SearchOptions};
@@ -117,6 +124,10 @@ pub struct Engine {
     /// The project search running for each project, at most one apiece — see
     /// project_search.rs.
     searches: project_search::ProjectSearches,
+    /// Language servers, the documents they have been told about and the
+    /// diagnostics they have published — see lsp.rs. Inert, and costing one
+    /// relaxed atomic load per edit, until a server actually starts.
+    lsp: lsp::LspState,
 }
 
 pub(crate) struct BufferState {
@@ -198,6 +209,10 @@ impl Engine {
     }
 
     pub fn close_buffer(&self, id: BufferId) -> bool {
+        // Before the buffer goes: the LSP side reads its path out of the
+        // registry it keeps, but a request still in flight against this buffer
+        // has to be retired here rather than left holding a slot forever.
+        self.lsp_did_close(id);
         self.buffers.lock().unwrap().remove(&id).is_some()
     }
 
@@ -223,6 +238,15 @@ impl Engine {
         }
         let start_point = snapshot.offset_to_point(start);
         let old_end_point = snapshot.offset_to_point(end);
+        // A `didChange` carries the range in the *old* text, which only this
+        // snapshot still knows. Taken before the edit and only when a server is
+        // actually running — the `play` flavour pays one relaxed load for it.
+        let lsp_range = self.lsp_is_live().then(|| {
+            (
+                snapshot.offset_to_point_utf16(start),
+                snapshot.offset_to_point_utf16(end),
+            )
+        });
         state.buffer.edit([(start..end, text)]);
         state.version += 1;
         let needs_highlight = if let Some(highlighter) = &mut state.highlight {
@@ -243,10 +267,24 @@ impl Engine {
             false
         };
         let version = state.version;
+        let lsp_change = lsp_range.map(|(start, old_end)| lsp::TextChange {
+            start,
+            old_end,
+            text: text.to_owned(),
+            // Only for a server that negotiated whole-document sync, because
+            // this is O(file) and sits on the keystroke path. None of the
+            // servers we start does; the flag is here so that one which did
+            // would work rather than silently drift.
+            whole: self.lsp_wants_full_text().then(|| state.buffer.text()),
+            buffer_version: version,
+        });
         // Release the lock before touching the worker.
         drop(buffers);
         if needs_highlight {
             self.request_highlight(id);
+        }
+        if let Some(change) = lsp_change {
+            self.lsp_did_change(id, change);
         }
         Ok(version)
     }
@@ -256,12 +294,22 @@ impl Engine {
     pub fn undo(&self, id: BufferId) -> Result<Option<u64>, EngineError> {
         let mut buffers = self.buffers.lock().unwrap();
         let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
+        let old_end = self
+            .lsp_is_live()
+            .then(|| state.buffer.snapshot().max_point_utf16());
         let result = state.buffer.undo().map(|_| {
             state.version += 1;
             let needs_highlight = state.reset_highlighter();
             (state.version, needs_highlight)
         });
+        let lsp_change = result
+            .is_some()
+            .then(|| self.history_change(state, old_end))
+            .flatten();
         drop(buffers);
+        if let Some(change) = lsp_change {
+            self.lsp_did_change(id, change);
+        }
         Ok(result.map(|(version, needs_highlight)| {
             if needs_highlight {
                 self.request_highlight(id);
@@ -270,17 +318,47 @@ impl Engine {
         }))
     }
 
+    /// Undo, redo and reload replace text wholesale: there is no edit shape to
+    /// hand a server. What goes out is one change covering the whole of the old
+    /// document, which is a perfectly ordinary incremental `didChange` — so the
+    /// LSP side keeps a single code path instead of a special case.
+    fn history_change(
+        &self,
+        state: &BufferState,
+        old_end: Option<rope::PointUtf16>,
+    ) -> Option<lsp::TextChange> {
+        let old_end = old_end?;
+        let text = state.buffer.text();
+        Some(lsp::TextChange {
+            start: rope::PointUtf16::new(0, 0),
+            old_end,
+            whole: self.lsp_wants_full_text().then(|| text.clone()),
+            text,
+            buffer_version: state.version,
+        })
+    }
+
     /// Redo the most recently undone transaction. Returns the new version,
     /// or `None` if there was nothing to redo.
     pub fn redo(&self, id: BufferId) -> Result<Option<u64>, EngineError> {
         let mut buffers = self.buffers.lock().unwrap();
         let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
+        let old_end = self
+            .lsp_is_live()
+            .then(|| state.buffer.snapshot().max_point_utf16());
         let result = state.buffer.redo().map(|_| {
             state.version += 1;
             let needs_highlight = state.reset_highlighter();
             (state.version, needs_highlight)
         });
+        let lsp_change = result
+            .is_some()
+            .then(|| self.history_change(state, old_end))
+            .flatten();
         drop(buffers);
+        if let Some(change) = lsp_change {
+            self.lsp_did_change(id, change);
+        }
         Ok(result.map(|(version, needs_highlight)| {
             if needs_highlight {
                 self.request_highlight(id);

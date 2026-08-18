@@ -227,6 +227,10 @@ impl crate::Engine {
     /// Stop scanning a project and forget its mirrored state.
     pub fn close_project(&self, id: ProjectId) -> bool {
         self.searches.cancel_project(id);
+        // Before the root goes: shutting a server down needs to know where it
+        // was started, and its diagnostics are meaningless without the project
+        // they are relative to.
+        self.lsp_close_project(id);
         let existed = self.projects.lock().unwrap().remove(&id).is_some();
         if existed {
             self.runtime().spawn(move |cx| {

@@ -1691,6 +1691,7 @@ dependencies = [
  "imara-diff",
  "libc",
  "log",
+ "lsp",
  "parking_lot",
  "path",
  "regex",

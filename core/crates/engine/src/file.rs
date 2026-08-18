@@ -115,6 +115,11 @@ impl crate::Engine {
         if let Some(state) = buffers.get_mut(&id) {
             state.file = Some(file);
         }
+        drop(buffers);
+        // The buffer now has both a path and a language, which is everything a
+        // language server needs to be started for it — lazily, off this thread,
+        // and silently when there is nothing to start (see lsp.rs).
+        self.lsp_did_open(id);
         Ok(id)
     }
 
@@ -185,6 +190,10 @@ impl crate::Engine {
             // edit that landed during the write must leave the buffer dirty.
             file.mark_synced(version);
         }
+        drop(buffers);
+        // rust-analyzer runs `cargo check` on save and nowhere else, so most of
+        // its diagnostics arrive because of this line.
+        self.lsp_did_save(id);
         Ok(version)
     }
 
@@ -200,6 +209,9 @@ impl crate::Engine {
         let mut buffers = self.buffers.lock().unwrap();
         let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
         let len = state.buffer.len();
+        let old_end = self
+            .lsp_is_live()
+            .then(|| state.buffer.snapshot().max_point_utf16());
         // `text`'s history groups edits that land close together in time, so
         // without these boundaries a reload would merge into whatever the
         // user typed a moment earlier and one undo would revert both. A
@@ -213,9 +225,13 @@ impl crate::Engine {
         if let Some(file) = &mut state.file {
             file.mark_synced(version);
         }
+        let lsp_change = self.history_change(state, old_end);
         drop(buffers);
         if needs_highlight {
             self.request_highlight(id);
+        }
+        if let Some(change) = lsp_change {
+            self.lsp_did_change(id, change);
         }
         Ok(version)
     }

@@ -18,6 +18,9 @@ imara-diff.workspace = true
 grammars = { workspace = true, features = ["load-grammars"] }
 libc.workspace = true
 log.workspace = true
+# Zed's own LSP client, vendored at core/vendor/lsp. We wire it, we do not
+# write one — see agent-docs/research/lsp-approach.md.
+lsp.workspace = true
 parking_lot.workspace = true
 path.workspace = true
 regex.workspace = true
