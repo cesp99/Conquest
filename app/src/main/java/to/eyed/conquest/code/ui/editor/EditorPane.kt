@@ -1397,7 +1397,15 @@ private fun EditorPopups(
                 onActed()
             },
             onDismiss = {
+                // A long press hid the clipboard toolbar to make room for the
+                // card, so closing the card has to give it back — otherwise
+                // the word the press selected is left with no way to copy it.
+                // The pane already wired `onNothingToSay` to exactly that, so
+                // dismissal borrows it rather than threading a second hook.
+                val byTouch = hover.askedByTouch
+                val restoreToolbar = hover.onNothingToSay
                 hover.clear()
+                if (byTouch) restoreToolbar?.invoke()
                 onActed()
             },
         )
@@ -1749,9 +1757,13 @@ private fun handleEditorKey(
             event.key == Key.Escape -> return menu.dismiss()
             event.key == Key.Enter || event.key == Key.NumPadEnter || event.key == Key.Tab ->
                 return menu.accept()
-            !alt && (event.key == Key.DirectionUp || (ctrl && event.key == Key.P)) ->
+            // Bare arrows only. Zed's context-menu bindings do not claim the
+            // shifted twins (default-linux.json's `showing_completions`
+            // context), and swallowing them here would stop a selection being
+            // extended while a list happens to be open.
+            !alt && !shift && (event.key == Key.DirectionUp || (ctrl && event.key == Key.P)) ->
                 return menu.moveSelection(-1)
-            !alt && (event.key == Key.DirectionDown || (ctrl && event.key == Key.N)) ->
+            !alt && !shift && (event.key == Key.DirectionDown || (ctrl && event.key == Key.N)) ->
                 return menu.moveSelection(1)
             // Zed's ContextMenuFirst / ContextMenuLast.
             event.key == Key.PageUp -> return menu.moveSelection(-menu.selected)

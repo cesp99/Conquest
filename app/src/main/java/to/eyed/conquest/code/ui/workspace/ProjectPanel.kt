@@ -30,6 +30,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -73,6 +74,7 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -85,73 +87,185 @@ import to.eyed.conquest.code.core.GitFileStatus as EngineStatus
 import to.eyed.conquest.code.core.GitignoredFiles
 import to.eyed.conquest.code.core.ProjectEntry
 import to.eyed.conquest.code.core.ProjectSession
+import to.eyed.conquest.code.ui.theme.LocalUiFontSize
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
-
-/** Zed's `indent_size` (assets/settings/default.json:828). */
-private val IndentPerLevel = 20.dp
-
-/** `px(Base06)` on the row; the indent is applied inside it (list_item.rs:364). */
-private val RowPadding = 6.dp
-
-/** `gap_1` between a row's icon and its name (list_item.rs:363). */
-private val RowGap = 4.dp
+import to.eyed.conquest.code.ui.theme.glyphHeight
+import to.eyed.conquest.code.ui.theme.rem
+import to.eyed.conquest.code.ui.theme.remsAt
 
 /**
- * Zed's row: a fixed `h_6` (24px) content box (project_panel.rs:6264) inside a
- * wrapper that always carries a 1px border — usually painted in the row's own
- * background, so invisible (project_panel.rs:5793) — for a 26px pitch. Per the
- * 2026-08-17 density decision in DECISIONS.md that is our row too: the whole
- * row is the tap target, and everything a small target does is also reachable
- * from the long-press menu or the keyboard.
- */
-private val RowHeight = 26.dp
-
-/** Guides are 1px, at every indent level a row is nested under. */
-private val IndentGuideWidth = 1.dp
-
-/**
- * Guides sit 15px right of each level's start, lining up with the icon column
- * (ui::LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET, indent_guides.rs:33, applied in
- * project_panel.rs:7212-7260).
- */
-private val IndentGuideOffset = 15.dp
-
-/**
- * The open file's border is 1px around plus a 2px rail on the right edge —
- * `border_1().border_r_2()` in `panel.focused_border` (project_panel.rs:5793-5797).
- */
-private val ActiveRowRail = 2.dp
-
-/**
- * A guide run stops 4px short of each of its real ends — `PADDING_Y`
- * (project_panel.rs:7214, applied at 7231-7247). Ours reads those ends from
- * the rows either side in the flattened tree, so only a run's true first and
- * last rows inset their slice and a run cut off by the viewport keeps running
- * where it is cut.
+ * The panel's metrics, as multiples of the rem — which is `ui_font_size`
+ * (theme_settings/src/settings.rs:619), so raising the UI font grows the rows
+ * and the gaps with the text instead of only the text.
  *
- * **One deliberate deviation.** Zed decides this per *run*, not per end: a run
- * that reaches the last row of the computed window is marked
- * `continues_offscreen` (indent_guides.rs:490-498), and the single `offset` it
- * yields moves the origin *and* shortens the length, so both ends lose their
- * inset together (project_panel.rs:7231-7247). A run that starts on screen and
- * continues past the viewport bottom therefore draws flush at its on-screen top
- * in Zed, where ours still insets. Matching it would mean telling every row
- * where the viewport ends — a per-row read of the layout on every scroll frame,
- * on the main thread — to reproduce a 4px gap that only appears while a run is
- * cut off, and that reads as an artefact rather than as an end.
+ * Held as bare numbers rather than `Dp` so the whole table is checkable on the
+ * host at any font size (`ChromeMetricsTest`); the composable getters
+ * below are what the panel actually reads. The px-valued members are the
+ * dimensions Zed writes as `px(…)`, which do *not* scale — see [PanelPixels].
  */
-private val GuideEndInset = 4.dp
+internal object PanelMetrics {
+
+    /** `gap_1` = `rems(0.25)` between a row's icon and its name (list_item.rs:363). */
+    const val ROW_GAP = 0.25f
+
+    /**
+     * `px(DynamicSpacing::Base06.rems(cx))` on the row (list_item.rs:364); the
+     * indent is applied inside it.
+     */
+    const val ROW_PADDING = 0.375f
+
+    /** The row's content box: `h_6` = `rems(1.5)` = 24px (project_panel.rs:6264). */
+    const val ROW_CONTENT = 1.5f
+
+    /**
+     * The gradient shadow under the pinned stack: `h_1p5` = `rems(0.375)`
+     * hanging off the last sticky row, black at 10% fading downward to nothing
+     * (project_panel.rs:6893-6907). It belongs to that row, not the stack, so
+     * the push-off drags the shadow with it, exactly as Zed's does.
+     */
+    const val STICKY_SHADOW = 0.375f
+
+    /**
+     * How far the git mark sits from the row's right edge.
+     *
+     * Zed's end slot keeps `pr_3` = `rems(0.75)` (project_panel.rs:6172); ours
+     * has been half that since the density pass, and Z-18 is a change of
+     * *units*, not of metrics, so `rems(0.375)` is what is recorded here — the
+     * same 6px it has been drawing, now scaling like everything else.
+     */
+    const val STATUS_SLOT_END_PADDING = 0.375f
+
+    /**
+     * A directory's change mark: `Indicator::dot()` is `w_1p5`/`h_1p5` =
+     * `rems(0.375)` (indicator.rs:73-78, project_panel.rs:6194).
+     */
+    const val DIRECTORY_DOT = 0.375f
+
+    /** Room under the last row so it is not flush against the panel's end. */
+    const val LIST_BOTTOM_PADDING = 0.75f
+
+    /** The inset around the panel's one-line messages ("Scanning…", errors). */
+    const val MESSAGE_PADDING = 0.75f
+
+    /**
+     * The row's pitch: the `h_6` content box inside a wrapper that always
+     * carries a 1px border — usually painted in the row's own background, so
+     * invisible (project_panel.rs:5793-5797). 24 + 1 + 1 = the 26px pitch, and
+     * only the 24 grows with the font, because `border_1` is `px(1.)`.
+     *
+     * Per the 2026-08-17 density decision in DECISIONS.md that is our row too:
+     * the whole row is the tap target, and everything a small target does is
+     * also reachable from the long-press menu or the keyboard.
+     */
+    fun rowHeight(uiFontSize: Float): Dp =
+        remsAt(uiFontSize, ROW_CONTENT) + PanelPixels.RowBorders
+}
 
 /**
- * The gradient shadow under the pinned stack: `h_1p5` (6px) hanging off the
- * last sticky row, black at 10% fading downward to nothing
- * (project_panel.rs:6893-6907). It belongs to that row, not the stack, so the
- * push-off drags the shadow with it, exactly as Zed's does.
+ * The panel dimensions Zed writes in **pixels**, which therefore do not move
+ * with `ui_font_size` and must not be spelled `rem(…)`.
+ *
+ * Every one is px in the source: `indent_size` is a settings number handed
+ * straight to `px()` (project_panel.rs:6140, 7155),
+ * `LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET` is `px(15.)` (indent_guides.rs:33),
+ * `PADDING_Y` is `px(4.)` (project_panel.rs:7215) and the guide itself and the
+ * row's borders are `px(1.)`/`px(2.)`. Growing them with the font would make
+ * the tree diverge from Zed's at exactly the setting this task exists to
+ * honour.
  */
-private val StickyShadowHeight = 6.dp
+internal object PanelPixels {
 
-/** The end slot keeps `pr_3` (12px) from the row's right edge (project_panel.rs:6160). */
-private val StatusSlotEndPadding = 6.dp
+    /** Zed's `indent_size` (assets/settings/default.json:828). */
+    val IndentPerLevel = 20.dp
+
+    /** Guides are 1px, at every indent level a row is nested under. */
+    val GuideWidth = 1.dp
+
+    /**
+     * Guides sit 15px right of each level's start, lining up with the icon
+     * column (ui::LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET, indent_guides.rs:33,
+     * applied in project_panel.rs:7212-7260).
+     */
+    val GuideOffset = 15.dp
+
+    /**
+     * A guide run stops 4px short of each of its real ends — `PADDING_Y`
+     * (project_panel.rs:7215, applied at 7232-7248).
+     */
+    val GuideEndInset = 4.dp
+
+    /**
+     * The open file's border is 1px around plus a 2px rail on the right edge —
+     * `border_1().border_r_2()` in `panel.focused_border`
+     * (project_panel.rs:5793-5797).
+     */
+    val ActiveRowRail = 2.dp
+
+    /** The 1px top and bottom of every row's wrapper, which make the 26px pitch. */
+    val RowBorders = 2.dp
+}
+
+private val RowPadding: Dp
+    @Composable @ReadOnlyComposable get() = rem(PanelMetrics.ROW_PADDING)
+
+private val RowGap: Dp
+    @Composable @ReadOnlyComposable get() = rem(PanelMetrics.ROW_GAP)
+
+/**
+ * The row, with the accessibility floor on top of Zed's metric.
+ *
+ * `max(26dp-at-the-default, the name's ink + the wrapper's two borders)`: at
+ * every ordinary font scale this is exactly [PanelMetrics.rowHeight], and it
+ * grows only once the *system's* font scale has made a file name taller than
+ * the row Zed specifies — the point at which a fixed height starts cutting the
+ * tops off ascenders. See [glyphHeight].
+ */
+private val RowHeight: Dp
+    @Composable @ReadOnlyComposable get() = maxOf(
+        PanelMetrics.rowHeight(LocalUiFontSize.current),
+        glyphHeight(MaterialTheme.typography.bodyMedium) + PanelPixels.RowBorders,
+    )
+
+private val StickyShadowHeight: Dp
+    @Composable @ReadOnlyComposable get() = rem(PanelMetrics.STICKY_SHADOW)
+
+private val StatusSlotEndPadding: Dp
+    @Composable @ReadOnlyComposable get() = rem(PanelMetrics.STATUS_SLOT_END_PADDING)
+
+/**
+ * Whether the guide for [level] has one of its ends on this row, given the
+ * rendered depth of the neighbouring row that way.
+ *
+ * A run at level ℓ spans exactly the contiguous rows drawn deeper than ℓ, so
+ * this row holds an end of it precisely when the row next door no longer draws
+ * ℓ. The neighbours are the *tree's*, not the viewport's, so a run cut off by
+ * the top or bottom of the list keeps running where it is cut.
+ *
+ * **This is a deliberate, measured deviation from Zed, and it is not the one a
+ * first reading suggests.** Zed computes its guides over the visible window
+ * only, and decides the 4px per *run*, not per end: `offset` is `px(0.)` when
+ * the run is flagged `continues_offscreen` and `PADDING_Y` otherwise, and that
+ * one number both moves the origin down and shortens the length by twice
+ * itself (project_panel.rs:7231-7248). The flag is set only for a run reaching
+ * the *last* row of the window whose level continues into it
+ * (indent_guides.rs:490-500). Two consequences follow, and they point opposite
+ * ways:
+ *
+ * - a run that starts on screen and continues past the bottom draws flush at
+ *   its true top in Zed, where ours insets; and
+ * - a run cut off by the *top* of the window — which is never flagged, because
+ *   the flag only ever looks at the bottom — gets the full 4px inset at the
+ *   window's edge in Zed, a gap that slides with the scroll, where ours draws
+ *   flush.
+ *
+ * Both are artefacts of computing guides per viewport rather than per tree.
+ * Reproducing them would mean telling every row where the viewport currently
+ * ends, i.e. reading the layout per row on every scroll frame on the main
+ * thread, to buy a 4px gap that appears and disappears as you scroll. We draw
+ * the ends the data has, and the insets stay where the run really ends.
+ */
+internal fun guideRunEndsHere(level: Int, neighbourRenderedDepth: Int): Boolean =
+    neighbourRenderedDepth <= level
 
 /** How often to check the engine for a newer worktree snapshot. */
 private const val SCANNING_POLL_MS = 120L
@@ -849,7 +963,9 @@ fun ProjectPanel(
                         LazyColumn(
                             state = listState,
                             modifier = Modifier.fillMaxSize(),
-                            contentPadding = PaddingValues(bottom = 12.dp),
+                            contentPadding = PaddingValues(
+                                bottom = rem(PanelMetrics.LIST_BOTTOM_PADDING),
+                            ),
                         ) {
                             itemsIndexed(rows, key = { _, row -> row.entry.path }) { index, row ->
                                 val active = activeGuide
@@ -1347,6 +1463,17 @@ private fun ProjectRow(
         onPress = { pressed.value = it },
         onContext = onContextMenu,
     )
+    // Read out here, not inside `drawBehind`: these are composition values now
+    // (the rem-scaled ones read the UI font size), and a draw lambda is not a
+    // composable scope. The px-valued ones come along for the ride so the draw
+    // block reads as one table.
+    val guideWidth = PanelPixels.GuideWidth
+    val guideStep = PanelPixels.IndentPerLevel
+    val guideLeftOffset = PanelPixels.GuideOffset
+    val guideEndInset = PanelPixels.GuideEndInset
+    val activeRail = PanelPixels.ActiveRowRail
+    val rowIndent = PanelPixels.IndentPerLevel * depth
+    val rowPadding = RowPadding
     // The menu is a child of this box rather than of the row's content, so the
     // popup is placed against the whole row and the offset it is given is the
     // press position unchanged.
@@ -1366,22 +1493,21 @@ private fun ProjectRow(
                     // continuous runs the uniform-list decoration computes,
                     // because a guide at level ℓ spans exactly the contiguous
                     // rows deeper than ℓ. A run's true ends pull in 4px
-                    // (PADDING_Y, project_panel.rs:7214): this row holds an
-                    // end of level ℓ's run exactly when its neighbour that way
-                    // no longer draws ℓ — the neighbours are the tree's, not
-                    // the viewport's, so a run cut off by the viewport edge
-                    // keeps running. Zed instead drops the inset at *both*
-                    // ends of a run that continues offscreen; see
-                    // [GuideEndInset] for why we don't.
+                    // (PADDING_Y, project_panel.rs:7215), which is
+                    // [guideRunEndsHere] — and where that rule parts company
+                    // with Zed's viewport-relative one, and why, is written out
+                    // there.
                     // The run under the selection is `panel.indent_guide_active`
                     // (find_active_indent_guide, project_panel.rs:6724-6790).
-                    val guide = IndentGuideWidth.toPx()
-                    val step = IndentPerLevel.toPx()
-                    val guideOffset = IndentGuideOffset.toPx()
-                    val endInset = GuideEndInset.toPx()
+                    val guide = guideWidth.toPx()
+                    val step = guideStep.toPx()
+                    val guideOffset = guideLeftOffset.toPx()
+                    val endInset = guideEndInset.toPx()
                     for (level in 0 until depth) {
-                        val topInset = if (prevRenderedDepth <= level) endInset else 0f
-                        val bottomInset = if (nextRenderedDepth <= level) endInset else 0f
+                        val topInset =
+                            if (guideRunEndsHere(level, prevRenderedDepth)) endInset else 0f
+                        val bottomInset =
+                            if (guideRunEndsHere(level, nextRenderedDepth)) endInset else 0f
                         drawRect(
                             color = if (level == activeGuideLevel) {
                                 rowColours.indentGuideActive
@@ -1407,8 +1533,8 @@ private fun ProjectRow(
                         )
                         drawRect(
                             color = rowColours.activeBorder,
-                            topLeft = Offset(size.width - ActiveRowRail.toPx(), 0f),
-                            size = Size(ActiveRowRail.toPx(), size.height),
+                            topLeft = Offset(size.width - activeRail.toPx(), 0f),
+                            size = Size(activeRail.toPx(), size.height),
                         )
                     }
                 }
@@ -1425,7 +1551,7 @@ private fun ProjectRow(
                     onClick = onClick,
                     onLongClick = { onContextMenu(pressed.value) },
                 )
-                .padding(start = RowPadding + IndentPerLevel * depth, end = RowPadding),
+                .padding(start = rowPadding + rowIndent, end = rowPadding),
         ) {
             Box(
                 modifier = Modifier.width(EntryIconWidth),
@@ -1459,7 +1585,7 @@ private fun ProjectRow(
                     Box(
                         modifier = Modifier
                             .padding(end = StatusSlotEndPadding)
-                            .size(6.dp)
+                            .size(rem(PanelMetrics.DIRECTORY_DOT))
                             .clip(CircleShape)
                             .background(tinted.copy(alpha = 0.5f)),
                     )
@@ -1495,7 +1621,7 @@ private fun statusLetter(status: GitFileStatus): String? = when (status) {
 
 @Composable
 private fun PanelMessage(text: String) {
-    Box(modifier = Modifier.fillMaxSize().padding(12.dp)) {
+    Box(modifier = Modifier.fillMaxSize().padding(rem(PanelMetrics.MESSAGE_PADDING))) {
         Text(
             text = text,
             style = MaterialTheme.typography.bodySmall,

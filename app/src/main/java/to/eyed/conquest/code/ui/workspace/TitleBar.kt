@@ -25,6 +25,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -39,24 +40,96 @@ import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import to.eyed.conquest.code.R
 import to.eyed.conquest.code.core.GitBranch
+import to.eyed.conquest.code.ui.theme.LocalUiFontSize
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
-
-// Zed: max(1.75rem, 34px) — 34 at the default 16px rem
-// (crates/ui/src/utils/constants.rs:17-19).
-private val TitleBarHeight = 34.dp
+import to.eyed.conquest.code.ui.theme.ZedRadius
+import to.eyed.conquest.code.ui.theme.glyphHeight
+import to.eyed.conquest.code.ui.theme.rem
+import to.eyed.conquest.code.ui.theme.remsAt
 
 /**
- * Everything that sits in the bar is a ButtonLike at `ButtonSize::Default`:
- * a 22px-tall box (button_like.rs:469) with `px(Base04)` = 4px inside
- * (button_like.rs:800-801), `rounded_sm` corners (button_like.rs:527) and
- * `gap(Base04)` = 4px between its children (button_like.rs:797).
+ * The title bar's metrics as rem multiples — `ui_font_size` is the rem
+ * (theme_settings/src/settings.rs:619) — held as bare numbers so the table is
+ * checkable on the host (`ChromeMetricsTest`).
  */
-private val BarButtonHeight = 22.dp
-private val BarButtonPad = 4.dp
-private val BarButtonGap = 4.dp
+internal object TitleBarMetrics {
+
+    /**
+     * Zed's bar is `(1.75 * rem_size).max(px(34.))`
+     * (ui/src/utils/constants.rs:16-19) — a rem *with a pixel floor*, which is
+     * why it is 34 rather than 28 at the default: the floor wins until
+     * `ui_font_size` passes 19.43. [barHeight] is that `max`, not one or the
+     * other.
+     */
+    const val HEIGHT = 1.75f
+    val HEIGHT_FLOOR = 34.dp
+
+    /**
+     * Everything that sits in the bar is a ButtonLike at `ButtonSize::Default`:
+     * `rems_from_px(22)` tall (button_like.rs:465-473) with `px(Base04)` inside
+     * (button_like.rs:800-801), `rounded_sm` corners (button_like.rs:527) and
+     * `gap(Base04)` between its children (button_like.rs:797).
+     */
+    const val BUTTON_HEIGHT = 1.375f
+    const val BUTTON_PAD = 0.25f
+    const val BUTTON_GAP = 0.25f
+
+    /** `gap_0p5` between the left group's buttons (title_bar.rs:292). */
+    const val LEFT_GROUP_GAP = 0.125f
+
+    /** `pl_2` — the bar's only outer padding (title_bar.rs:417). */
+    const val LEADING_PAD = 0.5f
+
+    /** `IconSize::XSmall` = `rems_from_px(12)` (icon.rs:73), the branch glyph. */
+    const val XSMALL_ICON = 0.75f
+
+    /** How wide the ☰ menu opens. Ours; a measure of the text in it. */
+    const val MENU_MIN_WIDTH = 16.25f
+
+    /** Zed's ListSeparator: 6px above and below the rule (list_separator.rs:9-12). */
+    const val SEPARATOR_GAP = 0.375f
+
+    /** An inset ListItem: 4px of surface around each row (list_item.rs:309). */
+    const val MENU_INSET = 0.25f
+
+    /** The row itself: `rounded_sm` with `px(Base06)` inside (list_item.rs:364). */
+    const val MENU_ROW_PAD_X = 0.375f
+    const val MENU_ROW_PAD_Y = 0.125f
+
+    /** `ml_4` between a label and its keybinding (context_menu.rs:2089). */
+    const val LABEL_TO_CHORD = 1f
+
+    fun barHeight(uiFontSize: Float): Dp = maxOf(remsAt(uiFontSize, HEIGHT), HEIGHT_FLOOR)
+}
+
+/**
+ * The bar and its buttons, each with the accessibility floor on top of Zed's
+ * metric: `max(Zed's number, the label's ink)`. At every ordinary font scale
+ * these are exactly [TitleBarMetrics.barHeight] and `rem(1.375f)`; they grow
+ * only once the *system's* font scale has made the text taller than the box
+ * Zed specifies. See [glyphHeight].
+ */
+private val TitleBarHeight: Dp
+    @Composable @ReadOnlyComposable get() = maxOf(
+        TitleBarMetrics.barHeight(LocalUiFontSize.current),
+        glyphHeight(MaterialTheme.typography.bodyMedium),
+    )
+
+private val BarButtonHeight: Dp
+    @Composable @ReadOnlyComposable get() = maxOf(
+        rem(TitleBarMetrics.BUTTON_HEIGHT),
+        glyphHeight(MaterialTheme.typography.bodyMedium),
+    )
+
+private val BarButtonPad: Dp
+    @Composable @ReadOnlyComposable get() = rem(TitleBarMetrics.BUTTON_PAD)
+
+private val BarButtonGap: Dp
+    @Composable @ReadOnlyComposable get() = rem(TitleBarMetrics.BUTTON_GAP)
 
 /** One entry in the menu: what it does, and the chord that also does it. */
 data class MenuAction(
@@ -94,15 +167,15 @@ fun TitleBar(
     Row(
         verticalAlignment = Alignment.CenterVertically,
         // The left group's rhythm is `gap_0p5` = 2px between the buttons,
-        // whose own 4px `px` makes the visible gap (title_bar.rs:295).
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        // whose own 4px `px` makes the visible gap (title_bar.rs:292).
+        horizontalArrangement = Arrangement.spacedBy(rem(TitleBarMetrics.LEFT_GROUP_GAP)),
         modifier = modifier
             .fillMaxWidth()
             .height(TitleBarHeight)
             .background(theme.color("title_bar.background", theme.color("tab_bar.background")))
             // Left only, as Zed's `pl_2`: the right end is a button group
             // that brings its own padding (title_bar/src/title_bar.rs:417).
-            .padding(start = 8.dp),
+            .padding(start = rem(TitleBarMetrics.LEADING_PAD)),
     ) {
         Box {
             val menuInteraction = remember { MutableInteractionSource() }
@@ -112,7 +185,7 @@ fun TitleBar(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
                     .height(BarButtonHeight)
-                    .clip(RoundedCornerShape(4.dp))
+                    .clip(RoundedCornerShape(rem(ZedRadius.SM)))
                     // A ghost button's states, swapped instantly: `Subtle` is
                     // `ghost_element.hover` under the pointer and
                     // `ghost_element.active` while pressed
@@ -143,7 +216,7 @@ fun TitleBar(
                 // and a 1px border in `border.variant` (styled_ext.rs:6-12) —
                 // the same container every context menu wears
                 // (context_menu.rs:2274).
-                shape = RoundedCornerShape(8.dp),
+                shape = RoundedCornerShape(rem(ZedRadius.LG)),
                 border = BorderStroke(1.dp, theme.color("border.variant")),
                 containerColor = theme.color(
                     "elevated_surface.background",
@@ -167,10 +240,10 @@ fun TitleBar(
                 // (list_item.rs:309, 364, 405).
                 Column(
                     modifier = Modifier
-                        .widthIn(min = 260.dp)
+                        .widthIn(min = rem(TitleBarMetrics.MENU_MIN_WIDTH))
                         .heightIn(max = maxMenuHeight)
                         .verticalScroll(rememberScrollState())
-                        .padding(horizontal = 4.dp)
+                        .padding(horizontal = rem(TitleBarMetrics.MENU_INSET))
                 ) {
                     menuGroups.forEachIndexed { index, group ->
                         if (index > 0) {
@@ -179,7 +252,9 @@ fun TitleBar(
                             Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(vertical = 6.dp)
+                                    .padding(vertical = rem(TitleBarMetrics.SEPARATOR_GAP))
+                                    // The rule itself is `border_1` — px(1.),
+                                    // and it stays one pixel.
                                     .height(1.dp)
                                     .background(theme.color("border.variant")),
                             )
@@ -205,7 +280,7 @@ fun TitleBar(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
                     .height(BarButtonHeight)
-                    .clip(RoundedCornerShape(4.dp))
+                    .clip(RoundedCornerShape(rem(ZedRadius.SM)))
                     .background(
                         if (nameHovered) {
                             theme.color("ghost_element.hover", Color.Transparent)
@@ -239,7 +314,7 @@ fun TitleBar(
                 horizontalArrangement = Arrangement.spacedBy(BarButtonGap),
                 modifier = Modifier
                     .height(BarButtonHeight)
-                    .clip(RoundedCornerShape(4.dp))
+                    .clip(RoundedCornerShape(rem(ZedRadius.SM)))
                     .background(
                         when {
                             branchPressed && onBranch != null ->
@@ -273,7 +348,7 @@ fun TitleBar(
                     colorFilter = ColorFilter.tint(
                         theme.color("text.muted", MaterialTheme.colorScheme.onSurfaceVariant)
                     ),
-                    modifier = Modifier.size(12.dp),
+                    modifier = Modifier.size(rem(TitleBarMetrics.XSMALL_ICON)),
                 )
                 Text(
                     // The branch label is `LabelSize::Small` in `Color::Muted`
@@ -329,10 +404,10 @@ private fun MenuRow(action: MenuAction, onChosen: () -> Unit) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         // `ml_4` between a label and its keybinding (context_menu.rs:2089).
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        horizontalArrangement = Arrangement.spacedBy(rem(TitleBarMetrics.LABEL_TO_CHORD)),
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(4.dp))
+            .clip(RoundedCornerShape(rem(ZedRadius.SM)))
             // A ghost row: `ghost_element.hover` under the pointer,
             // `ghost_element.active` while pressed (list_item.rs:380-385).
             .background(
@@ -356,7 +431,10 @@ private fun MenuRow(action: MenuAction, onChosen: () -> Unit) {
                     Modifier
                 }
             )
-            .padding(horizontal = 6.dp, vertical = 2.dp),
+            .padding(
+                horizontal = rem(TitleBarMetrics.MENU_ROW_PAD_X),
+                vertical = rem(TitleBarMetrics.MENU_ROW_PAD_Y),
+            ),
     ) {
         Text(
             text = action.label,

@@ -28,6 +28,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -47,52 +48,136 @@ import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
+import to.eyed.conquest.code.ui.theme.ZedRadius
+import to.eyed.conquest.code.ui.theme.glyphHeight
+import to.eyed.conquest.code.ui.theme.rem
+import to.eyed.conquest.code.ui.theme.remsAt
 
-// Zed: `DynamicSpacing::Base32` — 32px at the default 16px rem
-// (crates/ui/src/components/tab.rs:84). It was 40 for a while, for the ✕ and
-// the dot; the 2026-08-17 density decision in DECISIONS.md reversed that —
-// exact Zed metrics win, and every small target keeps a second route (the
-// tab's long-press menu closes it, Ctrl+S saves it).
-private val TabBarHeight = 32.dp
+/**
+ * The tab strip's metrics as rem multiples — `ui_font_size` is the rem
+ * (theme_settings/src/settings.rs:619), so raising the UI font grows the strip
+ * with its labels rather than leaving 14px tabs full of 20px text.
+ *
+ * Bare numbers rather than `Dp` so the table is checkable on the host at any
+ * font size (`ChromeMetricsTest`); the composable getters underneath are what
+ * the strip reads.
+ */
+internal object TabMetrics {
 
-/** Base32 − 1px: the border, or the selected tab's `pb_px`, eats it (tab.rs:79). */
-private val TabContentHeight = 31.dp
+    /**
+     * `DynamicSpacing::Base32` — 32px at the default 16px rem, and a rem
+     * despite the name (tab.rs:84, ui_macros/src/dynamic_spacing.rs:147-162).
+     * It was 40 for a while, for the ✕ and the dot; the 2026-08-17 density
+     * decision in DECISIONS.md reversed that — exact Zed metrics win, and every
+     * small target keeps a second route (the tab's long-press menu closes it,
+     * Ctrl+S saves it).
+     */
+    const val BAR_HEIGHT = 2f
 
-/** `px(Base04)` inside the tab, and the gap between its slots (tab.rs:173-174). */
-private val TabContentPadding = 4.dp
-private val TabContentGap = 4.dp
+    /** `px(Base04)` inside the tab, and the gap between its slots (tab.rs:173-174). */
+    const val CONTENT_PADDING = 0.25f
+    const val CONTENT_GAP = 0.25f
 
-/** Zed's `border_1`, which is every border in the chrome (styles.rs:1337). */
-private val TabBorder = 1.dp
+    /** `Indicator::dot()` — `w_1p5`/`h_1p5` = `rems(0.375)` (indicator.rs:73-78). */
+    const val DIRTY_DOT = 0.375f
 
-/** `Indicator::dot()` — `w_1p5`/`h_1p5` (crates/ui/src/components/indicator.rs:74). */
-private val DirtyDotSize = 6.dp
+    /**
+     * How wide a label is allowed to get before it ellipsises. Ours, not Zed's
+     * — Zed truncates the *string* at 24 characters (items.rs:66) — but it is a
+     * measure of text, so it grows with the text.
+     */
+    const val MAX_LABEL_WIDTH = 11.25f
 
-// Zed's slots: fixed 12px and 14px squares (tab.rs:8-9). The dot doubles as
-// the save button and the ✕ closes — both keep a bigger route (Ctrl+S, the
-// long-press menu), which is what the density decision in DECISIONS.md asks
-// for instead of widening the slots.
-private val StartSlotWidth = 12.dp
-private val EndSlotWidth = 14.dp
+    /** How far one notch of the wheel moves the strip. About one narrow tab. */
+    const val WHEEL_STEP = 6f
 
-private val MaxTabLabelWidth = 180.dp
+    /**
+     * The fixed groups at the strip's ends: Zed frames each in `px(Base06)`
+     * with `gap(Base04)` between the buttons, bordered below and on the side
+     * facing the tabs (tab_bar.rs:103-112 for the start group, 141-150
+     * mirrored for the end one).
+     */
+    const val TOOL_GROUP_PADDING = 0.375f
+    const val TOOL_GROUP_GAP = 0.25f
 
-/** How far one notch of the wheel moves the strip. About one narrow tab. */
-private val WheelStep = 96.dp
+    /**
+     * Zed's IconButton at `ButtonSize::Default`: `rems_from_px(22)`
+     * (button_like.rs:465-473).
+     */
+    const val TOOL_BUTTON_BOX = 1.375f
 
-// The fixed groups at the strip's ends: Zed frames each in `px(Base06)` with
-// `gap(Base04)` between the buttons, bordered below and on the side facing
-// the tabs (tab_bar.rs:103-112 for the start group, 141-150 mirrored for the
-// end one).
-private val ToolGroupPadding = 6.dp
-private val ToolGroupGap = 4.dp
+    /**
+     * Base32 − 1px: the border, or the selected tab's `pb_px`, eats it
+     * (tab.rs:79). Only the 32 scales; the pixel it gives up is a real pixel.
+     */
+    fun contentHeight(uiFontSize: Float): Dp = remsAt(uiFontSize, BAR_HEIGHT) - TabPixels.Border
+}
 
-/** Zed's IconButton at `ButtonSize::Default`: a 22px box (button_like.rs:469). */
-private val ToolButtonBox = 22.dp
+/**
+ * The tab dimensions Zed writes in **pixels**, which do not move with
+ * `ui_font_size`.
+ *
+ * The slots are the interesting pair: `START_TAB_SLOT_SIZE` and
+ * `END_TAB_SLOT_SIZE` are `px(12.)` and `px(14.)` (tab.rs:8-9), not rems, so
+ * spelling them `rem(0.75f)`/`rem(0.875f)` would have made our tabs diverge
+ * from Zed's at exactly the setting this change exists to honour. The dot
+ * doubles as the save button and the ✕ closes — both keep a bigger route
+ * (Ctrl+S, the long-press menu), which is what the density decision in
+ * DECISIONS.md asks for instead of widening the slots.
+ */
+internal object TabPixels {
+
+    /** Zed's `border_1`, which is every border in the chrome (styles.rs:1337). */
+    val Border = 1.dp
+
+    val StartSlotWidth = 12.dp
+    val EndSlotWidth = 14.dp
+}
+
+/**
+ * The bar, with the accessibility floor on top of Zed's metric.
+ *
+ * `max(rem(2), the label's ink)`: at every ordinary font scale this is exactly
+ * [TabMetrics.BAR_HEIGHT] — 32dp at the default — and it only grows once the
+ * *system's* font scale has made a tab label taller than the bar Zed specifies,
+ * which is the point at which a fixed 32 would start slicing the ascenders off.
+ * See [glyphHeight].
+ */
+private val TabBarHeight: Dp
+    @Composable @ReadOnlyComposable get() = maxOf(
+        rem(TabMetrics.BAR_HEIGHT),
+        glyphHeight(MaterialTheme.typography.bodyMedium) + TabPixels.Border,
+    )
+
+/** The bar less the pixel the border takes, whichever of the two won above. */
+private val TabContentHeight: Dp
+    @Composable @ReadOnlyComposable get() = TabBarHeight - TabPixels.Border
+
+private val TabContentPadding: Dp
+    @Composable @ReadOnlyComposable get() = rem(TabMetrics.CONTENT_PADDING)
+
+private val TabContentGap: Dp
+    @Composable @ReadOnlyComposable get() = rem(TabMetrics.CONTENT_GAP)
+
+private val DirtyDotSize: Dp
+    @Composable @ReadOnlyComposable get() = rem(TabMetrics.DIRTY_DOT)
+
+private val MaxTabLabelWidth: Dp
+    @Composable @ReadOnlyComposable get() = rem(TabMetrics.MAX_LABEL_WIDTH)
+
+private val ToolGroupPadding: Dp
+    @Composable @ReadOnlyComposable get() = rem(TabMetrics.TOOL_GROUP_PADDING)
+
+private val ToolGroupGap: Dp
+    @Composable @ReadOnlyComposable get() = rem(TabMetrics.TOOL_GROUP_GAP)
+
+private val ToolButtonBox: Dp
+    @Composable @ReadOnlyComposable get() = rem(TabMetrics.TOOL_BUTTON_BOX)
 
 /**
  * Zed-style tab strip: one tab per open file, a dot for unsaved edits, a
@@ -133,7 +218,9 @@ fun EditorTabs(
     val border = theme.color("border")
     val strip = rememberLazyListState()
     val scope = rememberCoroutineScope()
-    val wheelStep = with(LocalDensity.current) { WheelStep.toPx() }
+    val wheelStep = with(LocalDensity.current) { rem(TabMetrics.WHEEL_STEP).toPx() }
+    val barHeight = TabBarHeight
+    val borderWidth = TabPixels.Border
 
     // Ctrl+Tab and Ctrl+9 can select a tab that is scrolled out of the strip
     // entirely; bring it back rather than leaving the user looking at tabs
@@ -155,7 +242,7 @@ fun EditorTabs(
         verticalAlignment = Alignment.CenterVertically,
         modifier = modifier
             .fillMaxWidth()
-            .height(TabBarHeight)
+            .height(barHeight)
             .background(theme.color("tab_bar.background")),
     ) {
         // Zed's start group: back and forward, greyed when their stack is
@@ -190,7 +277,7 @@ fun EditorTabs(
                 // The end groups draw their own stretch, so the line runs
                 // unbroken across all three.
                 .drawBehind {
-                    val thickness = TabBorder.toPx()
+                    val thickness = borderWidth.toPx()
                     drawRect(
                         color = border,
                         topLeft = Offset(0f, size.height - thickness),
@@ -248,13 +335,14 @@ private fun TabBarToolGroup(
     content: @Composable RowScope.() -> Unit,
 ) {
     val border = LocalZedTheme.current.color("border")
+    val borderWidth = TabPixels.Border
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(ToolGroupGap),
         modifier = Modifier
             .fillMaxHeight()
             .drawBehind {
-                val thickness = TabBorder.toPx()
+                val thickness = borderWidth.toPx()
                 drawRect(
                     color = border,
                     topLeft = Offset(0f, size.height - thickness),
@@ -293,8 +381,12 @@ private fun TabBarIconButton(
     Box(
         contentAlignment = Alignment.Center,
         modifier = Modifier
-            .size(ToolButtonBox)
-            .clip(RoundedCornerShape(4.dp))
+            // The glyph is text, not a drawable, so the box is sized from the
+            // same TextUnit: `rem(1.375f)` — Zed's 22px button — until the
+            // system's font scale makes the arrow taller than that, and then
+            // the arrow. Width follows height so the box stays square.
+            .size(maxOf(ToolButtonBox, glyphHeight(MaterialTheme.typography.labelMedium)))
+            .clip(RoundedCornerShape(rem(ZedRadius.SM)))
             .background(
                 when {
                     !enabled -> Color.Transparent
@@ -450,12 +542,13 @@ private fun EditorTab(
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
     val border = theme.color("border")
+    val borderWidth = TabPixels.Border
     Box(
         modifier = Modifier
             .height(TabBarHeight)
             .background(background)
             .drawBehind {
-                val thickness = TabBorder.toPx()
+                val thickness = borderWidth.toPx()
                 if (borders.left) {
                     drawRect(border, Offset.Zero, Size(thickness, size.height))
                 }
@@ -494,7 +587,11 @@ private fun EditorTab(
                 // The pixel the border takes, whether or not this tab draws
                 // one: the content box is 31px tall and inset by 1 on each
                 // side in all five cases.
-                .padding(start = TabBorder, end = TabBorder, bottom = TabBorder)
+                .padding(
+                    start = TabPixels.Border,
+                    end = TabPixels.Border,
+                    bottom = TabPixels.Border,
+                )
                 .height(TabContentHeight)
                 .padding(horizontal = TabContentPadding),
         ) {
@@ -505,7 +602,9 @@ private fun EditorTab(
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
-                    .width(StartSlotWidth)
+                    // Genuinely `px(12.)` in Zed (tab.rs:8), and what it holds
+                    // is a dp-sized dot, so nothing here grows with the font.
+                    .width(TabPixels.StartSlotWidth)
                     .fillMaxHeight()
                     .then(
                         if (file.isDirty) {
@@ -554,7 +653,11 @@ private fun EditorTab(
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
-                    .width(EndSlotWidth)
+                    // `px(14.)` in Zed (tab.rs:9) — but unlike the start slot
+                    // this one holds *text*, so the pixel width is a minimum:
+                    // at an accessibility font scale the ✕ is wider than 14dp
+                    // and a fixed width would slice it down the middle.
+                    .widthIn(min = TabPixels.EndSlotWidth)
                     .fillMaxHeight()
                     .then(
                         if (showEnd) {
@@ -605,11 +708,11 @@ fun FileConflictBar(
     val theme = LocalZedTheme.current
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        horizontalArrangement = Arrangement.spacedBy(rem(1f)),
         modifier = modifier
             .fillMaxWidth()
             .background(theme.color("status_bar.background"))
-            .padding(horizontal = 14.dp, vertical = 8.dp),
+            .padding(horizontal = rem(0.875f), vertical = rem(0.5f)),
     ) {
         Text(
             text = if (file.isDeleted) {
@@ -643,6 +746,6 @@ private fun ConflictAction(label: String, onClick: () -> Unit) {
         modifier = Modifier
             .pointerHoverIcon(PointerIcon.Hand)
             .clickable(onClick = onClick)
-            .padding(horizontal = 4.dp, vertical = 2.dp),
+            .padding(horizontal = rem(0.25f), vertical = rem(0.125f)),
     )
 }

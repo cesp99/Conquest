@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -32,29 +33,72 @@ import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import to.eyed.conquest.code.R
 import to.eyed.conquest.code.ui.preview.PreviewKind
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
+import to.eyed.conquest.code.ui.theme.ZedRadius
+import to.eyed.conquest.code.ui.theme.glyphHeight
+import to.eyed.conquest.code.ui.theme.rem
 
 /**
- * Zed's toolbar frame: `py(Base06)` = 6px and `px(Base08)` = 8px around a
- * 32px item row (workspace/src/toolbar.rs:123-124, 140, 150), on
- * `toolbar.background` with a 1px `border.variant` underline
- * (toolbar.rs:128-130). Per the 2026-08-17 density decision the 40dp floor is
- * gone; every button's action stays a chord away.
+ * The toolbar's metrics as rem multiples — `ui_font_size` is the rem
+ * (theme_settings/src/settings.rs:619) — held as bare numbers so the table is
+ * checkable on the host (`ChromeMetricsTest`).
  */
-private val ToolbarItemRowHeight = 32.dp
-private val ToolbarVerticalPad = 6.dp
-private val ToolbarHorizontalPad = 8.dp
+internal object ToolbarMetrics {
+
+    /**
+     * Zed's toolbar frame: `py(Base06)` and `px(Base08)` around an `h_8` =
+     * `rems(2)` item row (workspace/src/toolbar.rs:123-124, 140, 150), on
+     * `toolbar.background` with a 1px `border.variant` underline
+     * (toolbar.rs:128-130). Per the 2026-08-17 density decision the 40dp floor
+     * is gone; every button's action stays a chord away.
+     */
+    const val ITEM_ROW_HEIGHT = 2f
+    const val VERTICAL_PAD = 0.375f
+    const val HORIZONTAL_PAD = 0.5f
+
+    /** `gap(Base08)` between the crumbs and the button group (toolbar.rs:136). */
+    const val GROUP_GAP = 0.5f
+
+    /** `gap_1` between breadcrumb segments (editor/src/element.rs:6813). */
+    const val CRUMB_GAP = 0.25f
+
+    /**
+     * Zed's IconButton at `ButtonSize::Default`: `rems_from_px(22)`
+     * (button_like.rs:465-473) around an `IconSize::Small` glyph,
+     * `rems_from_px(14)` (icon.rs:74) — the exact button the quick action bar's
+     * eye is (quick_action_bar/preview.rs:66-68).
+     */
+    const val BUTTON_BOX = 1.375f
+    const val ICON = 0.875f
+}
 
 /**
- * Zed's IconButton at `ButtonSize::Default`: a 22px box (button_like.rs:469)
- * around an `IconSize::Small` 14px glyph — the exact button the quick action
- * bar's eye is (quick_action_bar/preview.rs:66-68).
+ * The item row, with the accessibility floor on top of Zed's `h_8`:
+ * `max(rem(2), the crumbs' ink)`. Exactly 32dp at the default, and taller only
+ * once the *system's* font scale would otherwise clip a breadcrumb. See
+ * [glyphHeight].
  */
-private val ButtonBox = 22.dp
-private val IconSize = 14.dp
+private val ToolbarItemRowHeight: Dp
+    @Composable @ReadOnlyComposable get() = maxOf(
+        rem(ToolbarMetrics.ITEM_ROW_HEIGHT),
+        glyphHeight(MaterialTheme.typography.bodyMedium),
+    )
+
+private val ToolbarVerticalPad: Dp
+    @Composable @ReadOnlyComposable get() = rem(ToolbarMetrics.VERTICAL_PAD)
+
+private val ToolbarHorizontalPad: Dp
+    @Composable @ReadOnlyComposable get() = rem(ToolbarMetrics.HORIZONTAL_PAD)
+
+private val ButtonBox: Dp
+    @Composable @ReadOnlyComposable get() = rem(ToolbarMetrics.BUTTON_BOX)
+
+private val IconSize: Dp
+    @Composable @ReadOnlyComposable get() = rem(ToolbarMetrics.ICON)
 
 /**
  * The row under the tab strip: Zed's toolbar — breadcrumbs on the left
@@ -101,8 +145,7 @@ fun EditorToolbar(
             .padding(horizontal = ToolbarHorizontalPad, vertical = ToolbarVerticalPad)
             .height(ToolbarItemRowHeight),
         verticalAlignment = Alignment.CenterVertically,
-        // Base08 between the crumbs and the button group (toolbar.rs:136).
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        horizontalArrangement = Arrangement.spacedBy(rem(ToolbarMetrics.GROUP_GAP)),
     ) {
         // Breadcrumbs scroll off to the left rather than squeezing the
         // buttons, as Zed's `overflow_x_scroll` container does
@@ -114,7 +157,7 @@ fun EditorToolbar(
         Row(
             modifier = Modifier
                 .weight(1f)
-                .clip(RoundedCornerShape(4.dp))
+                .clip(RoundedCornerShape(rem(ZedRadius.SM)))
                 .background(
                     if (crumbHovered && onOpenOutline != null) {
                         theme.color("ghost_element.hover", Color.Transparent)
@@ -138,8 +181,7 @@ fun EditorToolbar(
                 )
                 .horizontalScroll(rememberScrollState()),
             verticalAlignment = Alignment.CenterVertically,
-            // `gap_1` between segments (editor/src/element.rs:6813).
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(rem(ToolbarMetrics.CRUMB_GAP)),
         ) {
             Text(
                 text = fileName,
@@ -202,7 +244,7 @@ private fun QuickActionButton(
     Box(
         modifier = Modifier
             .size(ButtonBox)
-            .clip(RoundedCornerShape(4.dp))
+            .clip(RoundedCornerShape(rem(ZedRadius.SM)))
             // `Subtle`, a ghost button: transparent at rest,
             // `ghost_element.hover` under the pointer and
             // `ghost_element.active` while pressed, swapped instantly

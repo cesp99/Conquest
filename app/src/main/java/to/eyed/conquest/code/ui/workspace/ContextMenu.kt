@@ -34,6 +34,30 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
+import to.eyed.conquest.code.ui.theme.ZedRadius
+import to.eyed.conquest.code.ui.theme.rem
+
+/**
+ * The menu's metrics as rem multiples — `ui_font_size` is the rem
+ * (theme_settings/src/settings.rs:619) — held as bare numbers so the table is
+ * checkable on the host (`ChromeMetricsTest`). The radii and the 1px border
+ * are `px(…)` in gpui and stay `.dp`.
+ */
+internal object MenuMetrics {
+
+    /** How wide a context menu opens before its labels push it wider. Ours. */
+    const val MIN_WIDTH = 13.75f
+
+    /** An inset ListItem: 4px of surface around each row (list_item.rs:309). */
+    const val INSET = 0.25f
+
+    /** The row itself: `rounded_sm` with `px(Base06)` inside (list_item.rs:364). */
+    const val ROW_PAD_X = 0.375f
+    const val ROW_PAD_Y = 0.125f
+
+    /** `ml_4` between a label and its keybinding (context_menu.rs:2089). */
+    const val LABEL_TO_CHORD = 1f
+}
 
 /** One row of a context menu: what it does, and the chord that also does it. */
 internal data class ContextMenuItem(
@@ -56,7 +80,7 @@ internal fun ContextMenu(
     onDismiss: () -> Unit,
     items: List<ContextMenuItem>,
     offset: DpOffset = DpOffset.Zero,
-    minWidth: Dp = 220.dp,
+    minWidth: Dp = rem(MenuMetrics.MIN_WIDTH),
 ) {
     val theme = LocalZedTheme.current
     DropdownMenu(
@@ -65,7 +89,7 @@ internal fun ContextMenu(
         offset = offset,
         // Zed's `elevation_2`: an elevated surface, `rounded_lg` 8px, and a
         // 1px border in `border.variant` (styled_ext.rs:6-12).
-        shape = RoundedCornerShape(8.dp),
+        shape = RoundedCornerShape(rem(ZedRadius.LG)),
         border = BorderStroke(1.dp, theme.color("border.variant")),
         containerColor = theme.color(
             "elevated_surface.background",
@@ -74,7 +98,11 @@ internal fun ContextMenu(
     ) {
         // Entries are inset ListItems: 4px of surface around each row, the
         // row itself `rounded_sm` with 6px inside (list_item.rs:309, 364, 405).
-        Column(modifier = Modifier.widthIn(min = minWidth).padding(horizontal = 4.dp)) {
+        Column(
+            modifier = Modifier
+                .widthIn(min = minWidth)
+                .padding(horizontal = rem(MenuMetrics.INSET)),
+        ) {
             for (item in items) {
                 ContextMenuRow(item, onChosen = onDismiss)
             }
@@ -89,11 +117,10 @@ private fun ContextMenuRow(item: ContextMenuItem, onChosen: () -> Unit) {
     val hovered by interaction.collectIsHoveredAsState()
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        // `ml_4` between a label and its keybinding (context_menu.rs:2089).
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        horizontalArrangement = Arrangement.spacedBy(rem(MenuMetrics.LABEL_TO_CHORD)),
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(4.dp))
+            .clip(RoundedCornerShape(rem(ZedRadius.SM)))
             .background(
                 if (hovered && item.enabled) {
                     theme.color("ghost_element.hover", Color.Transparent)
@@ -114,7 +141,10 @@ private fun ContextMenuRow(item: ContextMenuItem, onChosen: () -> Unit) {
                     Modifier
                 }
             )
-            .padding(horizontal = 6.dp, vertical = 2.dp),
+            .padding(
+                horizontal = rem(MenuMetrics.ROW_PAD_X),
+                vertical = rem(MenuMetrics.ROW_PAD_Y),
+            ),
     ) {
         Text(
             text = item.label,

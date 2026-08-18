@@ -3,24 +3,34 @@ package to.eyed.conquest.code.ui.workspace
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import to.eyed.conquest.code.ui.theme.rem
+
+/** `IconSize::Medium` = `rems_from_px(16)` (icon.rs:75) — a rem, so it scales. */
+internal const val ENTRY_ICON = 1f
 
 /**
- * `IconSize::Medium` — the panel's `Icon::from_path` never asks for a size,
- * so it gets the 16px default (project_panel.rs:6247, icon.rs:61-63, 76).
+ * The panel's file icon. `Icon::from_path` asks for no size, so it gets the
+ * 16px default (project_panel.rs:6247, icon.rs:61-63, 75) — and that default
+ * is `rems_from_px(16)`, a multiple of `ui_font_size` rather than a constant,
+ * so the icons grow with the rest of the chrome.
  */
-private val EntryIconSize = 16.dp
+private val EntryIconSize: Dp
+    @Composable @ReadOnlyComposable get() = rem(ENTRY_ICON)
 
 /**
- * The slot the icon sits in. The same 16px: Zed's alignment spacer for a row
+ * The slot the icon sits in. The same rem: Zed's alignment spacer for a row
  * with no icon is `IconSize::default().rems()` (project_panel.rs:6253-6259),
  * so every row's name starts at the same column whatever its icon is.
  */
-val EntryIconWidth = 16.dp
+val EntryIconWidth: Dp
+    @Composable @ReadOnlyComposable get() = rem(ENTRY_ICON)
 
 /**
  * The icon in front of a row: Zed's own, for the language the file is in.

@@ -246,7 +246,13 @@ class HoverCardState internal constructor(private val editor: EditorState) {
 
     private var question: HoverQuestion? by mutableStateOf(null)
     private var generation = 0
-    private var askedByTouch = false
+    /**
+     * Whether the card on screen was raised by a long press — which hid the
+     * clipboard toolbar to make room for it, so dismissing has to put the
+     * toolbar back. Readable by the pane for exactly that.
+     */
+    var askedByTouch = false
+        private set
     private var askedWithDelay = false
 
     val isShowing: Boolean get() = text.isNotEmpty()
@@ -330,7 +336,6 @@ class HoverCardState internal constructor(private val editor: EditorState) {
             // The pointer's delay is Zed's; a gesture or an action that named
             // this by hand has already waited.
             if (askedWithDelay) delay(HOVER_DELAY_MILLIS)
-            val version = editor.bufferVersion
             val answer = requestLsp(
                 LspRequestKind.Hover,
                 session.id,
@@ -344,7 +349,18 @@ class HoverCardState internal constructor(private val editor: EditorState) {
             }
             // A hover's range points at *text*, so an answer dated against a
             // buffer that has moved describes columns that have moved with it.
-            if (!answer.describes(session.id, version, pending.row, pending.col)) {
+            // Compared against the buffer as it is *now*, not as it was when
+            // the question was asked: the engine stamps the request with the
+            // version it saw at the start (lsp.rs:1335) and echoes that back,
+            // so testing it against the same captured value is `x == x` and
+            // guards nothing.
+            if (!answer.describes(
+                    session.id,
+                    editor.bufferVersion,
+                    pending.row,
+                    pending.col,
+                )
+            ) {
                 if (askedByTouch) onNothingToSay?.invoke()
                 clear()
                 return@LaunchedEffect
@@ -517,7 +533,6 @@ class DefinitionState internal constructor(private val editor: EditorState) {
         LaunchedEffect(pending) {
             if (pending == null) return@LaunchedEffect
             val session = editor.sessionOrNull ?: return@LaunchedEffect
-            val version = editor.bufferVersion
             val answer = requestLsp(
                 LspRequestKind.Definition,
                 session.id,
@@ -528,8 +543,16 @@ class DefinitionState internal constructor(private val editor: EditorState) {
             if (answer == null) return@LaunchedEffect
             // A definition is about the symbol that was under the point when
             // it was asked: if the buffer has moved since, the answer is about
-            // a name that may not be there any more.
-            if (!answer.describes(session.id, version, pending.row, pending.col)) {
+            // a name that may not be there any more — and jumping would throw
+            // the caret out of the line being typed. Against the *current*
+            // version, for the reason spelled out in the hover poller above.
+            if (!answer.describes(
+                    session.id,
+                    editor.bufferVersion,
+                    pending.row,
+                    pending.col,
+                )
+            ) {
                 return@LaunchedEffect
             }
             // Zed opens every target in a multibuffer when there is more than

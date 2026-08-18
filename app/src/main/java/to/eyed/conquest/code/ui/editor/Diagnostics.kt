@@ -410,6 +410,19 @@ data class LspServer(
             }
             else -> null
         }
+
+    /**
+     * Whether the note's action — install this server — is the right answer
+     * to it.
+     *
+     * False for a server the engine refused on the process budget (P5-4,
+     * `CAP_REACHED` in lsp.rs): that one is installed and running elsewhere,
+     * and the fix is closing a project or a tab, not apt. Offering "install"
+     * there would be a button that downloads nothing and changes nothing.
+     */
+    val installable: Boolean
+        get() = state == LspServerState.Unavailable &&
+            error?.contains("too many language servers", ignoreCase = true) != true
 }
 
 fun parseLspServers(json: String?): List<LspServer> {

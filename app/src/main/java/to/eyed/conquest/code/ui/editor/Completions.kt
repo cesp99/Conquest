@@ -846,12 +846,28 @@ class CompletionMenuState internal constructor(private val editor: EditorState) 
         // A null `edit` means "the UI picks the word around the caret", which
         // is Zed's own fallback: the word start to the caret
         // (completions.rs:468-480).
-        val range = item.edit ?: LspRange(
+        val served = item.edit ?: LspRange(
             row = anchorRow,
             colUtf16 = anchorCol.coerceIn(0, line.length),
             endRow = anchorRow,
             endColUtf16 = editor.cursorCol.coerceIn(0, line.length),
         )
+        // The server's range was measured when it answered, and the user has
+        // very likely typed since — the list filters locally, so a whole word
+        // can be typed against one answer. Zed clamps the end *forward* to the
+        // caret for exactly this (`process_completion_for_edit`,
+        // editor.rs:11280-11286); without it the characters typed after the
+        // request survive the replacement and get glued on: "s" + "tr" then
+        // accepting `strlen` leaves `strlentr`. Only ever extended, never
+        // shrunk — a range that already reaches past the caret is the
+        // insert-and-replace case the bridge documents.
+        val endsBeforeCaret = served.endRow < editor.cursorRow ||
+            (served.endRow == editor.cursorRow && served.endColUtf16 < editor.cursorCol)
+        val range = if (endsBeforeCaret) {
+            served.copy(endRow = editor.cursorRow, endColUtf16 = editor.cursorCol)
+        } else {
+            served
+        }
         val (text, caret) =
             if (item.isSnippet) expandSnippet(item.insertText) else item.insertText to item.insertText.length
         dismiss()

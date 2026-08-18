@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -36,12 +37,18 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import to.eyed.conquest.code.R
 import to.eyed.conquest.code.ui.editor.Diagnostic
 import to.eyed.conquest.code.ui.editor.DiagnosticSummary
 import to.eyed.conquest.code.ui.editor.LspServer
+import to.eyed.conquest.code.ui.theme.LocalUiFontSize
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
+import to.eyed.conquest.code.ui.theme.ZedRadius
+import to.eyed.conquest.code.ui.theme.glyphHeight
+import to.eyed.conquest.code.ui.theme.rem
+import to.eyed.conquest.code.ui.theme.remsAt
 
 /** One panel's button: which panel, whether its dock is showing it, and the tap. */
 data class PanelButton(
@@ -51,13 +58,79 @@ data class PanelButton(
 )
 
 /**
- * Every item is Zed's IconButton at `ButtonSize::Default`: a 22px box
- * (button_like.rs:469) with `rounded_sm` corners (button_like.rs:527) around
- * an `IconSize::Small` 14px glyph (status_bar.rs:187 spec; dock.rs:1398-1400).
- * Two of them plus the bar's 4px `p(Base04)` is the whole 30px height.
+ * The status bar's metrics as rem multiples — `ui_font_size` is the rem
+ * (theme_settings/src/settings.rs:619) — held as bare numbers so the table is
+ * checkable on the host (`ChromeMetricsTest`).
  */
-private val ItemBox = 22.dp
-private val ItemIconSize = 14.dp
+internal object StatusBarMetrics {
+
+    /**
+     * Every item is Zed's IconButton at `ButtonSize::Default`:
+     * `rems_from_px(22)` (button_like.rs:465-473) with `rounded_sm` corners
+     * (button_like.rs:527) around an `IconSize::Small` glyph, itself
+     * `rems_from_px(14)` (icon.rs:74; status_bar.rs:187; dock.rs:1398-1400).
+     */
+    const val ITEM_BOX = 1.375f
+    const val ITEM_ICON = 0.875f
+
+    /** The bar's own `p(DynamicSpacing::Base04.rems(cx))` (status_bar.rs:153). */
+    const val BAR_PADDING = 0.25f
+
+    /** `gap_1` within a group (status_bar.rs:196, 215). */
+    const val ITEM_GAP = 0.25f
+
+    /**
+     * `Divider::vertical()` between the middle and a dock's button group:
+     * `h_4` = `rems(1)` tall (divider.rs:29, 147-149; dock.rs:1433-1446). Its
+     * 1px width is `px(1.)` and stays in [StatusBarPixels].
+     */
+    const val DIVIDER_HEIGHT = 1f
+
+    /** `Indicator::dot()` at the size the LSP note uses (indicator.rs). */
+    const val NOTE_DOT = 0.25f
+
+    /**
+     * The bar has no declared height in Zed: it is one default button plus the
+     * frame's padding top and bottom, which comes to 30px at the default rem
+     * (status_bar.rs:153). Written as that sum so it stays true at any font
+     * size instead of drifting from the buttons it is supposed to contain.
+     */
+    fun barHeight(uiFontSize: Float): Dp =
+        remsAt(uiFontSize, ITEM_BOX) + remsAt(uiFontSize, BAR_PADDING) * 2f
+}
+
+/** The one status-bar dimension Zed writes in pixels: the divider's rule. */
+internal object StatusBarPixels {
+    val DividerWidth = 1.dp
+}
+
+/**
+ * The bar and its item boxes, each with the accessibility floor on top of Zed's
+ * metric: `max(Zed's number, the label's ink)`. At every ordinary font scale
+ * these are exactly [StatusBarMetrics.barHeight] and `rem(1.375f)`. See
+ * [glyphHeight].
+ */
+private val StatusBarHeight: Dp
+    @Composable @ReadOnlyComposable get() = maxOf(
+        StatusBarMetrics.barHeight(LocalUiFontSize.current),
+        glyphHeight(MaterialTheme.typography.labelMedium) +
+            rem(StatusBarMetrics.BAR_PADDING) * 2f,
+    )
+
+private val ItemBox: Dp
+    @Composable @ReadOnlyComposable get() = maxOf(
+        rem(StatusBarMetrics.ITEM_BOX),
+        glyphHeight(MaterialTheme.typography.labelMedium),
+    )
+
+private val ItemIconSize: Dp
+    @Composable @ReadOnlyComposable get() = rem(StatusBarMetrics.ITEM_ICON)
+
+private val BarPadding: Dp
+    @Composable @ReadOnlyComposable get() = rem(StatusBarMetrics.BAR_PADDING)
+
+private val ItemGap: Dp
+    @Composable @ReadOnlyComposable get() = rem(StatusBarMetrics.ITEM_GAP)
 
 /**
  * Zed-style status bar: **state, not actions**.
@@ -108,15 +181,11 @@ fun StatusBar(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            // 30 = a 22px default button plus 4px of padding on each side,
-            // which is how Zed's status bar gets its height rather than by
-            // declaring one (crates/workspace/src/status_bar.rs:153).
-            .height(30.dp)
+            .height(StatusBarHeight)
             .background(theme.color("status_bar.background"))
-            .padding(4.dp),
+            .padding(BarPadding),
         verticalAlignment = Alignment.CenterVertically,
-        // `gap_1` = 4px within a group (status_bar.rs:196, 215).
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(ItemGap),
     ) {
         for (button in leftPanels) {
             PanelStatusButton(button)
@@ -130,7 +199,9 @@ fun StatusBar(
             LanguageServerNote(
                 note = blocked.note!!,
                 others = servers.count { it.note != null } - 1,
-                onClick = onInstallServer?.let { install -> { install(blocked) } },
+                onClick = onInstallServer
+                    ?.takeIf { blocked.installable }
+                    ?.let { install -> { install(blocked) } },
             )
         }
         if (diagnostics != null) {
@@ -158,14 +229,14 @@ fun StatusBar(
                 text = "${cursorRow + 1}:${cursorCol + 1}",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.padding(horizontal = 4.dp),
+                modifier = Modifier.padding(horizontal = ItemGap),
             )
             if (language != null) {
                 Text(
                     text = language,
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.padding(horizontal = 4.dp),
+                    modifier = Modifier.padding(horizontal = ItemGap),
                 )
             }
         }
@@ -216,7 +287,7 @@ private fun StatusIconAction(
     Box(
         modifier = Modifier
             .size(ItemBox)
-            .clip(RoundedCornerShape(4.dp))
+            .clip(RoundedCornerShape(rem(ZedRadius.SM)))
             // `Subtle`, a ghost button: transparent at rest,
             // `ghost_element.hover` under the pointer, `ghost_element.active`
             // while pressed, swapped instantly — no ripple
@@ -279,7 +350,7 @@ private fun DiagnosticIndicator(summary: DiagnosticSummary, onClick: (() -> Unit
     Row(
         modifier = Modifier
             .height(ItemBox)
-            .clip(RoundedCornerShape(4.dp))
+            .clip(RoundedCornerShape(rem(ZedRadius.SM)))
             .background(
                 when {
                     onClick == null -> Color.Transparent
@@ -302,10 +373,10 @@ private fun DiagnosticIndicator(summary: DiagnosticSummary, onClick: (() -> Unit
                         )
                 }
             )
-            .padding(horizontal = 4.dp),
+            .padding(horizontal = ItemGap),
         verticalAlignment = Alignment.CenterVertically,
         // Zed's `gap_1` inside the indicator (items.rs:42).
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(ItemGap),
     ) {
         if (summary.isClean) {
             CheckIcon(theme.color("text", MaterialTheme.colorScheme.onSurface), summary.label)
@@ -370,7 +441,7 @@ private fun CursorDiagnosticMessage(diagnostic: Diagnostic, onClick: (() -> Unit
                         )
                 }
             )
-            .padding(horizontal = 4.dp),
+            .padding(horizontal = ItemGap),
     )
 }
 
@@ -393,7 +464,7 @@ private fun LanguageServerNote(note: String, others: Int, onClick: (() -> Unit)?
     Row(
         modifier = Modifier
             .height(ItemBox)
-            .clip(RoundedCornerShape(4.dp))
+            .clip(RoundedCornerShape(rem(ZedRadius.SM)))
             // The same ghost ramp every other item in this bar wears, and
             // only when there is somewhere for the tap to go.
             .background(
@@ -418,13 +489,13 @@ private fun LanguageServerNote(note: String, others: Int, onClick: (() -> Unit)?
                         )
                 }
             )
-            .padding(horizontal = 4.dp),
+            .padding(horizontal = ItemGap),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(ItemGap),
     ) {
         // `Indicator::dot().color(Color::Error)` — 4px, which is Zed's
         // `Indicator` dot at its default size (ui/src/components/indicator.rs).
-        Canvas(modifier = Modifier.size(4.dp)) {
+        Canvas(modifier = Modifier.size(rem(StatusBarMetrics.NOTE_DOT))) {
             drawCircle(color = theme.color("error"), radius = size.minDimension / 2f)
         }
         Text(
@@ -540,8 +611,8 @@ private fun Modifier.semanticsLabel(label: String): Modifier =
 private fun GroupDivider(color: androidx.compose.ui.graphics.Color) {
     Box(
         modifier = Modifier
-            .width(1.dp)
-            .height(16.dp)
+            .width(StatusBarPixels.DividerWidth)
+            .height(rem(StatusBarMetrics.DIVIDER_HEIGHT))
             .background(color)
     )
 }
