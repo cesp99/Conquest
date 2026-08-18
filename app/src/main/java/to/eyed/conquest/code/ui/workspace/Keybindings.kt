@@ -133,6 +133,16 @@ enum class WorkspaceCommand(
     /** Open the settings screen. */
     OpenSettings("conquest::OpenSettings"),
 
+    /**
+     * Open settings.json itself as an editor tab — Zed's
+     * `zed::OpenSettingsFile` (zed/src/zed.rs:261). Not a convenience: the
+     * file lives in app-private storage no other editor on the device can
+     * reach, and it is the only place `agent_servers` and anything else
+     * without a settings-screen row can be written at all. Needs a project
+     * only because the tab strip does.
+     */
+    OpenSettingsFile("zed::OpenSettingsFile", isAvailable = { it.hasProject }),
+
     /** Pick a theme, previewing each as the selection moves — Zed's own. */
     SelectTheme("theme_selector::Toggle"),
 

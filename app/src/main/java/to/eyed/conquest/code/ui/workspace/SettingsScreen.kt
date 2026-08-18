@@ -63,6 +63,12 @@ fun SettingsScreen(
     refusal: String? = null,
     onSet: (keyPath: String, valueJson: String) -> Unit,
     onDismiss: () -> Unit,
+    /**
+     * Open settings.json itself in the editor — the route to every key this
+     * screen has no row for (`agent_servers` above all). Null where there is
+     * nowhere to open a tab, and the path is then shown as plain text.
+     */
+    onEditFile: (() -> Unit)? = null,
 ) {
     val theme = LocalZedTheme.current
     // The interface size lives in ThemeStore (a preference, not settings.json)
@@ -204,12 +210,24 @@ fun SettingsScreen(
                 HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 
                 if (settingsPath != null) {
-                    Text(
-                        text = "Edit directly: $settingsPath",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
-                    )
+                    if (onEditFile != null) {
+                        Text(
+                            text = "Edit settings.json — custom agents and every other key",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier
+                                .pointerHoverIcon(PointerIcon.Hand)
+                                .clickable(onClick = onEditFile)
+                                .padding(horizontal = 20.dp, vertical = 4.dp),
+                        )
+                    } else {
+                        Text(
+                            text = "Edit directly: $settingsPath",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
+                        )
+                    }
                 }
                 Row(modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)) {
                     Box(modifier = Modifier.weight(1f))

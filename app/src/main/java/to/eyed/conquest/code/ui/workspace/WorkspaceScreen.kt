@@ -524,6 +524,14 @@ fun WorkspaceScreen(
             withContext(Dispatchers.IO) { open.save() }
             file.refreshStatus()
             dismissedConflicts.value -= file.path
+            // Saving the settings tab *is* the reload: the engine reads the
+            // file fresh on every settings() call, so re-parsing here applies
+            // the edit everywhere at the only moment the file can change from
+            // inside the app — Zed's file watcher, without the watcher.
+            if (file.path == settingsPath) {
+                settingsValid = withContext(Dispatchers.IO) { CoreBridge.settingsAreValid() }
+                onSettingsChanged(withContext(Dispatchers.IO) { AppSettings.load() })
+            }
         }
     }
 
@@ -790,6 +798,24 @@ fun WorkspaceScreen(
                     settingsOpen = true
                 }
             }
+            WorkspaceCommand.OpenSettingsFile -> {
+                if (project == null) return false
+                val path = settingsPath ?: return false
+                val existing = files.indexOfPath(path)
+                if (existing >= 0) {
+                    files.select(existing)
+                } else {
+                    scope.launch {
+                        // Keyed by its absolute path — it belongs to no
+                        // project, and the engine opens it like any other
+                        // file. Saving it is what applies it; see save().
+                        val session =
+                            withContext(Dispatchers.IO) { BufferSession.openFile(path) }
+                                ?: return@launch
+                        files.open(OpenFile(path, EditorState(session), absolutePath = path))
+                    }
+                }
+            }
             WorkspaceCommand.ToggleTerminal -> {
                 val root = project?.rootPath ?: return false
                 if (terminals.isOpen) {
@@ -1040,6 +1066,12 @@ fun WorkspaceScreen(
                 },
                 MenuAction("Settings…", shortcutLabel(WorkspaceCommand.OpenSettings)) {
                     runCommand(WorkspaceCommand.OpenSettings)
+                },
+                // The screen above covers what has a row; the file covers
+                // everything (agent_servers among it), and it lives where no
+                // other editor on the device can reach it.
+                MenuAction("Edit settings.json", null, enabled = project != null) {
+                    runCommand(WorkspaceCommand.OpenSettingsFile)
                 },
             ) + userlandActions(context) { removeUserlandOpen = true },
         )
@@ -1391,6 +1423,15 @@ fun WorkspaceScreen(
             onDismiss = {
                 settingsOpen = false
                 settingsRefusal = null
+            },
+            onEditFile = if (project != null && settingsPath != null) {
+                {
+                    settingsOpen = false
+                    settingsRefusal = null
+                    runCommand(WorkspaceCommand.OpenSettingsFile)
+                }
+            } else {
+                null
             },
         )
     }

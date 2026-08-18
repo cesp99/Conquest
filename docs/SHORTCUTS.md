@@ -66,6 +66,7 @@ editor.
 | `Ctrl` `Shift` `G` | Show/hide the git panel |
 | `Ctrl` `Alt` `A` | Show/hide the agent panel |
 | `Ctrl` `,` | Open settings |
+| — | Edit settings.json as a tab (`zed: open settings file` in the palette, or the ☰ menu) |
 | `Ctrl` `=` / `Ctrl` `-` | Make the interface bigger / smaller |
 | `Ctrl` `0` | Back to the default size |
 | — | Pick a theme (`theme selector: toggle` in the palette, or the ☰ menu) |
@@ -247,6 +248,26 @@ The agent runs inside the Linux userland, so this panel is absent from the Play
 edition entirely. It needs Node, which the panel offers to install with apt the
 way a language server is installed, and an agent, which you install yourself:
 the panel shows the `npm install -g …` line to run in the terminal.
+
+**Any agent, not just those two.** Add your own under `agent_servers` in
+settings.json — the same key Zed uses — and it appears in the picker. The file
+opens as an ordinary editor tab from `☰` → **Edit settings.json**, the command
+palette's `zed: open settings file`, or the link at the bottom of the Settings
+screen; saving it applies it.
+
+```jsonc
+"agent_servers": {
+  "My agent": { "command": "my-agent", "args": ["--acp"], "env": {} }
+}
+```
+
+The command runs inside the Linux userland, so it is anything on Debian's
+PATH — or an absolute path in the guest — that speaks the Agent Client
+Protocol on stdin and stdout. An entry named exactly like a built-in
+("Claude Code", "Gemini CLI") replaces it, which is how you point a built-in
+name at your own wrapper. An edit reaches the picker as soon as you save;
+a conversation that is already running keeps the command it started with
+until you press **New**.
 
 ## Find in file
 
