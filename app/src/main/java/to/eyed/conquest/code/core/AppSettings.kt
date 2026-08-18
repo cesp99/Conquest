@@ -67,6 +67,14 @@ data class AppSettings(
     val panels: Map<String, PanelPlacement> = DEFAULT_PANELS,
     /** How gitignored entries appear in the project tree. */
     val gitignoredFiles: GitignoredFiles = GitignoredFiles.Dimmed,
+    /**
+     * ACP agents configured by hand — Zed's `agent_servers`, in name order.
+     *
+     * This is what makes the panel's promise of *any* ACP agent true rather
+     * than "the two we happen to name": the command runs inside the Linux
+     * userland, so anything on Debian's PATH that speaks the protocol counts.
+     */
+    val agents: List<AgentDefinition> = emptyList(),
 ) {
     /**
      * Where the panel keyed [settingsKey] sits, falling back to the shipped
@@ -126,8 +134,45 @@ data class AppSettings(
                 gitignoredFiles = GitignoredFiles.fromKey(
                     panel?.optString("gitignored_files", "dimmed") ?: "dimmed"
                 ),
+                agents = parseAgents(root.optJSONObject("agent_servers")),
             )
         }.getOrDefault(AppSettings())
+
+        /**
+         * `agent_servers` as the panel's own list.
+         *
+         * An agent with no command is dropped rather than offered: it would
+         * be a row that can only fail, and a half-written settings entry is
+         * an ordinary state of a file people edit by hand.
+         *
+         * Sorted by name here, explicitly: the engine sends the map sorted
+         * (its `BTreeMap`), but `JSONObject` promises nothing about key
+         * order, and a picker that reshuffles between launches would make
+         * muscle memory impossible.
+         */
+        private fun parseAgents(json: JSONObject?): List<AgentDefinition> {
+            if (json == null) return emptyList()
+            return json.keys().asSequence().mapNotNull { name ->
+                val entry = json.optJSONObject(name) ?: return@mapNotNull null
+                val command = entry.optString("command").takeIf { it.isNotBlank() }
+                    ?: return@mapNotNull null
+                val args = entry.optJSONArray("args")
+                val env = entry.optJSONObject("env")
+                AgentDefinition(
+                    id = "custom:$name",
+                    name = name,
+                    argv = listOf(command) + List(args?.length() ?: 0) {
+                        args!!.optString(it)
+                    },
+                    env = env?.keys()?.asSequence()?.associateWith { key ->
+                        env.optString(key)
+                    }.orEmpty(),
+                    // Configured by hand, so there is nothing for the panel to
+                    // tell the user to install.
+                    npmPackage = null,
+                )
+            }.sortedBy { it.name }.toList()
+        }
 
         /** Read the current settings. **Blocking** — call it off the main thread. */
         fun load(): AppSettings = parse(CoreBridge.settings())

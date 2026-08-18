@@ -12,6 +12,7 @@
 //! over. Unknown keys are left alone rather than dropped: a settings file is
 //! the user's, and a future version of the app may understand more of it.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -139,6 +140,26 @@ impl Default for PanelSettings {
     }
 }
 
+/// One ACP agent the user configured by hand.
+///
+/// Zed's `agent_servers` entry, with the same three keys it uses
+/// (settings_content/src/agent.rs:740-748): `command`, `args`, `env`. Zed's
+/// has four more for modes and config-option defaults; those describe
+/// surfaces this panel does not have, and a setting that does nothing is
+/// worse than no setting.
+///
+/// The command is resolved **inside the guest**, not on Android: it is a
+/// program on Debian's PATH, or an absolute path within it. That is the whole
+/// reason a custom agent is possible at all — the engine already knows how to
+/// enter the userland, so any program that speaks ACP on stdio is an agent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CustomAgent {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+}
+
 /// Everything the app can be configured with. Every field here is wired to
 /// something visible — a setting that does nothing is worse than no setting.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -160,6 +181,48 @@ pub struct Settings {
     pub project_search: PanelSettings,
     /// The Markdown and SVG preview, likewise.
     pub preview: PanelSettings,
+    /// The agent panel — Zed's `agent_panel.dock` and `default_width`.
+    pub agent_panel: PanelSettings,
+    /// ACP agents the user configured, by the name the panel lists them under.
+    ///
+    /// A `BTreeMap`, not a `HashMap`, and that is not a detail: this is what
+    /// the picker is built from, and a hash map would reorder the list on
+    /// every launch.
+    ///
+    /// Deserialized leniently, per entry: settings.json is a file people edit
+    /// by hand, and one half-written agent must cost that one entry, not the
+    /// whole parse — a strict map here silently reset *every* setting to its
+    /// default the moment someone typed `"Claude": "claude"`.
+    #[serde(deserialize_with = "lenient_agent_servers")]
+    pub agent_servers: BTreeMap<String, CustomAgent>,
+}
+
+/// Each `agent_servers` entry parsed on its own, a broken one dropped with a
+/// log rather than sinking its neighbours — and, because a bad field anywhere
+/// fails the whole `Settings` parse, rather than sinking the entire file. The
+/// Kotlin parser (`AppSettings.parseAgents`) is lenient the same way.
+fn lenient_agent_servers<'de, D>(deserializer: D) -> Result<BTreeMap<String, CustomAgent>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let raw: serde_json::Map<String, serde_json::Value> = match value {
+        serde_json::Value::Object(map) => map,
+        other => {
+            log::warn!("settings: agent_servers is {other} rather than an object; ignored");
+            return Ok(BTreeMap::new());
+        }
+    };
+    Ok(raw
+        .into_iter()
+        .filter_map(|(name, value)| match serde_json::from_value(value) {
+            Ok(agent) => Some((name, agent)),
+            Err(err) => {
+                log::warn!("settings: agent_servers entry {name:?} is malformed ({err}); dropped");
+                None
+            }
+        })
+        .collect())
 }
 
 impl Default for Settings {
@@ -174,6 +237,8 @@ impl Default for Settings {
             git_panel: PanelSettings::new(DockSide::Right, 360.0),
             project_search: PanelSettings::new(DockSide::Right, 360.0),
             preview: PanelSettings::new(DockSide::Right, 400.0),
+            agent_panel: PanelSettings::new(DockSide::Right, 400.0),
+            agent_servers: BTreeMap::new(),
         }
     }
 }
@@ -194,6 +259,7 @@ impl Settings {
             &mut self.git_panel,
             &mut self.project_search,
             &mut self.preview,
+            &mut self.agent_panel,
         ] {
             panel.default_width = panel.default_width.clamp(120.0, 900.0);
         }
@@ -254,7 +320,24 @@ const DEFAULT_FILE: &str = r#"// Conquest Code settings.
   "preview": {
     "dock": "right",
     "default_width": 400
-  }
+  },
+
+  "agent_panel": {
+    "dock": "right",
+    "default_width": 400
+  },
+
+  // ACP agents, by the name the panel lists them under. The command runs
+  // inside the Linux userland, so it is a program on Debian's PATH — which
+  // is what "npm install -g" puts one on. Anything that speaks the Agent
+  // Client Protocol on stdin and stdout works here; the editor installs
+  // nothing for you.
+  //
+  //   "agent_servers": {
+  //     "Claude Code": { "command": "claude-code-acp" },
+  //     "Gemini CLI": { "command": "gemini", "args": ["--experimental-acp"] }
+  //   }
+  "agent_servers": {}
 }
 "#;
 
@@ -606,6 +689,101 @@ mod tests {
 
             let updated = engine.set_settings_text("{ \"tab_size\": 2 }").unwrap();
             assert_eq!(updated.tab_size, 2);
+        });
+    }
+
+    /// A hand-configured agent, in Zed's own `agent_servers` shape.
+    ///
+    /// This is what makes "any ACP agent" true rather than "the two we
+    /// happen to name": the command is resolved inside the guest, so any
+    /// program on Debian's PATH that speaks the protocol is an agent.
+    #[test]
+    fn a_custom_agent_is_read_from_settings() {
+        with_settings_dir(|engine, _dir| {
+            let settings = engine
+                .set_settings_text(
+                    r#"{
+                        "agent_servers": {
+                            "My agent": {
+                                "command": "python3",
+                                "args": ["/root/agent.py", "--acp"],
+                                "env": { "TOKEN": "x" }
+                            },
+                            "Bare": { "command": "some-agent" }
+                        }
+                    }"#,
+                )
+                .unwrap();
+
+            assert_eq!(settings.agent_servers.len(), 2);
+            let mine = &settings.agent_servers["My agent"];
+            assert_eq!(mine.command, "python3");
+            assert_eq!(mine.args, ["/root/agent.py", "--acp"]);
+            assert_eq!(mine.env.get("TOKEN").map(String::as_str), Some("x"));
+            // Everything but the command is optional.
+            let bare = &settings.agent_servers["Bare"];
+            assert_eq!(bare.command, "some-agent");
+            assert!(bare.args.is_empty());
+            assert!(bare.env.is_empty());
+
+            // Sorted, because this list *is* the picker and a hash map would
+            // reorder it on every launch.
+            let names: Vec<&str> = settings.agent_servers.keys().map(String::as_str).collect();
+            assert_eq!(names, ["Bare", "My agent"]);
+        });
+    }
+
+    /// A half-written `agent_servers` entry costs that entry, nothing else.
+    ///
+    /// It used to cost everything: the strict map failed the whole `Settings`
+    /// parse, so `"Claude": "claude"` — the obvious first guess at the shape —
+    /// silently reset the theme, the font size and every panel to defaults.
+    /// The Kotlin parser was already lenient; now both sides agree.
+    #[test]
+    fn a_malformed_agent_entry_costs_only_itself() {
+        with_settings_dir(|engine, _dir| {
+            let settings = engine
+                .set_settings_text(
+                    r#"{
+                        "theme": "dark",
+                        "agent_servers": {
+                            "Not an object": "claude",
+                            "Wrong types": { "command": 7 },
+                            "Works": { "command": "fine-agent" }
+                        }
+                    }"#,
+                )
+                .unwrap();
+            let names: Vec<&str> = settings.agent_servers.keys().map(String::as_str).collect();
+            assert_eq!(names, ["Works"]);
+            // The rest of the file still counted — the parse did not fall
+            // back to defaults.
+            assert_eq!(settings.theme, ThemeMode::Dark);
+
+            // And `agent_servers` itself being rubbish ignores the key, not
+            // the file.
+            let settings = engine
+                .set_settings_text(r#"{ "theme": "dark", "agent_servers": 17 }"#)
+                .unwrap();
+            assert!(settings.agent_servers.is_empty());
+            assert_eq!(settings.theme, ThemeMode::Dark);
+        });
+    }
+
+    /// The agent panel's dock is a real setting, not one the engine drops.
+    ///
+    /// It was: the settings screen wrote `agent_panel.dock` and `Settings` had
+    /// no such field, so serde ignored it and the row did nothing at all.
+    #[test]
+    fn the_agent_panels_dock_survives_a_write() {
+        with_settings_dir(|engine, _dir| {
+            assert_eq!(engine.settings().agent_panel.dock, DockSide::Right);
+            let updated = engine
+                .set_setting(&["agent_panel", "dock"], serde_json::json!("left"))
+                .unwrap();
+            assert_eq!(updated.agent_panel.dock, DockSide::Left);
+            // And it is still there when the file is read back from disk.
+            assert_eq!(engine.settings().agent_panel.dock, DockSide::Left);
         });
     }
 }

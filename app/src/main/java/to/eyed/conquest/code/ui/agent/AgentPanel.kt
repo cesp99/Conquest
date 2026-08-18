@@ -151,7 +151,7 @@ fun AgentPanel(
 ) {
     val theme = LocalZedTheme.current
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
+    val settings = LocalAppSettings.current
     val composer = remember { FocusRequester() }
 
     val agent = AgentSessions.agent
@@ -179,6 +179,18 @@ fun AgentPanel(
             agent = agent,
             onChangeAgent = { AgentSessions.reset() },
             onNewSession = {
+                // Re-resolved by name first: settings.json may have been
+                // edited since this definition was captured, and "New" should
+                // launch what the file says *now* — the running conversation
+                // deliberately keeps the argv it started with, so this is the
+                // moment an edit takes effect. An entry edited away entirely
+                // keeps the old definition: the user asked for a session, not
+                // the picker.
+                agent?.let { current ->
+                    Agents.all(settings.agents)
+                        .firstOrNull { it.name == current.name }
+                        ?.let(AgentSessions::choose)
+                }
                 AgentSessions.close()
                 AgentSessions.open(project.id)
             },
@@ -192,7 +204,10 @@ fun AgentPanel(
                 "This edition has no Linux userland, so it cannot run an agent.",
             )
 
-            agent == null -> AgentPicker(onChoose = { AgentSessions.choose(it) })
+            agent == null -> AgentPicker(
+                agents = Agents.all(settings.agents),
+                onChoose = { AgentSessions.choose(it) },
+            )
 
             AgentSessions.startError != null -> Notice(
                 AgentSessions.startError!!,
@@ -314,7 +329,7 @@ private fun BarAction(label: String, onClick: () -> Unit) {
  * often tied to their own account — is their call, not the editor's.
  */
 @Composable
-private fun AgentPicker(onChoose: (AgentDefinition) -> Unit) {
+private fun AgentPicker(agents: List<AgentDefinition>, onChoose: (AgentDefinition) -> Unit) {
     val theme = LocalZedTheme.current
     Column(
         modifier = Modifier
@@ -335,7 +350,7 @@ private fun AgentPicker(onChoose: (AgentDefinition) -> Unit) {
             style = MaterialTheme.typography.bodySmall,
             color = theme.color("text.muted"),
         )
-        for (definition in Agents.ALL) {
+        for (definition in agents) {
             AgentChoice(definition, onClick = { onChoose(definition) })
         }
     }

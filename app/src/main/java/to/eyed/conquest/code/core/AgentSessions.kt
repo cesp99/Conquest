@@ -29,8 +29,14 @@ object AgentSessions {
 
     private const val TAG = "conquest-agent"
 
-    /** The agent the user picked, by [AgentDefinition.id]; null until they do. */
-    var agentId by mutableStateOf<String?>(null)
+    /**
+     * The agent the user picked; null until they do.
+     *
+     * The definition itself rather than its id, because a configured agent
+     * exists only in settings.json — there is no table to look it up in, and
+     * a stale id would silently resolve to nothing after an edit.
+     */
+    var agent by mutableStateOf<AgentDefinition?>(null)
         private set
 
     /** The live session, or -1. */
@@ -52,8 +58,6 @@ object AgentSessions {
      */
     var startError by mutableStateOf<String?>(null)
         private set
-
-    val agent: AgentDefinition? get() = Agents.byId(agentId)
 
     /** False in builds with no userland: there is no agent panel there at all. */
     val isSupported: Boolean get() = Userland.backend.isSupported
@@ -77,10 +81,10 @@ object AgentSessions {
     private var generation = 0
 
     /** Remember the choice without starting anything. */
-    fun choose(agent: AgentDefinition) {
-        if (agentId == agent.id) return
+    fun choose(chosen: AgentDefinition) {
+        if (agent == chosen) return
         close()
-        agentId = agent.id
+        agent = chosen
     }
 
     /**
@@ -220,6 +224,6 @@ object AgentSessions {
     /** Forget the chosen agent as well — back to the picker. */
     fun reset() {
         close()
-        agentId = null
+        agent = null
     }
 }

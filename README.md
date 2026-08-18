@@ -90,7 +90,7 @@ Samsung DeX.
 | Navigation history | ✅ back and forward across the places you jumped from |
 | Language servers on-device | ✅ diagnostics, completions, hover, go-to-definition; servers installed with `apt` (`full` edition) |
 | Interface size | ✅ `Ctrl+=` / `Ctrl+-` / `Ctrl+0`, and a settings row — all the chrome scales |
-| ACP agent panel | 🚧 built, unproven — the panel, the client and the permission gating are in; a conversation needs an agent you install yourself with `npm` (`full` edition) |
+| ACP agent panel | ✅ conversations with any ACP agent — permission-gated edits, unified diff review, plans; built-ins launch Claude Code/Gemini CLI, `agent_servers` in settings.json adds your own (`full` edition) |
 
 ## Editions
 

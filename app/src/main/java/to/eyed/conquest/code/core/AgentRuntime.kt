@@ -1,5 +1,8 @@
 package to.eyed.conquest.code.core
 
+import org.json.JSONArray
+import org.json.JSONObject
+
 /**
  * Node in the guest, and the agents that run on it.
  *
@@ -108,6 +111,8 @@ data class AgentDefinition(
     val name: String,
     /** The guest argv. */
     val argv: List<String>,
+    /** Extra environment, on top of the guest's own. */
+    val env: Map<String, String> = emptyMap(),
     /** The npm package that provides [argv]'s program, when there is one. */
     val npmPackage: String? = null,
 ) {
@@ -121,11 +126,19 @@ data class AgentDefinition(
     val installCommand: String?
         get() = npmPackage?.let { "npm install -g $it" }
 
-    /** The engine's `AgentSpec`, as JSON. */
-    fun toSpecJson(): String {
-        val argvJson = argv.joinToString(",") { org.json.JSONObject.quote(it) }
-        return """{"name":${org.json.JSONObject.quote(name)},"argv":[$argvJson],"env":{}}"""
-    }
+    /**
+     * The engine's `AgentSpec`, as JSON.
+     *
+     * Assembled with `JSONObject` rather than by hand. A custom agent's name
+     * and arguments are whatever the user typed into settings.json, so either
+     * may contain a quote or a backslash — and hand-built JSON is exactly
+     * where that stops being valid JSON and the engine rejects the spec.
+     */
+    fun toSpecJson(): String = JSONObject().apply {
+        put("name", name)
+        put("argv", JSONArray(argv))
+        put("env", JSONObject(env.toMap()))
+    }.toString()
 }
 
 /**
@@ -154,7 +167,22 @@ object Agents {
         npmPackage = "@google/gemini-cli",
     )
 
-    val ALL: List<AgentDefinition> = listOf(CLAUDE_CODE, GEMINI_CLI)
+    /** The two the panel names out of the box. */
+    val BUILT_IN: List<AgentDefinition> = listOf(CLAUDE_CODE, GEMINI_CLI)
 
-    fun byId(id: String?): AgentDefinition? = ALL.firstOrNull { it.id == id }
+    /**
+     * Everything the picker offers: the built-ins, then whatever
+     * `agent_servers` adds.
+     *
+     * A configured agent whose name matches a built-in *replaces* it, so
+     * pointing "Claude Code" at your own wrapper is one settings entry rather
+     * than a second row with the same name.
+     */
+    fun all(configured: List<AgentDefinition>): List<AgentDefinition> {
+        val overridden = configured.map { it.name }.toSet()
+        return BUILT_IN.filterNot { it.name in overridden } + configured
+    }
+
+    fun byId(id: String?, configured: List<AgentDefinition> = emptyList()): AgentDefinition? =
+        all(configured).firstOrNull { it.id == id }
 }
