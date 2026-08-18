@@ -46,7 +46,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -78,6 +78,24 @@ pub(crate) const PROCESSES_PER_RUN: usize = 2;
 /// language-server cap in lsp.rs, which is the only consumer that runs
 /// long-lived children in an unbounded number.
 pub(crate) const PROCESS_BUDGET: usize = 32;
+
+/// Processes the running ACP agents have reserved out of [`PROCESS_BUDGET`]:
+/// [`crate::acp::PROCESSES_PER_AGENT`] for each live agent connection. It
+/// lives here, beside the constants it spends, because this is the module that
+/// knows what entering the guest costs; `acp.rs` adds and subtracts it and the
+/// language-server cap in `lsp.rs` subtracts it from the budget — the revisit
+/// the P5-4 decision scheduled for "once the ACP agent panel starts spending
+/// the same budget".
+///
+/// **A counter, not a flag, and this is the whole reason.** Only one agent is
+/// meant to run at a time, but replacing one overlaps the two: the new agent
+/// starts while the old one's watcher is still inside proot's SIGQUIT grace.
+/// With a `store`, the departing watcher wrote 0 over the arriving agent's
+/// reservation and the language-server cap silently went back to 4 — the exact
+/// over-subscription the reservation exists to prevent. Adding and subtracting
+/// makes the overlap read as *more* reserved rather than less, which is the
+/// safe direction to be wrong in.
+pub(crate) static RESERVED_FOR_AGENT: AtomicUsize = AtomicUsize::new(0);
 
 /// Where the guest lives. The engine never guesses any of this: Kotlin knows
 /// the flavour, the install state and the paths, and hands them over through
@@ -458,22 +476,18 @@ pub(crate) fn capture(
 /// somebody else already started. Framing, restart and the request tables then
 /// all belong to the vendored crate rather than to us. See lsp.rs.
 ///
-/// So this stays for the next resident guest program that is not an LSP server
-/// — an ACP agent, most likely — and it still owes its caller one thing it does
-/// not do: noticing that the child died (the handle below only knows when
-/// asked).
+/// The caller this seam waited for arrived in P6: the ACP agent (`acp.rs`)
+/// comes through here, owns all three pipes, and supplies the one thing this
+/// does not do — noticing that the child died — with a watcher thread that
+/// polls [`GuestProcess::exit_status`].
 ///
-/// It does **not** owe a budget any more, but it does not enforce one either.
-/// P5-4 put the budget where the unbounded number of resident children actually
-/// is — one language server per language per project, capped and swept in
-/// lsp.rs — and left the arithmetic here, in [`PROCESSES_PER_RUN`] and
+/// It does **not** owe a budget, but it does not enforce one either. P5-4 put
+/// the budget where the unbounded number of resident children actually is —
+/// one language server per language per project, capped and swept in lsp.rs —
+/// and left the arithmetic here, in [`PROCESSES_PER_RUN`] and
 /// [`PROCESS_BUDGET`], because this is the module that knows what entering the
-/// guest costs. A second kind of resident guest program must budget itself
-/// against the same two constants rather than inventing a number.
-#[allow(
-    dead_code,
-    reason = "the resident-process seam outlived its first expected caller; see above"
-)]
+/// guest costs. The agent budgets itself against the same two constants,
+/// through [`RESERVED_FOR_AGENT`].
 pub(crate) fn spawn(userland: &Userland, command: &GuestCommand) -> Option<GuestProcess> {
     if !userland.is_installed() {
         return None;
@@ -518,7 +532,6 @@ pub(crate) struct GuestProcess {
     exited: Option<std::process::ExitStatus>,
 }
 
-#[allow(dead_code, reason = "see the note on `spawn`")]
 impl GuestProcess {
     /// The write half. Taken rather than borrowed because the caller will want
     /// it behind its own lock, away from whatever owns the read half.
@@ -670,6 +683,74 @@ fn terminate(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Test doubles for the guest, shared with `acp.rs`'s tests: a stand-in proot
+/// and a [`Userland`] pointing at it, so plumbing on either side of the spawn
+/// can run on a host that has no rootfs.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    /// Stand in for proot, so the plumbing either side of it can be tested on
+    /// a host that has no rootfs.
+    ///
+    /// It drops every flag up to and including `-w <dir>` and execs the rest,
+    /// which is exactly the contract `proot_command` relies on: the guest
+    /// argv is the tail of the command line. It cannot pretend to be a fake
+    /// root, and does not try — what is under test is the deadline, the
+    /// draining and the pipes, none of which care what the program is.
+    #[cfg(unix)]
+    pub(crate) fn fake_proot(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("fake-proot");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nwhile [ \"$1\" != \"-w\" ]; do shift; done\nshift 2\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // ETXTBSY, and why this is not just a write followed by a spawn.
+        //
+        // Writing a program and immediately exec'ing it races with every other
+        // thread in this process that forks — and the suite has several.
+        // Between a fork and its exec the child still holds our *write*
+        // descriptor, and Linux refuses to exec a file anybody has open for
+        // writing: "Text file busy". It surfaced as roughly one run in eight
+        // of `cargo test -p engine`, as a capture that returned `None` for no
+        // reason the assertions could explain.
+        //
+        // The window closes on its own, so probe until it has: once one exec
+        // of this path succeeds, no writer holds it and none can appear — this
+        // is the only code that ever writes it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let ok = Command::new(&path)
+                .args(["-w", "/", "/bin/sh", "-c", ":"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if ok || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        path
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn fake_userland(dir: &Path) -> Userland {
+        Userland {
+            proot: fake_proot(dir),
+            rootfs: dir.to_path_buf(),
+            tmp_dir: dir.to_path_buf(),
+            projects_dir: dir.to_path_buf(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -875,65 +956,8 @@ mod tests {
         assert!(argv.contains(&"/elsewhere/repo:/elsewhere/repo".to_owned()));
     }
 
-    /// Stand in for proot, so the plumbing either side of it can be tested on
-    /// a host that has no rootfs.
-    ///
-    /// It drops every flag up to and including `-w <dir>` and execs the rest,
-    /// which is exactly the contract [`proot_command`] relies on: the guest
-    /// argv is the tail of the command line. It cannot pretend to be a fake
-    /// root, and does not try — what is under test here is the deadline, the
-    /// draining and the pipes, none of which care what the program is.
     #[cfg(unix)]
-    fn fake_proot(dir: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
-        let path = dir.join("fake-proot");
-        std::fs::write(
-            &path,
-            "#!/bin/sh\nwhile [ \"$1\" != \"-w\" ]; do shift; done\nshift 2\nexec \"$@\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // ETXTBSY, and why this is not just a write followed by a spawn.
-        //
-        // Writing a program and immediately exec'ing it races with every other
-        // thread in this process that forks — and the suite has several, here
-        // and in git.rs. Between a fork and its exec the child still holds our
-        // *write* descriptor, and Linux refuses to exec a file anybody has open
-        // for writing: "Text file busy". It surfaced as roughly one run in
-        // eight of `cargo test -p engine`, as a capture that returned `None`
-        // for no reason the assertions could explain.
-        //
-        // The window closes on its own, so probe until it has: once one exec
-        // of this path succeeds, no writer holds it and none can appear — this
-        // is the only code that ever writes it.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let ok = Command::new(&path)
-                .args(["-w", "/", "/bin/sh", "-c", ":"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
-            if ok || Instant::now() >= deadline {
-                break;
-            }
-            thread::sleep(POLL_INTERVAL);
-        }
-        path
-    }
-
-    #[cfg(unix)]
-    fn fake_userland(dir: &Path) -> Userland {
-        Userland {
-            proot: fake_proot(dir),
-            rootfs: dir.to_path_buf(),
-            tmp_dir: dir.to_path_buf(),
-            projects_dir: dir.to_path_buf(),
-        }
-    }
+    use super::testing::fake_userland;
 
     #[cfg(unix)]
     fn sh(script: &str) -> Vec<OsString> {

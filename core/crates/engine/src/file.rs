@@ -273,6 +273,15 @@ fn language_for_path_str(path: &Path) -> Option<&'static str> {
 /// a full disk then leaves the previous contents intact rather than a
 /// half-written source file.
 fn write_atomically(path: &Path, text: &str) -> Result<(), EngineError> {
+    write_atomically_io(path, text).map_err(|err| EngineError::Io {
+        path: path.display().to_string(),
+        message: err.to_string(),
+    })
+}
+
+/// The same write, speaking `io::Error` — for the ACP fs handler, whose
+/// errors go back over a wire rather than into an [`EngineError`].
+pub(crate) fn write_atomically_io(path: &Path, text: &str) -> std::io::Result<()> {
     let directory = path.parent().unwrap_or(Path::new("."));
     let temporary = directory.join(format!(
         ".{}.conquest-tmp",
@@ -280,10 +289,9 @@ fn write_atomically(path: &Path, text: &str) -> Result<(), EngineError> {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "buffer".to_owned())
     ));
-    std::fs::write(&temporary, text).map_err(|err| io_error(&temporary, err))?;
-    std::fs::rename(&temporary, path).map_err(|err| {
+    std::fs::write(&temporary, text)?;
+    std::fs::rename(&temporary, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&temporary);
-        io_error(path, err)
     })
 }
 

@@ -141,6 +141,20 @@ const RESERVED_PROCESSES: usize = 8 + 6 + 6;
 const MAX_RUNNING_SERVERS: usize =
     (guest::PROCESS_BUDGET - RESERVED_PROCESSES) / PROCESSES_PER_SERVER;
 
+/// The cap as it stands *right now*: [`MAX_RUNNING_SERVERS`] when nothing
+/// else has moved into the budget, less while the ACP agent holds its share
+/// ([`guest::RESERVED_FOR_AGENT`], set by acp.rs) — the revisit the P5-4
+/// decision scheduled. With the agent's 6 that is (32 − 20 − 6) / 3 = 2
+/// servers, and the sweep's idle rules are what free the difference; a server
+/// already past the reduced cap is not killed, because the burst spare
+/// absorbs the overlap the same way it absorbs a pressure sweep's.
+fn max_running_servers() -> usize {
+    let reserved = RESERVED_PROCESSES + guest::RESERVED_FOR_AGENT.load(Ordering::Relaxed);
+    // A reservation can only shrink the cap, never raise it past the
+    // configured ceiling.
+    MAX_RUNNING_SERVERS.min(guest::PROCESS_BUDGET.saturating_sub(reserved) / PROCESSES_PER_SERVER)
+}
+
 /// What a server refused by the cap reports as its `error`.
 ///
 /// It rides the contract that already exists — `lspServers[].state =
@@ -869,12 +883,14 @@ enum Claim {
 /// Ask the registry for a slot, and take it when the budget allows.
 ///
 /// Counting and inserting under one lock, deliberately: a count that is already
-/// stale by the time it is acted on is not a cap.
-fn claim(servers: &mut SlotMap, project: ProjectId, server: Server) -> Claim {
+/// stale by the time it is acted on is not a cap. `cap` is passed in —
+/// [`max_running_servers`] in production — so the decision stays a function of
+/// numbers a test can name.
+fn claim(servers: &mut SlotMap, project: ProjectId, server: Server, cap: usize) -> Claim {
     if servers.contains_key(&(project, server.name)) {
         return Claim::Taken;
     }
-    if running_servers(servers) >= MAX_RUNNING_SERVERS {
+    if running_servers(servers) >= cap {
         return Claim::Full;
     }
     servers.insert((project, server.name), Slot::starting(project, server));
@@ -1585,9 +1601,10 @@ impl crate::Engine {
         // The budget, in three steps: ask; if the answer is no, stop what is
         // not earning its processes and ask once more; if it is still no,
         // record the refusal where the user can read it.
-        let mut claimed = claim(&mut self.lsp.servers.lock().unwrap(), project, server);
+        let cap = max_running_servers();
+        let mut claimed = claim(&mut self.lsp.servers.lock().unwrap(), project, server, cap);
         if claimed == Claim::Full && self.sweep_idle_servers(true) > 0 {
-            claimed = claim(&mut self.lsp.servers.lock().unwrap(), project, server);
+            claimed = claim(&mut self.lsp.servers.lock().unwrap(), project, server, cap);
         }
         match claimed {
             Claim::Taken => return,
@@ -1649,9 +1666,10 @@ impl crate::Engine {
                 return;
             }
             log::info!(
-                "lsp: not starting {} for project {project}: {} already running (cap {MAX_RUNNING_SERVERS})",
+                "lsp: not starting {} for project {project}: {} already running (cap {})",
                 server.name,
                 running_servers(&servers),
+                max_running_servers(),
             );
             servers.insert((project, server.name), Slot::refused(project, server));
         }
@@ -1668,7 +1686,7 @@ impl crate::Engine {
     fn retry_capped_servers(&self, project: ProjectId) {
         let retried: Vec<(ProjectId, &'static str)> = {
             let mut servers = self.lsp.servers.lock().unwrap();
-            let room = MAX_RUNNING_SERVERS.saturating_sub(running_servers(&servers));
+            let room = max_running_servers().saturating_sub(running_servers(&servers));
             if room == 0 {
                 return;
             }
@@ -2595,6 +2613,15 @@ mod tests {
                     <= guest::PROCESS_BUDGET
             )
         };
+        // And with the ACP agent's share carved out (P6), the live cap drops
+        // to two rather than going negative or staying four.
+        const {
+            assert!(
+                (guest::PROCESS_BUDGET - RESERVED_PROCESSES - crate::acp::PROCESSES_PER_AGENT)
+                    / PROCESSES_PER_SERVER
+                    == 2
+            )
+        };
     }
 
     fn fake_server(name: &'static str) -> Server {
@@ -2605,23 +2632,36 @@ mod tests {
     /// every project, because the budget belongs to the app.
     #[test]
     fn the_cap_counts_running_servers_across_every_project() {
+        // The cap is named explicitly so a concurrently running ACP test —
+        // whose agent reservation legitimately shrinks the live cap — cannot
+        // make this arithmetic flaky.
+        let cap = MAX_RUNNING_SERVERS;
         let mut servers = SlotMap::new();
         for name in ["one", "two", "three", "four"] {
-            assert_eq!(claim(&mut servers, 1, fake_server(name)), Claim::Room);
+            assert_eq!(claim(&mut servers, 1, fake_server(name), cap), Claim::Room);
         }
-        assert_eq!(claim(&mut servers, 1, fake_server("five")), Claim::Full);
+        assert_eq!(
+            claim(&mut servers, 1, fake_server("five"), cap),
+            Claim::Full
+        );
         // A second project does not get a budget of its own.
-        assert_eq!(claim(&mut servers, 2, fake_server("five")), Claim::Full);
+        assert_eq!(
+            claim(&mut servers, 2, fake_server("five"), cap),
+            Claim::Full
+        );
 
         // A refusal is a record, not a process: it does not count against the
         // cap, and it is not claimed twice.
         servers.insert((1, "five"), Slot::refused(1, fake_server("five")));
-        assert_eq!(claim(&mut servers, 1, fake_server("five")), Claim::Taken);
+        assert_eq!(
+            claim(&mut servers, 1, fake_server("five"), cap),
+            Claim::Taken
+        );
         assert_eq!(running_servers(&servers), MAX_RUNNING_SERVERS);
 
         // One stops; the room it frees is anybody's.
         servers.remove(&(1, "one"));
-        assert_eq!(claim(&mut servers, 2, fake_server("six")), Claim::Room);
+        assert_eq!(claim(&mut servers, 2, fake_server("six"), cap), Claim::Room);
     }
 
     fn running_slot(project: ProjectId, server: Server, last_activity: Instant) -> Slot {

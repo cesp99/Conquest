@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# The ACP SDK, the exact crate and pin Zed uses — we implement the client
+# around it, never the protocol. See acp.rs.
+agent-client-protocol.workspace = true
 aho-corasick.workspace = true
 anyhow.workspace = true
 clock.workspace = true

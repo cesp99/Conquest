@@ -37,6 +37,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use rope::Point;
 use sum_tree::Bias;
 
+mod acp;
+mod acp_thread;
 mod config;
 mod file;
 mod find;
@@ -128,6 +130,9 @@ pub struct Engine {
     /// diagnostics they have published — see lsp.rs. Inert, and costing one
     /// relaxed atomic load per edit, until a server actually starts.
     lsp: lsp::LspState,
+    /// The ACP agent connection and its sessions — see acp.rs. Inert until
+    /// the panel starts one; the `play` flavour never does.
+    acp: acp::AcpState,
 }
 
 pub(crate) struct BufferState {
@@ -145,6 +150,13 @@ pub(crate) struct BufferState {
 impl BufferState {
     fn line_count(&self) -> u32 {
         self.buffer.max_point().row + 1
+    }
+
+    /// The canonical path of the file behind this buffer, when there is one —
+    /// for callers holding the shared buffer map without an `Engine` (the
+    /// worktree watcher, the ACP fs handlers).
+    pub(crate) fn file_path(&self) -> Option<&Path> {
+        self.file.as_ref().map(|file| file.path.as_path())
     }
 
     /// Mark the tree stale after a history operation, where the edit shape
