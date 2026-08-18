@@ -102,6 +102,17 @@ object CoreBridge {
     external fun bufferOutlinePath(bufferId: Long, row: Long, colUtf16: Long): String?
 
     /**
+     * Every outline item in the buffer, in source order — the rows of Zed's
+     * outline picker — as a JSON array of
+     * `{label, depth, row, col_utf16, end_row}`, where row/col are the
+     * *item's* start (the caret target Zed confirms onto, outline.rs:417-425)
+     * and end_row closes its extent. Empty array when the buffer has no
+     * language; null for unknown buffers. Same staleness contract as
+     * [bufferOutlinePath].
+     */
+    external fun bufferOutline(bufferId: Long): String?
+
+    /**
      * Byte offset of (row, byte column), clipped to the buffer. -1 for an
      * unknown buffer or negative arguments.
      */

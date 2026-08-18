@@ -63,8 +63,8 @@ private val IconSize = 14.dp
  * The breadcrumb text is the file name, then the engine's symbol path at the
  * caret ("impl Foo" › "fn bar"), separated by Zed's own `›` glyph in
  * `text.placeholder` with the segments muted (editor/src/element.rs:6793,
- * 6809). Zed's crumbs are a button that opens the outline; ours are plain
- * text until an outline picker exists.
+ * 6809). The trail is a button into the outline picker, which is Zed's own
+ * wiring for it — and the picker's touch route.
  *
  * Quick actions: the magnifier toggles the search bar — the touch twin of
  * Ctrl+F, which Zed's quick action bar carries in the same spot — and for a
@@ -76,6 +76,8 @@ fun EditorToolbar(
     symbolPath: List<String>,
     onToggleSearch: (() -> Unit)?,
     modifier: Modifier = Modifier,
+    /** A tap on the crumbs — Zed wraps them in a button into the outline. */
+    onOpenOutline: (() -> Unit)? = null,
     kind: PreviewKind? = null,
     isPreviewOpen: Boolean = false,
     onTogglePreview: (() -> Unit)? = null,
@@ -104,10 +106,36 @@ fun EditorToolbar(
     ) {
         // Breadcrumbs scroll off to the left rather than squeezing the
         // buttons, as Zed's `overflow_x_scroll` container does
-        // (breadcrumbs.rs:53-55).
+        // (breadcrumbs.rs:53-55). The whole trail is one button into the
+        // outline — Zed wraps it in a `ButtonLike` with `rounded_sm` and a
+        // ghost hover (element.rs:6838-6839).
+        val crumbInteraction = remember { MutableInteractionSource() }
+        val crumbHovered by crumbInteraction.collectIsHoveredAsState()
         Row(
             modifier = Modifier
                 .weight(1f)
+                .clip(RoundedCornerShape(4.dp))
+                .background(
+                    if (crumbHovered && onOpenOutline != null) {
+                        theme.color("ghost_element.hover", Color.Transparent)
+                    } else {
+                        Color.Transparent
+                    }
+                )
+                .then(
+                    if (onOpenOutline != null) {
+                        Modifier
+                            .pointerHoverIcon(PointerIcon.Hand)
+                            .clickable(
+                                interactionSource = crumbInteraction,
+                                indication = null,
+                                onClickLabel = "Open the outline",
+                                onClick = onOpenOutline,
+                            )
+                    } else {
+                        Modifier
+                    }
+                )
                 .horizontalScroll(rememberScrollState()),
             verticalAlignment = Alignment.CenterVertically,
             // `gap_1` between segments (editor/src/element.rs:6813).

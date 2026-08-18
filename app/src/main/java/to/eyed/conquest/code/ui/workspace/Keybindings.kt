@@ -269,7 +269,10 @@ private val BINDINGS: List<Binding> = listOf(
     ),
     Binding(
         WorkspaceCommand.OpenProjects,
-        Chord(AndroidKeyEvent.KEYCODE_O, "O", shift = null),
+        // `shift = false`, not "either": the shifted twin is the outline
+        // picker (Zed's `outline::Toggle`), and two commands on one physical
+        // chord must be disjoint here rather than settled by handler order.
+        Chord(AndroidKeyEvent.KEYCODE_O, "O", shift = false),
         InWorkspace,
     ),
     Binding(WorkspaceCommand.FindFile, Chord(AndroidKeyEvent.KEYCODE_P, "P"), InWorkspace),
@@ -458,6 +461,22 @@ fun isGoToLine(event: KeyEvent, focus: Focus = Focus.Workspace): Boolean {
     if (event.type != KeyEventType.KeyDown) return false
     if (event.nativeKeyEvent.isAltPressed) return false
     return GoToLineChord.matches(event.nativeKeyEvent)
+}
+
+/**
+ * The outline picker — Zed's `outline::Toggle` on `ctrl-shift-o`
+ * (default-linux.json:621). A surface like go-to-line, and for the same
+ * reason: it previews as you browse and must restore the caret on Escape.
+ * The breadcrumbs are its touch route, as they are Zed's own button into it.
+ */
+val OutlineChord = Chord(AndroidKeyEvent.KEYCODE_O, "O", shift = true)
+
+/** True when this event should open the outline picker. */
+fun isOutline(event: KeyEvent, focus: Focus = Focus.Workspace): Boolean {
+    if (focus != Focus.Workspace) return false
+    if (event.type != KeyEventType.KeyDown) return false
+    if (event.nativeKeyEvent.isAltPressed) return false
+    return OutlineChord.matches(event.nativeKeyEvent)
 }
 
 /**

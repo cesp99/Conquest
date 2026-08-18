@@ -238,6 +238,7 @@ fun WorkspaceScreen(
     val docks = remember { DockLayout() }
     /** Ctrl+G. A surface rather than a command: it answers for itself. */
     var goToLineOpen by remember { mutableStateOf(false) }
+    var outlineOpen by remember { mutableStateOf(false) }
     /** Ctrl+Shift+F. The token is bumped to pull focus back to its query. */
     var projectSearchFocus by remember { mutableIntStateOf(0) }
     /** Ctrl+Shift+G, the same way: press it again to put focus back on the list. */
@@ -398,7 +399,10 @@ fun WorkspaceScreen(
     // The panel moves the caret of the buffer it was opened on; if that tab
     // closes underneath it there is nothing left for it to move.
     LaunchedEffect(files.active) {
-        if (files.active?.editor == null) goToLineOpen = false
+        if (files.active?.editor == null) {
+            goToLineOpen = false
+            outlineOpen = false
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -834,6 +838,11 @@ fun WorkspaceScreen(
                     goToLineOpen = true
                     return@onPreviewKeyEvent true
                 }
+                if (isOutline(event, focus)) {
+                    if (files.active?.editor == null) return@onPreviewKeyEvent false
+                    outlineOpen = true
+                    return@onPreviewKeyEvent true
+                }
                 tabIndexFor(event, files.tabs.size, focus)?.let { index ->
                     files.select(index)
                     return@onPreviewKeyEvent true
@@ -882,6 +891,9 @@ fun WorkspaceScreen(
                 },
                 MenuAction("Go to line…", GoToLineChord.label, enabled = active?.editor != null) {
                     goToLineOpen = true
+                },
+                MenuAction("Outline…", OutlineChord.label, enabled = active?.editor != null) {
+                    outlineOpen = true
                 },
                 MenuAction(
                     "Toggle preview",
@@ -1032,6 +1044,7 @@ fun WorkspaceScreen(
                                         rootFocus.requestFocus()
                                     },
                                     onToggleSearch = { searchBarOpen = !searchBarOpen },
+                                    onOpenOutline = { outlineOpen = true },
                                     isPreviewOpen = docks.isOpen(WorkspacePanel.Preview, settings),
                                     onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
                                     diffProject = project,
@@ -1105,6 +1118,20 @@ fun WorkspaceScreen(
                             rootFocus.requestFocus()
                         },
                         modifier = Modifier.align(Alignment.TopCenter),
+                    )
+                }
+                // Gated like go-to-line: previewing moves the caret, which is
+                // pointless — and invisible — behind a full-screen panel.
+                val outlineEditor = active?.editor
+                if (outlineOpen && outlineEditor != null &&
+                    plan.fullScreen == null && !terminalIsFullScreen
+                ) {
+                    OutlinePicker(
+                        editor = outlineEditor,
+                        onDismiss = {
+                            outlineOpen = false
+                            rootFocus.requestFocus()
+                        },
                     )
                 }
             }
@@ -1364,6 +1391,8 @@ private fun EditorArea(
     onSearchDismissed: () -> Unit,
     /** The toolbar magnifier — the touch twin of Ctrl+F. */
     onToggleSearch: () -> Unit,
+    /** A tap on the breadcrumbs — Zed's own button into the outline. */
+    onOpenOutline: () -> Unit,
     isPreviewOpen: Boolean,
     onTogglePreview: () -> Unit,
     /** For a diff tab, which needs the project rather than a buffer. */
@@ -1410,6 +1439,7 @@ private fun EditorArea(
                 fileName = active.name,
                 symbolPath = symbolPath,
                 onToggleSearch = onToggleSearch,
+                onOpenOutline = onOpenOutline,
                 kind = previewKind,
                 isPreviewOpen = isPreviewOpen,
                 onTogglePreview = if (previewKind != null) onTogglePreview else null,

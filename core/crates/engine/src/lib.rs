@@ -58,7 +58,7 @@ pub use config::{GitignoredFiles, ProjectPanelSettings, Settings, ThemeMode};
 pub use find::FileMatch;
 pub use git::{BranchInfo, ChangedFile, GitChanges, GitStatus};
 pub use git_diff::{BlameEntry, Hunk, HunkKind};
-pub use highlight::{HighlightSpan, STYLE_NAMES, language_for_path};
+pub use highlight::{HighlightSpan, OutlineItem, STYLE_NAMES, language_for_path};
 pub use language_config::config_json as language_config_json;
 pub use project::{ProjectId, TreeEntry};
 pub use project_search::{FileMatches, LineMatch, SearchId, SearchResults, SearchState};
@@ -336,6 +336,18 @@ impl Engine {
             );
             let offset = rope.point_utf16_to_offset(point);
             highlighter.outline_path(rope, offset)
+        })
+    }
+
+    /// Every outline item in the buffer, in source order with nesting depths
+    /// — the rows of Zed's outline picker. Same staleness contract as
+    /// [`Self::outline_path`]: reads the last parsed tree, never parses.
+    pub fn outline(&self, id: BufferId) -> Result<Vec<highlight::OutlineItem>, EngineError> {
+        self.with_buffer(id, |state| {
+            let Some(highlighter) = &state.highlight else {
+                return Vec::new();
+            };
+            highlighter.outline_items(state.buffer.as_rope())
         })
     }
 
@@ -734,6 +746,29 @@ mod tests {
     /// `not_in = ["comment", "string"]`, so a quote typed inside either must
     /// not bring a closer with it.
     #[test]
+    fn outline_lists_every_item_with_depth() {
+        let engine = Engine::new();
+        let text = "struct Foo;\n\nimpl Foo {\n    fn bar(&self) {\n        let x = 1;\n    }\n}\n\nfn main() {\n    println!(\"hi\");\n}\n";
+        let id = engine.create_buffer(text);
+        assert!(engine.set_language(id, "rust").unwrap());
+
+        let items = engine.outline(id).unwrap();
+        let flat: Vec<(String, u32, u32)> = items
+            .into_iter()
+            .map(|item| (item.label, item.depth, item.row))
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                ("struct Foo".to_owned(), 0, 0),
+                ("impl Foo".to_owned(), 0, 2),
+                ("fn bar".to_owned(), 1, 3),
+                ("fn main".to_owned(), 0, 8),
+            ]
+        );
+    }
+
+    #[test]
     fn outline_path_names_the_symbols_containing_the_caret() {
         let engine = Engine::new();
         let text = "struct Foo;\n\nimpl Foo {\n    fn bar(&self) {\n        let x = 1;\n    }\n}\n";
@@ -754,6 +789,15 @@ mod tests {
         // A buffer with no language answers with nothing, not an error.
         let plain = engine.create_buffer("just text\n");
         assert!(engine.outline_path(plain, 0, 2).unwrap().is_empty());
+
+        // The boundary byte between two siblings belongs to one symbol, not
+        // both — Zed keeps only strictly nesting items (buffer.rs:4475-4482).
+        let touching = engine.create_buffer("fn a() {}fn b() {}\n");
+        assert!(engine.set_language(touching, "rust").unwrap());
+        assert_eq!(
+            engine.outline_path(touching, 0, 9).unwrap(),
+            vec!["fn a".to_owned()]
+        );
     }
 
     #[test]

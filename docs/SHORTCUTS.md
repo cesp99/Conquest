@@ -228,6 +228,20 @@ cursor, and the exact scroll position — not just the line number.
 `Ctrl` `G` is deliberately not offered while a terminal has the keyboard, where
 it is BEL and readline's abort.
 
+## Outline
+
+`Ctrl` `Shift` `O` opens the outline — every symbol in the file, nested as the
+code nests, exactly Zed's `outline::Toggle`. Tapping the **breadcrumbs** above
+the editor opens it too, which is Zed's own wiring for them and the touch
+route. Type to filter; the caret follows the selected symbol **as you
+browse**, the way go-to-line previews.
+
+| Shortcut | Action |
+|---|---|
+| `↑` / `↓` | Browse — the editor follows |
+| `Enter`, or a tap | Keep the caret on the symbol |
+| `Esc` | Put the caret, the selection and the view back where they were |
+
 ## Preview
 
 `Ctrl` `Shift` `M` previews the open file — a `.md` rendered, or a `.svg`

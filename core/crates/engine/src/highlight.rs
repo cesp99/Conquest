@@ -59,6 +59,21 @@ pub const STYLE_NAMES: &[&str] = &[
     "variable.special",
 ];
 
+/// One row of the buffer's outline: an item's label ("fn bar"), how deep it
+/// nests, and where the *item* starts — the caret target when the picker
+/// confirms it, which is Zed's behaviour (outline.rs:417-425 selects the
+/// item range's start, e.g. the `pub` or `impl`, not the name). `end_row`
+/// closes the item's extent so the picker can find the symbol containing
+/// the caret without a second engine call.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OutlineItem {
+    pub label: String,
+    pub depth: u32,
+    pub row: u32,
+    pub col_utf16: u32,
+    pub end_row: u32,
+}
+
 /// One highlighted range on one row. Columns are UTF-16 offsets within the
 /// row's line, ready for Compose's AnnotatedString ranges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,11 +422,11 @@ impl HighlightState {
     /// The symbol path containing `offset`, outermost first — what Zed's
     /// breadcrumbs show after the file name ("impl Foo" › "fn bar").
     ///
-    /// Each entry is the item's `@context` and `@name` captures in source
-    /// order, joined with single spaces, exactly how Zed's outline items get
-    /// their text (crates/language/src/buffer.rs, `outline_items_containing`).
-    /// Reads whatever tree the last parse produced — a caret move must never
-    /// pay for a reparse; a stale answer lasts one worker round-trip.
+    /// The query is clamped to a two-byte window around the caret, as Zed's
+    /// `symbols_containing` clamps it (buffer.rs:4471-4474) — an @item
+    /// intersecting the window is still reported whole. Reads whatever tree
+    /// the last parse produced — a caret move must never pay for a reparse;
+    /// a stale answer lasts one worker round-trip.
     pub fn outline_path(&self, text: &Rope, offset: usize) -> Vec<String> {
         let Some(tree) = &self.tree else {
             return Vec::new();
@@ -421,6 +436,7 @@ impl HighlightState {
         };
         let mut items: Vec<(usize, usize, String)> = Vec::new();
         let mut cursor = QueryCursor::new();
+        cursor.set_byte_range(offset.saturating_sub(1)..offset.saturating_add(1));
         let mut matches =
             cursor.matches(&outline.query, tree.root_node(), RopeTextProvider(text));
         while let Some(match_) = matches.next() {
@@ -436,38 +452,140 @@ impl HighlightState {
             if offset < start || offset > end {
                 continue;
             }
-            let mut parts: Vec<(usize, String)> = match_
-                .captures
-                .iter()
-                .filter(|capture| {
-                    capture.index == outline.name || Some(capture.index) == outline.context
-                })
-                .map(|capture| {
-                    let range = capture.node.byte_range();
-                    let mut piece = String::with_capacity(range.len().min(64));
-                    for chunk in text.chunks_in_range(range.clone()) {
-                        piece.push_str(chunk);
-                    }
-                    (range.start, piece)
-                })
-                .collect();
-            if parts.is_empty() {
+            let Some(label) = self.outline_label(text, match_) else {
                 continue;
-            }
-            parts.sort_by_key(|(at, _)| *at);
-            let mut label = String::new();
-            for (_, piece) in parts {
-                if !label.is_empty() {
-                    label.push(' ');
-                }
-                // A multi-line name (a long impl type) collapses to one line.
-                label.push_str(&piece.split_whitespace().collect::<Vec<_>>().join(" "));
-            }
+            };
             items.push((start, end, label));
         }
         // Outermost first: containing ranges start earlier or end later.
         items.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-        items.into_iter().map(|(_, _, label)| label).collect()
+        // Zed keeps only strictly nesting items (buffer.rs:4475-4482): a
+        // caret on the boundary byte between two siblings would otherwise
+        // claim to be in both.
+        let mut kept: Vec<(usize, usize, String)> = Vec::new();
+        for (start, end, label) in items {
+            if let Some(last) = kept.last() {
+                let (kept_start, kept_end) = (last.0, last.1);
+                let inside = start >= kept_start
+                    && end <= kept_end
+                    && (start > kept_start || end < kept_end);
+                if !inside {
+                    continue;
+                }
+            }
+            kept.push((start, end, label));
+        }
+        kept.into_iter().map(|(_, _, label)| label).collect()
+    }
+
+    /// Every outline item in the buffer, in source order, with its nesting
+    /// depth and the row/column of the item's start — Zed's outline picker's
+    /// rows (crates/outline/src/outline.rs renders exactly this list).
+    pub fn outline_items(&self, text: &Rope) -> Vec<OutlineItem> {
+        let Some(tree) = &self.tree else {
+            return Vec::new();
+        };
+        let Some(outline) = &self.language.outline else {
+            return Vec::new();
+        };
+        struct Raw {
+            start: usize,
+            end: usize,
+            label: String,
+        }
+        let mut raw: Vec<Raw> = Vec::new();
+        let mut cursor = QueryCursor::new();
+        let mut matches =
+            cursor.matches(&outline.query, tree.root_node(), RopeTextProvider(text));
+        while let Some(match_) = matches.next() {
+            let Some(item) = match_
+                .captures
+                .iter()
+                .find(|capture| capture.index == outline.item)
+            else {
+                continue;
+            };
+            let Some(label) = self.outline_label(text, match_) else {
+                continue;
+            };
+            raw.push(Raw {
+                start: item.node.start_byte(),
+                end: item.node.end_byte(),
+                label,
+            });
+        }
+        raw.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+        // Depth is how many earlier items still enclose this one.
+        let mut open: Vec<usize> = Vec::new();
+        raw.into_iter()
+            .map(|item| {
+                while matches!(open.last(), Some(&end) if end < item.end) {
+                    open.pop();
+                }
+                let depth = open.len() as u32;
+                open.push(item.end);
+                let utf16 = text.offset_to_point_utf16(item.start);
+                let end_row = text.offset_to_point_utf16(item.end).row;
+                OutlineItem {
+                    label: item.label,
+                    depth,
+                    row: utf16.row,
+                    col_utf16: utf16.column,
+                    end_row,
+                }
+            })
+            .collect()
+    }
+
+    /// The label of one outline match, rendered as Zed renders it
+    /// (buffer.rs:4699-4756): the @context and @name captures in source
+    /// order, each clipped to the first line it starts on, with a joining
+    /// space only where the source itself has a gap — so `fn bar` keeps its
+    /// space and `#define FOO(` keeps its bracket tight. None when the match
+    /// has no @name or the label comes out empty.
+    fn outline_label(
+        &self,
+        text: &Rope,
+        match_: &tree_sitter::QueryMatch<'_, '_>,
+    ) -> Option<String> {
+        let outline = self.language.outline.as_ref()?;
+        match_
+            .captures
+            .iter()
+            .find(|capture| capture.index == outline.name)?;
+        let mut ranges: Vec<Range<usize>> = match_
+            .captures
+            .iter()
+            .filter(|capture| {
+                capture.index == outline.name || Some(capture.index) == outline.context
+            })
+            .map(|capture| {
+                let range = capture.node.byte_range();
+                // Clip a multi-line capture to its first line, as Zed does.
+                let start_point = text.offset_to_point(range.start);
+                let line_end = text.point_to_offset(Point::new(
+                    start_point.row,
+                    text.line_len(start_point.row),
+                ));
+                range.start..range.end.min(line_end).max(range.start)
+            })
+            .collect();
+        ranges.sort_by_key(|range| range.start);
+        let mut label = String::new();
+        let mut last_end: Option<usize> = None;
+        for range in ranges {
+            if let Some(prev) = last_end {
+                if !label.is_empty() && range.start > prev {
+                    label.push(' ');
+                }
+            }
+            for chunk in text.chunks_in_range(range.clone()) {
+                label.push_str(chunk);
+            }
+            last_end = Some(range.end.max(last_end.unwrap_or(0)));
+        }
+        let label = label.trim().to_string();
+        if label.is_empty() { None } else { Some(label) }
     }
 
     pub fn highlights(&self, text: &Rope, range: Range<usize>) -> Vec<HighlightSpan> {

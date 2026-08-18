@@ -319,6 +319,30 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferOutlineP
     }
 }
 
+/// Every outline item in the buffer, in source order — the rows of Zed's
+/// outline picker — as a JSON array of `{label, depth, row, col_utf16}`.
+/// Empty array when the buffer has no language; null for unknown buffers.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferOutline(
+    env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+) -> jstring {
+    match engine().outline(buffer_id as u64) {
+        Ok(items) => {
+            let json = serde_json::to_string(&items).unwrap_or_else(|err| {
+                log::warn!("bufferOutline failed to serialize: {err}");
+                "[]".to_owned()
+            });
+            to_jstring(&env, json)
+        }
+        Err(err) => {
+            log::warn!("bufferOutline failed: {err}");
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Byte offset of (row, byte column), clipped to the buffer. -1 for an
 /// unknown buffer or negative arguments.
 #[unsafe(no_mangle)]
