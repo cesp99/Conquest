@@ -116,9 +116,18 @@ object LanguageServers {
             language = "Rust",
             server = "rust-analyzer",
             grammars = listOf("rust"),
-            // Debian stable/main, 1.85.0+dfsg3-1. The one server that wants a
-            // real Cargo workspace before it says anything interesting.
-            packages = listOf("rust-analyzer"),
+            // Debian stable/main, 1.85.0+dfsg3-1 — **and `cargo`**, which it
+            // does not depend on and cannot work without: rust-analyzer
+            // builds its crate graph by running `cargo metadata`, so without
+            // cargo it starts, initializes, reports a clean file and answers
+            // no completion at all. Proved on the emulator: with
+            // rust-analyzer alone, `which cargo` says nothing and `x.` in a
+            // Rust file offers nothing while the server sits there refreshing
+            // semantic tokens. This is the pyflakes lesson again — a server
+            // that runs and says nothing is the failure mode this table
+            // exists to prevent.
+            packages = listOf("rust-analyzer", "cargo"),
+            note = "rust-analyzer reads the crate graph with cargo, so both are installed.",
         ),
         LanguageServerPackage(
             language = "C and C++",

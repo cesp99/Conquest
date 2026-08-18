@@ -259,13 +259,16 @@ class LanguageServersTest {
     @Test
     fun asksWithoutAPriceRatherThanInventingOne() {
         val rust = LanguageServers.forGrammar("rust")!!
+        // Both packages are named: rust-analyzer builds its crate graph by
+        // running `cargo metadata`, and without cargo it starts, looks
+        // healthy and answers nothing — proved on the emulator.
         assertEquals(
-            "Rust needs a language server — install rust-analyzer?",
+            "Rust needs a language server — install rust-analyzer and cargo?",
             LanguageServers.question(rust, null),
         )
         val blind = LanguageServers.parsePlan("E: Unable to locate package rust-analyzer\n")
         assertEquals(
-            "Rust needs a language server — install rust-analyzer?",
+            "Rust needs a language server — install rust-analyzer and cargo?",
             LanguageServers.question(rust, blind),
         )
         assertTrue(
