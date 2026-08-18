@@ -2,7 +2,6 @@ package to.eyed.conquest.code.core
 
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -46,8 +45,6 @@ class AppSettingsAgentsTest {
         assertEquals("custom:My agent", mine.id)
         assertEquals(listOf("python3", "/root/agent.py", "--acp"), mine.argv)
         assertEquals(mapOf("TOKEN" to "x"), mine.env)
-        // Configured by hand: there is no npm package to tell the user about.
-        assertNull(mine.installCommand)
 
         val bare = parsed.agents[0]
         assertEquals(listOf("some-agent"), bare.argv)
@@ -83,36 +80,17 @@ class AppSettingsAgentsTest {
 
     // --- the picker's list ----------------------------------------------------
 
-    @Test
-    fun configuredAgentsAppendAfterTheBuiltIns() {
-        val custom = AgentDefinition(id = "custom:Mine", name = "Mine", argv = listOf("mine"))
-        val all = Agents.all(listOf(custom))
-        assertEquals(
-            listOf("Claude Code", "Gemini CLI", "Mine"),
-            all.map { it.name },
-        )
-        assertEquals(custom, Agents.byId("custom:Mine", listOf(custom)))
-        assertNull(
-            "a custom id resolves only through the configured list",
-            Agents.byId("custom:Mine"),
-        )
-    }
-
     /**
-     * A configured agent named exactly like a built-in *replaces* it: pointing
-     * "Claude Code" at your own wrapper is one settings entry, not a second
-     * row with the same name and a coin-toss over which one a tap launches.
+     * The picker *is* the configured list — nothing else. ACP is a standard
+     * and the panel is agent-agnostic by the owner's ruling: no agent is
+     * named in code, so an empty `agent_servers` means an empty picker (which
+     * the panel renders as Zed's empty state), never a vendor list.
      */
     @Test
-    fun aSameNamedConfiguredAgentReplacesTheBuiltIn() {
-        val mine = AgentDefinition(
-            id = "custom:Claude Code",
-            name = "Claude Code",
-            argv = listOf("my-claude-wrapper"),
-        )
-        val all = Agents.all(listOf(mine))
-        assertEquals(listOf("Gemini CLI", "Claude Code"), all.map { it.name })
-        assertEquals(listOf("my-claude-wrapper"), all.last().argv)
+    fun thePickerOffersExactlyWhatIsConfigured() {
+        assertTrue(settings("{}").agents.isEmpty())
+        val parsed = settings("""{"Mine": {"command": "mine"}}""")
+        assertEquals(listOf("Mine"), parsed.agents.map { it.name })
     }
 
     // --- the spec that crosses the bridge --------------------------------------

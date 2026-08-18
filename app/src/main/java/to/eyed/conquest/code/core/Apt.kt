@@ -21,7 +21,7 @@ import to.eyed.conquest.code.terminal.Userland
  * something costs without installing it, how to read the answer, and how to
  * turn apt's failures into a sentence. Phase 6 needs the same thing for Node,
  * and a second copy would be a second behaviour, so the general half lives
- * here and the two callers ([LanguageServers], [AgentRuntime]) supply only
+ * here and the two callers ([LanguageServers], the language-server table) supply only
  * what differs: which packages, and what to say about them.
  *
  * **Nothing here installs anything on its own.** Every path starts from

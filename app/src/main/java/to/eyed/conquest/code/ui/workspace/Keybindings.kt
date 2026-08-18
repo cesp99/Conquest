@@ -110,7 +110,10 @@ enum class WorkspaceCommand(
     RevealInProjectPanel("pane::RevealInProjectPanel", isAvailable = { it.hasActiveFile }),
 
     /** Show or hide the project panel. */
-    ToggleProjectPanel("project_panel::Toggle"),
+    ToggleProjectPanel(
+        "project_panel::Toggle",
+        isAvailable = { "project_panel" !in it.hiddenPanels },
+    ),
 
     /** Open the project picker (switch, create, import, export). */
     OpenProjects("projects::Open"),
@@ -128,7 +131,10 @@ enum class WorkspaceCommand(
      * them appears is a property of the file, not a choice the user makes.
      * Unavailable — greyed, not hidden — on a file with neither.
      */
-    TogglePreview("conquest::TogglePreview", isAvailable = { it.canPreview }),
+    TogglePreview(
+        "conquest::TogglePreview",
+        isAvailable = { it.canPreview && "preview" !in it.hiddenPanels },
+    ),
 
     /** Open the settings screen. */
     OpenSettings("conquest::OpenSettings"),
@@ -198,7 +204,10 @@ enum class WorkspaceCommand(
      * Show or hide the git panel — Zed's `git_panel::ToggleFocus`, on the
      * chord Zed gives it (default-linux.json:700).
      */
-    ToggleGitPanel("git_panel::ToggleFocus", isAvailable = { it.hasProject }),
+    ToggleGitPanel(
+        "git_panel::ToggleFocus",
+        isAvailable = { it.hasProject && "git_panel" !in it.hiddenPanels },
+    ),
 
     /**
      * Show or hide the agent panel — Zed's `agent::ToggleFocus`, on the chord
@@ -211,7 +220,7 @@ enum class WorkspaceCommand(
     ToggleAgentPanel(
         "agent::ToggleFocus",
         isOffered = { it.canUseAgent },
-        isAvailable = { it.hasProject },
+        isAvailable = { it.hasProject && "agent_panel" !in it.hiddenPanels },
     ),
 
     /**

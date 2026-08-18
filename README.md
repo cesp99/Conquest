@@ -28,9 +28,9 @@ agents as first-class citizens through the
   `proot` — `apt install` whatever you need, from Debian's own
   repositories, on your phone. The terminal emulation builds on the
   excellent work of [Termux](https://termux.dev).
-- **AI-native via ACP.** Any ACP-speaking agent (Claude Code, Gemini
-  CLI, custom agents) can run against your project, with the same
-  panel-based agent UX Zed pioneered.
+- **AI-native via ACP.** ACP is a standard and the panel is
+  agent-agnostic: any ACP-speaking agent you configure can run against
+  your project, with the same panel-based agent UX Zed pioneered.
 - **No telemetry. No analytics. Ever.** In the tradition of
   [VSCodium](https://vscodium.com): the user's code and behavior are
   nobody's business.
@@ -90,7 +90,7 @@ Samsung DeX.
 | Navigation history | ✅ back and forward across the places you jumped from |
 | Language servers on-device | ✅ diagnostics, completions, hover, go-to-definition; servers installed with `apt` (`full` edition) |
 | Interface size | ✅ `Ctrl+=` / `Ctrl+-` / `Ctrl+0`, and a settings row — all the chrome scales |
-| ACP agent panel | ✅ conversations with any ACP agent — permission-gated edits, unified diff review, plans; built-ins launch Claude Code/Gemini CLI, `agent_servers` in settings.json adds your own (`full` edition) |
+| ACP agent panel | ✅ conversations with any ACP agent — permission-gated edits, unified diff review, plans; agents are configured in `agent_servers` (settings.json or the Settings screen), none are bundled or named in code (`full` edition) |
 
 ## Editions
 

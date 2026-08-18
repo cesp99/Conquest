@@ -80,8 +80,10 @@ class DockLayout {
     }
 
     /** Whether [panel] is the one its own dock is showing. */
-    fun isOpen(panel: WorkspacePanel, settings: AppSettings): Boolean =
-        active(panel.sideIn(settings)) == panel
+    fun isOpen(panel: WorkspacePanel, settings: AppSettings): Boolean {
+        val side = panel.sideIn(settings)
+        return side != DockSide.Hidden && active(side) == panel
+    }
 
     /**
      * Bring [panel]'s dock to the front when the screen cannot show both.
@@ -94,7 +96,7 @@ class DockLayout {
      */
     fun raise(panel: WorkspacePanel, settings: AppSettings) {
         val side = panel.sideIn(settings)
-        if (active(side) != panel) return
+        if (side == DockSide.Hidden || active(side) != panel) return
         lastOpened = side
     }
 
@@ -106,10 +108,12 @@ class DockLayout {
      * Show [panel], seeding its dock's width the first time. Returns false when
      * it was already showing — the caller decides whether that means "close it"
      * or "put the keyboard back in it", which is the difference between a
-     * button press and a chord.
+     * button press and a chord. A panel whose dock is `"hidden"` never opens:
+     * hidden means switched off, not "somewhere else".
      */
     fun open(panel: WorkspacePanel, settings: AppSettings): Boolean {
         val side = panel.sideIn(settings)
+        if (side == DockSide.Hidden) return false
         if (active(side) == panel) return false
         if (width(side) == null) setWidth(side, panel.widthIn(settings))
         show(side, panel)
@@ -119,6 +123,7 @@ class DockLayout {
 
     fun close(panel: WorkspacePanel, settings: AppSettings) {
         val side = panel.sideIn(settings)
+        if (side == DockSide.Hidden) return
         if (active(side) == panel) show(side, null)
     }
 
@@ -136,6 +141,11 @@ class DockLayout {
      * on the *new* side, so the two disagree.
      */
     fun reconcile(settings: AppSettings) {
+        // A panel whose dock just became `"hidden"` is closed, not moved:
+        // hiding an open panel from settings must take it off the screen, or
+        // the row would look like it did nothing.
+        if (left?.sideIn(settings) == DockSide.Hidden) left = null
+        if (right?.sideIn(settings) == DockSide.Hidden) right = null
         val movedFromLeft = left?.takeIf { it.sideIn(settings) != DockSide.Left }
         val movedFromRight = right?.takeIf { it.sideIn(settings) != DockSide.Right }
         if (movedFromLeft == null && movedFromRight == null) return

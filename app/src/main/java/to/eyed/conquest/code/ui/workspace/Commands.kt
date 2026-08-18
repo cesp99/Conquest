@@ -56,6 +56,12 @@ data class CommandContext(
     val canPreview: Boolean = false,
     /** Whether the navigation history has anywhere to go back to. */
     val canGoBack: Boolean = false,
+    /**
+     * Settings keys of panels whose dock is `"hidden"`: their toggle commands
+     * grey out rather than silently doing nothing, because a hidden panel is
+     * switched off and its chord must say so, not shrug.
+     */
+    val hiddenPanels: Set<String> = emptySet(),
     /** …or forward to, which only a GoBack can set up. */
     val canGoForward: Boolean = false,
 )

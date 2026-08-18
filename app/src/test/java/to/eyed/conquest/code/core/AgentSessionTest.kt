@@ -110,7 +110,7 @@ class AgentSessionTest {
         )
         assertEquals(AgentPhase.Unavailable, state.phase)
         assertFalse(state.canPrompt)
-        assertTrue(AgentRuntime.looksLikeMissingProgram(state.error))
+        assertTrue(Agents.looksLikeMissingProgram(state.error))
     }
 
     // --- the entries ---------------------------------------------------------

@@ -1122,7 +1122,7 @@ fun WorkspaceScreen(
                 canSplit = isWide,
             )
             dockTookWorkArea = plan.fullScreen
-            drawnDocks = DockSide.entries.filter { plan.draws(it) }.toSet()
+            drawnDocks = DockSide.docks.filter { plan.draws(it) }.toSet()
             val terminalIsFullScreen = !isWide && terminals.isOpen && plan.fullScreen == null
             Box(modifier = Modifier.weight(1f)) {
                 val fullScreen = plan.fullScreen
@@ -1140,6 +1140,7 @@ fun WorkspaceScreen(
                         onOpenEntry = onOpenEntry,
                         onOpenMatch = ::openMatch,
                         onOpenPath = ::openFromDock,
+                        onOpenSettings = { runCommand(WorkspaceCommand.OpenSettings) },
                         onOpenDiff = ::openDiff,
                         onOpenGraph = ::openGraph,
                         onEntryRemoved = ::closeTabsUnder,
@@ -1161,7 +1162,7 @@ fun WorkspaceScreen(
                     )
                 } else {
                     Row(modifier = Modifier.fillMaxSize()) {
-                        for (side in DockSide.entries) {
+                        for (side in DockSide.docks) {
                             val panel = docks.active(side)?.takeIf { plan.draws(side) }
                             // The editor sits between the two, so it is drawn
                             // when the loop reaches the right-hand dock.
@@ -1252,6 +1253,9 @@ fun WorkspaceScreen(
                                         onOpenEntry = onOpenEntry,
                                         onOpenMatch = ::openMatch,
                                         onOpenPath = ::openFromDock,
+                                        onOpenSettings = {
+                                            runCommand(WorkspaceCommand.OpenSettings)
+                                        },
                                         onOpenDiff = ::openDiff,
                                         onOpenGraph = ::openGraph,
                                         onEntryRemoved = ::closeTabsUnder,
@@ -1433,6 +1437,47 @@ fun WorkspaceScreen(
             } else {
                 null
             },
+            // The External Agents section — absent entirely in the `play`
+            // edition, which has no userland to run an agent in.
+            onSaveAgent = if (isAgentPanelSupported) {
+                { originalName, name, command, args ->
+                    scope.launch {
+                        val updated = withContext(Dispatchers.IO) {
+                            // A rename removes the old entry first, as Zed's
+                            // form does (external_agents_page.rs:762-769); an
+                            // edit keeps the entry's env, which the form does
+                            // not carry.
+                            if (originalName != null && originalName != name) {
+                                AppSettings.removeAgent(originalName)
+                            }
+                            val env = settings.agents
+                                .firstOrNull { it.name == originalName }?.env.orEmpty()
+                            AppSettings.saveAgent(name, command, args, env)
+                        }
+                        if (updated != null) {
+                            onSettingsChanged(updated)
+                            settingsRefusal = null
+                        } else {
+                            settingsRefusal =
+                                "The agent \"$name\" could not be written to settings.json."
+                        }
+                    }
+                }
+            } else {
+                null
+            },
+            onRemoveAgent = { name ->
+                scope.launch {
+                    val updated = withContext(Dispatchers.IO) { AppSettings.removeAgent(name) }
+                    if (updated != null) {
+                        onSettingsChanged(updated)
+                        settingsRefusal = null
+                    } else {
+                        settingsRefusal =
+                            "The agent \"$name\" could not be removed from settings.json."
+                    }
+                }
+            },
         )
     }
 
@@ -1478,6 +1523,10 @@ fun WorkspaceScreen(
                 canPreview = canPreviewActiveFile(),
                 canGoBack = files.canGoBack,
                 canGoForward = files.canGoForward,
+                hiddenPanels = WorkspacePanel.entries
+                    .filter { it.sideIn(settings) == DockSide.Hidden }
+                    .map { it.settingsKey }
+                    .toSet(),
             ),
             onRun = { runCommand(it) },
             onDismiss = {
@@ -1872,6 +1921,8 @@ private fun DockPanel(
     onEntryMoved: (String, String) -> Unit,
     /** The project panel reporting whether it holds the keyboard. */
     onPanelFocusChanged: (Boolean) -> Unit,
+    /** Open the settings screen — the agent panel's empty state points here. */
+    onOpenSettings: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     when (panel) {
@@ -1910,6 +1961,7 @@ private fun DockPanel(
             project = project ?: return,
             focusToken = agentFocus,
             onOpenPath = onOpenPath,
+            onOpenSettings = onOpenSettings,
         )
     }
 }

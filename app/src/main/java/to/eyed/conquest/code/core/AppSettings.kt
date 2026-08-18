@@ -37,13 +37,29 @@ enum class ThemeMode(val key: String) {
  * comments through edits made here (see `core/crates/engine/src/config.rs`).
  * This is just the read model; every field is wired to something visible.
  */
-/** Which side of the workspace a panel lives on — Zed's `dock`. */
+/**
+ * Which side of the workspace a panel lives on — Zed's `dock` — plus
+ * [Hidden], this app's third answer: the panel is switched off, its
+ * status-bar button gone and its commands refusing. Zed separates that into a
+ * per-panel `"button"` key; here it is one row with three answers, by the
+ * owner's design.
+ */
 enum class DockSide(val key: String, val label: String) {
     Left("left", "Left"),
-    Right("right", "Right");
+    Right("right", "Right"),
+    Hidden("hidden", "Hidden");
 
     companion object {
         fun fromKey(key: String?): DockSide = entries.firstOrNull { it.key == key } ?: Left
+
+        /**
+         * The docks that exist on screen. **Iterate this, never [entries]**,
+         * when walking the workspace's docks: [Hidden] is a per-panel state,
+         * not a third dock — an `entries` loop treated it as one and drew the
+         * right dock's panel twice, because every `left-else-right` branch
+         * reads Hidden as Right.
+         */
+        val docks: List<DockSide> = listOf(Left, Right)
     }
 }
 
@@ -68,11 +84,10 @@ data class AppSettings(
     /** How gitignored entries appear in the project tree. */
     val gitignoredFiles: GitignoredFiles = GitignoredFiles.Dimmed,
     /**
-     * ACP agents configured by hand — Zed's `agent_servers`, in name order.
-     *
-     * This is what makes the panel's promise of *any* ACP agent true rather
-     * than "the two we happen to name": the command runs inside the Linux
-     * userland, so anything on Debian's PATH that speaks the protocol counts.
+     * ACP agents — Zed's `agent_servers`, in name order, and the *only*
+     * source of agents there is: the panel names none of its own. The command
+     * runs inside the Linux userland, so anything on Debian's PATH that
+     * speaks the protocol counts.
      */
     val agents: List<AgentDefinition> = emptyList(),
 ) {
@@ -167,9 +182,6 @@ data class AppSettings(
                     env = env?.keys()?.asSequence()?.associateWith { key ->
                         env.optString(key)
                     }.orEmpty(),
-                    // Configured by hand, so there is nothing for the panel to
-                    // tell the user to install.
-                    npmPackage = null,
                 )
             }.sortedBy { it.name }.toList()
         }
@@ -183,5 +195,29 @@ data class AppSettings(
          */
         fun set(keyPath: String, valueJson: String): AppSettings? =
             CoreBridge.setSetting(keyPath, valueJson)?.let(::parse)
+
+        /**
+         * Add or replace one `agent_servers` entry — the Add Agent form,
+         * saved. The name travels whole (never through [set]'s dot-split key
+         * path, where "my.agent" would nest). **Blocking** — call it off the
+         * main thread.
+         */
+        fun saveAgent(
+            name: String,
+            command: String,
+            args: List<String>,
+            env: Map<String, String> = emptyMap(),
+        ): AppSettings? {
+            val spec = JSONObject().apply {
+                put("command", command)
+                put("args", org.json.JSONArray(args))
+                put("env", JSONObject(env))
+            }
+            return CoreBridge.setAgentServer(name, spec.toString())?.let(::parse)
+        }
+
+        /** Remove one `agent_servers` entry. **Blocking** — off the main thread. */
+        fun removeAgent(name: String): AppSettings? =
+            CoreBridge.removeAgentServer(name)?.let(::parse)
     }
 }

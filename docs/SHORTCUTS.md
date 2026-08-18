@@ -164,11 +164,11 @@ to the ends of the *line*, not of the screen row.
 ## Panels and docks
 
 Every panel lives in a dock — left or right — and each one's side is a setting,
-as in Zed: **Settings** → *Project panel* / *Git panel* / *Project search* /
-*Preview* / *Agent panel*, or `project_panel.dock` and friends in
-settings.json. Its button in
-the status bar moves with it, so the button is always on the side the panel
-will appear.
+as in Zed: **Settings** → *Panels*, or `project_panel.dock` and friends in
+settings.json. Its button in the status bar moves with it, so the button is
+always on the side the panel will appear. The third answer is `"hidden"`:
+the panel is switched off — its button leaves the status bar and its
+commands grey out — until the setting says otherwise.
 
 | Shortcut | Action |
 |---|---|
@@ -217,9 +217,8 @@ screen and leaving the editor a character wide.
 
 ## Agent panel
 
-`Ctrl` `Alt` `A` opens a conversation with an ACP agent — Claude Code, Gemini
-CLI, or anything else that speaks the protocol — working on the open project.
-Pressing it again puts the keyboard back in the composer.
+`Ctrl` `Alt` `A` opens a conversation with an ACP agent working on the open
+project. Pressing it again puts the keyboard back in the composer.
 
 | Shortcut | Action |
 |---|---|
@@ -244,16 +243,11 @@ file the turn stops, the diff appears in the conversation, and **Allow** and
 **Deny** sit underneath it — the change and the choice on one screen. Diffs are
 unified, never side by side.
 
-The agent runs inside the Linux userland, so this panel is absent from the Play
-edition entirely. It needs Node, which the panel offers to install with apt the
-way a language server is installed, and an agent, which you install yourself:
-the panel shows the `npm install -g …` line to run in the terminal.
-
-**Any agent, not just those two.** Add your own under `agent_servers` in
-settings.json — the same key Zed uses — and it appears in the picker. The file
-opens as an ordinary editor tab from `☰` → **Edit settings.json**, the command
-palette's `zed: open settings file`, or the link at the bottom of the Settings
-screen; saving it applies it.
+**Agent-agnostic, like the protocol.** ACP is a standard, so the panel names
+no agent of its own and installs nothing: every agent comes from
+`agent_servers` in settings.json — the same key Zed uses — and the picker
+offers exactly that list. Add, edit and remove entries from **Settings** →
+*External Agents* (name, command, arguments), or write the file yourself:
 
 ```jsonc
 "agent_servers": {
@@ -263,11 +257,15 @@ screen; saving it applies it.
 
 The command runs inside the Linux userland, so it is anything on Debian's
 PATH — or an absolute path in the guest — that speaks the Agent Client
-Protocol on stdin and stdout. An entry named exactly like a built-in
-("Claude Code", "Gemini CLI") replaces it, which is how you point a built-in
-name at your own wrapper. An edit reaches the picker as soon as you save;
-a conversation that is already running keeps the command it started with
-until you press **New**.
+Protocol on stdin and stdout. Putting it there is yours to do, in the
+terminal. settings.json opens as an ordinary editor tab from `☰` → **Edit
+settings.json**, the palette's `zed: open settings file`, or the link at the
+bottom of the Settings screen; saving it applies it. An edit reaches the
+picker as soon as you save; a conversation that is already running keeps the
+command it started with until you press **New**.
+
+The panel runs the agent inside the Linux userland, so it is absent from the
+Play edition entirely.
 
 ## Find in file
 

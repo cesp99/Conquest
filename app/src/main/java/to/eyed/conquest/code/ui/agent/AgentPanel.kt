@@ -1,6 +1,7 @@
 package to.eyed.conquest.code.ui.agent
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -45,7 +46,6 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
@@ -58,13 +58,10 @@ import to.eyed.conquest.code.core.AgentConversation
 import to.eyed.conquest.code.core.AgentDefinition
 import to.eyed.conquest.code.core.AgentEntry
 import to.eyed.conquest.code.core.AgentPhase
-import to.eyed.conquest.code.core.AgentRuntime
-import to.eyed.conquest.code.core.AgentRuntimeInstaller
 import to.eyed.conquest.code.core.AgentSessionState
 import to.eyed.conquest.code.core.AgentSessions
 import to.eyed.conquest.code.core.Agents
 import to.eyed.conquest.code.core.CoreBridge
-import to.eyed.conquest.code.core.AptInstallState
 import to.eyed.conquest.code.core.FileDiff
 import to.eyed.conquest.code.core.PermissionOption
 import to.eyed.conquest.code.core.ProjectSession
@@ -109,10 +106,10 @@ private const val MaxDiffLines = 200
 /**
  * Whether this build can show an agent panel at all.
  *
- * Agents run on Node inside the Linux userland, so the `play` edition — which
- * has no userland and never will — is not offered one, greyed or otherwise.
- * The same rule the git panel, the clone action and the language-server
- * install already follow.
+ * Agents run inside the Linux userland, so the `play` edition — which has no
+ * userland and never will — is not offered one, greyed or otherwise. The
+ * same rule the git panel, the clone action and the language-server install
+ * already follow.
  */
 val isAgentPanelSupported: Boolean
     get() = AgentSessions.isSupported
@@ -147,10 +144,11 @@ fun AgentPanel(
      */
     focusToken: Int,
     onOpenPath: (String) -> Unit,
+    /** Open the settings screen — where agents are added and edited. */
+    onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val theme = LocalZedTheme.current
-    val context = LocalContext.current
     val settings = LocalAppSettings.current
     val composer = remember { FocusRequester() }
 
@@ -187,7 +185,7 @@ fun AgentPanel(
                 // keeps the old definition: the user asked for a session, not
                 // the picker.
                 agent?.let { current ->
-                    Agents.all(settings.agents)
+                    settings.agents
                         .firstOrNull { it.name == current.name }
                         ?.let(AgentSessions::choose)
                 }
@@ -205,8 +203,9 @@ fun AgentPanel(
             )
 
             agent == null -> AgentPicker(
-                agents = Agents.all(settings.agents),
+                agents = settings.agents,
                 onChoose = { AgentSessions.choose(it) },
+                onOpenSettings = onOpenSettings,
             )
 
             AgentSessions.startError != null -> Notice(
@@ -224,9 +223,6 @@ fun AgentPanel(
                     onOpenPath = onOpenPath,
                     onRespond = AgentSessions::respondToPermission,
                     onAuthenticate = AgentSessions::authenticate,
-                    onInstallRuntime = {
-                        AgentRuntimeInstaller.offer(context, AgentRuntime.NODE)
-                    },
                     modifier = Modifier.weight(1f),
                 )
                 HorizontalDivider(color = theme.color("border"))
@@ -322,14 +318,19 @@ private fun BarAction(label: String, onClick: () -> Unit) {
 }
 
 /**
- * Which agent to talk to.
- *
- * Named, not installed: the command that puts each one on the guest's PATH is
- * shown for the user to run in the terminal. Installing somebody's agent —
- * often tied to their own account — is their call, not the editor's.
+ * Which agent to talk to — Zed's External Agents list, as the panel's front
+ * door (settings_ui/src/pages/external_agents_page.rs:51-58): the agents
+ * connected through the Agent Client Protocol, which means exactly what
+ * `agent_servers` configures. No agent is named in code and none is offered
+ * for installation — ACP is a standard, and which agent to run (and how it
+ * gets onto the userland's PATH) is the user's own business.
  */
 @Composable
-private fun AgentPicker(agents: List<AgentDefinition>, onChoose: (AgentDefinition) -> Unit) {
+private fun AgentPicker(
+    agents: List<AgentDefinition>,
+    onChoose: (AgentDefinition) -> Unit,
+    onOpenSettings: () -> Unit,
+) {
     val theme = LocalZedTheme.current
     Column(
         modifier = Modifier
@@ -338,21 +339,40 @@ private fun AgentPicker(agents: List<AgentDefinition>, onChoose: (AgentDefinitio
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Text(
-            text = "CHOOSE AN AGENT",
+            text = "EXTERNAL AGENTS",
             style = MaterialTheme.typography.labelSmall,
             fontWeight = FontWeight.SemiBold,
             color = theme.color("text.muted"),
         )
         Text(
-            text = "The panel runs the agent inside ${Userland.backend.displayName} and " +
-                "gives it this project. Install the one you want with npm in the " +
-                "terminal first.",
+            text = "Agents connected through the Agent Client Protocol, run inside " +
+                "${Userland.backend.displayName} against this project.",
             style = MaterialTheme.typography.bodySmall,
             color = theme.color("text.muted"),
         )
+        if (agents.isEmpty()) {
+            // Zed's dashed empty-state box (external_agents_page.rs:111-125),
+            // pointing at the two ways in: the settings section's form, and
+            // the settings.json key it writes.
+            Text(
+                text = "No external agents added yet. Add one in Settings, or under " +
+                    "agent_servers in settings.json.",
+                style = MaterialTheme.typography.bodySmall,
+                color = theme.color("text.muted"),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(
+                        1.dp,
+                        theme.color("border").copy(alpha = 0.6f),
+                        RoundedCornerShape(FieldRadius),
+                    )
+                    .padding(12.dp),
+            )
+        }
         for (definition in agents) {
             AgentChoice(definition, onClick = { onChoose(definition) })
         }
+        PanelButton("Add Agent", isPrimary = agents.isEmpty(), onClick = onOpenSettings)
     }
 }
 
@@ -389,15 +409,14 @@ private fun AgentChoice(agent: AgentDefinition, onClick: () -> Unit) {
             color = theme.color("text"),
             maxLines = 1,
         )
-        agent.installCommand?.let { command ->
-            Text(
-                text = command,
-                style = MaterialTheme.typography.labelSmall.copy(fontFamily = BufferFontFamily),
-                color = theme.color("text.muted"),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
+        // The command line it will run — identification, not instruction.
+        Text(
+            text = agent.argv.joinToString(" "),
+            style = MaterialTheme.typography.labelSmall.copy(fontFamily = BufferFontFamily),
+            color = theme.color("text.muted"),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
@@ -410,7 +429,6 @@ private fun Conversation(
     onOpenPath: (String) -> Unit,
     onRespond: (toolCall: String, option: String) -> Unit,
     onAuthenticate: (String) -> Unit,
-    onInstallRuntime: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val list = rememberLazyListState()
@@ -466,7 +484,7 @@ private fun Conversation(
         }
         if (state.phase == AgentPhase.Unavailable || state.needsAuth) {
             item(key = "trouble") {
-                Trouble(state, agent, onAuthenticate, onInstallRuntime)
+                Trouble(state, agent, onAuthenticate)
             }
         }
     }
@@ -787,17 +805,14 @@ private fun PermissionRow(options: List<PermissionOption>, onChoose: (Permission
     }
 }
 
-/** What is wrong, and the one thing that would fix it. */
+/** What is wrong, said plainly — the fix is the user's, and they know how. */
 @Composable
 private fun Trouble(
     state: AgentSessionState,
     agent: AgentDefinition?,
     onAuthenticate: (String) -> Unit,
-    onInstallRuntime: () -> Unit,
 ) {
     val theme = LocalZedTheme.current
-    val context = LocalContext.current
-    val install = AgentRuntimeInstaller.state
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -833,77 +848,18 @@ private fun Trouble(
                 }
             }
 
-            // "not found" from the guest means one of two things, and the two
-            // want different answers: Node is ours to offer, the agent is not.
-            AgentRuntime.looksLikeMissingProgram(state.error) -> {
+            // The guest could not find the program. Nothing is offered for
+            // installation — the panel names the command and where it is
+            // configured, and leaves the terminal to the developer.
+            Agents.looksLikeMissingProgram(state.error) -> {
                 Text(
-                    text = "Neither Node nor ${agent?.name ?: "the agent"} was found in " +
-                        "${Userland.backend.displayName}. Node installs from here; the " +
-                        "agent installs with npm in the terminal.",
+                    text = "${Userland.backend.displayName} has no " +
+                        "\"${agent?.argv?.firstOrNull() ?: "agent"}\". Install it in the " +
+                        "terminal, or point this agent's entry in Settings at the right " +
+                        "command.",
                     style = MaterialTheme.typography.bodySmall,
                     color = theme.color("text.muted"),
                 )
-                agent?.installCommand?.let { command ->
-                    Text(
-                        text = command,
-                        style = MaterialTheme.typography.labelSmall
-                            .copy(fontFamily = BufferFontFamily),
-                        color = theme.color("text"),
-                    )
-                }
-                when (install) {
-                    is AptInstallState.Checking ->
-                        Notice("Asking apt what Node would cost…")
-
-                    is AptInstallState.Offered -> {
-                        Text(
-                            text = install.target.question(install.plan),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = theme.color("text"),
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            PanelButton("No, don't install it") {
-                                AgentRuntimeInstaller.dismiss()
-                            }
-                            PanelButton("Install", isPrimary = true) {
-                                AgentRuntimeInstaller.install(context, install.target)
-                            }
-                        }
-                    }
-
-                    is AptInstallState.Installing -> {
-                        Notice(install.step)
-                        // apt can run for minutes; the language-server prompt
-                        // gives the same state a Cancel and so must this.
-                        PanelButton("Cancel", isPrimary = true) {
-                            AgentRuntimeInstaller.cancel()
-                        }
-                    }
-
-                    is AptInstallState.Failed -> {
-                        Notice(install.summary, isError = true)
-                        install.detail?.let { Notice(it) }
-                        // Without this the installer is stuck in `Failed` for
-                        // the life of the process — it is a process-global —
-                        // and the Install button never comes back.
-                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            PanelButton("Dismiss") { AgentRuntimeInstaller.dismiss() }
-                            PanelButton("Try again", isPrimary = true) {
-                                AgentRuntimeInstaller.offer(context, AgentRuntime.NODE)
-                            }
-                        }
-                    }
-
-                    is AptInstallState.Finished ->
-                        Notice(install.target.installedMessage())
-
-                    is AptInstallState.AlreadyInstalled ->
-                        Notice(install.target.alreadyInstalledMessage())
-
-                    AptInstallState.Idle -> PanelButton("Install Node", isPrimary = true) {
-                        onInstallRuntime()
-                    }
-                }
             }
         }
     }
