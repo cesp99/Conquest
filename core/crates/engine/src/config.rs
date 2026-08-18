@@ -72,6 +72,12 @@ pub enum SoftWrap {
 pub enum DockSide {
     Left,
     Right,
+    /// The panel is switched off: no status-bar button, and its commands
+    /// refuse. This app's third value rather than Zed's — Zed hides a
+    /// panel's *button* with a separate per-panel `"button": false` — folded
+    /// into `dock` here by the owner's design: one row per panel, three
+    /// answers, and a hidden panel costs no second key.
+    Hidden,
 }
 
 /// Zed's `git.inline_blame`. An object with one field rather than a bare
@@ -415,6 +421,41 @@ impl crate::Engine {
         key_path: &[&str],
         value: serde_json::Value,
     ) -> Result<Settings, EngineError> {
+        self.edit_settings_value(key_path, Some(value))
+    }
+
+    /// Add or replace one `agent_servers` entry — what the settings screen's
+    /// Add Agent form saves, mirroring Zed's own form, which writes the same
+    /// key (settings_ui/src/pages/external_agents_page.rs:762-770).
+    ///
+    /// **Blocking**: call it off the Android main thread.
+    pub fn set_agent_server(
+        &self,
+        name: &str,
+        agent: CustomAgent,
+    ) -> Result<Settings, EngineError> {
+        let value = serde_json::to_value(&agent)
+            .map_err(|err| EngineError::InvalidSettings(err.to_string()))?;
+        // The name goes into the path verbatim — never through the bridge's
+        // dot-split `set_setting` route, where an agent called "my.agent"
+        // would silently become a nested object.
+        self.edit_settings_value(&["agent_servers", name], Some(value))
+    }
+
+    /// Remove one `agent_servers` entry, as Zed's trash button does
+    /// (external_agents_page.rs:226-249). Removing a name that is not there
+    /// is not an error: the entry is gone either way.
+    ///
+    /// **Blocking**: call it off the Android main thread.
+    pub fn remove_agent_server(&self, name: &str) -> Result<Settings, EngineError> {
+        self.edit_settings_value(&["agent_servers", name], None)
+    }
+
+    fn edit_settings_value(
+        &self,
+        key_path: &[&str],
+        value: Option<serde_json::Value>,
+    ) -> Result<Settings, EngineError> {
         let Some(path) = settings_path() else {
             return Err(EngineError::NoSettingsFile);
         };
@@ -422,10 +463,15 @@ impl crate::Engine {
         let mut text = original.clone();
         let indent = settings_json::infer_json_indent_size(&text).max(1);
         // Surgical: this returns the byte range of just that key's value (or
-        // where to insert it), so everything around it — comments included —
-        // is untouched.
-        let (range, replacement) =
-            settings_json::replace_value_in_json_text(&text, key_path, indent, Some(&value), None);
+        // where to insert it — or, with `None`, what to cut), so everything
+        // around it, comments included, is untouched.
+        let (range, replacement) = settings_json::replace_value_in_json_text(
+            &text,
+            key_path,
+            indent,
+            value.as_ref(),
+            None,
+        );
         text.replace_range(range, &replacement);
         // A value of the wrong shape — a string where an enum has two names,
         // a bool where a number goes — does not break one setting, it breaks
@@ -435,10 +481,10 @@ impl crate::Engine {
         // broke it, and it is put back.
         let was_valid = settings_json::parse_json_with_comments::<Settings>(&original).is_ok();
         if was_valid && settings_json::parse_json_with_comments::<Settings>(&text).is_err() {
-            return Err(EngineError::InvalidSettings(format!(
-                "\"{}\" cannot be set to {value}",
-                key_path.join(".")
-            )));
+            return Err(EngineError::InvalidSettings(match &value {
+                Some(value) => format!("\"{}\" cannot be set to {value}", key_path.join(".")),
+                None => format!("\"{}\" cannot be removed", key_path.join(".")),
+            }));
         }
         std::fs::write(&path, &text).map_err(|err| EngineError::Io {
             path: path.display().to_string(),
@@ -767,6 +813,68 @@ mod tests {
                 .unwrap();
             assert!(settings.agent_servers.is_empty());
             assert_eq!(settings.theme, ThemeMode::Dark);
+        });
+    }
+
+    /// The settings screen's Add Agent form and its trash button, at the
+    /// engine seam: an entry written by name lands under `agent_servers`
+    /// exactly, comments survive, and removal takes only that entry. The name
+    /// goes into the key path verbatim — a dot in it must not open a nested
+    /// object, which is what the dot-split `setSetting` route would do.
+    #[test]
+    fn an_agent_server_can_be_added_and_removed_by_name() {
+        with_settings_dir(|engine, dir| {
+            engine.settings_text(); // materialize the commented default file
+            let agent = CustomAgent {
+                command: "python3".to_owned(),
+                args: vec!["/root/agent.py".to_owned()],
+                env: BTreeMap::from([("KEY".to_owned(), "v".to_owned())]),
+            };
+            let settings = engine.set_agent_server("my.agent", agent.clone()).unwrap();
+            assert_eq!(settings.agent_servers.get("my.agent"), Some(&agent));
+
+            // Replacing the same name is an edit, not a second entry.
+            let mut edited = agent.clone();
+            edited.command = "node".to_owned();
+            let settings = engine.set_agent_server("my.agent", edited.clone()).unwrap();
+            assert_eq!(settings.agent_servers.len(), 1);
+            assert_eq!(settings.agent_servers.get("my.agent"), Some(&edited));
+
+            // A neighbour survives the removal, and so do the file's comments.
+            engine
+                .set_agent_server(
+                    "other",
+                    CustomAgent {
+                        command: "other-agent".to_owned(),
+                        ..CustomAgent::default()
+                    },
+                )
+                .unwrap();
+            let settings = engine.remove_agent_server("my.agent").unwrap();
+            let names: Vec<&str> = settings.agent_servers.keys().map(String::as_str).collect();
+            assert_eq!(names, ["other"]);
+            let text = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+            assert!(text.contains("// Conquest Code settings."));
+            assert!(!text.contains("my.agent"));
+
+            // Removing what is not there is not an error — it is gone.
+            assert!(engine.remove_agent_server("my.agent").is_ok());
+        });
+    }
+
+    /// `"hidden"` is a real third answer for a panel's dock: it parses, it
+    /// survives a write, and it round-trips to the app as `"hidden"`.
+    #[test]
+    fn a_panel_can_be_hidden_by_its_dock_setting() {
+        with_settings_dir(|engine, _dir| {
+            let updated = engine
+                .set_setting(&["git_panel", "dock"], serde_json::json!("hidden"))
+                .unwrap();
+            assert_eq!(updated.git_panel.dock, DockSide::Hidden);
+            // And back from disk, not only from the in-memory return.
+            assert_eq!(engine.settings().git_panel.dock, DockSide::Hidden);
+            let json = serde_json::to_value(engine.settings()).unwrap();
+            assert_eq!(json["git_panel"]["dock"], "hidden");
         });
     }
 

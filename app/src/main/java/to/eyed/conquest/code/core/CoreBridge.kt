@@ -371,6 +371,22 @@ object CoreBridge {
     external fun setSettingsText(text: String): String?
 
     /**
+     * Adds or replaces one `agent_servers` entry — the settings screen's Add
+     * Agent form, saved. [name] goes into the file verbatim (never through
+     * [setSetting]'s dot-split path, where "my.agent" would nest), and
+     * [specJson] is `{"command": …, "args": […], "env": {…}}`. Returns the
+     * resolved settings as JSON, or null on failure.
+     */
+    external fun setAgentServer(name: String, specJson: String): String?
+
+    /**
+     * Removes one `agent_servers` entry by name. Removing a name that is not
+     * there succeeds — the entry is gone either way. Returns the resolved
+     * settings as JSON, or null on failure.
+     */
+    external fun removeAgentServer(name: String): String?
+
+    /**
      * Fuzzy-matches [query] against the project's files, best first, as a JSON
      * array of objects with `path`, `name`, `positions` (UTF-16 offsets into
      * `path`, for highlighting) and `score`. An empty query lists files rather

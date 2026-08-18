@@ -947,6 +947,66 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_setSetting(
     }
 }
 
+/// Add or replace one `agent_servers` entry. `name` is the entry's key,
+/// verbatim — not dot-split like `setSetting`'s path, so a name containing a
+/// dot stays one key — and `spec_json` is a `CustomAgent`:
+/// `{"command": …, "args": […], "env": {…}}`. Returns the resolved settings
+/// as JSON, or null on failure.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_setAgentServer(
+    mut env: JNIEnv,
+    _class: JClass,
+    name: JString,
+    spec_json: JString,
+) -> jstring {
+    let name = get_string(&mut env, &name);
+    let spec_json = get_string(&mut env, &spec_json);
+    let agent: engine::CustomAgent = match serde_json::from_str(&spec_json) {
+        Ok(agent) => agent,
+        Err(err) => {
+            log::warn!("setAgentServer: {spec_json:?} is not an agent spec: {err}");
+            return std::ptr::null_mut();
+        }
+    };
+    match engine().set_agent_server(&name, agent) {
+        Ok(settings) => match serde_json::to_string(&settings) {
+            Ok(json) => to_jstring(&env, json),
+            Err(err) => {
+                log::warn!("setAgentServer failed to serialize: {err}");
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            log::warn!("setAgentServer failed: {err}");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Remove one `agent_servers` entry by name. Removing a name that is not
+/// there succeeds. Returns the resolved settings as JSON, or null on failure.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_removeAgentServer(
+    mut env: JNIEnv,
+    _class: JClass,
+    name: JString,
+) -> jstring {
+    let name = get_string(&mut env, &name);
+    match engine().remove_agent_server(&name) {
+        Ok(settings) => match serde_json::to_string(&settings) {
+            Ok(json) => to_jstring(&env, json),
+            Err(err) => {
+                log::warn!("removeAgentServer failed to serialize: {err}");
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            log::warn!("removeAgentServer failed: {err}");
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Replace the whole settings file. Returns the resolved settings as JSON, or
 /// null if the text doesn't parse — in which case the file is left untouched.
 #[unsafe(no_mangle)]

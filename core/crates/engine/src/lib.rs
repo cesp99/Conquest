@@ -57,7 +57,7 @@ mod project_search;
 mod runtime;
 mod search;
 
-pub use config::{GitignoredFiles, ProjectPanelSettings, Settings, ThemeMode};
+pub use config::{CustomAgent, GitignoredFiles, ProjectPanelSettings, Settings, ThemeMode};
 pub use find::FileMatch;
 pub use git::{BranchInfo, ChangedFile, GitChanges, GitStatus};
 pub use git_diff::{BlameEntry, Hunk, HunkKind};
