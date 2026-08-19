@@ -1006,4 +1006,10 @@ object CoreBridge {
      * question that is already gone.
      */
     external fun acpRespondElicitation(elicitationId: String, actionJson: String): Boolean
+
+    /**
+     * Puts away the `notice` in [acpSessionState] — the one line saying why
+     * the last mode or config change the user asked for did not happen.
+     */
+    external fun acpClearNotice(sessionId: Long): Boolean
 }

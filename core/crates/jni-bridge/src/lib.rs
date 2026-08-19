@@ -2006,6 +2006,21 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpLogout(
     }
 }
 
+/// Put away the notice saying why the last mode or config change did not
+/// take. False for a session the engine has forgotten.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpClearNotice(
+    _env: JNIEnv,
+    _class: JClass,
+    session_id: jlong,
+) -> jboolean {
+    if engine().acp_clear_notice(session_id as u64) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
 /// Answer one of the agent's questions — `elicitation/create`, the shape
 /// every ask that is not a permission arrives in. `action_json` is
 /// `{"action":"accept","content":{…}}`, `{"action":"decline"}` or

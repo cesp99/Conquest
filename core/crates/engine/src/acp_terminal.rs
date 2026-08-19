@@ -42,7 +42,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -75,6 +75,21 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// nowhere near a memory problem.
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
+/// How much of a released terminal's output is kept for the card.
+///
+/// Releasing frees the process; it does not un-say what the command printed.
+/// Zed keeps the terminal in the thread after release for exactly this reason
+/// — the transcript still has the tool call, and a card that empties itself
+/// the moment the agent tidies up is a card the user can never read, because
+/// agents release as soon as they have the output they wanted. Smaller than
+/// the live cap because this is scrollback, not a working buffer.
+const RETAINED_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// How many released terminals are kept. Oldest first out; the transcript
+/// keeps the tool call either way, and a session that ran hundreds of
+/// commands does not need every one of their logs resident.
+const MAX_RETAINED: usize = 16;
+
 /// One live terminal.
 pub(crate) struct AgentTerminal {
     /// The id the agent knows it by, and the id the panel asks for.
@@ -86,6 +101,10 @@ pub(crate) struct AgentTerminal {
     /// back — `ToolCallContent::Terminal` carries only an id — so the client
     /// is the only one that can say what is running.
     pub(crate) label: String,
+    /// Where it ran, so the card can say so. A command's meaning depends on
+    /// its directory, and Zed puts it in the header
+    /// (terminal_tool_header.rs:136-171).
+    pub(crate) cwd: PathBuf,
     limit: usize,
     state: Mutex<TerminalState>,
     /// Parked `terminal/wait_for_exit` responders. More than one is legal:
@@ -100,6 +119,16 @@ pub(crate) struct AgentTerminal {
 }
 
 struct TerminalState {
+    /// When it started and, once it has, when it ended — so a card can say
+    /// "running for 4m" rather than the same static word for a wedged
+    /// command and a long build.
+    started: Instant,
+    ended: Option<Instant>,
+    /// How much was thrown off the front to stay under the limit. "Some
+    /// output was dropped" is not a useful sentence; "2.4 MB of earlier
+    /// output dropped" is.
+    dropped_bytes: u64,
+    dropped_lines: u64,
     /// Bumped by every append and by the exit, so the panel can poll cheaply.
     ///
     /// **Starts at 1**, for the reason [`crate::acp_thread::SessionThread`]'s
@@ -117,6 +146,10 @@ struct TerminalState {
 impl Default for TerminalState {
     fn default() -> Self {
         TerminalState {
+            started: Instant::now(),
+            ended: None,
+            dropped_bytes: 0,
+            dropped_lines: 0,
             revision: 1,
             output: String::new(),
             truncated: false,
@@ -129,8 +162,14 @@ impl Default for TerminalState {
 pub(crate) struct TerminalSnapshot {
     pub(crate) revision: u64,
     pub(crate) label: String,
+    pub(crate) cwd: PathBuf,
     pub(crate) output: String,
     pub(crate) truncated: bool,
+    pub(crate) dropped_bytes: u64,
+    pub(crate) dropped_lines: u64,
+    /// How long it has been running, or ran. Frozen at the exit, so a
+    /// finished card does not keep counting.
+    pub(crate) elapsed: Duration,
     pub(crate) exit: Option<acp::TerminalExitStatus>,
 }
 
@@ -152,6 +191,8 @@ impl AgentTerminal {
                 .map(|(index, _)| index)
                 .find(|index| *index >= cut)
                 .unwrap_or(state.output.len());
+            state.dropped_bytes += cut as u64;
+            state.dropped_lines += state.output[..cut].matches('\n').count() as u64;
             state.output.drain(..cut);
             state.truncated = true;
         }
@@ -165,6 +206,7 @@ impl AgentTerminal {
                 return;
             }
             state.exit = Some(exit.clone());
+            state.ended = Some(Instant::now());
             state.revision += 1;
         }
         for responder in self.waiters.lock().unwrap().drain(..) {
@@ -177,10 +219,35 @@ impl AgentTerminal {
         TerminalSnapshot {
             revision: state.revision,
             label: self.label.clone(),
+            cwd: self.cwd.clone(),
             output: state.output.clone(),
             truncated: state.truncated,
+            dropped_bytes: state.dropped_bytes,
+            dropped_lines: state.dropped_lines,
+            elapsed: state.ended.unwrap_or_else(Instant::now) - state.started,
             exit: state.exit.clone(),
         }
+    }
+
+    /// Cut the kept output down to `limit`, on a character boundary. Called
+    /// once, when the terminal is released and stops growing.
+    fn trim_to(&self, limit: usize) {
+        let mut state = self.state.lock().unwrap();
+        if state.output.len() <= limit {
+            return;
+        }
+        let cut = state.output.len() - limit;
+        let cut = state
+            .output
+            .char_indices()
+            .map(|(index, _)| index)
+            .find(|index| *index >= cut)
+            .unwrap_or(state.output.len());
+        state.dropped_bytes += cut as u64;
+        state.dropped_lines += state.output[..cut].matches('\n').count() as u64;
+        state.output.drain(..cut);
+        state.truncated = true;
+        state.revision += 1;
     }
 
     /// The revision alone, for a poller that only wants to know whether to
@@ -226,11 +293,22 @@ impl AgentTerminal {
 pub(crate) struct Terminals {
     next: AtomicU64,
     live: Mutex<HashMap<String, Arc<AgentTerminal>>>,
+    /// Released terminals, newest last — see [`RETAINED_OUTPUT_BYTES`].
+    /// The process is gone; what is kept is what it said.
+    finished: Mutex<Vec<Arc<AgentTerminal>>>,
 }
 
 impl Terminals {
     pub(crate) fn get(&self, id: &str) -> Option<Arc<AgentTerminal>> {
-        self.live.lock().unwrap().get(id).cloned()
+        if let Some(terminal) = self.live.lock().unwrap().get(id) {
+            return Some(terminal.clone());
+        }
+        self.finished
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|terminal| terminal.id == id)
+            .cloned()
     }
 
     /// Start a command and register the terminal it runs in.
@@ -291,6 +369,7 @@ impl Terminals {
             id: id.clone(),
             session,
             label,
+            cwd: cwd.clone(),
             limit,
             state: Mutex::new(TerminalState::default()),
             waiters: Mutex::new(Vec::new()),
@@ -320,19 +399,35 @@ impl Terminals {
         Ok(terminal)
     }
 
-    /// `terminal/release`: the agent is done with it. The command dies with
-    /// it, which is the protocol's own wording — release is the end of the
-    /// terminal's life, not a detach.
+    /// `terminal/release`: the agent is done with it.
+    ///
+    /// The command dies with it — release is the end of the terminal's life,
+    /// not a detach — but what it printed is kept, trimmed, so the card in
+    /// the transcript still says what happened. Agents release the moment
+    /// they have read the output they wanted, which for a card the user has
+    /// not opened yet is immediately.
     pub(crate) fn release(&self, id: &str) -> bool {
         let Some(terminal) = self.live.lock().unwrap().remove(id) else {
             return false;
         };
         terminal.abandon();
+        terminal.trim_to(RETAINED_OUTPUT_BYTES);
+        let mut finished = self.finished.lock().unwrap();
+        finished.push(terminal);
+        while finished.len() > MAX_RETAINED {
+            finished.remove(0);
+        }
         true
     }
 
-    /// Every terminal belonging to a session that is going away.
+    /// Every terminal belonging to a session that is going away — the live
+    /// ones and the kept ones alike, because the thread they were shown in
+    /// is going too.
     pub(crate) fn release_session(&self, session: u64) {
+        self.finished
+            .lock()
+            .unwrap()
+            .retain(|terminal| terminal.session != session);
         let doomed: Vec<Arc<AgentTerminal>> = {
             let mut live = self.live.lock().unwrap();
             let ids: Vec<String> = live
@@ -347,13 +442,15 @@ impl Terminals {
         }
     }
 
-    /// Everything, for a connection that is shutting down.
+    /// Everything, for a connection that is shutting down. Nothing is kept:
+    /// the sessions those cards belonged to are going with it.
     pub(crate) fn release_all(&self) {
         let doomed: Vec<Arc<AgentTerminal>> =
             self.live.lock().unwrap().drain().map(|(_, t)| t).collect();
         for terminal in doomed {
             terminal.abandon();
         }
+        self.finished.lock().unwrap().clear();
     }
 }
 
@@ -501,8 +598,17 @@ pub(crate) fn snapshot_json(terminal: &AgentTerminal, since: u64) -> serde_json:
     serde_json::json!({
         "revision": snapshot.revision,
         "label": snapshot.label,
+        // Absolute, because the panel shows it start-ellipsised and the
+        // interesting end is the tail.
+        "cwd": snapshot.cwd.to_string_lossy(),
         "output": snapshot.output,
         "truncated": snapshot.truncated,
+        // How much was dropped, not merely that something was: a card that
+        // says "2.4 MB of earlier output dropped" tells the reader whether to
+        // go looking elsewhere, and "some output was dropped" does not.
+        "droppedBytes": snapshot.dropped_bytes,
+        "droppedLines": snapshot.dropped_lines,
+        "elapsedMs": snapshot.elapsed.as_millis() as u64,
         "exitStatus": snapshot.exit,
         "running": snapshot.exit.is_none(),
     })
@@ -535,6 +641,7 @@ mod tests {
             id: "term-1".to_owned(),
             session: 1,
             label: "sh -c :".to_owned(),
+            cwd: PathBuf::from("/p"),
             limit,
             state: Mutex::new(TerminalState::default()),
             waiters: Mutex::new(Vec::new()),
@@ -570,6 +677,37 @@ mod tests {
     /// Zero is reserved for "the engine does not have this terminal", so a
     /// live one that has printed nothing yet must not answer with it — the
     /// card reads zero as released and stops polling.
+    /// Releasing frees the process, not the record. Agents release as soon as
+    /// they have read what they wanted, so a card that emptied itself here
+    /// would be a card nobody could ever read.
+    #[cfg(unix)]
+    #[test]
+    fn a_released_terminal_keeps_what_it_printed() {
+        let dir = tempfile::tempdir().unwrap();
+        let userland = crate::guest::testing::fake_userland(dir.path());
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let terminals = Terminals::default();
+
+        let request = acp::CreateTerminalRequest::new(acp::SessionId::new("s"), "/bin/sh")
+            .args(vec!["-c".to_owned(), "echo kept".to_owned()]);
+        let terminal = terminals.create(&userland, 1, &root, &request).unwrap();
+        let id = terminal.id.clone();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while terminal.snapshot().exit.is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(terminals.release(&id));
+        let kept = terminals.get(&id).expect("still readable after release");
+        assert!(kept.snapshot().output.contains("kept"));
+        assert_eq!(snapshot_json(&kept, 0)["running"], false);
+
+        // The session going away does take them, though: the thread that
+        // showed those cards is gone with it.
+        terminals.release_session(1);
+        assert!(terminals.get(&id).is_none());
+    }
+
     #[test]
     fn a_terminal_that_has_printed_nothing_is_still_not_gone() {
         let terminal = terminal_for_test(1024);

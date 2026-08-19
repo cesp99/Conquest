@@ -1,5 +1,11 @@
 package to.eyed.conquest.code.ui.agent
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.VectorConverter
+import androidx.compose.animation.core.animateValue
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.animateScrollBy
@@ -15,9 +21,11 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -70,6 +78,8 @@ import to.eyed.conquest.code.core.AgentDefinition
 import to.eyed.conquest.code.core.AgentAuthMethod
 import to.eyed.conquest.code.core.AgentCapabilities
 import to.eyed.conquest.code.core.AgentElicitation
+import to.eyed.conquest.code.core.AgentErrorKind
+import to.eyed.conquest.code.core.AgentPlanEntry
 import to.eyed.conquest.code.core.AgentPastSession
 import to.eyed.conquest.code.core.AgentEntry
 import to.eyed.conquest.code.core.AgentThread
@@ -199,6 +209,14 @@ fun AgentPanel(
     val sessionId = AgentSessions.sessionId.takeIf { it >= 0 }
     val snapshot = rememberAgentSession(sessionId)
     val state = snapshot.state
+    // Bumped by the strip's "Show", read by the transcript, which is the only
+    // thing that can scroll itself.
+    var scrollToPending by remember { mutableStateOf(0) }
+    // Everything the agent is blocked on: a tool call at its permission gate,
+    // and any question it has asked. This is what the strip counts.
+    val pendingCount = snapshot.conversation.entries.count {
+        it is AgentEntry.ToolCall && it.status == ToolCallStatus.WaitingForConfirmation
+    } + state.elicitations.count { !it.accepted }
     // The thread list — Zed's history view, toggled from the bar.
     var showThreads by remember { mutableStateOf(false) }
 
@@ -316,6 +334,7 @@ fun AgentPanel(
                     state = state,
                     conversation = snapshot.conversation,
                     agent = agent,
+                    scrollToPending = scrollToPending,
                     onOpenPath = onOpenPath,
                     onRespond = AgentSessions::respondToPermission,
                     onAuthenticate = { method ->
@@ -352,6 +371,14 @@ fun AgentPanel(
                         }
                     },
                     modifier = Modifier.weight(1f),
+                )
+                // The pinned strip: the plan, a turn that failed, anything
+                // waiting on the user. Everything in it used to be in the
+                // transcript, where it scrolled away exactly when it mattered.
+                ActivityStrip(
+                    state = state,
+                    pendingCount = pendingCount,
+                    onScrollToPending = { scrollToPending++ },
                 )
                 HorizontalDivider(color = theme.color("border"))
                 // Zed's bottom row: the mode, the model, whatever else the
@@ -907,12 +934,24 @@ private fun Conversation(
     state: AgentSessionState,
     conversation: AgentConversation,
     agent: AgentDefinition?,
+    /**
+     * Bumped by the strip's "Show" to jump to the first thing waiting on the
+     * user — a permission prompt that scrolled away stalls the whole turn
+     * with nothing on screen to explain it.
+     */
+    scrollToPending: Int,
     onOpenPath: (String) -> Unit,
     onRespond: (toolCall: String, option: String) -> Unit,
     onAuthenticate: (AgentAuthMethod) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val list = rememberLazyListState()
+    // **Hoisted out of the cards.** `remember` inside a LazyColumn item dies
+    // with the item, so a card the user opened forgot it the moment it
+    // scrolled off — and a running command showed one grey line for its whole
+    // life. Zed keeps the same thing outside its list
+    // (entry_view_state.rs:76, a HashSet<ToolCallId>).
+    val expanded = remember { mutableStateMapOf<String, Boolean>() }
     // Follow the tail while the agent is talking — but only while the reader
     // is *at* the tail. Scrolling on every version bump (eight a second during
     // a turn) undid any scroll-back within 120 ms, so the transcript could not
@@ -940,28 +979,74 @@ private fun Conversation(
         }
     }
 
+    // Jump to whatever is waiting. Guarded on a non-zero token so it does not
+    // fire on first composition.
+    LaunchedEffect(scrollToPending) {
+        if (scrollToPending == 0) return@LaunchedEffect
+        val waiting = conversation.entries.indexOfFirst {
+            it is AgentEntry.ToolCall && it.status == ToolCallStatus.WaitingForConfirmation
+        }
+        val target = if (waiting >= 0) waiting else conversation.entries.lastIndex
+        if (target >= 0) runCatching { list.animateScrollToItem(target) }
+    }
+
     LazyColumn(
         state = list,
         modifier = modifier.fillMaxWidth(),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        if (state.plan.isNotEmpty()) {
-            item(key = "plan") { PlanCard(state) }
-        }
+        // The plan is **not** here: it lives in the pinned strip above the
+        // composer. It used to be item 0, which also meant every entry index
+        // was off by one whenever a plan existed — so the tail-follow above
+        // scrolled to the wrong row and measured the wrong overflow.
+        //
         // Keyed by position rather than by content: two identical messages are
         // perfectly ordinary, and a duplicate key throws inside LazyLayout.
         items(count = conversation.entries.size, key = { "entry:$it" }) { index ->
             when (val entry = conversation.entries[index]) {
                 is AgentEntry.User -> UserRow(entry)
-                is AgentEntry.Assistant -> AssistantRow(entry, onOpenPath)
-                is AgentEntry.ToolCall -> ToolCallCard(entry, onOpenPath, onRespond)
+
+                // An assistant turn with nothing in it is not a row. It used
+                // to be a padded Column with 8dp of list spacing around it,
+                // which on a phone is a visible hole. Zed returns Empty for
+                // the same case (thread_view.rs:6374-6376).
+                is AgentEntry.Assistant ->
+                    if (entry.spoken.isNotBlank() || entry.thoughts.isNotBlank()) {
+                        AssistantRow(entry, onOpenPath)
+                    }
+
+                // Nor is a cancelled call that never produced anything.
+                // Pressing Stop on a turn with five parallel reads left five
+                // empty grey slabs, which is most of a phone screen
+                // (thread_view.rs:6394-6407).
+                is AgentEntry.ToolCall ->
+                    if (entry.status != ToolCallStatus.Canceled ||
+                        entry.content.isNotEmpty() ||
+                        entry.options.isNotEmpty()
+                    ) {
+                        ToolCallCard(
+                            call = entry,
+                            expanded = expanded,
+                            onOpenPath = onOpenPath,
+                            onRespond = onRespond,
+                        )
+                    }
+
+                is AgentEntry.CompletedPlan -> CompletedPlanCard(entry)
+
                 // A kind this build predates. One quiet line, so the rest of
                 // the conversation stays readable and honest about the gap.
                 AgentEntry.Unsupported -> Notice(
                     "This version of Conquest Code cannot show that message.",
                 )
             }
+        }
+        // Between Send and the first token the transcript was indistinguishable
+        // from idle. Zed draws a generating indicator for exactly this gap
+        // (thread_view.rs:7295-7399).
+        if (state.phase == AgentPhase.Running) {
+            item(key = "working") { WorkingRow() }
         }
         // The questions go last, under everything, because a question is the
         // next thing to do: the agent is blocked on it and nothing further
@@ -980,12 +1065,241 @@ private fun Conversation(
     }
 }
 
-/** What the agent says it is going to do — Zed's plan view, as a list. */
+/**
+ * The pinned strip between the transcript and the composer.
+ *
+ * Zed calls it the activity bar (thread_view.rs:3086-3197): the few things
+ * that must not scroll away because they are what to do next — the plan, a
+ * turn that failed, a question waiting to be answered. Everything in it used
+ * to live in the transcript, which meant it scrolled off exactly when it
+ * mattered, and the plan being item 0 also put every entry index out by one.
+ *
+ * Empty means no strip at all: a pinned bar with nothing in it is a bar that
+ * has taken height off a phone screen for nothing.
+ */
 @Composable
-private fun PlanCard(state: AgentSessionState) {
+private fun ActivityStrip(
+    state: AgentSessionState,
+    pendingCount: Int,
+    onScrollToPending: () -> Unit,
+) {
     val theme = LocalZedTheme.current
-    var expanded by remember { mutableStateOf(true) }
+    val notices = listOfNotNull(state.notice, AgentSessions.lastRefusal)
+    val stopNotice = stopReasonNotice(state)
+    val showError = state.error != null
+    if (state.plan.isEmpty() && notices.isEmpty() && stopNotice == null &&
+        !showError && pendingCount == 0
+    ) {
+        return
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(theme.color("element.background", Color.Transparent)),
+    ) {
+        HorizontalDivider(color = theme.color("border"))
+        if (pendingCount > 0) {
+            StripRow(
+                label = if (pendingCount == 1) {
+                    "Waiting for you"
+                } else {
+                    "Waiting for you — $pendingCount"
+                },
+                accent = true,
+                action = "Show",
+                onAction = onScrollToPending,
+            )
+        }
+        if (showError) {
+            ErrorRow(state)
+        }
+        stopNotice?.let { NoticeRow(it, onDismiss = null) }
+        for (notice in notices) {
+            NoticeRow(notice, onDismiss = { AgentSessions.clearNotice() })
+        }
+        if (state.plan.isNotEmpty()) {
+            PlanStrip(state)
+        }
+    }
+}
+
+/** One line in the strip: a label, and one thing to do about it. */
+@Composable
+private fun StripRow(
+    label: String,
+    accent: Boolean,
+    action: String?,
+    onAction: (() -> Unit)?,
+) {
+    val theme = LocalZedTheme.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = RowStartPadding, vertical = 6.dp),
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (accent) {
+                theme.color("text.accent", MaterialTheme.colorScheme.primary)
+            } else {
+                theme.color("text")
+            },
+            modifier = Modifier.weight(1f),
+        )
+        if (action != null && onAction != null) BarAction(action, onAction)
+    }
+}
+
+/**
+ * A turn that failed, said properly.
+ *
+ * Independent of `phase`, which is the bug this replaces: `Trouble` was gated
+ * on `Unavailable || needsAuth`, so a *turn* that failed on a session that is
+ * otherwise fine — the common case, a rate limit — left `error` set and drawn
+ * by nobody. A dead turn looked exactly like an idle one.
+ */
+@Composable
+private fun ErrorRow(state: AgentSessionState) {
+    val theme = LocalZedTheme.current
+    val kind = state.errorKind
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = RowStartPadding, vertical = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Text(
+            text = kind?.heading ?: "Something went wrong",
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.Medium,
+            color = theme.color("error", MaterialTheme.colorScheme.error),
+        )
+        state.error?.let { MarkdownText(it) }
+        kind?.advice?.let { advice ->
+            Text(
+                text = advice,
+                style = MaterialTheme.typography.labelSmall,
+                color = theme.color("text.muted"),
+            )
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (state.canRetry) {
+                PanelButton("Try again", isPrimary = true) { AgentSessions.retryLastPrompt() }
+            }
+            if (state.errorKind == AgentErrorKind.ContextWindow ||
+                state.errorKind == AgentErrorKind.Transport
+            ) {
+                PanelButton("New thread") { AgentSessions.newThreadHere() }
+            }
+        }
+    }
+}
+
+/** One dismissible line saying why something did not happen. */
+@Composable
+private fun NoticeRow(text: String, onDismiss: (() -> Unit)?) {
+    val theme = LocalZedTheme.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = RowStartPadding, vertical = 6.dp),
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelSmall,
+            color = theme.color("text.muted"),
+            modifier = Modifier.weight(1f),
+        )
+        if (onDismiss != null) BarAction("✕", onDismiss)
+    }
+}
+
+/**
+ * What the last turn's stop reason means, when it means anything.
+ *
+ * `stopReason` was parsed and read by nothing, so a refused prompt and a
+ * reply cut off at the token limit both ended in silence.
+ */
+private fun stopReasonNotice(state: AgentSessionState): String? = when {
+    state.isBusy -> null
+    state.stopReason == "refusal" ->
+        "The agent declined that prompt, and removed it from the conversation."
+    state.stopReason == "max_tokens" ->
+        "The reply hit the model's length limit. Ask it to carry on."
+    state.stopReason == "max_turn_requests" ->
+        "The agent used its whole turn. Ask it to carry on."
+    else -> null
+}
+
+/** The live plan, in the strip. Collapsed by default: it is a reference, not a feed. */
+@Composable
+private fun PlanStrip(state: AgentSessionState) {
+    val theme = LocalZedTheme.current
+    var expanded by remember { mutableStateOf(false) }
     val done = state.plan.count { it.status == "completed" }
+    val current = state.plan.firstOrNull { it.status == "in_progress" }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = RowStartPadding, vertical = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .pointerHoverIcon(PointerIcon.Hand)
+                .clickable(onClickLabel = "Plan") { expanded = !expanded },
+        ) {
+            Text(
+                text = "PLAN  $done/${state.plan.size}",
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.SemiBold,
+                color = theme.color("text.muted"),
+            )
+            // Collapsed, the one line worth having is what it is doing *now*.
+            Text(
+                text = if (expanded) "" else current?.content.orEmpty(),
+                style = MaterialTheme.typography.labelSmall,
+                color = theme.color("text"),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                text = if (expanded) "hide" else "show",
+                style = MaterialTheme.typography.labelSmall,
+                color = theme.color("text.muted"),
+            )
+        }
+        if (expanded) {
+            // Bounded and scrolling: a fifteen-step plan must not take the
+            // composer off the screen (Zed caps it the same way,
+            // thread_view.rs:3796-3824).
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 160.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                for (entry in state.plan) PlanRow(entry)
+            }
+        }
+    }
+}
+
+/** A plan the agent finished, filed in the transcript where its turn was. */
+@Composable
+private fun CompletedPlanCard(entry: AgentEntry.CompletedPlan) {
+    val theme = LocalZedTheme.current
+    var expanded by remember { mutableStateOf(false) }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1000,10 +1314,10 @@ private fun PlanCard(state: AgentSessionState) {
             modifier = Modifier
                 .fillMaxWidth()
                 .pointerHoverIcon(PointerIcon.Hand)
-                .clickable(onClickLabel = "Plan") { expanded = !expanded },
+                .clickable(onClickLabel = "Finished plan") { expanded = !expanded },
         ) {
             Text(
-                text = "PLAN  $done/${state.plan.size}",
+                text = "PLAN  done (${entry.entries.size})",
                 style = MaterialTheme.typography.labelSmall,
                 fontWeight = FontWeight.SemiBold,
                 color = theme.color("text.muted"),
@@ -1015,35 +1329,65 @@ private fun PlanCard(state: AgentSessionState) {
                 color = theme.color("text.muted"),
             )
         }
-        if (expanded) {
-            for (entry in state.plan) {
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text(
-                        text = when (entry.status) {
-                            "completed" -> "✓"
-                            "in_progress" -> "▸"
-                            else -> "·"
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = when (entry.status) {
-                            "completed" -> theme.color("created", theme.color("text.muted"))
-                            "in_progress" -> theme.color("text.accent")
-                            else -> theme.color("text.muted")
-                        },
-                    )
-                    Text(
-                        text = entry.content,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (entry.status == "completed") {
-                            theme.color("text.muted")
-                        } else {
-                            theme.color("text")
-                        },
-                    )
-                }
-            }
-        }
+        if (expanded) for (row in entry.entries) PlanRow(row)
     }
+}
+
+/** One step of a plan, live or finished. */
+@Composable
+private fun PlanRow(entry: AgentPlanEntry) {
+    val theme = LocalZedTheme.current
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            text = when (entry.status) {
+                "completed" -> "✓"
+                "in_progress" -> "▸"
+                else -> "·"
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = when (entry.status) {
+                "completed" -> theme.color("created", theme.color("text.muted"))
+                "in_progress" -> theme.color("text.accent")
+                else -> theme.color("text.muted")
+            },
+        )
+        Text(
+            text = entry.content,
+            style = MaterialTheme.typography.bodySmall,
+            color = if (entry.status == "completed") {
+                theme.color("text.muted")
+            } else {
+                theme.color("text")
+            },
+        )
+    }
+}
+
+/**
+ * The three dots between Send and the first token.
+ *
+ * Not decoration: the transcript was otherwise indistinguishable from idle
+ * for however long the model took to start, and a phone gives no other clue
+ * that anything is happening.
+ */
+@Composable
+private fun WorkingRow() {
+    val theme = LocalZedTheme.current
+    val step by rememberInfiniteTransition(label = "working").animateValue(
+        initialValue = 0,
+        targetValue = 3,
+        typeConverter = Int.VectorConverter,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = LinearEasing),
+        ),
+        label = "dots",
+    )
+    Text(
+        text = "·".repeat(step + 1),
+        style = MaterialTheme.typography.bodyMedium,
+        color = theme.color("text.muted"),
+        modifier = Modifier.padding(horizontal = 12.dp),
+    )
 }
 
 /** The user's own message: set apart, the way Zed sets its prompt blocks apart. */
@@ -1106,23 +1450,62 @@ private fun AssistantRow(entry: AgentEntry.Assistant, onOpenPath: (String) -> Un
 @Composable
 private fun ToolCallCard(
     call: AgentEntry.ToolCall,
+    /**
+     * Which cards are open, held by the transcript.
+     *
+     * Not `remember` inside the item: a LazyColumn destroys an item's state
+     * when it scrolls off, so a card the user opened forgot it, and a running
+     * command was one grey line for its whole life. Zed keeps the same set
+     * outside its list (entry_view_state.rs:76).
+     */
+    expanded: MutableMap<String, Boolean>,
     onOpenPath: (String) -> Unit,
     onRespond: (toolCall: String, option: String) -> Unit,
 ) {
     val theme = LocalZedTheme.current
     val waiting = call.status == ToolCallStatus.WaitingForConfirmation
-    // Open by default exactly when a decision depends on it: nobody should
-    // have to expand a diff to find out what they are allowing.
-    var expanded by remember(call.id) { mutableStateOf(false) }
-    val showBody = expanded || waiting
+    val hasDiff = call.content.any { it is to.eyed.conquest.code.core.ToolContent.Diff }
+    val hasTerminal = call.content.any { it is to.eyed.conquest.code.core.ToolContent.Terminal }
+
+    // Seeded rather than closed. Zed opens edit and terminal cards by default
+    // (entry_view_state.rs:308-334) for the obvious reason: a diff you are
+    // being asked to approve and a command that is producing output are the
+    // two things you were going to open anyway. The user's own toggle wins
+    // afterwards, which is what the map remembers.
+    val open = expanded[call.id] ?: (hasDiff || hasTerminal)
+    val showBody = open || waiting
+
+    // Zed's `use_card_layout` (thread_view.rs:8203): only calls worth
+    // stopping at get the box. Ten reads and one pending edit used to be
+    // eleven identical grey slabs.
+    val isCard = waiting || call.kind == ToolKind.Edit || hasDiff || call.kind == ToolKind.Execute
+    val failed = call.status == ToolCallStatus.Failed ||
+        call.status == ToolCallStatus.Rejected ||
+        call.status == ToolCallStatus.Canceled
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 8.dp)
-            .clip(RoundedCornerShape(FieldRadius))
-            .background(theme.color("element.background", Color.Transparent))
-            .padding(8.dp),
+            .then(
+                if (isCard) {
+                    Modifier
+                        .clip(RoundedCornerShape(FieldRadius))
+                        .background(theme.color("element.background", Color.Transparent))
+                        .border(
+                            width = 1.dp,
+                            color = if (failed) {
+                                theme.color("error", MaterialTheme.colorScheme.error)
+                            } else {
+                                theme.color("border", Color.Transparent)
+                            },
+                            shape = RoundedCornerShape(FieldRadius),
+                        )
+                        .padding(8.dp)
+                } else {
+                    Modifier.padding(vertical = 2.dp)
+                }
+            ),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Row(
@@ -1131,8 +1514,21 @@ private fun ToolCallCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .pointerHoverIcon(PointerIcon.Hand)
-                .clickable(onClickLabel = call.title) { expanded = !expanded },
+                .clickable(onClickLabel = call.title) { expanded[call.id] = !open },
         ) {
+            // A chevron, so a card that *can* be opened says so. Without one
+            // the only way to find out was to tap every row.
+            Text(
+                text = if (call.content.isEmpty() && call.rawInput == null) {
+                    " "
+                } else if (showBody) {
+                    "⌄"
+                } else {
+                    "›"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = theme.color("text.muted"),
+            )
             Text(
                 text = glyph(call.kind),
                 style = MaterialTheme.typography.labelMedium,
@@ -1150,22 +1546,81 @@ private fun ToolCallCard(
         }
 
         if (showBody) {
-            for (content in call.content) {
-                when (content) {
-                    is to.eyed.conquest.code.core.ToolContent.Markdown ->
-                        MarkdownText(content.markdown)
+            // Not a card: hang the body off a rail rather than a box, as Zed
+            // does (thread_view.rs:10408). A Row with a one-pixel Box is the
+            // whole trick — Compose has no left-only border.
+            Row(modifier = Modifier.fillMaxWidth()) {
+                if (!isCard) {
+                    Box(
+                        modifier = Modifier
+                            .width(1.dp)
+                            .fillMaxHeight()
+                            .background(theme.color("border", Color.Transparent)),
+                    )
+                }
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = if (isCard) 0.dp else 13.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    for (content in call.content) {
+                        when (content) {
+                            is to.eyed.conquest.code.core.ToolContent.Markdown ->
+                                MarkdownText(content.markdown)
 
-                    is to.eyed.conquest.code.core.ToolContent.Diff ->
-                        DiffCard(content.file, onOpenPath)
+                            is to.eyed.conquest.code.core.ToolContent.Diff ->
+                                DiffCard(content.file, waiting, onOpenPath)
 
-                    is to.eyed.conquest.code.core.ToolContent.Terminal ->
-                        TerminalCard(content.terminalId)
+                            is to.eyed.conquest.code.core.ToolContent.Terminal ->
+                                TerminalCard(content.terminalId, content.sealed)
+                        }
+                    }
+                    // What the agent is actually asking to run. A title like
+                    // "Edit notes.md" does not say what the edit is, and a
+                    // permission prompt asks the user to approve the *call*.
+                    call.rawInput?.let {
+                        RawInputBlock(it, startOpen = waiting && call.content.isEmpty())
+                    }
                 }
             }
         }
 
         if (waiting && call.options.isNotEmpty()) {
             PermissionRow(call.options) { option -> onRespond(call.id, option.id) }
+        }
+    }
+}
+
+/** The tool call's arguments, folded away — it is JSON, and mostly not needed. */
+@Composable
+private fun RawInputBlock(rawInput: String, startOpen: Boolean) {
+    val theme = LocalZedTheme.current
+    val settings = LocalAppSettings.current
+    var open by remember(rawInput) { mutableStateOf(startOpen) }
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+            text = if (open) "hide arguments" else "show arguments",
+            style = MaterialTheme.typography.labelSmall,
+            color = theme.color("text.muted"),
+            modifier = Modifier
+                .pointerHoverIcon(PointerIcon.Hand)
+                .clickable(onClickLabel = "Arguments") { open = !open },
+        )
+        if (open) {
+            Text(
+                text = rawInput,
+                style = TextStyle(
+                    fontFamily = BufferFontFamily,
+                    fontSize = (settings.bufferFontSize * 0.85f).sp,
+                    lineHeight = (settings.bufferFontSize * 1.3f).sp,
+                ),
+                color = theme.color("text.muted"),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 180.dp)
+                    .verticalScroll(rememberScrollState()),
+            )
         }
     }
 }
@@ -1494,10 +1949,17 @@ private fun FormLine(value: String, numeric: Boolean, onValue: (String) -> Unit)
  * [rememberAgentTerminal] for why — and stops the moment the command ends.
  */
 @Composable
-private fun TerminalCard(terminalId: String) {
+private fun TerminalCard(terminalId: String, sealed: AgentTerminalState?) {
     val theme = LocalZedTheme.current
     val settings = LocalAppSettings.current
-    val terminal = rememberAgentTerminal(terminalId)
+    // The live poll while the command is running; the copy sealed onto the
+    // entry once the agent released it. The engine keeps only the last few
+    // released terminals resident, so an agent that ran seventeen commands
+    // had silently emptied its first card — the transcript is the record and
+    // has to be able to stand on its own.
+    val live = rememberAgentTerminal(terminalId, enabled = sealed == null)
+    val terminal = if (live.revision > 0L) live else sealed ?: live
+
     val code = remember(settings.bufferFontSize) {
         TextStyle(
             fontFamily = BufferFontFamily,
@@ -1505,28 +1967,54 @@ private fun TerminalCard(terminalId: String) {
             lineHeight = (settings.bufferFontSize * 1.4f).sp,
         )
     }
-    val across = rememberScrollState()
+    var showAll by remember(terminalId) { mutableStateOf(false) }
     // The tail, because the end of a command's output is where the answer is.
-    val lines = remember(terminal.output) {
+    val (total, shown) = remember(terminal.output, showAll) {
         val all = terminal.output.trimEnd('\n').split('\n')
-        all.size to all.takeLast(MaxTerminalLines)
+        all.size to if (showAll) all else all.takeLast(MaxTerminalLines)
     }
-    val (total, shown) = lines
+    val pane = rememberScrollState()
+    // Pinned to the bottom while it is still printing — a build log that
+    // scrolls itself is how you watch a build.
+    LaunchedEffect(terminal.revision, terminal.running) {
+        if (terminal.running) runCatching { pane.scrollTo(pane.maxValue) }
+    }
 
-    Column(modifier = Modifier.fillMaxWidth()) {
+    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        // The command, wrapping. It used to be `maxLines = 1` ellipsised,
+        // which on a dock cut every real command at about four words.
+        Text(
+            text = if (terminal.label.isEmpty()) "$ …" else "$ ${terminal.label}",
+            style = code,
+            color = theme.color("text"),
+            modifier = Modifier.fillMaxWidth(),
+        )
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
-            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+            modifier = Modifier.fillMaxWidth(),
         ) {
-            Text(
-                text = if (terminal.label.isEmpty()) "$ …" else "$ ${terminal.label}",
-                style = code,
-                color = theme.color("text"),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f, fill = false),
-            )
+            if (terminal.cwd.isNotEmpty()) {
+                Text(
+                    // Start-ellipsised: the interesting end of a path is the
+                    // tail (Zed truncates the same way,
+                    // terminal_tool_header.rs:145-153).
+                    text = "…" + terminal.cwd.takeLast(34),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = theme.color("text.muted"),
+                    maxLines = 1,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+            }
+            Box(modifier = Modifier.weight(1f))
+            terminal.elapsedLabel?.let { elapsed ->
+                Text(
+                    text = elapsed,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = theme.color("text.muted"),
+                    maxLines = 1,
+                )
+            }
             Text(
                 text = terminalOutcome(terminal),
                 style = MaterialTheme.typography.labelSmall,
@@ -1546,24 +2034,42 @@ private fun TerminalCard(terminalId: String) {
                 Notice(if (terminal.running) "Running…" else "It printed nothing.")
 
             else -> {
-                if (terminal.truncated || total > shown.size) {
+                terminal.droppedSentence?.let { sentence ->
                     Text(
-                        text = "… earlier output dropped.",
+                        text = sentence,
                         style = MaterialTheme.typography.labelSmall,
                         color = theme.color("text.muted"),
                     )
                 }
-                // One scroll state across every row, so a long line scrolls
-                // the whole block sideways rather than one line out of step
-                // with its neighbours — the same trick the diff rows use.
-                Column(modifier = Modifier.fillMaxWidth().horizontalScroll(across)) {
+                if (total > shown.size) {
+                    Text(
+                        text = "Showing the last ${shown.size} of $total lines — show all",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = theme.color("text.accent", MaterialTheme.colorScheme.primary),
+                        modifier = Modifier
+                            .pointerHoverIcon(PointerIcon.Hand)
+                            .clickable(onClickLabel = "Show every line") { showAll = true },
+                    )
+                }
+                // A bounded pane that scrolls **vertically**. The old card
+                // printed a fixed 40 lines with no way to reach the rest, so
+                // the compiler error at the top of a 200-line log existed in
+                // the engine and could not be looked at. Lines soft-wrap
+                // rather than scrolling sideways: a horizontal drag inside a
+                // vertical transcript fights the transcript, and Zed wraps
+                // for the same reason (thread_view.rs:7777-7782).
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 220.dp)
+                        .verticalScroll(pane),
+                ) {
                     for (line in shown) {
                         Text(
                             text = line,
                             style = code,
                             color = theme.color("text"),
-                            softWrap = false,
-                            maxLines = 1,
+                            modifier = Modifier.fillMaxWidth(),
                         )
                     }
                 }
@@ -1590,7 +2096,7 @@ private fun terminalOutcome(terminal: AgentTerminalState): String = when {
  * git one. Unified only, as decided.
  */
 @Composable
-private fun DiffCard(file: FileDiff, onOpenPath: (String) -> Unit) {
+private fun DiffCard(file: FileDiff, whole: Boolean, onOpenPath: (String) -> Unit) {
     val theme = LocalZedTheme.current
     val settings = LocalAppSettings.current
     val code = remember(settings.bufferFontSize) {
@@ -1641,16 +2147,26 @@ private fun DiffCard(file: FileDiff, onOpenPath: (String) -> Unit) {
             file.isBinary -> Notice("Binary file — nothing to show line by line.")
             lines.isEmpty() -> Notice("Nothing to show.")
             else -> {
-                for (line in lines.take(MaxDiffLines)) {
+                // `whole` is set while the user is being *asked* about this
+                // diff. Cutting it there is the one place the cut must never
+                // happen: the card is force-open under an Allow button, and
+                // approving an edit you were shown 200 of 400 lines of is
+                // approving something you did not see. Zed force-expands
+                // every hunk for the same reason (entry_view_state.rs:655).
+                var showAll by remember(file) { mutableStateOf(false) }
+                val limit = if (whole || showAll) lines.size else MaxDiffLines
+                for (line in lines.take(limit)) {
                     DiffLineRow(line, code, across, contentWidth)
                 }
-                if (lines.size > MaxDiffLines) {
+                if (lines.size > limit) {
                     Text(
-                        text = "… and ${lines.size - MaxDiffLines} more lines. " +
-                            "Open the file to see all of it.",
+                        text = "Show all ${lines.size} lines",
                         style = MaterialTheme.typography.labelSmall,
-                        color = theme.color("text.muted"),
-                        modifier = Modifier.padding(top = 4.dp),
+                        color = theme.color("text.accent", MaterialTheme.colorScheme.primary),
+                        modifier = Modifier
+                            .padding(top = 4.dp)
+                            .pointerHoverIcon(PointerIcon.Hand)
+                            .clickable(onClickLabel = "Show the whole diff") { showAll = true },
                     )
                 }
             }
@@ -1664,13 +2180,67 @@ private fun DiffCard(file: FileDiff, onOpenPath: (String) -> Unit) {
  */
 @Composable
 private fun PermissionRow(options: List<PermissionOption>, onChoose: (PermissionOption) -> Unit) {
-    Row(
+    val theme = LocalZedTheme.current
+    // A **column**, not a row. Agents offer up to five options ("Allow",
+    // "Allow always for this session", "Allow all edits in this file",
+    // "Reject", "Reject always") and on a 400dp dock a row loses the last of
+    // them off the right edge — which is always a rejection.
+    //
+    // And in **wire order**: the old `sortedByDescending { isAllow }` threw
+    // away the agent's own ordering, which is its editorial choice about
+    // which answer it expects.
+    Column(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.End),
-        verticalAlignment = Alignment.CenterVertically,
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        for (option in options.sortedByDescending { it.isAllow }) {
-            PanelButton(option.name, isPrimary = option.isAllow) { onChoose(option) }
+        for (option in options) {
+            val allow = option.isAllow
+            val always = option.kind.endsWith("always")
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 36.dp)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(
+                        // The primary fill goes to the *once* grant only, so
+                        // the permanent one is not the easiest thing to tap.
+                        if (allow && !always) {
+                            theme.color("element.background", Color.Transparent)
+                        } else {
+                            Color.Transparent
+                        }
+                    )
+                    .pointerHoverIcon(PointerIcon.Hand)
+                    .clickable(onClickLabel = option.name) { onChoose(option) }
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+            ) {
+                Text(
+                    text = if (allow) (if (always) "✓✓" else "✓") else "✕",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (allow) {
+                        theme.color("created", theme.color("text.accent"))
+                    } else {
+                        theme.color("error", MaterialTheme.colorScheme.error)
+                    },
+                )
+                Text(
+                    text = option.name,
+                    style = MaterialTheme.typography.labelMedium,
+                    // Two lines, because "Allow all edits in this file" does
+                    // not fit on one in a dock and the fixed-height button
+                    // clipped it.
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    color = if (allow && !always) {
+                        theme.color("text.accent", MaterialTheme.colorScheme.primary)
+                    } else {
+                        theme.color("text")
+                    },
+                    modifier = Modifier.weight(1f),
+                )
+            }
         }
     }
 }

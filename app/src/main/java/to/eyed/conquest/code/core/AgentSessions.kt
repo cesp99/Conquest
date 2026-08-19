@@ -301,6 +301,38 @@ object AgentSessions {
         lastRefusal = message
     }
 
+    /**
+     * Clear the engine's own notice — why the last mode or config change did
+     * not take — and ours.
+     */
+    fun clearNotice() {
+        lastRefusal = null
+        val session = sessionId.takeIf { it >= 0 } ?: return
+        scope.launch { runCatching { CoreBridge.acpClearNotice(session) } }
+    }
+
+    /**
+     * Send the last prompt again, for a turn that failed on something worth
+     * retrying — a rate limit, a provider hiccup.
+     *
+     * The text is remembered rather than read back out of the transcript,
+     * because a refusal truncates the transcript past it and the whole point
+     * is to be able to try again after one.
+     */
+    fun retryLastPrompt() {
+        val text = lastPrompt ?: return
+        prompt(text.first, text.second) { }
+    }
+
+    /** Start a fresh thread on the project the active one is in. */
+    fun newThreadHere() {
+        val thread = active ?: return
+        newThread(thread.projectId, thread.projectName)
+    }
+
+    /** The last prompt sent, for [retryLastPrompt]. */
+    private var lastPrompt: Pair<String, List<String>>? = null
+
     fun clearRefusal() {
         lastRefusal = null
     }
@@ -318,6 +350,9 @@ object AgentSessions {
             return
         }
         lastRefusal = null
+        // Kept for `retryLastPrompt`: a refusal truncates the transcript past
+        // the prompt it refused, so the transcript cannot be the source.
+        lastPrompt = text to mentions
         val mentionsJson = org.json.JSONArray(mentions).toString()
         scope.launch {
             val sent = runCatching { CoreBridge.acpPrompt(session, text, mentionsJson) }

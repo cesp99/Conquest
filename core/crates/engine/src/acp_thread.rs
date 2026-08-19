@@ -39,6 +39,67 @@ const DIFF_CONTEXT: u32 = 3;
 /// a generated megabyte is seconds of work nobody will scroll.
 const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
 
+/// What kind of failure an `error` is.
+///
+/// The panel needs this to say the right sentence and offer the right way
+/// out: a rate limit is worth retrying in a minute, an auth failure needs
+/// signing in, a context-window overflow needs a new thread, and a transport
+/// error means the agent is gone. Zed distinguishes the same set
+/// (thread_view.rs:11019-11135).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    /// The provider is throttling. Worth retrying.
+    RateLimit,
+    /// The agent wants signing in to.
+    Auth,
+    /// The conversation no longer fits. A new thread is the way on.
+    ContextWindow,
+    /// The agent declined the prompt itself.
+    Refusal,
+    /// The connection is gone — the process died, or the pipes closed.
+    Transport,
+    /// The provider answered with an error of its own.
+    Api,
+    Other,
+}
+
+impl ErrorKind {
+    /// Whether trying the same thing again could plausibly work.
+    pub fn can_retry(self) -> bool {
+        matches!(self, ErrorKind::RateLimit | ErrorKind::Api)
+    }
+
+    /// Guess the kind from the sentence, for the paths that have only a
+    /// sentence. Deliberately conservative: anything unrecognised is
+    /// [`ErrorKind::Other`], which offers no retry and makes no promise.
+    pub fn guess(message: &str) -> ErrorKind {
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("rate limit")
+            || lower.contains("429")
+            || lower.contains("too many requests")
+        {
+            ErrorKind::RateLimit
+        } else if lower.contains("context")
+            && (lower.contains("window") || lower.contains("length"))
+        {
+            ErrorKind::ContextWindow
+        } else if lower.contains("sign in")
+            || lower.contains("authenticat")
+            || lower.contains("401")
+        {
+            ErrorKind::Auth
+        } else if lower.contains("connection closed")
+            || lower.contains("transport")
+            || lower.contains("exited")
+        {
+            ErrorKind::Transport
+        } else {
+            ErrorKind::Other
+        }
+    }
+}
+
 /// Where a session is in its life. Serialized snake_case into the state JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,7 +158,7 @@ fn status_after_grant(current: ToolStatus) -> ToolStatus {
 }
 
 /// One piece of a tool call's output.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolContent {
     /// Ordinary content, rendered as markdown.
@@ -114,8 +175,27 @@ pub enum ToolContent {
     /// entry is deliberate: the entry delta is a merge-in-place cache, and a
     /// build log growing inside it would re-send the whole card on every
     /// chunk.
+    ///
+    /// Once the agent releases the terminal the engine *seals* what it
+    /// printed onto this entry — see [`SessionThread::seal_terminal`] — so
+    /// the transcript stops depending on a registry that evicts. Absent while
+    /// the command is still live, which is the poll's job.
     #[serde(rename_all = "camelCase")]
-    Terminal { terminal_id: String },
+    Terminal {
+        terminal_id: String,
+        /// The command line, for a card whose terminal is gone.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        /// What it printed, trimmed, once it is over.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        /// Whether anything was dropped off the front of that.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+        /// How it ended: `{"exitCode": n}` or `{"signal": "SIGQUIT"}`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exit_status: Option<serde_json::Value>,
+    },
 }
 
 /// A file position the agent says it is working at, passed through verbatim.
@@ -149,6 +229,16 @@ pub struct ToolCallEntry {
     pub options: Vec<acp::PermissionOption>,
     pub content: Vec<ToolContent>,
     pub locations: Vec<Location>,
+    /// The arguments the agent is asking to run with, pretty-printed, when it
+    /// sent them.
+    ///
+    /// Not decoration: a permission prompt asks the user to approve a *call*,
+    /// and a title like "Edit notes.md" does not say what the edit is. Zed
+    /// puts the same thing behind a disclosure on the card
+    /// (thread_view.rs:8270, 8353). Folded away by default — it is JSON, and
+    /// most calls do not need reading.
+    #[serde(rename = "rawInput")]
+    pub raw_input: Option<String>,
     /// What `status` goes back to if the user allows the call — not serialized,
     /// the UI never needs it.
     #[serde(skip)]
@@ -183,6 +273,17 @@ pub enum EntryBody {
         chunks: Vec<AssistantChunk>,
     },
     ToolCall(ToolCallEntry),
+    /// A plan the agent finished, moved out of the live plan and into the
+    /// transcript where the turn it belonged to is.
+    ///
+    /// Without this a plan lives for ever: nothing clears it, so a plan
+    /// completed three turns ago still reads "4/4" beside the composer and is
+    /// indistinguishable from one the agent is working through now. Zed
+    /// snapshots it at the end of a turn and clears the live one at the start
+    /// of the next.
+    CompletedPlan {
+        entries: Vec<acp::PlanEntry>,
+    },
 }
 
 /// One row of the conversation, stamped with the revision that last touched
@@ -195,10 +296,22 @@ pub struct Entry {
 }
 
 /// Context-window usage, from ACP's `UsageUpdate`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Usage {
     pub used: u64,
     pub size: u64,
+    /// What the turn has cost so far, when the agent says. Zed shows it
+    /// beside the context bar (thread_view.rs:5728-5903); an agent that
+    /// reports it and a client that drops it is a bill the user cannot see.
+    pub cost: Option<Cost>,
+}
+
+/// Money, as the agent reports it. Currency is the agent's own string — an
+/// ISO code by convention, but not one we are entitled to reinterpret.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Cost {
+    pub amount: f64,
+    pub currency: String,
 }
 
 /// What granting or refusing a permission means for the tool call.
@@ -277,6 +390,19 @@ pub struct SessionThread {
     pub revision: u64,
     /// The session wants `authenticate` before `session/new` will work.
     pub needs_auth: bool,
+    /// The agent's own timestamp for this conversation, from
+    /// `SessionInfoUpdate`. ISO-8601 as the agent wrote it — passed through,
+    /// never reformatted, because only the agent knows its own clock.
+    pub updated_at: Option<String>,
+    /// What *kind* of failure `error` is, so the panel can say something
+    /// better than one red sentence and can offer the right way out. Zed
+    /// keeps the same taxonomy (thread_view.rs:11019-11135).
+    pub error_kind: Option<ErrorKind>,
+    /// A one-line answer to something the user just did that did not happen —
+    /// a mode the agent refused, a config option it rejected. Cleared by the
+    /// next thing they do. Without it those failures were computed and shown
+    /// to nobody.
+    pub notice: Option<String>,
     /// The running turn has been cancelled and its answer is still on its
     /// way. While this is set, a `session/request_permission` that arrives is
     /// **answered `cancelled` immediately** rather than parked: the user has
@@ -306,7 +432,22 @@ impl SessionThread {
             queued_prompt: None,
             revision: 1,
             needs_auth: false,
+            updated_at: None,
+            error_kind: None,
+            notice: None,
             turn_cancelled: false,
+        }
+    }
+
+    /// Say why the last thing the user asked for did not happen.
+    pub fn notice(&mut self, message: String) {
+        self.notice = Some(message);
+        self.bump();
+    }
+
+    pub fn clear_notice(&mut self) {
+        if self.notice.take().is_some() {
+            self.bump();
         }
     }
 
@@ -337,6 +478,9 @@ impl SessionThread {
     pub fn push_user_message(&mut self, text: &str) {
         self.stop_reason = None;
         self.error = None;
+        self.error_kind = None;
+        self.notice = None;
+        self.clear_stale_plan();
         self.phase = Phase::Running;
         self.turn_cancelled = false;
         self.push_entry(EntryBody::User {
@@ -513,11 +657,23 @@ impl SessionThread {
                     self.title = Some(title);
                     self.bump();
                 }
+                // The agent's own idea of when this conversation last moved,
+                // which is what its history list is sorted by. Dropping it
+                // meant a thread reopened from history had no date at all.
+                if let agent_client_protocol::schema::MaybeUndefined::Value(at) = update.updated_at
+                {
+                    self.updated_at = Some(at);
+                    self.bump();
+                }
             }
             acp::SessionUpdate::UsageUpdate(update) => {
                 self.usage = Some(Usage {
                     used: update.used,
                     size: update.size,
+                    cost: update.cost.map(|cost| Cost {
+                        amount: cost.amount,
+                        currency: cost.currency,
+                    }),
                 });
                 self.bump();
             }
@@ -599,6 +755,7 @@ impl SessionThread {
                 options: Vec::new(),
                 content: Vec::new(),
                 locations: Vec::new(),
+                raw_input: None,
                 resume: ToolStatus::Pending,
             };
             apply_tool_fields(
@@ -718,13 +875,49 @@ impl SessionThread {
             }
             _ => {}
         }
+        // A finished plan becomes history. Not on a cancel: a plan the user
+        // stopped is not a plan the agent completed, and filing it as done
+        // would say it was.
+        if !matches!(stop_reason, acp::StopReason::Cancelled) {
+            self.snapshot_completed_plan();
+        }
         self.take_queued_prompt()
+    }
+
+    /// Move a finished plan into the transcript.
+    ///
+    /// Only when every entry is settled — a plan the agent is still working
+    /// through belongs beside the composer, where it can be watched.
+    fn snapshot_completed_plan(&mut self) {
+        if self.plan.is_empty() {
+            return;
+        }
+        let settled = self
+            .plan
+            .iter()
+            .all(|entry| matches!(entry.status, acp::PlanEntryStatus::Completed));
+        if !settled {
+            return;
+        }
+        let entries = std::mem::take(&mut self.plan);
+        self.push_entry(EntryBody::CompletedPlan { entries });
+    }
+
+    /// Drop a plan the agent has stopped talking about, at the start of the
+    /// next turn. An unsettled plan from a turn that has ended is stale, and
+    /// a stale plan beside a live composer is a lie about what is happening.
+    fn clear_stale_plan(&mut self) {
+        if !self.plan.is_empty() {
+            self.plan.clear();
+            self.bump();
+        }
     }
 
     /// The turn failed outright — transport error, agent bug. The session
     /// stays usable: the next prompt may well work.
     pub fn fail_turn(&mut self, message: String) {
         self.phase = Phase::Ready;
+        self.error_kind = Some(ErrorKind::guess(&message));
         self.error = Some(message);
         self.turn_cancelled = false;
         self.discard_queued_prompt();
@@ -736,6 +929,7 @@ impl SessionThread {
     pub fn fail(&mut self, message: String) {
         self.phase = Phase::Unavailable;
         if self.error.is_none() {
+            self.error_kind = Some(ErrorKind::guess(&message));
             self.error = Some(message);
         }
         self.discard_queued_prompt();
@@ -763,8 +957,52 @@ impl SessionThread {
     pub fn auth_required(&mut self, message: String) {
         self.phase = Phase::Unavailable;
         self.needs_auth = true;
+        self.error_kind = Some(ErrorKind::Auth);
         self.error = Some(message);
         self.bump();
+    }
+
+    /// Write a finished terminal's output onto the entry that names it.
+    ///
+    /// The registry keeps a bounded number of released terminals, and an
+    /// agent that runs seventeen commands has silently emptied the first
+    /// card. The transcript is the record, so the record has to be able to
+    /// stand on its own: sealing costs one entry update per command — not per
+    /// chunk, which is why the live bytes are still kept out of the delta.
+    pub fn seal_terminal(
+        &mut self,
+        terminal_id: &str,
+        label: String,
+        output: String,
+        truncated: bool,
+        exit_status: Option<serde_json::Value>,
+    ) {
+        let mut sealed = None;
+        for (index, entry) in self.entries.iter_mut().enumerate() {
+            let EntryBody::ToolCall(call) = &mut entry.body else {
+                continue;
+            };
+            for content in &mut call.content {
+                if let ToolContent::Terminal {
+                    terminal_id: id,
+                    label: card_label,
+                    output: card_output,
+                    truncated: card_truncated,
+                    exit_status: card_exit,
+                } = content
+                    && id == terminal_id
+                {
+                    *card_label = Some(label.clone());
+                    *card_output = Some(output.clone());
+                    *card_truncated = truncated;
+                    *card_exit = exit_status.clone();
+                    sealed = Some(index);
+                }
+            }
+        }
+        if let Some(index) = sealed {
+            self.touch(index);
+        }
     }
 
     /// Everything but the entries, for the UI's cheap state read.
@@ -784,6 +1022,14 @@ impl SessionThread {
             "modes": self.modes,
             "commands": self.commands,
             "configOptions": self.config_options,
+            // What kind of failure `error` is, and whether trying again could
+            // work — the panel needs both to say anything better than one red
+            // sentence.
+            "errorKind": self.error_kind,
+            "canRetry": self.error_kind.is_some_and(ErrorKind::can_retry),
+            "notice": self.notice,
+            "acpSessionId": self.acp_id.as_ref().map(|id| id.0.to_string()),
+            "updatedAt": self.updated_at,
             "agent": agent,
         })
     }
@@ -838,9 +1084,45 @@ fn apply_tool_fields(call: &mut ToolCallEntry, fields: acp::ToolCallUpdateFields
             })
             .collect();
     }
-    // raw_input / raw_output are deliberately dropped: Zed renders raw_output
-    // only when a call has no content at all (acp_thread.rs:1055-1065), and
-    // for a phone the content the agent chose to send is the card.
+    // `raw_output` is the fallback, not a second body: an agent that sends no
+    // `content` at all still has to leave *something* on the card, and this is
+    // what it has. Applied after the content above, and only when that left
+    // the card empty — Zed's own rule and its own reason
+    // (acp_thread.rs:1054-1065). Without it a call whose agent reports through
+    // `rawOutput` — which the protocol allows and plenty of agents do —
+    // renders as a title and nothing else.
+    //
+    if let Some(raw_input) = fields.raw_input
+        && !raw_input.is_null()
+    {
+        call.raw_input = Some(
+            serde_json::to_string_pretty(&raw_input).unwrap_or_else(|_| raw_input.to_string()),
+        );
+    }
+    if call.content.is_empty()
+        && let Some(raw_output) = fields.raw_output
+        && let Some(markdown) = raw_output_markdown(&raw_output)
+    {
+        call.content.push(ToolContent::Markdown { markdown });
+    }
+}
+
+/// A tool call's `rawOutput` as something a card can show.
+///
+/// Scalars speak for themselves; anything structured becomes a fenced JSON
+/// block, which is what Zed does (acp_thread.rs:4721-4762) and is the only
+/// honest rendering of a shape we know nothing about.
+fn raw_output_markdown(raw_output: &serde_json::Value) -> Option<String> {
+    match raw_output {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        value => {
+            let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+            Some(format!("```json\n{pretty}\n```"))
+        }
+    }
 }
 
 fn apply_tool_status(call: &mut ToolCallEntry, status: ToolStatus) {
@@ -867,6 +1149,10 @@ fn tool_content(content: acp::ToolCallContent, root: &Path) -> Option<ToolConten
         }),
         acp::ToolCallContent::Terminal(terminal) => Some(ToolContent::Terminal {
             terminal_id: terminal.terminal_id.0.to_string(),
+            label: None,
+            output: None,
+            truncated: false,
+            exit_status: None,
         }),
         _ => None,
     }
@@ -1127,6 +1413,161 @@ mod tests {
     /// model the agent changed on its own — a rate-limit downgrade, its own
     /// `/model` — left the selector chip showing the old value for ever, and
     /// the boolean toggle then computed what to send from that stale value.
+    /// A plan that is finished is history, not a live plan.
+    ///
+    /// Nothing used to clear one, so a plan completed three turns ago still
+    /// read "4/4" beside the composer — indistinguishable from one the agent
+    /// was working through right now.
+    #[test]
+    fn a_finished_plan_becomes_history_and_a_stale_one_is_dropped() {
+        let entry = |content: &str, status| {
+            acp::PlanEntry::new(content.to_owned(), acp::PlanEntryPriority::Medium, status)
+        };
+        let mut thread = SessionThread::new(1, PathBuf::from("/p"));
+
+        // A plan still in progress stays beside the composer when the turn
+        // ends — the agent may pick it up again in the next one.
+        thread.apply_update(acp::SessionUpdate::Plan(acp::Plan::new(vec![
+            entry("one", acp::PlanEntryStatus::Completed),
+            entry("two", acp::PlanEntryStatus::InProgress),
+        ])));
+        thread.end_turn(acp::StopReason::EndTurn);
+        assert_eq!(thread.plan.len(), 2, "unsettled: still the live plan");
+
+        // Finished: it moves into the transcript.
+        thread.apply_update(acp::SessionUpdate::Plan(acp::Plan::new(vec![
+            entry("one", acp::PlanEntryStatus::Completed),
+            entry("two", acp::PlanEntryStatus::Completed),
+        ])));
+        thread.end_turn(acp::StopReason::EndTurn);
+        assert!(thread.plan.is_empty(), "no longer live");
+        assert!(
+            matches!(
+                thread.entries.last().map(|e| &e.body),
+                Some(EntryBody::CompletedPlan { entries }) if entries.len() == 2
+            ),
+            "filed in the transcript"
+        );
+
+        // A cancel is not a completion: the plan stays where it is, because
+        // filing it as done would say the agent finished it.
+        thread.apply_update(acp::SessionUpdate::Plan(acp::Plan::new(vec![entry(
+            "three",
+            acp::PlanEntryStatus::Completed,
+        )])));
+        thread.end_turn(acp::StopReason::Cancelled);
+        assert_eq!(thread.plan.len(), 1, "a cancelled plan is not filed");
+
+        // And the next turn starting clears whatever was left over.
+        thread.push_user_message("go on then");
+        assert!(thread.plan.is_empty(), "stale plan dropped at turn start");
+    }
+
+    /// The transcript is the record, so a released terminal's output has to
+    /// live on the entry — the registry evicts, and a card whose terminal has
+    /// gone must still say what the command did.
+    #[test]
+    fn a_released_terminals_output_is_sealed_onto_its_entry() {
+        let mut thread = SessionThread::new(1, PathBuf::from("/p"));
+        thread.apply_update(acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new(acp::ToolCallId::new("t1"), "$ cargo test").content(vec![
+                acp::ToolCallContent::Terminal(acp::Terminal::new(acp::TerminalId::new("term-1"))),
+            ]),
+        ));
+        let before = thread.revision;
+
+        thread.seal_terminal(
+            "term-1",
+            "cargo test".to_owned(),
+            "ok. 258 passed\n".to_owned(),
+            true,
+            Some(serde_json::json!({"exitCode": 0})),
+        );
+
+        assert!(thread.revision > before, "the panel has to be told");
+        let ToolContent::Terminal {
+            label,
+            output,
+            truncated,
+            exit_status,
+            ..
+        } = &call_named(&thread, "t1").content[0]
+        else {
+            panic!("expected a terminal block");
+        };
+        assert_eq!(label.as_deref(), Some("cargo test"));
+        assert_eq!(output.as_deref(), Some("ok. 258 passed\n"));
+        assert!(truncated);
+        assert_eq!(exit_status.as_ref().unwrap()["exitCode"], 0);
+    }
+
+    /// A tool call whose agent reports through `rawOutput` and sends no
+    /// `content` must still say something. Zed falls back to exactly this
+    /// (acp_thread.rs:1054-1065); without it the card is a title and nothing
+    /// else, which reads as "the tool did nothing".
+    #[test]
+    fn raw_output_fills_a_tool_call_that_has_no_content() {
+        let mut thread = SessionThread::new(1, PathBuf::from("/p"));
+
+        thread.apply_update(acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new(acp::ToolCallId::new("t1"), "Look something up")
+                .status(acp::ToolCallStatus::Completed)
+                .raw_output(serde_json::json!({"found": 3, "where": "src"})),
+        ));
+        // A structured answer is fenced JSON, the only honest rendering of a
+        // shape we know nothing about.
+        let ToolContent::Markdown { markdown } = &call_named(&thread, "t1").content[0] else {
+            panic!("expected markdown from rawOutput");
+        };
+        assert!(markdown.starts_with("```json\n"), "fenced: {markdown}");
+        assert!(
+            markdown.contains("\"found\": 3"),
+            "pretty-printed: {markdown}"
+        );
+
+        // A plain string is itself, not a JSON-quoted string.
+        thread.apply_update(acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new(acp::ToolCallId::new("t2"), "Ask")
+                .raw_output(serde_json::json!("all clear")),
+        ));
+        assert_eq!(
+            call_named(&thread, "t2").content[0],
+            ToolContent::Markdown {
+                markdown: "all clear".to_owned()
+            }
+        );
+
+        // And it is a *fallback*: real content wins, and rawOutput does not
+        // append a second copy of the same answer underneath it.
+        thread.apply_update(acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new(acp::ToolCallId::new("t3"), "Read")
+                .content(vec![acp::ToolCallContent::from(acp::ContentBlock::from(
+                    "the real answer",
+                ))])
+                .raw_output(serde_json::json!("noise")),
+        ));
+        let content = &call_named(&thread, "t3").content;
+        assert_eq!(content.len(), 1, "no second body: {content:?}");
+        assert_eq!(
+            content[0],
+            ToolContent::Markdown {
+                markdown: "the real answer".to_owned()
+            }
+        );
+    }
+
+    /// The tool call with `id`, for the assertions above.
+    fn call_named<'a>(thread: &'a SessionThread, id: &str) -> &'a ToolCallEntry {
+        thread
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.body {
+                EntryBody::ToolCall(call) if call.id == id => Some(call),
+                _ => None,
+            })
+            .expect("the tool call")
+    }
+
     #[test]
     fn a_config_option_update_moves_the_revision() {
         let mut thread = thread();

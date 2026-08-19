@@ -304,8 +304,13 @@ fn scope_tool_call(scope: &acp::ElicitationScope) -> Option<String> {
     }
 }
 
-/// The schema, flattened into one field per property in the order the schema
-/// lists them, each carrying only what a form needs to draw and validate it.
+/// The schema, flattened into one field per property, each carrying only what
+/// a form needs to draw and validate it.
+///
+/// Field order is the property *names*' order, because that is all there is:
+/// the schema's `properties` is a `BTreeMap` and JSON objects have no order,
+/// so an agent cannot express "ask this one first" and a client cannot honour
+/// it. Alphabetical is at least stable between renders.
 fn form_fields(schema: &acp::ElicitationSchema) -> Vec<serde_json::Value> {
     let required = schema.required.clone().unwrap_or_default();
     schema

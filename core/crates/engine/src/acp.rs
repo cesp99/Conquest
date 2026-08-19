@@ -851,6 +851,29 @@ impl AgentShared {
         request: acp::ReleaseTerminalRequest,
         responder: Responder<acp::ReleaseTerminalResponse>,
     ) {
+        // Seal what it printed onto the transcript *before* letting go of it.
+        // The registry keeps only the last few released terminals, and the
+        // transcript is the record — a card whose terminal has since been
+        // evicted must still be able to say what the command did.
+        let terminal_id = request.terminal_id.0.to_string();
+        if let Some(terminal) = self.terminals.get(&terminal_id) {
+            let snapshot = terminal.snapshot();
+            if let Some(handle) = self.session(terminal.session) {
+                let exit = snapshot
+                    .exit
+                    .as_ref()
+                    .and_then(|exit| serde_json::to_value(exit).ok());
+                handle.update(|thread| {
+                    thread.seal_terminal(
+                        &terminal_id,
+                        snapshot.label.clone(),
+                        snapshot.output.clone(),
+                        snapshot.truncated,
+                        exit,
+                    );
+                });
+            }
+        }
         if !self.terminals.release(request.terminal_id.0.as_ref()) {
             let _ = responder.respond_with_error(
                 acp::Error::invalid_params().data(serde_json::json!("unknown terminal")),
@@ -1967,6 +1990,16 @@ impl crate::Engine {
             object.insert("elicitations".to_owned(), elicitations.into());
         }
         state.to_string()
+    }
+
+    /// Put away the one-line notice saying why the last thing the user asked
+    /// for did not happen. False for a session the engine has forgotten.
+    pub fn acp_clear_notice(&self, session: u64) -> bool {
+        let Some(handle) = self.session_handle(session) else {
+            return false;
+        };
+        handle.update(|thread| thread.clear_notice());
+        true
     }
 
     /// Answer one of the agent's questions. `action_json` is
@@ -3123,6 +3156,7 @@ mod tests {
             match &entry.body {
                 EntryBody::User { .. } => kinds.push("user"),
                 EntryBody::Assistant { .. } => kinds.push("assistant"),
+                EntryBody::CompletedPlan { .. } => kinds.push("completed_plan"),
                 EntryBody::ToolCall(call) => {
                     kinds.push("tool_call");
                     assert_eq!(call.status, ToolStatus::Completed);
@@ -3724,7 +3758,7 @@ mod tests {
                 .find_map(|entry| match &entry.body {
                     EntryBody::ToolCall(call) if call.id == "t-3" => {
                         call.content.iter().find_map(|content| match content {
-                            crate::acp_thread::ToolContent::Terminal { terminal_id } => {
+                            crate::acp_thread::ToolContent::Terminal { terminal_id, .. } => {
                                 Some(terminal_id.clone())
                             }
                             _ => None,
@@ -3733,9 +3767,22 @@ mod tests {
                     _ => None,
                 })
                 .expect("the tool call names its terminal");
-            // Released by the agent at the end of its turn, so the panel's
-            // read is the "this is history" answer rather than a stale buffer.
-            assert!(shared.terminals.get(&terminal_id).is_none());
+            // Released by the agent at the end of its turn — and *still
+            // readable*, because releasing frees the process, not the record
+            // of what it printed. Agents release the moment they have the
+            // output they wanted, so a card that emptied itself on release
+            // would be a card the user could never read.
+            let kept = shared
+                .terminals
+                .get(&terminal_id)
+                .expect("a released terminal is still readable");
+            let snapshot = kept.snapshot();
+            assert!(snapshot.exit.is_some(), "and it is over");
+            assert!(
+                snapshot.output.contains("out"),
+                "with its output: {:?}",
+                snapshot.output
+            );
 
             // What the agent said it saw is what the command actually did.
             let reply = thread

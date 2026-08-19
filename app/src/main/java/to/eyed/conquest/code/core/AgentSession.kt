@@ -150,13 +150,76 @@ sealed interface ToolContent {
      * is what stops a growing build log re-sending the whole card on every
      * chunk of output.
      */
-    data class Terminal(val terminalId: String) : ToolContent
+    data class Terminal(
+        val terminalId: String,
+        /**
+         * What the command printed, sealed onto the entry when the agent
+         * released its terminal.
+         *
+         * The engine keeps only the last few released terminals resident, so
+         * the transcript cannot depend on the registry: this is the card's
+         * copy, and the live poll is only an optimisation while the command
+         * is still running. Null means it is still live.
+         */
+        val sealed: AgentTerminalState? = null,
+    ) : ToolContent
 }
 
 /** A live agent terminal, as [CoreBridge.acpTerminalOutput] reports it. */
+/** What a turn has cost, when the agent says. Currency is the agent's string. */
+data class AgentCost(val amount: Double, val currency: String)
+
+/**
+ * What kind of failure the session's `error` is.
+ *
+ * The panel needs it to say the right sentence and offer the right way out: a
+ * rate limit is worth retrying, a context overflow needs a new thread, and a
+ * dead transport means the agent is gone and nothing will help but restarting
+ * it. One red line for all of them is what we had.
+ */
+enum class AgentErrorKind {
+    RateLimit, Auth, ContextWindow, Refusal, Transport, Api, Other;
+
+    /** The heading to put over the error, in the user's words. */
+    val heading: String
+        get() = when (this) {
+            RateLimit -> "The provider is rate-limiting"
+            Auth -> "The agent needs signing in to"
+            ContextWindow -> "This conversation is too long to continue"
+            Refusal -> "The agent declined"
+            Transport -> "The agent is gone"
+            Api -> "The provider returned an error"
+            Other -> "Something went wrong"
+        }
+
+    /** What to do about it, when there is something to say. */
+    val advice: String?
+        get() = when (this) {
+            RateLimit -> "Wait a moment and try again."
+            ContextWindow -> "Start a new thread; this one cannot take any more."
+            Transport -> "Start a new thread to bring it back."
+            else -> null
+        }
+
+    internal companion object {
+        fun parse(text: String?): AgentErrorKind? = when (text) {
+            "rate_limit" -> RateLimit
+            "auth" -> Auth
+            "context_window" -> ContextWindow
+            "refusal" -> Refusal
+            "transport" -> Transport
+            "api" -> Api
+            "other" -> Other
+            else -> null
+        }
+    }
+}
+
 data class AgentTerminalState(
     val revision: Long,
     val label: String,
+    /** Where it ran. A command's meaning depends on its directory. */
+    val cwd: String,
     val output: String,
     val truncated: Boolean,
     val running: Boolean,
@@ -164,10 +227,48 @@ data class AgentTerminalState(
     val exitCode: Int?,
     /** The signal that ended it, when one did. */
     val signal: String?,
+    /** How long it has run, or ran — frozen at the exit. */
+    val elapsedMs: Long = 0,
+    /** How much was dropped off the front to stay under the cap. */
+    val droppedBytes: Long = 0,
+    val droppedLines: Long = 0,
 ) {
+    /**
+     * "2.4 MB of earlier output dropped from the start", or null.
+     *
+     * The amount is the point: "some output was dropped" tells the reader
+     * nothing about whether to go looking elsewhere for it.
+     */
+    val droppedSentence: String?
+        get() = when {
+            !truncated -> null
+            droppedBytes <= 0 -> "Earlier output dropped from the start."
+            else -> {
+                val size = when {
+                    droppedBytes >= 1024L * 1024 -> "%.1f MB".format(droppedBytes / 1048576.0)
+                    droppedBytes >= 1024 -> "${droppedBytes / 1024} kB"
+                    else -> "$droppedBytes bytes"
+                }
+                val lines = if (droppedLines > 0) " ($droppedLines lines)" else ""
+                "$size$lines of earlier output dropped from the start."
+            }
+        }
+
+    /** "4m 12s", or null when it is not worth saying. */
+    val elapsedLabel: String?
+        get() {
+            val seconds = elapsedMs / 1000
+            return when {
+                seconds < 2 -> null
+                seconds < 60 -> "${seconds}s"
+                seconds < 3600 -> "${seconds / 60}m ${seconds % 60}s"
+                else -> "${seconds / 3600}h ${(seconds % 3600) / 60}m"
+            }
+        }
+
     companion object {
         /** What a terminal the engine no longer has looks like. */
-        val Gone = AgentTerminalState(0, "", "", false, false, null, null)
+        val Gone = AgentTerminalState(0, "", "", "", false, false, null, null)
 
         /**
          * Parse one poll. Returns [previous] unchanged when the revision has
@@ -183,11 +284,15 @@ data class AgentTerminalState(
             return AgentTerminalState(
                 revision = revision,
                 label = root.optString("label"),
+                cwd = root.optString("cwd"),
                 output = root.optString("output"),
                 truncated = root.optBoolean("truncated"),
                 running = root.optBoolean("running"),
                 exitCode = exit?.takeIf { !it.isNull("exitCode") }?.optInt("exitCode"),
                 signal = exit?.takeIf { !it.isNull("signal") }?.optString("signal"),
+                elapsedMs = root.optLong("elapsedMs"),
+                droppedBytes = root.optLong("droppedBytes"),
+                droppedLines = root.optLong("droppedLines"),
             )
         }
     }
@@ -431,6 +536,15 @@ sealed interface AgentEntry {
         val options: List<PermissionOption>,
         val content: List<ToolContent>,
         val locations: List<AgentLocation>,
+        /**
+         * The arguments the agent wants to run with, pretty-printed JSON,
+         * when it sent them.
+         *
+         * A permission prompt asks the user to approve a *call*, and "Edit
+         * notes.md" does not say what the edit is. Folded away by default —
+         * it is JSON, and most calls do not need reading.
+         */
+        val rawInput: String?,
     ) : AgentEntry {
         val diffs: List<FileDiff> get() = content.filterIsInstance<ToolContent.Diff>().map { it.file }
     }
@@ -447,12 +561,35 @@ sealed interface AgentEntry {
      * kind exactly what it should be: one line nobody can render, and the rest
      * of the conversation intact.
      */
+    /**
+     * A plan the agent finished, filed where the turn it belonged to is.
+     *
+     * Distinct from the live plan beside the composer on purpose: a plan
+     * completed three turns ago is history, and showing it as though the
+     * agent were still working through it is the bug this exists to fix.
+     */
+    data class CompletedPlan(val entries: List<AgentPlanEntry>) : AgentEntry
+
     data object Unsupported : AgentEntry
 
     companion object {
         /** Never null: an unknown row is [Unsupported], never a hole. */
         internal fun parse(json: JSONObject): AgentEntry = when (json.optString("kind")) {
             "user" -> User(json.optString("markdown"))
+
+            "completed_plan" -> {
+                val entries = json.optJSONArray("entries") ?: JSONArray()
+                CompletedPlan(
+                    List(entries.length()) { index ->
+                        val entry = entries.getJSONObject(index)
+                        AgentPlanEntry(
+                            content = entry.optString("content"),
+                            priority = entry.optString("priority"),
+                            status = entry.optString("status"),
+                        )
+                    }
+                )
+            }
 
             "assistant" -> {
                 val chunks = json.optJSONArray("chunks") ?: JSONArray()
@@ -490,11 +627,38 @@ sealed interface AgentEntry {
 
                             "terminal" -> item.optString("terminalId")
                                 .takeIf { it.isNotEmpty() }
-                                ?.let { ToolContent.Terminal(it) }
+                                ?.let { id ->
+                                    val exit = item.optJSONObject("exitStatus")
+                                    ToolContent.Terminal(
+                                        terminalId = id,
+                                        // Present only once the agent has
+                                        // released it; until then the card
+                                        // polls the live terminal.
+                                        sealed = if (item.has("output")) {
+                                            AgentTerminalState(
+                                                revision = 1,
+                                                label = item.optString("label"),
+                                                cwd = "",
+                                                output = item.optString("output"),
+                                                truncated = item.optBoolean("truncated"),
+                                                running = false,
+                                                exitCode = exit
+                                                    ?.takeIf { !it.isNull("exitCode") }
+                                                    ?.optInt("exitCode"),
+                                                signal = exit
+                                                    ?.takeIf { !it.isNull("signal") }
+                                                    ?.optString("signal"),
+                                            )
+                                        } else {
+                                            null
+                                        },
+                                    )
+                                }
 
                             else -> null
                         }
                     },
+                    rawInput = json.stringOrNull("rawInput"),
                     locations = List(locations.length()) { index ->
                         val location = locations.getJSONObject(index)
                         AgentLocation(
@@ -511,9 +675,17 @@ sealed interface AgentEntry {
 }
 
 /** Context-window usage, when the agent reports it. */
-data class AgentUsage(val used: Long, val size: Long) {
+data class AgentUsage(val used: Long, val size: Long, val cost: AgentCost? = null) {
     /** 0..1, or null when the agent gave a nonsensical window. */
     val fraction: Float? get() = if (size > 0) (used.toFloat() / size).coerceIn(0f, 1f) else null
+
+    /**
+     * Whether the window is close enough to full to be worth saying so.
+     *
+     * Zed warns rather than only drawing a bar, because a thread that hits
+     * the limit mid-turn loses the reply and the user had no notice.
+     */
+    val isNearlyFull: Boolean get() = (fraction ?: 0f) >= 0.85f
 }
 
 /** One entry of the agent's plan. */
@@ -727,6 +899,20 @@ data class AgentSessionState(
      * transcript where the next thing to do is.
      */
     val elicitations: List<AgentElicitation>,
+    /** What kind of failure [error] is, when the engine could tell. */
+    val errorKind: AgentErrorKind?,
+    /** Whether trying the same thing again could plausibly work. */
+    val canRetry: Boolean,
+    /**
+     * Why the last thing the user asked for did not happen — a mode the agent
+     * refused, a config option it rejected. These used to be computed and
+     * shown to nobody.
+     */
+    val notice: String?,
+    /** The agent's own id for this session, for reconciling its history list. */
+    val acpSessionId: String?,
+    /** The agent's own timestamp for the conversation, as it wrote it. */
+    val updatedAt: String?,
     val agent: AgentInfo?,
 ) {
     val isBusy: Boolean get() = phase == AgentPhase.Running
@@ -750,6 +936,11 @@ data class AgentSessionState(
             commands = emptyList(),
             configOptions = emptyList(),
             elicitations = emptyList(),
+            errorKind = null,
+            canRetry = false,
+            notice = null,
+            acpSessionId = null,
+            updatedAt = null,
             agent = null,
         )
 
@@ -776,7 +967,16 @@ data class AgentSessionState(
                         status = entry.optString("status"),
                     )
                 },
-                usage = usage?.let { AgentUsage(it.optLong("used"), it.optLong("size")) },
+                usage = usage?.let {
+                    val cost = it.optJSONObject("cost")
+                    AgentUsage(
+                        used = it.optLong("used"),
+                        size = it.optLong("size"),
+                        cost = cost?.let { money ->
+                            AgentCost(money.optDouble("amount"), money.optString("currency"))
+                        },
+                    )
+                },
                 modes = modes?.let {
                     val available = it.optJSONArray("availableModes") ?: JSONArray()
                     AgentModes(
@@ -794,6 +994,11 @@ data class AgentSessionState(
                 commands = parseCommands(root.optJSONArray("commands")),
                 configOptions = parseConfigOptions(root.optJSONArray("configOptions")),
                 elicitations = parseElicitations(root.optJSONArray("elicitations")),
+                errorKind = AgentErrorKind.parse(root.stringOrNull("errorKind")),
+                canRetry = root.optBoolean("canRetry"),
+                notice = root.stringOrNull("notice"),
+                acpSessionId = root.stringOrNull("acpSessionId"),
+                updatedAt = root.stringOrNull("updatedAt"),
                 agent = agent?.let {
                     val methods = it.optJSONArray("auth_methods") ?: JSONArray()
                     AgentInfo(
@@ -1063,9 +1268,13 @@ fun rememberAgentSessionList(enabled: Boolean, refreshToken: Int): AgentSessionL
  * never changes again, and nothing that never changes is worth waking for.
  */
 @Composable
-fun rememberAgentTerminal(terminalId: String): AgentTerminalState {
+fun rememberAgentTerminal(terminalId: String, enabled: Boolean = true): AgentTerminalState {
     var state by remember(terminalId) { mutableStateOf(AgentTerminalState.Gone) }
-    LaunchedEffect(terminalId) {
+    LaunchedEffect(terminalId, enabled) {
+        // A terminal whose output is already sealed onto the entry needs no
+        // poll at all: the record is on the card, and the engine may well
+        // have evicted the live one.
+        if (!enabled) return@LaunchedEffect
         var seen = 0L
         while (true) {
             val previous = state
