@@ -87,6 +87,9 @@ object AgentSessions {
 
     private const val TAG = "conquest-agent"
 
+    /** Zed's cut for a title taken from a message (thread_view.rs:1730). */
+    private const val PROVISIONAL_TITLE_MAX = 200
+
     /**
      * The agent the user picked; null until they do.
      *
@@ -404,6 +407,14 @@ object AgentSessions {
         // Kept for `retryLastPrompt`: a refusal truncates the transcript past
         // the prompt it refused, so the transcript cannot be the source.
         lastPrompt = text to mentions
+        // Name the thread after the first thing said in it, until the agent
+        // sends a name of its own — Zed's provisional title, set at exactly
+        // this moment (thread_view.rs:1720-1732). Without it every
+        // conversation was "Thread 1", "Thread 2", and the history list was a
+        // column of numbers with no way to tell one from another.
+        active?.let { thread ->
+            if (thread.title == null) thread.title = provisionalTitle(text)
+        }
         val mentionsJson = org.json.JSONArray(mentions).toString()
         scope.launch {
             val sent = runCatching { CoreBridge.acpPrompt(session, text, mentionsJson) }
@@ -412,6 +423,25 @@ object AgentSessions {
                 onRefused()
                 lastRefusal = "The agent did not take that message; the session may have ended."
             }
+        }
+    }
+
+    /**
+     * What to call a thread whose agent has not named it: the first line of
+     * the first thing the user said, trimmed — Zed's rule, and its 200
+     * characters (thread_view.rs:1728-1730), which the bar ellipsizes and the
+     * threads list has room for.
+     *
+     * Null for a message with nothing in it but whitespace, so an empty name
+     * never displaces `Thread N`.
+     */
+    internal fun provisionalTitle(text: String): String? {
+        val line = text.lineSequence().firstOrNull { it.isNotBlank() }?.trim() ?: return null
+        if (line.isEmpty()) return null
+        return if (line.length > PROVISIONAL_TITLE_MAX) {
+            line.take(PROVISIONAL_TITLE_MAX).trimEnd() + "…"
+        } else {
+            line
         }
     }
 

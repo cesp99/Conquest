@@ -227,6 +227,13 @@ can see where threads would live. Tap a thread to return to it — its whole
 transcript is kept — and **Close** to end it. Threads live with the agent
 process: they survive the panel closing, not the app.
 
+A thread is named after the first thing you say in it, and takes the agent's
+own name for the conversation instead as soon as the agent sends one.
+
+**Reasoning.** An agent that thinks out loud gets a **Thinking** line above
+its answer. It opens itself while the thought is arriving and closes when the
+answer starts; tap it to keep it open, or to read it again later.
+
 **What the agent itself remembers.** Some agents keep their conversations on
 their own side. When yours does, the Threads view has a *Kept by the agent*
 section under your own threads: tap one to reopen it — with its transcript

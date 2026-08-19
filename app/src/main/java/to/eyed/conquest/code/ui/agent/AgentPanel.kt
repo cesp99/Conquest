@@ -7,6 +7,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.horizontalScroll
@@ -26,6 +27,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -52,10 +54,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isShiftPressed
@@ -133,6 +139,16 @@ private val RowStartPadding = 10.dp
 
 /** Inputs are `rounded_md` = 6px (search_bar.rs:78). */
 private val FieldRadius = 6.dp
+
+/**
+ * The switch a boolean config option is, at Zed's proportions: track 32×20
+ * with a 12 thumb inset by 2 (`DynamicSpacing::Base32`/`Base20`/`Base12`/
+ * `Base02`, toggle.rs:518-539), scaled down a touch because the panel's own
+ * text is smaller than Zed's on a desktop.
+ */
+private val SwitchWidth = 28.dp
+private val SwitchHeight = 16.dp
+private val SwitchInset = 2.dp
 
 /**
  * Six lines of composer and no more, which is what Zed pins its own panel
@@ -1156,27 +1172,42 @@ private fun SwitchChip(
             },
             maxLines = 1,
         )
-        Box(
-            modifier = Modifier
-                .size(width = 30.dp, height = 16.dp)
-                .clip(CircleShape)
-                .background(track)
-                .border(1.dp, outline, CircleShape)
-                .padding(2.dp),
-            contentAlignment = if (checked) Alignment.CenterEnd else Alignment.CenterStart,
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(11.dp)
-                    .clip(CircleShape)
-                    .background(theme.color("text"))
-                    .alpha(
-                        when {
-                            !enabled -> 0.2f
-                            checked -> 1f
-                            else -> 0.5f
-                        }
-                    ),
+        // **Drawn, not composed, and both halves of that are the bug fix.**
+        // A track Box with the thumb as an aligned child rendered as a plain
+        // blue pill on the device: the thumb never appeared, and the track
+        // came out 24dp wide against the 30dp it asked for, because a `size`
+        // only *proposes* — the row it sits in clamped it and the inset child
+        // was squeezed out of existence. `requiredSize` refuses the clamp (the
+        // row scrolls, so there is somewhere to overflow to), and one canvas
+        // puts the thumb at a position derived from the size actually
+        // measured, so it cannot go missing however tight the row becomes.
+        val thumbColor = theme.color("text")
+        val thumbAlpha = when {
+            !enabled -> 0.2f
+            checked -> 1f
+            else -> 0.5f
+        }
+        Canvas(modifier = Modifier.requiredSize(SwitchWidth, SwitchHeight)) {
+            val radius = size.height / 2f
+            drawRoundRect(color = track, cornerRadius = CornerRadius(radius, radius))
+            drawRoundRect(
+                color = outline,
+                cornerRadius = CornerRadius(radius, radius),
+                style = Stroke(width = 1.dp.toPx()),
+            )
+            val inset = SwitchInset.toPx()
+            val thumbRadius = (size.height - inset * 2f) / 2f
+            drawCircle(
+                color = thumbColor.copy(alpha = thumbAlpha),
+                radius = thumbRadius,
+                center = Offset(
+                    x = if (checked) {
+                        size.width - inset - thumbRadius
+                    } else {
+                        inset + thumbRadius
+                    },
+                    y = size.height / 2f,
+                ),
             )
         }
     }
@@ -1289,7 +1320,19 @@ private fun Conversation(
                 // the same case (thread_view.rs:6374-6376).
                 is AgentEntry.Assistant ->
                     if (entry.spoken.isNotBlank() || entry.thoughts.isNotBlank()) {
-                        AssistantRow(entry, onOpenPath)
+                        AssistantRow(
+                            entry = entry,
+                            // Zed's `Auto` thinking display: the block opens
+                            // by itself while the thought is streaming and
+                            // closes when it stops (entry_view_state.rs:
+                            // 116-148). The live thought is the last entry of
+                            // a running turn that has not started speaking —
+                            // once there is an answer, the thinking is over.
+                            thinkingNow = state.isBusy &&
+                                index == conversation.entries.lastIndex &&
+                                entry.spoken.isBlank(),
+                            onOpenPath = onOpenPath,
+                        )
                     }
 
                 // Nor is a cancelled call that never produced anything.
@@ -1703,7 +1746,14 @@ private fun WorkingRow() {
     )
 }
 
-/** The user's own message: set apart, the way Zed sets its prompt blocks apart. */
+/**
+ * The user's own message: the editor background inside a bordered, rounded
+ * block, which is exactly how Zed draws it — `rounded_md`, `bg(editor
+ * _background)`, `border_1` in `border` (thread_view.rs:6207-6218). It used to
+ * be a fill with no border, which on a panel whose own background is close to
+ * `element.background` left the prompt barely distinguishable from the reply
+ * under it.
+ */
 @Composable
 private fun UserRow(entry: AgentEntry.User) {
     val theme = LocalZedTheme.current
@@ -1712,19 +1762,38 @@ private fun UserRow(entry: AgentEntry.User) {
             .fillMaxWidth()
             .padding(horizontal = 8.dp)
             .clip(RoundedCornerShape(FieldRadius))
-            .background(theme.color("element.background", Color.Transparent))
-            .padding(horizontal = 10.dp, vertical = 8.dp),
+            .background(theme.color("editor.background", Color.Transparent))
+            .border(1.dp, theme.color("border"), RoundedCornerShape(FieldRadius))
+            .padding(horizontal = 8.dp, vertical = 8.dp),
     ) {
         MarkdownText(entry.markdown)
     }
 }
 
-/** The reply, with its reasoning folded away until asked for. */
+/**
+ * The reply, with its reasoning above it in Zed's thinking block: the think
+ * icon, the word *Thinking*, a chevron, and — when open — the reasoning behind
+ * a left rule, indented (thread_view.rs:7462-7516). It used to be the words
+ * `thinking…` in the muted label size, which said neither that it could be
+ * opened nor that anything was in it.
+ */
 @Composable
-private fun AssistantRow(entry: AgentEntry.Assistant, onOpenPath: (String) -> Unit) {
+private fun AssistantRow(
+    entry: AgentEntry.Assistant,
+    /** The thought is still arriving, so the block shows itself. */
+    thinkingNow: Boolean,
+    onOpenPath: (String) -> Unit,
+) {
     val theme = LocalZedTheme.current
-    var showThoughts by remember { mutableStateOf(false) }
+    // Null until the reader has an opinion, and their opinion then outranks
+    // the streaming state for good — Zed keeps the same two facts apart
+    // (`expanded_thinking_blocks` and `user_toggled_thinking_blocks`),
+    // because a block the reader closed must not spring open on the next
+    // chunk of the same thought.
+    var openedByHand by remember { mutableStateOf<Boolean?>(null) }
     val thoughts = entry.thoughts
+    val open = openedByHand ?: thinkingNow
+    val ruleColor = theme.color("border.variant", theme.color("border"))
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1732,19 +1801,49 @@ private fun AssistantRow(entry: AgentEntry.Assistant, onOpenPath: (String) -> Un
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         if (thoughts.isNotEmpty()) {
-            Text(
-                text = if (showThoughts) "hide thinking" else "thinking…",
-                style = MaterialTheme.typography.labelSmall,
-                color = theme.color("text.muted"),
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
                 modifier = Modifier
+                    .fillMaxWidth()
                     .pointerHoverIcon(PointerIcon.Hand)
-                    .clickable(onClickLabel = "Thinking") { showThoughts = !showThoughts },
-            )
-            if (showThoughts) {
+                    .clickable(onClickLabel = "Thinking") { openedByHand = !open },
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_agent_think),
+                    contentDescription = null,
+                    tint = theme.color("text.muted"),
+                    modifier = Modifier.size(14.dp),
+                )
+                Text(
+                    text = "Thinking",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = theme.color("text.muted"),
+                    maxLines = 1,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                Text(
+                    text = if (open) "⌃" else "⌄",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = theme.color("text.muted"),
+                )
+            }
+            if (open) {
+                // The left rule is the whole reason this reads as reasoning
+                // rather than as more answer: `ml_1p5 pl_3p5 border_l_1` in
+                // the tool card's border colour (thread_view.rs:7507-7512).
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(start = 8.dp),
+                        .padding(start = 6.dp)
+                        .drawBehind {
+                            val width = 1.dp.toPx()
+                            drawRect(
+                                color = ruleColor,
+                                size = androidx.compose.ui.geometry.Size(width, size.height),
+                            )
+                        }
+                        .padding(start = 14.dp),
                 ) {
                     MarkdownText(thoughts)
                 }

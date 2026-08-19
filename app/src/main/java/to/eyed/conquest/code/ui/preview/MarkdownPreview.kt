@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -838,13 +839,23 @@ private fun BulletsView(
                     style = style.body,
                     color = style.theme.color("text.muted"),
                     textAlign = if (list.ordered) TextAlign.End else TextAlign.Start,
-                    // Fixed, so the items' text lines up, and wide enough for
-                    // `100.` at the body size. One line: a marker that wrapped
-                    // would push its own item's first line down.
+                    // One line: a marker that wrapped would push its own
+                    // item's first line down.
+                    //
+                    // **The width is a minimum, not a width**, and only an
+                    // ordered list gets one. A fixed 30dp column was there so
+                    // `100.` would line up, but it applied to `•` as well, and
+                    // a bullet followed by nearly forty points of nothing was
+                    // what the agent panel's lists looked like: an empty
+                    // corridor down the left of every reply. Zed sizes the
+                    // marker to itself and leaves one gap (markdown.rs:
+                    // 2005-2017, `h_flex().items_start()` with `gap_1`), which
+                    // is what an unordered list gets here now; the numbers
+                    // keep a minimum so they still align with each other.
                     maxLines = 1,
-                    modifier = Modifier.width(30.dp),
+                    modifier = if (list.ordered) Modifier.widthIn(min = 24.dp) else Modifier,
                 )
-                Column(modifier = Modifier.padding(start = 8.dp).weight(1f)) {
+                Column(modifier = Modifier.padding(start = 6.dp).weight(1f)) {
                     for (child in item.blocks) BlockView(child, document, style, onLink)
                 }
             }
