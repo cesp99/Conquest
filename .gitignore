@@ -33,3 +33,7 @@ core/**/target
 /agent-docs/
 /CLAUDE.md
 /AGENTS.md
+
+/app/build
+/app/full
+/app/play

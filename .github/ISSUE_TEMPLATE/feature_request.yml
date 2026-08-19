@@ -1,0 +1,81 @@
+name: Feature request
+description: Suggest a feature or improvement for Conquest Code
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! Conquest Code aims to bring a
+        Zed-class IDE to Android. Tell us what you'd like to see.
+
+        Keep in mind the project's principles: truly local, fast,
+        privacy-first, and built for foldables and tablets.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that Conquest Code doesn't let you do today? What's painful about the current workflow?
+      placeholder: |
+        I'm trying to … but Conquest Code currently doesn't …
+        This is frustrating because …
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: What you'd like
+      description: Describe the feature or change you'd like to see. Be as specific as you can.
+      placeholder: |
+        It would be great if Conquest Code could …
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: Have you tried any workarounds? Other apps that do this?
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the IDE does this touch?
+      options:
+        - Editor (typing, cursors, selection, clipboard)
+        - Syntax highlighting / language support
+        - Language servers (LSP)
+        - Terminal / Debian userland
+        - Project panel / file management
+        - Git integration
+        - Agent panel (ACP)
+        - Themes / appearance
+        - Settings / configuration
+        - Navigation / search
+        - Adaptive UI (foldable / tablet / phone layout)
+        - Performance
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: zed-reference
+    attributes:
+      label: Zed reference
+      description: Zed is the design north star for this project. Does Zed have this feature?
+      options:
+        - "Yes — Zed has this, and we should match it"
+        - "Zed doesn't have this, but it makes sense for Android"
+        - "Not applicable"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Code of conduct
+      options:
+        - label: I have searched existing issues for duplicates
+          required: true

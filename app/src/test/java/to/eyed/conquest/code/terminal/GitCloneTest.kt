@@ -22,8 +22,8 @@ class GitCloneTest {
 
     @Test
     fun derivesNameFromAnHttpsUrl() {
-        assertEquals("conquest", GitCloneUrl.projectName("https://github.com/eyed/conquest"))
-        assertEquals("conquest", GitCloneUrl.projectName("https://github.com/eyed/conquest.git"))
+        assertEquals("conquest", GitCloneUrl.projectName("https://github.com/cesp99/conquest"))
+        assertEquals("conquest", GitCloneUrl.projectName("https://github.com/cesp99/conquest.git"))
         assertEquals("conquest", GitCloneUrl.projectName("http://example.com/git/conquest.git"))
     }
 
@@ -32,16 +32,16 @@ class GitCloneTest {
         // scp-style: no scheme, and a colon where a slash would be.
         assertEquals("conquest", GitCloneUrl.projectName("git@github.com:eyed/conquest.git"))
         assertEquals("conquest", GitCloneUrl.projectName("git@github.com:eyed/conquest"))
-        assertEquals("conquest", GitCloneUrl.projectName("ssh://git@github.com/eyed/conquest.git"))
+        assertEquals("conquest", GitCloneUrl.projectName("ssh://git@github.com/cesp99/conquest.git"))
         assertEquals("conquest", GitCloneUrl.projectName("ssh://git@host:2222/eyed/conquest.git/"))
     }
 
     @Test
     fun ignoresTrailingSlashesAndQueryStrings() {
-        assertEquals("conquest", GitCloneUrl.projectName("https://github.com/eyed/conquest/"))
-        assertEquals("conquest", GitCloneUrl.projectName("https://github.com/eyed/conquest.git/"))
-        assertEquals("conquest", GitCloneUrl.projectName("  https://github.com/eyed/conquest  "))
-        assertEquals("conquest", GitCloneUrl.projectName("https://github.com/eyed/conquest.git#main"))
+        assertEquals("conquest", GitCloneUrl.projectName("https://github.com/cesp99/conquest/"))
+        assertEquals("conquest", GitCloneUrl.projectName("https://github.com/cesp99/conquest.git/"))
+        assertEquals("conquest", GitCloneUrl.projectName("  https://github.com/cesp99/conquest  "))
+        assertEquals("conquest", GitCloneUrl.projectName("https://github.com/cesp99/conquest.git#main"))
     }
 
     @Test
@@ -61,7 +61,7 @@ class GitCloneTest {
         // A project called ".git" or "." would be a hidden directory, or a
         // name ProjectsRoot rejects anyway. Better to suggest nothing.
         assertNull(GitCloneUrl.projectName(".git"))
-        assertNull(GitCloneUrl.projectName("https://github.com/eyed/.git"))
+        assertNull(GitCloneUrl.projectName("https://github.com/cesp99/.git"))
         assertNull(GitCloneUrl.projectName("../"))
     }
 

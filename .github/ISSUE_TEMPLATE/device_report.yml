@@ -1,0 +1,99 @@
+name: Device / compatibility report
+description: Report how Conquest Code works (or doesn't) on a specific device, foldable, or tablet
+labels: ["device-testing"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Testing on real hardware is the most valuable contribution you
+        can make to Conquest Code. Many bugs only appear on actual
+        foldables, tablets, or specific Android versions — they can
+        never be found on an emulator alone.
+
+        Use this template whether things work great or break. Positive
+        reports are just as useful: they tell us which devices are
+        covered.
+
+  - type: input
+    id: device-model
+    attributes:
+      label: Device model
+      description: Full model name.
+      placeholder: "Samsung Galaxy Z Fold 5 (SM-F946B)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: form-factor
+    attributes:
+      label: Form factor
+      options:
+        - Foldable (inner screen)
+        - Foldable (cover screen)
+        - Tablet
+        - Phone
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: android-version
+    attributes:
+      label: Android version
+      placeholder: "14 (API 34)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: edition
+    attributes:
+      label: Edition
+      options:
+        - full (F-Droid / direct APK)
+        - play (Google Play)
+        - Both
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: "1.0-full"
+
+  - type: textarea
+    id: what-works
+    attributes:
+      label: What works well
+      description: Features you tested that work correctly. Be specific — editor, terminal, git, themes, fold/unfold transitions, keyboard/mouse, etc.
+      placeholder: |
+        - Editor typing and multi-cursor: smooth, no dropped frames
+        - Terminal: Debian userland installed and apt works
+        - Fold/unfold: layout adapts correctly
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-breaks
+    attributes:
+      label: What breaks or is broken
+      description: Anything that didn't work, crashed, or behaved unexpectedly. Include steps to reproduce if possible.
+      placeholder: |
+        - When unfolding, the project panel disappears and doesn't come back
+        - Keyboard input lags after opening a split
+        - Steps: 1) … 2) … 3) …
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional notes
+      description: Anything else worth knowing — keyboard type used (Bluetooth, DeX, on-screen), external display, stylus, etc.
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Code of conduct
+      options:
+        - label: I have searched existing issues for duplicates
+          required: true

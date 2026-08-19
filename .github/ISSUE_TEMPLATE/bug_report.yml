@@ -1,0 +1,83 @@
+name: Bug report
+description: Report something that isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report! Conquest Code is
+        early software — your reports make it better.
+
+        Before opening a new issue, please search existing issues to avoid
+        duplicates.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug. What did you expect, and what happened instead?
+      placeholder: |
+        Steps to reproduce:
+        1. Open a project with …
+        2. Press Ctrl+…
+        3. …
+
+        Expected: …
+        Actual: …
+    validations:
+      required: true
+
+  - type: dropdown
+    id: edition
+    attributes:
+      label: Edition
+      description: Which build of Conquest Code are you using?
+      options:
+        - full (F-Droid / direct APK — includes Debian userland)
+        - play (Google Play — no userland)
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The version shown in Settings → About, or the versionName from the APK.
+      placeholder: "1.0-full"
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: Model and form factor. Foldables and tablets are especially relevant to this project.
+      placeholder: "Samsung Galaxy Z Fold 5 / tablet / phone"
+
+  - type: input
+    id: android-version
+    attributes:
+      label: Android version
+      placeholder: "14 (API 34)"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logcat / crash output
+      description: If the app crashed or misbehaved, paste relevant logcat output. You can capture it with `adb logcat | grep conquest`.
+      render: shell
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots / screen recording
+      description: Visual bugs are much easier to fix with a picture. Foldable unfold/fold transitions especially.
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Code of conduct
+      options:
+        - label: I have searched existing issues for duplicates
+          required: true
