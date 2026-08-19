@@ -298,6 +298,72 @@ data class AgentTerminalState(
     }
 }
 
+/**
+ * Terminal output with its escape sequences taken out.
+ *
+ * Agents run `cargo test`, jest and eslint, and those tools colour their
+ * output whenever they think a terminal is watching — which lands in the card
+ * as escape-code noise wrapped around every word. This is the *display* path
+ * only: what the agent reads back over `terminal/output` stays byte-faithful,
+ * because the agent is parsing it.
+ *
+ * Handles the two sequence families that actually appear: CSI (ESC `[` … a
+ * final byte — colour, cursor movement, erase) and OSC (ESC `]` … BEL or
+ * ESC `\` — window titles, hyperlinks). Any other escape is dropped with the
+ * byte after it, which covers the short two-character ones.
+ */
+fun stripAnsi(text: String): String {
+    // A carriage return counts too: a progress bar rewrites its line without
+    // ever emitting an escape, and leaving the CR in makes the whole line
+    // vanish in a Compose Text.
+    if (!text.contains(ESC) && !text.contains('\r')) return text
+    val out = StringBuilder(text.length)
+    var i = 0
+    while (i < text.length) {
+        val ch = text[i]
+        if (ch != ESC) {
+            // A bare carriage return is a progress bar rewriting its line.
+            // Keeping it makes the whole line vanish in a Compose Text, so
+            // restart the line: the last state written is the one to show.
+            if (ch == '\r' && i + 1 < text.length && text[i + 1] != '\n') {
+                out.setLength(out.lastIndexOf("\n") + 1)
+            } else if (ch != '\r') {
+                out.append(ch)
+            }
+            i++
+            continue
+        }
+        if (i + 1 >= text.length) break
+        when (text[i + 1]) {
+            '[' -> {
+                // CSI: parameters and intermediates, then one final byte in
+                // @-~. One cut off by a chunk boundary is dropped, not
+                // printed.
+                var j = i + 2
+                while (j < text.length && text[j] !in '\u0040'..'\u007E') j++
+                i = if (j < text.length) j + 1 else text.length
+            }
+            ']' -> {
+                // OSC: runs to BEL, or to ESC-backslash.
+                var j = i + 2
+                while (j < text.length && text[j] != BEL) {
+                    if (text[j] == ESC && j + 1 < text.length && text[j + 1] == '\\') {
+                        j++
+                        break
+                    }
+                    j++
+                }
+                i = if (j < text.length) j + 1 else text.length
+            }
+            else -> i += 2
+        }
+    }
+    return out.toString()
+}
+
+private const val ESC = '\u001B'
+private const val BEL = '\u0007'
+
 /** One choice in a select or multi-select elicitation field. */
 data class ElicitationOption(val value: String, val title: String, val description: String?)
 

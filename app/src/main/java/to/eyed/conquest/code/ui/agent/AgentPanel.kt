@@ -101,6 +101,7 @@ import to.eyed.conquest.code.core.ToolKind
 import to.eyed.conquest.code.core.rememberAgentSession
 import to.eyed.conquest.code.core.rememberAgentSessionList
 import to.eyed.conquest.code.core.rememberAgentTerminal
+import to.eyed.conquest.code.core.stripAnsi
 import to.eyed.conquest.code.terminal.TerminalSessions
 import to.eyed.conquest.code.terminal.Userland
 import to.eyed.conquest.code.ui.theme.BufferFontFamily
@@ -231,8 +232,11 @@ fun AgentPanel(
     }
     // Stamp the agent's own title onto the thread, so the history list can
     // name it after it stops being the one showing.
-    LaunchedEffect(state.title, activeThread) {
+    LaunchedEffect(state.title, state.acpSessionId, activeThread) {
         state.title?.let { title -> activeThread?.title = title }
+        // Stamped onto the thread so the history list can tell a conversation
+        // that is already open from one that is not.
+        state.acpSessionId?.let { id -> activeThread?.acpSessionId = id }
     }
 
     Column(
@@ -245,7 +249,12 @@ fun AgentPanel(
             agent = agent,
             thread = activeThread,
             showingThreads = showThreads,
-            onChangeAgent = { AgentSessions.reset() },
+            agents = settings.agents,
+            onUseAgent = { chosen ->
+                // A *new thread* with that agent, not a purge. The threads
+                // this agent already has stay open.
+                AgentSessions.startWith(chosen, project.id, project.rootName)
+            },
             onSignOut = {
                 // Deliberately does not end the open threads: what signing
                 // out means for a conversation in flight is the agent's call,
@@ -299,7 +308,16 @@ fun AgentPanel(
                 },
                 onClose = { thread -> AgentSessions.closeThread(thread) },
                 onReopen = { past ->
-                    AgentSessions.resumeThread(project.id, project.rootName, past.sessionId)
+                    // Already open? Show it. Resuming it again would index
+                    // the agent's session id onto a second thread and steal
+                    // the first one's updates — leaving a thread on screen
+                    // that could never receive anything again.
+                    val open = AgentSessions.threadFor(past.sessionId)
+                    if (open != null) {
+                        AgentSessions.select(open)
+                    } else {
+                        AgentSessions.resumeThread(project.id, project.rootName, past.sessionId)
+                    }
                     showThreads = false
                 },
                 onNewThread = {
@@ -410,7 +428,9 @@ private fun AgentBar(
     agent: AgentDefinition?,
     thread: AgentThread?,
     showingThreads: Boolean,
-    onChangeAgent: () -> Unit,
+    /** Every agent settings.json configures, for the bar's Agent menu. */
+    agents: List<AgentDefinition>,
+    onUseAgent: (AgentDefinition) -> Unit,
     onSignOut: () -> Unit,
     onNewThread: () -> Unit,
     onToggleThreads: () -> Unit,
@@ -455,10 +475,25 @@ private fun AgentBar(
             BarAction(if (showingThreads) "Back" else "Threads", onClick = onToggleThreads)
             // A menu rather than a fourth word: the bar is 32px on a phone,
             // and everything in it is about *which agent this is*.
+            // The configured agents, inline. It used to be one item —
+            // "Change agent…" — that closed **every** open thread behind a
+            // single tap, with no confirmation and no undo. Zed's own New
+            // Thread menu lists each registered agent and leaves the existing
+            // threads alone (agent_panel.rs:5817-5985).
             SelectorChip(
                 label = "Agent",
                 items = buildList {
-                    add(ContextMenuItem("Change agent…", onClick = onChangeAgent))
+                    for (other in agents) {
+                        add(
+                            ContextMenuItem(
+                                label = if (other.name == agent?.name) {
+                                    "✓ ${other.name}"
+                                } else {
+                                    "New thread with ${other.name}"
+                                },
+                            ) { onUseAgent(other) },
+                        )
+                    }
                     if (state.agent?.capabilities?.logout == true) {
                         add(ContextMenuItem("Sign out", onClick = onSignOut))
                     }
@@ -668,16 +703,27 @@ private fun ThreadsView(
                 if (project.name != currentProject.rootName) add(project.name)
             }
         }
+        // Whether anything at all matched, so the view can say so once at the
+        // end rather than printing "No threads yet" under every project.
+        var anything = false
         for (name in names) {
+            // A query that matches the *project* keeps all of its threads.
+            // Typing a project's name used to print "No threads yet" under
+            // that project's own header while its threads sat one filter
+            // away, because the filter only ever looked at the thread title
+            // (threads_archive_view.rs:301 matches the folder name too).
+            val matchesProject = name.contains(query, ignoreCase = true)
             val mine = AgentSessions.threads
                 .filter { thread ->
                     thread.projectName == name &&
-                        (query.isBlank() || thread.listTitle.contains(query, ignoreCase = true))
+                        (query.isBlank() || matchesProject ||
+                            thread.listTitle.contains(query, ignoreCase = true))
                 }
                 .sortedByDescending { it.ordinal }
-            if (query.isNotBlank() && mine.isEmpty() && !name.contains(query, ignoreCase = true)) {
+            if (query.isNotBlank() && mine.isEmpty() && !matchesProject) {
                 continue
             }
+            if (mine.isNotEmpty()) anything = true
             Text(
                 text = name,
                 style = MaterialTheme.typography.bodyMedium,
@@ -688,7 +734,7 @@ private fun ThreadsView(
             )
             if (mine.isEmpty()) {
                 Text(
-                    text = "No threads yet",
+                    text = if (query.isBlank()) "No threads yet" else "No threads match",
                     style = MaterialTheme.typography.labelSmall,
                     color = theme.color("text.muted"),
                     modifier = Modifier.padding(start = 10.dp),
@@ -731,9 +777,15 @@ private fun ThreadsView(
                     color = theme.color("text.muted"),
                 )
             }
+            // Searched by the directory too, for the same reason as above:
+            // an agent's own sessions are named after where they ran when
+            // the agent gave them no title.
             val past = history.sessions.filter {
-                query.isBlank() || it.label.contains(query, ignoreCase = true)
+                query.isBlank() ||
+                    it.label.contains(query, ignoreCase = true) ||
+                    it.cwd.contains(query, ignoreCase = true)
             }
+            if (past.isNotEmpty()) anything = true
             when {
                 history.error != null -> Notice(history.error, isError = true)
                 past.isEmpty() && history.loading -> Text(
@@ -752,6 +804,7 @@ private fun ThreadsView(
                     PastSessionRow(
                         session = session,
                         canDelete = capabilities.delete,
+                        isOpen = AgentSessions.threadFor(session.sessionId) != null,
                         onOpen = { onReopen(session) },
                         onDelete = {
                             scope.launch {
@@ -768,6 +821,17 @@ private fun ThreadsView(
                 }
             }
         }
+
+        // One honest sentence rather than a column of "No threads yet"
+        // headings — a search that matches nothing should say so once.
+        if (!anything && query.isNotBlank()) {
+            Text(
+                text = "No threads match “$query”.",
+                style = MaterialTheme.typography.bodySmall,
+                color = theme.color("text.muted"),
+                modifier = Modifier.padding(top = 12.dp),
+            )
+        }
     }
 }
 
@@ -776,6 +840,8 @@ private fun ThreadsView(
 private fun PastSessionRow(
     session: AgentPastSession,
     canDelete: Boolean,
+    /** Whether a live thread is already showing this conversation. */
+    isOpen: Boolean,
     onOpen: () -> Unit,
     onDelete: () -> Unit,
 ) {
@@ -808,6 +874,14 @@ private fun PastSessionRow(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
+        if (isOpen) {
+            Text(
+                text = "open",
+                style = MaterialTheme.typography.labelSmall,
+                color = theme.color("text.accent", MaterialTheme.colorScheme.primary),
+                maxLines = 1,
+            )
+        }
         session.updatedAt?.take(10)?.let { day ->
             Text(
                 text = day,
@@ -2090,7 +2164,10 @@ private fun TerminalCard(terminalId: String, sealed: AgentTerminalState?) {
     var showAll by remember(terminalId) { mutableStateOf(false) }
     // The tail, because the end of a command's output is where the answer is.
     val (total, shown) = remember(terminal.output, showAll) {
-        val all = terminal.output.trimEnd('\n').split('\n')
+        // Stripped here, in the display path only: what the agent reads back
+        // over `terminal/output` has to stay byte-faithful, because the agent
+        // is parsing it.
+        val all = stripAnsi(terminal.output).trimEnd('\n').split('\n')
         all.size to if (showAll) all else all.takeLast(MaxTerminalLines)
     }
     val pane = rememberScrollState()

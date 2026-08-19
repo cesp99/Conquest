@@ -426,13 +426,25 @@ impl AgentShared {
             list.loading = true;
             list.version += 1;
         }
+        // Every session this connection owns shares one project root — the
+        // agent key includes it — so any of them will do.
+        let root = self
+            .own_sessions()
+            .first()
+            .map(|(_, handle)| handle.thread.lock().unwrap().root.clone());
         let task_shared = self.clone();
         let task_cx = cx.clone();
         let _ = cx.spawn(async move {
-            let result = task_cx
-                .send_request(acp::ListSessionsRequest::new())
-                .block_task()
-                .await;
+            // Scoped to the project. Without a `cwd` an agent answers with
+            // every conversation it has ever had, and tapping one from
+            // another project resumed *that* conversation pointed at *this*
+            // project's files — the agent's context says one tree and every
+            // path it is handed is in another.
+            let request = match root {
+                Some(root) => acp::ListSessionsRequest::new().cwd(root),
+                None => acp::ListSessionsRequest::new(),
+            };
+            let result = task_cx.send_request(request).block_task().await;
             let mut list = task_shared.session_list.lock().unwrap();
             list.loading = false;
             list.version += 1;

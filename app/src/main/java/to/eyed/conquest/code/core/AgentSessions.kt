@@ -39,6 +39,16 @@ class AgentThread internal constructor(
     var title by mutableStateOf<String?>(null)
         internal set
 
+    /**
+     * The agent's own id for this session, once it has one.
+     *
+     * Kept so the history list can tell a conversation that is already open
+     * from one that is not — reopening the former would steal the live
+     * thread's updates.
+     */
+    var acpSessionId by mutableStateOf<String?>(null)
+        internal set
+
     /** What the history list prints. */
     val listTitle: String get() = title ?: "Thread $ordinal"
 
@@ -143,6 +153,35 @@ object AgentSessions {
     }
 
     /**
+     * Start a thread with [chosen], keeping every thread that is already
+     * open.
+     *
+     * The bar's old "Change agent…" called [choose], which closes the lot —
+     * one tap, no confirmation, no undo. Choosing a different agent is a
+     * reason to start a conversation, not to end the ones you have; Zed's New
+     * Thread menu works the same way (agent_panel.rs:5817-5985).
+     *
+     * Switching agents *does* replace the running process — the engine keeps
+     * one at a time — so the other agent's threads lose their sessions
+     * whatever we do. What this avoids is throwing away the threads of the
+     * agent you are staying with.
+     */
+    fun startWith(chosen: AgentDefinition, project: Long, projectName: String) {
+        if (agent != chosen) {
+            // Another agent's threads cannot survive the process being
+            // replaced, so close those and only those.
+            val doomed = threads.toList()
+            threads.clear()
+            active = null
+            for (thread in doomed) {
+                scope.launch { runCatching { CoreBridge.acpCloseSession(thread.sessionId) } }
+            }
+            agent = chosen
+        }
+        newThread(project, projectName)
+    }
+
+    /**
      * Make sure [project] has a thread showing: select its most recent, or
      * start its first. Returns at once; watch [active] and then
      * [rememberAgentSession].
@@ -233,6 +272,18 @@ object AgentSessions {
 
     /** Whether [project] has any thread at all — the panel's empty state. */
     fun hasThreadFor(project: Long): Boolean = threads.any { it.projectId == project }
+
+    /**
+     * The thread already showing the agent's session [acpSessionId], if one
+     * is.
+     *
+     * Reopening a conversation that is already open used to index the agent's
+     * session id onto a *new* thread, which silently stole the updates from
+     * the old one — that thread was still on screen, still listed, and would
+     * never receive anything again.
+     */
+    fun threadFor(acpSessionId: String): AgentThread? =
+        threads.firstOrNull { it.acpSessionId == acpSessionId }
 
     /** Show [thread] — the history view's tap. */
     fun select(thread: AgentThread) {
