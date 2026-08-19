@@ -232,8 +232,9 @@ their own side. When yours does, the Threads view has a *Kept by the agent*
 section under your own threads: tap one to reopen it — with its transcript
 where the agent can replay it, without where it can only continue — and
 **Forget** to delete it for good. Agents that keep nothing simply have no such
-section. **Agent** in the bar changes which agent you are talking to, and
-signs out of one that supports it.
+section. **Agent** in the bar lists the agents settings.json configures:
+picking one starts a *new* thread with it rather than closing the ones you
+have, and signs out of an agent that supports it.
 
 **The composer speaks the protocol.** Type `/` at the start for the agent's
 own slash commands (it advertises them; the strip completes them), and `@`
@@ -274,9 +275,10 @@ Alt chord, so while the *terminal* has focus it belongs to the shell, and the
 `☰` menu or the command palette is the way to the panel from there.
 
 **Nothing the agent writes lands without a decision.** When it asks to change a
-file the turn stops, the diff appears in the conversation, and **Allow** and
-**Deny** sit underneath it — the change and the choice on one screen. Diffs are
-unified, never side by side.
+file the turn stops, the whole diff appears in the conversation — never
+truncated while you are being asked about it — and the agent's own choices sit
+underneath it as a full-width list, in the order it offered them. The change
+and the choice are one screen. Diffs are unified, never side by side.
 
 **Signing in.** When an agent wants signing in to, the panel offers whatever
 methods *it* advertised. Most are a button the agent handles itself; one kind
