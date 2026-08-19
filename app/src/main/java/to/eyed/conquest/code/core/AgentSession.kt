@@ -140,6 +140,57 @@ sealed interface ToolContent {
      * a second one that drifts from it.
      */
     data class Diff(val file: FileDiff) : ToolContent
+
+    /**
+     * A command the agent asked the editor to run, through `terminal/create`.
+     *
+     * Only the id is here, because only the id travels in the protocol: the
+     * command line, the output and the exit status are read live from the
+     * engine by [CoreBridge.acpTerminalOutput]. Keeping them out of the entry
+     * is what stops a growing build log re-sending the whole card on every
+     * chunk of output.
+     */
+    data class Terminal(val terminalId: String) : ToolContent
+}
+
+/** A live agent terminal, as [CoreBridge.acpTerminalOutput] reports it. */
+data class AgentTerminalState(
+    val revision: Long,
+    val label: String,
+    val output: String,
+    val truncated: Boolean,
+    val running: Boolean,
+    /** Null while it is still running, or when the wait itself failed. */
+    val exitCode: Int?,
+    /** The signal that ended it, when one did. */
+    val signal: String?,
+) {
+    companion object {
+        /** What a terminal the engine no longer has looks like. */
+        val Gone = AgentTerminalState(0, "", "", false, false, null, null)
+
+        /**
+         * Parse one poll. Returns [previous] unchanged when the revision has
+         * not moved — the engine sends no payload in that case, and the whole
+         * point of the revision is that this is the common answer.
+         */
+        fun parse(json: String, previous: AgentTerminalState?): AgentTerminalState {
+            val root = runCatching { JSONObject(json) }.getOrNull() ?: return Gone
+            val revision = root.optLong("revision")
+            if (revision == 0L) return Gone
+            if (previous != null && previous.revision == revision) return previous
+            val exit = root.optJSONObject("exitStatus")
+            return AgentTerminalState(
+                revision = revision,
+                label = root.optString("label"),
+                output = root.optString("output"),
+                truncated = root.optBoolean("truncated"),
+                running = root.optBoolean("running"),
+                exitCode = exit?.takeIf { !it.isNull("exitCode") }?.optInt("exitCode"),
+                signal = exit?.takeIf { !it.isNull("signal") }?.optString("signal"),
+            )
+        }
+    }
 }
 
 /** One chunk of the agent's reply; thoughts fold away. */
@@ -221,6 +272,10 @@ sealed interface AgentEntry {
                             "markdown" -> ToolContent.Markdown(item.optString("markdown"))
                             "diff" -> item.optJSONObject("diff")
                                 ?.let { ToolContent.Diff(FileDiff.parse(it)) }
+
+                            "terminal" -> item.optString("terminalId")
+                                .takeIf { it.isNotEmpty() }
+                                ?.let { ToolContent.Terminal(it) }
 
                             else -> null
                         }
@@ -608,4 +663,38 @@ fun rememberAgentSession(sessionId: Long?): AgentSessionSnapshot {
         }
     }
     return snapshot
+}
+
+/**
+ * Poll one agent terminal while its card is on screen.
+ *
+ * Separate from [rememberAgentSession] on purpose. A terminal's output is the
+ * one thing in a session that grows without bound, and putting it in the
+ * entry delta would re-send the whole tool-call card on every chunk; keeping
+ * it here means the transcript's poll stays the size of the transcript, and
+ * the terminal's poll costs a revision compare until something is actually
+ * printed.
+ *
+ * The loop stops on its own once the command has ended — a finished terminal
+ * never changes again, and nothing that never changes is worth waking for.
+ */
+@Composable
+fun rememberAgentTerminal(terminalId: String): AgentTerminalState {
+    var state by remember(terminalId) { mutableStateOf(AgentTerminalState.Gone) }
+    LaunchedEffect(terminalId) {
+        var seen = 0L
+        while (true) {
+            val previous = state
+            val fresh = withContext(Dispatchers.Default) {
+                AgentTerminalState.parse(CoreBridge.acpTerminalOutput(terminalId, seen), previous)
+            }
+            state = fresh
+            seen = fresh.revision
+            // Gone (released, or its session closed) and finished are both
+            // final; the card keeps what it last read.
+            if (fresh.revision == 0L || !fresh.running) return@LaunchedEffect
+            delay(POLL_MS)
+        }
+    }
+    return state
 }

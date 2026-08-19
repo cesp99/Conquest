@@ -936,4 +936,18 @@ object CoreBridge {
      * kept in step. Pass back the `total` you were last given.
      */
     external fun acpWrittenFiles(since: Long): String
+
+    /**
+     * One agent terminal — a command the agent asked *us* to run through
+     * `terminal/create`, named by a `terminal` content block on a tool call.
+     *
+     * Poll it with the `revision` you were last given. An unchanged terminal
+     * answers `{"revision": n}` and nothing else, so watching a build log is
+     * as cheap as watching an idle one; when it has moved you get
+     * `{"revision", "label", "output", "truncated", "exitStatus", "running"}`.
+     * `{"revision": 0}` means the engine no longer has it: the agent released
+     * it, or its session closed. The transcript keeps the tool call either
+     * way — it is the live process that is gone.
+     */
+    external fun acpTerminalOutput(terminalId: String, since: Long): String
 }

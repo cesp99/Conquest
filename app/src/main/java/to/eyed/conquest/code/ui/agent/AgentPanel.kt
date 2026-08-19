@@ -68,6 +68,7 @@ import to.eyed.conquest.code.core.AgentThread
 import to.eyed.conquest.code.core.AgentPhase
 import to.eyed.conquest.code.core.AgentSessionState
 import to.eyed.conquest.code.core.AgentSessions
+import to.eyed.conquest.code.core.AgentTerminalState
 import to.eyed.conquest.code.core.Agents
 import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.core.FileDiff
@@ -78,6 +79,7 @@ import to.eyed.conquest.code.core.ProjectSummary
 import to.eyed.conquest.code.core.ToolCallStatus
 import to.eyed.conquest.code.core.ToolKind
 import to.eyed.conquest.code.core.rememberAgentSession
+import to.eyed.conquest.code.core.rememberAgentTerminal
 import to.eyed.conquest.code.terminal.Userland
 import to.eyed.conquest.code.ui.theme.BufferFontFamily
 import to.eyed.conquest.code.ui.git.DiffLineRow
@@ -114,6 +116,16 @@ private const val ComposerLines = 6
  * generated file would bury it.
  */
 private const val MaxDiffLines = 200
+
+/**
+ * How many lines of a terminal's output the card shows.
+ *
+ * The engine already caps what it *keeps* (a megabyte), which is the memory
+ * question; this is the reading question. A build log unrolled in full pushes
+ * the rest of the conversation off the screen, so the card shows the tail —
+ * the end is where the error is — and says how much it left out.
+ */
+private const val MaxTerminalLines = 40
 
 /**
  * Whether this build can show an agent panel at all.
@@ -941,6 +953,9 @@ private fun ToolCallCard(
 
                     is to.eyed.conquest.code.core.ToolContent.Diff ->
                         DiffCard(content.file, onOpenPath)
+
+                    is to.eyed.conquest.code.core.ToolContent.Terminal ->
+                        TerminalCard(content.terminalId)
                 }
             }
         }
@@ -983,6 +998,106 @@ private fun StatusChip(status: ToolCallStatus) {
         color = color,
         maxLines = 1,
     )
+}
+
+/**
+ * A command the agent asked us to run, and what it printed.
+ *
+ * This is what `terminal: true` in the client capabilities buys the user: an
+ * agent that would otherwise shell out invisibly inside its own process
+ * instead runs here, where the command line, its output and its exit status
+ * are all on screen. Zed draws the same card off the same `terminal` content
+ * block (agent_ui/src/entry_view_state.rs:311).
+ *
+ * It polls itself rather than riding the transcript's delta — see
+ * [rememberAgentTerminal] for why — and stops the moment the command ends.
+ */
+@Composable
+private fun TerminalCard(terminalId: String) {
+    val theme = LocalZedTheme.current
+    val settings = LocalAppSettings.current
+    val terminal = rememberAgentTerminal(terminalId)
+    val code = remember(settings.bufferFontSize) {
+        TextStyle(
+            fontFamily = BufferFontFamily,
+            fontSize = (settings.bufferFontSize * 0.9f).sp,
+            lineHeight = (settings.bufferFontSize * 1.4f).sp,
+        )
+    }
+    val across = rememberScrollState()
+    // The tail, because the end of a command's output is where the answer is.
+    val lines = remember(terminal.output) {
+        val all = terminal.output.trimEnd('\n').split('\n')
+        all.size to all.takeLast(MaxTerminalLines)
+    }
+    val (total, shown) = lines
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+        ) {
+            Text(
+                text = if (terminal.label.isEmpty()) "$ …" else "$ ${terminal.label}",
+                style = code,
+                color = theme.color("text"),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            Text(
+                text = terminalOutcome(terminal),
+                style = MaterialTheme.typography.labelSmall,
+                color = when {
+                    terminal.running -> theme.color("text.muted")
+                    terminal.exitCode == 0 -> theme.color("created", theme.color("text.muted"))
+                    else -> theme.color("error", MaterialTheme.colorScheme.error)
+                },
+                maxLines = 1,
+            )
+        }
+        when {
+            terminal.revision == 0L && terminal.output.isEmpty() ->
+                Notice("That command is over; its output is no longer kept.")
+
+            terminal.output.isEmpty() ->
+                Notice(if (terminal.running) "Running…" else "It printed nothing.")
+
+            else -> {
+                if (terminal.truncated || total > shown.size) {
+                    Text(
+                        text = "… earlier output dropped.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = theme.color("text.muted"),
+                    )
+                }
+                // One scroll state across every row, so a long line scrolls
+                // the whole block sideways rather than one line out of step
+                // with its neighbours — the same trick the diff rows use.
+                Column(modifier = Modifier.fillMaxWidth().horizontalScroll(across)) {
+                    for (line in shown) {
+                        Text(
+                            text = line,
+                            style = code,
+                            color = theme.color("text"),
+                            softWrap = false,
+                            maxLines = 1,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** The one phrase that says how a command is doing, or how it went. */
+private fun terminalOutcome(terminal: AgentTerminalState): String = when {
+    terminal.running -> "running"
+    terminal.signal != null -> "killed (${terminal.signal})"
+    terminal.exitCode == 0 -> "done"
+    terminal.exitCode != null -> "exit ${terminal.exitCode}"
+    else -> "ended"
 }
 
 /**

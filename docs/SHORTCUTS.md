@@ -259,6 +259,14 @@ file the turn stops, the diff appears in the conversation, and **Allow** and
 **Deny** sit underneath it — the change and the choice on one screen. Diffs are
 unified, never side by side.
 
+**Commands the agent runs are on screen.** An agent that wants to run
+`cargo test` asks the editor to run it rather than shelling out invisibly, so
+the command line, what it printed and how it exited appear on the tool call —
+tap the call to unfold it, and the output scrolls sideways for long lines. The
+command runs in the Linux userland with the project as its working directory,
+which it cannot leave. Only its tail is shown; a command that floods keeps its
+last megabyte and says so.
+
 **Agent-agnostic, like the protocol.** ACP is a standard, so the panel names
 no agent of its own and installs nothing: every agent comes from
 `agent_servers` in settings.json — the same key Zed uses — and the picker

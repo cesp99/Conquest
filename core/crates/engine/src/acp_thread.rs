@@ -105,6 +105,17 @@ pub enum ToolContent {
     /// A file edit, pre-diffed into the exact shape `gitPatch` hands the diff
     /// view, so the panel's expandable diff is the same renderer as a git tab.
     Diff { diff: FileDiff },
+    /// A command the agent asked *us* to run, through `terminal/create`.
+    ///
+    /// Only the id travels in the protocol — `acp::Terminal` has no other
+    /// field — so everything the card shows (the command line, the output so
+    /// far, the exit status) is read from the engine's own terminal registry
+    /// by id, through `acpTerminalOutput`. Keeping the live bytes out of the
+    /// entry is deliberate: the entry delta is a merge-in-place cache, and a
+    /// build log growing inside it would re-send the whole card on every
+    /// chunk.
+    #[serde(rename_all = "camelCase")]
+    Terminal { terminal_id: String },
 }
 
 /// A file position the agent says it is working at, passed through verbatim.
@@ -854,9 +865,9 @@ fn tool_content(content: acp::ToolCallContent, root: &Path) -> Option<ToolConten
         acp::ToolCallContent::Diff(diff) => Some(ToolContent::Diff {
             diff: tool_diff(root, &diff),
         }),
-        // We do not advertise the terminal capability, so a terminal id here
-        // is an agent talking past the negotiated capabilities; skip it.
-        acp::ToolCallContent::Terminal(_) => None,
+        acp::ToolCallContent::Terminal(terminal) => Some(ToolContent::Terminal {
+            terminal_id: terminal.terminal_id.0.to_string(),
+        }),
         _ => None,
     }
 }

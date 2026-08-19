@@ -575,19 +575,33 @@ impl GuestProcess {
             }
         }
     }
+
+    /// Take it down now, and say how it went.
+    ///
+    /// The same shutdown [`Drop`] does — it is the body of `Drop` — but with
+    /// the status handed back instead of discarded. A caller that kills a
+    /// process on somebody's behalf owes them an answer: an ACP
+    /// `terminal/kill` is followed by a `terminal/wait_for_exit` that must
+    /// report the *real* signal, and the escalation inside [`terminate`] means
+    /// only the wait knows whether the polite one was enough.
+    pub(crate) fn terminate_now(&mut self) -> Option<std::process::ExitStatus> {
+        if let Some(status) = self.exited {
+            return Some(status);
+        }
+        // Fields are dropped *after* a `Drop` body, so an stdin the caller
+        // never took would still be open while we wait — and a server that
+        // would have exited politely on EOF would never see one. Close it
+        // first and give the polite path its chance; `terminate` then costs
+        // nothing.
+        self.stdin.take();
+        self.exited = terminate(&mut self.child);
+        self.exited
+    }
 }
 
 impl Drop for GuestProcess {
     fn drop(&mut self) {
-        if self.exited.is_some() {
-            return;
-        }
-        // Fields are dropped *after* this body, so an stdin the caller never
-        // took would still be open while we wait — and a server that would
-        // have exited politely on EOF would never see one. Close it first and
-        // give the polite path its chance; `terminate` then costs nothing.
-        self.stdin.take();
-        terminate(&mut self.child);
+        self.terminate_now();
     }
 }
 
@@ -665,7 +679,7 @@ fn identity_bind(path: &Path) -> String {
 /// Kotlin side.
 ///
 /// SIGKILL stays as the last resort, for a proot that ignores even this.
-fn terminate(child: &mut Child) {
+fn terminate(child: &mut Child) -> Option<std::process::ExitStatus> {
     #[cfg(unix)]
     {
         // Safety: `child` is alive here — nothing has reaped it, since the only
@@ -675,14 +689,14 @@ fn terminate(child: &mut Child) {
         let deadline = Instant::now() + QUIT_GRACE;
         while Instant::now() < deadline {
             match child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(status)) => return Some(status),
                 Ok(None) => thread::sleep(POLL_INTERVAL),
                 Err(_) => break,
             }
         }
     }
     let _ = child.kill();
-    let _ = child.wait();
+    child.wait().ok()
 }
 
 /// Test doubles for the guest, shared with `acp.rs`'s tests: a stand-in proot
@@ -740,6 +754,18 @@ pub(crate) mod testing {
             thread::sleep(POLL_INTERVAL);
         }
         path
+    }
+
+    /// A [`Userland`] that cannot start anything, for tests that need one in
+    /// hand but never spawn — `is_installed` is false, so `spawn` refuses
+    /// before it reaches the paths.
+    pub(crate) fn unusable_userland() -> Userland {
+        Userland {
+            proot: PathBuf::from("/nowhere/proot"),
+            rootfs: PathBuf::from("/nowhere/rootfs"),
+            tmp_dir: PathBuf::from("/nowhere/tmp"),
+            projects_dir: PathBuf::from("/nowhere/projects"),
+        }
     }
 
     #[cfg(unix)]

@@ -81,6 +81,13 @@ class Agent:
         self.cancelled = False
         self.next_request = 0
         self.tool_calls = 0
+        # What the client said it can do, from `initialize`. A conformance
+        # agent must *honour* the negotiation, not just perform it: anything
+        # offered that the client did not claim is a bug on this side, and an
+        # agent that offers it anyway hides the client's missing capability
+        # instead of exposing it. Empty until initialize, which the protocol
+        # requires before anything else.
+        self.client_capabilities = {}
         # Per-session ids, "conf-<n>": the spec wants unique ids, and a
         # constant would collide the moment a client opened a second session
         # on the same process.
@@ -100,18 +107,44 @@ class Agent:
             {"cwd": os.getcwd(), "model": "conf-one", "verbose": False},
         )
 
+    def can(self, *path):
+        """Whether the client advertised the capability at `path`.
+
+        ACP capabilities are "present and non-null means yes": an empty object
+        is the affirmative spelling, so anything that is not None counts.
+        """
+        node = self.client_capabilities
+        for key in path:
+            if not isinstance(node, dict):
+                return False
+            node = node.get(key)
+            if node is None:
+                return False
+        return node is not False
+
     def config_options(self, session_id):
+        """The session's config options — *if* the client can render them.
+
+        Gated on `session.configOptions`, and the boolean one gated again on
+        `session.configOptions.boolean`, because that is what the capability
+        means. It is also the only way this file can prove the engine sends
+        those capabilities: no advertisement, no options, no chips.
+        """
+        if not self.can("session", "configOptions"):
+            return []
         state = self.session(session_id)
-        return [
+        options = [
             {"id": "model", "name": "Model", "type": "select",
              "category": "model", "currentValue": state["model"],
              "options": [
                  {"value": "conf-one", "name": "Conformance One"},
                  {"value": "conf-two", "name": "Conformance Two"},
              ]},
-            {"id": "verbose", "name": "Verbose", "type": "boolean",
-             "currentValue": state["verbose"]},
         ]
+        if self.can("session", "configOptions", "boolean"):
+            options.append({"id": "verbose", "name": "Verbose",
+                            "type": "boolean", "currentValue": state["verbose"]})
+        return options
 
     # -- outbound ------------------------------------------------------------
 
@@ -194,6 +227,8 @@ class Agent:
         params = message.get("params") or {}
 
         if method == "initialize":
+            self.client_capabilities = params.get("clientCapabilities") or {}
+            log("client capabilities: " + json.dumps(self.client_capabilities))
             send({
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -214,15 +249,25 @@ class Agent:
                   "result": {"sessionId": session_id,
                              "configOptions": self.config_options(session_id)}})
             # Slash commands arrive as an update, the way live agents send
-            # them (the panel's / popup completes from these).
+            # them (the panel's / popup completes from these). /run is offered
+            # only to a client that can run it — that is what the terminal
+            # capability means, and offering it anyway would hide a client
+            # that never implemented `terminal/*`.
+            commands = [
+                {"name": "plan", "description": "Show a plan and stop"},
+                {"name": "echo",
+                 "description": "Repeat the text back",
+                 "input": {"hint": "text to repeat"}},
+            ]
+            if self.can("terminal"):
+                commands.append({
+                    "name": "run",
+                    "description": "Run a shell command in a terminal",
+                    "input": {"hint": "shell command"},
+                })
             self.update(session_id, {
                 "sessionUpdate": "available_commands_update",
-                "availableCommands": [
-                    {"name": "plan", "description": "Show a plan and stop"},
-                    {"name": "echo",
-                     "description": "Repeat the text back",
-                     "input": {"hint": "text to repeat"}},
-                ],
+                "availableCommands": commands,
             })
         elif method == "session/set_config_option":
             session_id = params.get("sessionId")
@@ -282,6 +327,8 @@ class Agent:
                 self.chunk(session_id, "agent_message_chunk",
                            "Echo [%s]: %s" % (state["model"], prompt[5:].strip()))
                 return "end_turn"
+            if prompt.startswith("/run"):
+                return self.run_command(session_id, prompt[4:].strip())
             if prompt.startswith("/plan"):
                 self.plan(session_id,
                           ("Look around", "in_progress"), ("Report back", "pending"))
@@ -376,6 +423,67 @@ class Agent:
         except Cancelled:
             log("turn cancelled")
             return "cancelled"
+
+    def run_command(self, session_id, shell):
+        """The `terminal/*` round trip, in the order an agent really uses it.
+
+        create -> show the terminal on a tool call -> wait_for_exit -> output
+        -> release. The tool call carries `{"type": "terminal", "terminalId"}`
+        content, which is the only way the client learns *which* terminal
+        belongs to *which* call — the terminal methods themselves say nothing
+        about tool calls.
+        """
+        if not self.can("terminal"):
+            self.chunk(session_id, "agent_message_chunk",
+                       "This editor has no terminal capability.")
+            return "end_turn"
+        shell = shell or "echo hello from the conformance agent"
+        created = self.request("terminal/create", {
+            "sessionId": session_id,
+            "command": "/bin/sh",
+            "args": ["-c", shell],
+            "outputByteLimit": 16 * 1024,
+        })
+        if created is None:
+            self.chunk(session_id, "agent_message_chunk", "The editor refused a terminal.")
+            return "end_turn"
+        terminal_id = created["terminalId"]
+
+        self.tool_calls += 1
+        tool_id = "t-%d" % self.tool_calls
+        self.update(session_id, {
+            "sessionUpdate": "tool_call",
+            "toolCallId": tool_id,
+            "title": "$ " + shell,
+            "kind": "execute",
+            "status": "in_progress",
+            "content": [{"type": "terminal", "terminalId": terminal_id}],
+        })
+
+        # `terminal/wait_for_exit` answers with the exit status *flattened*
+        # into the result — {"exitCode": 3} — while `terminal/output` nests
+        # the same object under "exitStatus". The asymmetry is the schema's
+        # (WaitForTerminalExitResponse flattens, TerminalOutputResponse does
+        # not), and reading the wrong one gives a silent None.
+        status = self.request("terminal/wait_for_exit",
+                              {"sessionId": session_id, "terminalId": terminal_id}) or {}
+        read = self.request("terminal/output",
+                            {"sessionId": session_id, "terminalId": terminal_id}) or {}
+        self.update(session_id, {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tool_id,
+            "status": "completed" if status.get("exitCode") == 0 else "failed",
+        })
+        summary = "exit code %s" % status.get("exitCode")
+        if status.get("signal"):
+            summary = "killed by %s" % status["signal"]
+        self.chunk(session_id, "agent_message_chunk",
+                   "Ran `%s` (%s), output:\n\n```\n%s```\n"
+                   % (shell, summary, read.get("output", "")))
+        # Release last: the output has been read, and a terminal nobody
+        # released is a process nobody stopped.
+        self.request("terminal/release", {"sessionId": session_id, "terminalId": terminal_id})
+        return "end_turn"
 
     @staticmethod
     def pick_target(prompt):

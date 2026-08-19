@@ -65,6 +65,7 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1 as acp;
 use agent_client_protocol::{Agent, Client, ConnectionTo, Lines, Responder};
 
+use crate::acp_terminal::{Terminals, snapshot_json};
 use crate::acp_thread::{PermissionDecision, Phase, PromptInput, SessionThread};
 use crate::guest::{self, GuestCommand};
 use crate::{BufferId, BufferState, ProjectId};
@@ -279,6 +280,12 @@ struct AgentShared {
     /// [`MAX_EARLY_UPDATES`].
     early_updates: Mutex<Vec<(acp::SessionId, acp::SessionUpdate)>>,
     stderr: Mutex<String>,
+    /// Where to run the commands `terminal/create` asks for. The agent's own
+    /// process came out of the same userland; a terminal is another guest
+    /// program beside it.
+    userland: Arc<guest::Userland>,
+    /// The agent's terminals, by their protocol id.
+    terminals: Terminals,
     /// Ask the watcher to take the process down.
     shutdown: AtomicBool,
     /// The process is gone — observed dead, or killed on request.
@@ -289,6 +296,7 @@ impl AgentShared {
     fn new(
         spec: &AgentSpec,
         key: String,
+        userland: Arc<guest::Userland>,
         sessions: Sessions,
         index: Index,
         written: Arc<WrittenFiles>,
@@ -308,6 +316,8 @@ impl AgentShared {
             pending_sessions: Mutex::new(Vec::new()),
             early_updates: Mutex::new(Vec::new()),
             stderr: Mutex::new(String::new()),
+            userland,
+            terminals: Terminals::default(),
             shutdown: AtomicBool::new(false),
             dead: AtomicBool::new(false),
         })
@@ -501,6 +511,119 @@ impl AgentShared {
                 acp::RequestPermissionOutcome::Cancelled,
             ));
         }
+    }
+
+    // ---- terminals ------------------------------------------------------
+    //
+    // The five `terminal/*` methods, in the order an agent uses them: create,
+    // read, wait, kill, release. Zed serves the same set
+    // (agent_servers/src/acp.rs:722-740); the mechanics are
+    // [`crate::acp_terminal`], and what is here is the session lookup and the
+    // protocol's error shapes.
+
+    fn on_create_terminal(
+        &self,
+        request: acp::CreateTerminalRequest,
+        responder: Responder<acp::CreateTerminalResponse>,
+    ) {
+        let Some((our_id, handle)) = self.session_for_acp_id(&request.session_id) else {
+            let _ = responder.respond_with_error(
+                acp::Error::invalid_params().data(serde_json::json!("unknown session")),
+            );
+            return;
+        };
+        let root = handle.thread.lock().unwrap().root.clone();
+        match self
+            .terminals
+            .create(&self.userland, our_id, &root, &request)
+        {
+            Ok(terminal) => {
+                log::info!("acp: terminal {} runs `{}`", terminal.id, terminal.label);
+                // The panel draws a terminal card off the tool call's
+                // content, and the content is only as fresh as the revision —
+                // so the session has to move when a terminal appears, or the
+                // card sits empty until something else happens to bump it.
+                handle.update(|thread| {
+                    thread.bump();
+                });
+                let _ = responder.respond(acp::CreateTerminalResponse::new(acp::TerminalId::new(
+                    terminal.id.clone(),
+                )));
+            }
+            Err(err) => {
+                log::warn!("acp: terminal refused: {err:?}");
+                let _ = responder.respond_with_error(err);
+            }
+        }
+    }
+
+    fn on_terminal_output(
+        &self,
+        request: acp::TerminalOutputRequest,
+        responder: Responder<acp::TerminalOutputResponse>,
+    ) {
+        let Some(terminal) = self.terminals.get(request.terminal_id.0.as_ref()) else {
+            let _ = responder.respond_with_error(
+                acp::Error::invalid_params().data(serde_json::json!("unknown terminal")),
+            );
+            return;
+        };
+        let snapshot = terminal.snapshot();
+        let mut response = acp::TerminalOutputResponse::new(snapshot.output, snapshot.truncated);
+        if let Some(exit) = snapshot.exit {
+            response = response.exit_status(exit);
+        }
+        let _ = responder.respond(response);
+    }
+
+    fn on_wait_for_terminal_exit(
+        &self,
+        request: acp::WaitForTerminalExitRequest,
+        responder: Responder<acp::WaitForTerminalExitResponse>,
+    ) {
+        let Some(terminal) = self.terminals.get(request.terminal_id.0.as_ref()) else {
+            let _ = responder.respond_with_error(
+                acp::Error::invalid_params().data(serde_json::json!("unknown terminal")),
+            );
+            return;
+        };
+        // Parked, never awaited here: this runs on the connection's event
+        // loop, and a command that takes a minute would take the whole
+        // connection with it — including the `terminal/output` polls the
+        // agent makes while it waits.
+        terminal.wait(responder);
+    }
+
+    fn on_kill_terminal(
+        &self,
+        request: acp::KillTerminalRequest,
+        responder: Responder<acp::KillTerminalResponse>,
+    ) {
+        let Some(terminal) = self.terminals.get(request.terminal_id.0.as_ref()) else {
+            let _ = responder.respond_with_error(
+                acp::Error::invalid_params().data(serde_json::json!("unknown terminal")),
+            );
+            return;
+        };
+        // Kill is not release: the output stays readable, which is the whole
+        // point — an agent kills a command that has hung and then reads what
+        // it managed to print.
+        terminal.kill();
+        let _ = responder.respond(acp::KillTerminalResponse::new());
+    }
+
+    fn on_release_terminal(
+        &self,
+        request: acp::ReleaseTerminalRequest,
+        responder: Responder<acp::ReleaseTerminalResponse>,
+    ) {
+        if !self.terminals.release(request.terminal_id.0.as_ref()) {
+            let _ = responder.respond_with_error(
+                acp::Error::invalid_params().data(serde_json::json!("unknown terminal")),
+            );
+            return;
+        }
+        let _ = responder.respond(acp::ReleaseTerminalResponse::new());
     }
 
     fn on_write_text_file(
@@ -869,9 +992,13 @@ fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) {
         .unwrap_or_else(|err| panic!("failed to spawn {name}: {err}"));
 }
 
-/// The SDK connection: Zed's handler set minus what we do not advertise
-/// (terminals, elicitations), with the same newline-delimited transport
-/// (agent_servers/src/acp.rs:678-765).
+/// The SDK connection: Zed's handler set, with the same newline-delimited
+/// transport (agent_servers/src/acp.rs:678-765).
+///
+/// Every handler registered here is a capability advertised in
+/// [`agent_main`], and the two lists must stay the same length: a capability
+/// with no handler is a request that hangs, and a handler with no capability
+/// is a request that never arrives.
 async fn run_connection(
     shared: Arc<AgentShared>,
     transport: impl agent_client_protocol::ConnectTo<Client> + 'static,
@@ -880,6 +1007,11 @@ async fn run_connection(
     let write_shared = shared.clone();
     let read_shared = shared.clone();
     let update_shared = shared.clone();
+    let create_terminal_shared = shared.clone();
+    let terminal_output_shared = shared.clone();
+    let wait_terminal_shared = shared.clone();
+    let kill_terminal_shared = shared.clone();
+    let release_terminal_shared = shared.clone();
     let main_shared = shared.clone();
 
     let result = Client
@@ -890,6 +1022,51 @@ async fn run_connection(
                         responder: Responder<acp::RequestPermissionResponse>,
                         _cx| {
                 permission_shared.on_permission(request, responder);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: acp::CreateTerminalRequest,
+                        responder: Responder<acp::CreateTerminalResponse>,
+                        _cx| {
+                create_terminal_shared.on_create_terminal(request, responder);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: acp::TerminalOutputRequest,
+                        responder: Responder<acp::TerminalOutputResponse>,
+                        _cx| {
+                terminal_output_shared.on_terminal_output(request, responder);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: acp::WaitForTerminalExitRequest,
+                        responder: Responder<acp::WaitForTerminalExitResponse>,
+                        _cx| {
+                wait_terminal_shared.on_wait_for_terminal_exit(request, responder);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: acp::KillTerminalRequest,
+                        responder: Responder<acp::KillTerminalResponse>,
+                        _cx| {
+                kill_terminal_shared.on_kill_terminal(request, responder);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: acp::ReleaseTerminalRequest,
+                        responder: Responder<acp::ReleaseTerminalResponse>,
+                        _cx| {
+                release_terminal_shared.on_release_terminal(request, responder);
                 Ok(())
             },
             agent_client_protocol::on_receive_request!(),
@@ -931,14 +1108,28 @@ async fn run_connection(
 async fn agent_main(shared: Arc<AgentShared>, cx: ConnectionTo<Agent>) -> Result<(), acp::Error> {
     *shared.connection.lock().unwrap() = Some(cx.clone());
 
-    // The capabilities Zed advertises, minus terminals — without the
-    // capability an agent runs commands inside its own process, which is the
-    // right shape while the terminal dock knows nothing about agents. Minus
-    // elicitations too, which are unstable; an agent must not offer what we
-    // cannot render.
-    let capabilities = acp::ClientCapabilities::new().fs(acp::FileSystemCapabilities::new()
-        .read_text_file(true)
-        .write_text_file(true));
+    // What we can actually do, in the shape Zed sends it
+    // (agent_servers/src/acp.rs:766-793). Every line here is a promise the
+    // handlers below keep, and — the other direction — an agent is entitled to
+    // stay silent about anything we do not claim. `session.configOptions` is
+    // the one that bites: the panel's selector chips are driven entirely by
+    // `ConfigOptionUpdate`, and a conformant agent sends none of those unless
+    // this capability says we can render them.
+    let capabilities = acp::ClientCapabilities::new()
+        .fs(acp::FileSystemCapabilities::new()
+            .read_text_file(true)
+            .write_text_file(true))
+        .terminal(true)
+        // An auth method that says "run this in a terminal" is only offerable
+        // to a client that has one. We do now, so agents whose login is a
+        // command (`claude /login` and its kin) can say so.
+        .auth(acp::AuthCapabilities::new().terminal(true))
+        .session(
+            acp::ClientSessionCapabilities::new().config_options(
+                acp::SessionConfigOptionsCapabilities::new()
+                    .boolean(acp::BooleanConfigOptionCapabilities::new()),
+            ),
+        );
     let initialize = cx
         .send_request(
             acp::InitializeRequest::new(ProtocolVersion::V1)
@@ -1302,6 +1493,7 @@ impl crate::Engine {
                 let shared = AgentShared::new(
                     &spec,
                     key.clone(),
+                    userland.clone(),
                     self.acp.sessions.clone(),
                     self.acp.index.clone(),
                     self.acp.written.clone(),
@@ -1734,6 +1926,11 @@ impl crate::Engine {
         }
         let mut slot = self.acp.agent.lock().unwrap();
         if let Some(shared) = slot.as_ref() {
+            // Whatever this session had running dies with it. An agent that
+            // never got to `terminal/release` — because the user closed the
+            // thread mid-command — must not leave a build running in the
+            // guest, and any `wait_for_exit` it parked must still be answered.
+            shared.terminals.release_session(session);
             // Tell the agent the turn is over, so it stops spending tokens.
             if let (Some(acp_id), Some(cx)) = (acp_id, shared.connection()) {
                 let _ = cx.send_notification(acp::CancelNotification::new(acp_id));
@@ -1758,6 +1955,29 @@ impl crate::Engine {
         self.acp.written.json(since as usize).to_string()
     }
 
+    /// One agent terminal, for the card that shows it:
+    /// `{"revision": n}` when nothing has moved since `since`, and otherwise
+    /// `{"revision", "label", "output", "truncated", "exitStatus", "running"}`.
+    ///
+    /// `{"revision": 0}` for a terminal the engine does not have — released by
+    /// the agent, or belonging to a session that is gone. The card reads that
+    /// as "this is history now" and stops polling, which is exactly what it
+    /// is: the transcript keeps the tool call, but the command behind it is
+    /// over and unreadable.
+    pub fn acp_terminal_output(&self, terminal_id: &str, since: u64) -> String {
+        let terminal = self
+            .acp
+            .agent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|shared| shared.terminals.get(terminal_id));
+        match terminal {
+            Some(terminal) => snapshot_json(&terminal, since).to_string(),
+            None => serde_json::json!({ "revision": 0 }).to_string(),
+        }
+    }
+
     fn session_handle(&self, session: u64) -> Option<Arc<SessionHandle>> {
         self.acp.sessions.lock().unwrap().get(&session).cloned()
     }
@@ -1767,6 +1987,10 @@ impl crate::Engine {
 /// SIGQUIT-first shutdown. The connection future ends when the pipes close.
 fn shutdown_agent(shared: &Arc<AgentShared>) {
     shared.shutdown.store(true, Ordering::Release);
+    // Terminals are children of the agent's *connection*, not of its process:
+    // proot does not take them with it, so an agent replaced mid-build would
+    // otherwise leave that build running against the process budget.
+    shared.terminals.release_all();
     *shared.connection.lock().unwrap() = None;
 }
 
@@ -1937,6 +2161,9 @@ mod tests {
                 env: HashMap::new(),
             },
             "test-key".to_owned(),
+            // These tests never spawn anything; the userland is only reached
+            // through `terminal/create`, which none of them makes.
+            Arc::new(guest::testing::unusable_userland()),
             sessions.clone(),
             index.clone(),
             Arc::new(WrittenFiles::default()),
@@ -2261,6 +2488,10 @@ mod tests {
     struct Rig {
         shared: Arc<AgentShared>,
         handle: Arc<SessionHandle>,
+        /// Holds the stand-in proot the rig's userland points at. Dropping it
+        /// would delete the script out from under any terminal the fake agent
+        /// asks for, so the rig keeps it for its own lifetime.
+        _guest_dir: tempfile::TempDir,
     }
 
     /// The production connection stack over an in-memory wire, with one
@@ -2275,7 +2506,16 @@ mod tests {
             argv: vec!["fake".to_owned()],
             env: HashMap::new(),
         };
-        let shared = AgentShared::new(&spec, spec.key(), sessions.clone(), index, written, buffers);
+        let guest_dir = tempfile::tempdir().unwrap();
+        let shared = AgentShared::new(
+            &spec,
+            spec.key(),
+            Arc::new(guest::testing::fake_userland(guest_dir.path())),
+            sessions.clone(),
+            index,
+            written,
+            buffers,
+        );
         let handle = Arc::new(SessionHandle::new(
             shared.id,
             SessionThread::new(1, root.to_path_buf()),
@@ -2302,7 +2542,11 @@ mod tests {
                 })
                 .unwrap();
         }
-        Rig { shared, handle }
+        Rig {
+            shared,
+            handle,
+            _guest_dir: guest_dir,
+        }
     }
 
     #[test]
@@ -2313,7 +2557,7 @@ mod tests {
         std::fs::write(&file, "old\n").unwrap();
 
         let rig = rig(&root, &file);
-        let Rig { shared, handle } = &rig;
+        let Rig { shared, handle, .. } = &rig;
 
         // The handshake runs and the pending session comes up on its own.
         wait_for("the session to be ready", || {
@@ -2408,7 +2652,7 @@ mod tests {
         std::fs::write(&file, "old\n").unwrap();
 
         let rig = rig(&root, &file);
-        let Rig { shared, handle } = &rig;
+        let Rig { shared, handle, .. } = &rig;
         wait_for("the session to be ready", || {
             handle.thread.lock().unwrap().phase == Phase::Ready
         });
@@ -2464,7 +2708,7 @@ mod tests {
         let target = outside.path().join("escape.txt");
 
         let rig = rig(&root, &target);
-        let Rig { shared, handle } = &rig;
+        let Rig { shared, handle, .. } = &rig;
         wait_for("the session to be ready", || {
             handle.thread.lock().unwrap().phase == Phase::Ready
         });
@@ -2537,6 +2781,7 @@ mod tests {
         let shared = AgentShared::new(
             &spec,
             spec.key(),
+            userland.clone(),
             sessions.clone(),
             index,
             Arc::new(WrittenFiles::default()),
@@ -2718,6 +2963,7 @@ mod tests {
         let shared = AgentShared::new(
             &spec,
             spec.key(),
+            userland.clone(),
             sessions.clone(),
             index,
             Arc::new(WrittenFiles::default()),
@@ -2751,7 +2997,10 @@ mod tests {
                 .iter()
                 .map(|command| command.name.as_str())
                 .collect();
-            assert_eq!(names, ["plan", "echo"]);
+            // `run` is in the list only because the client advertised
+            // `terminal: true` — the conformance agent gates it on exactly
+            // that, so this line is the capability negotiation under test.
+            assert_eq!(names, ["plan", "echo", "run"]);
             let ids: Vec<String> = thread
                 .config_options
                 .iter()
@@ -2930,6 +3179,68 @@ mod tests {
             "a rejected call writes nothing"
         );
         assert_eq!(tool_call_status(&handle, "t-2"), Some(ToolStatus::Rejected));
+
+        // ---- turn three: the whole `terminal/*` round trip ------------------
+        //
+        // The agent creates a terminal, hangs it off a tool call, waits for
+        // the exit, reads the output and releases it. All five methods, over
+        // the real spawn path, with a command that writes to *both* pipes and
+        // exits non-zero — the shape that catches an interleave bug and an
+        // exit code dropped on the floor.
+        let run = "/run echo out; echo err >&2; exit 3";
+        handle.update(|thread| thread.push_user_message(run));
+        start_prompt(&shared, &cx, 1, PromptInput::text_only(run), false);
+        wait_for("the terminal turn to end", || {
+            let thread = handle.thread.lock().unwrap();
+            thread.phase == Phase::Ready && thread.stop_reason.as_deref() == Some("end_turn")
+        });
+        {
+            let thread = handle.thread.lock().unwrap();
+            let terminal_id = thread
+                .entries
+                .iter()
+                .find_map(|entry| match &entry.body {
+                    EntryBody::ToolCall(call) if call.id == "t-3" => {
+                        call.content.iter().find_map(|content| match content {
+                            crate::acp_thread::ToolContent::Terminal { terminal_id } => {
+                                Some(terminal_id.clone())
+                            }
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                })
+                .expect("the tool call names its terminal");
+            // Released by the agent at the end of its turn, so the panel's
+            // read is the "this is history" answer rather than a stale buffer.
+            assert!(shared.terminals.get(&terminal_id).is_none());
+
+            // What the agent said it saw is what the command actually did.
+            let reply = thread
+                .entries
+                .iter()
+                .rev()
+                .find_map(|entry| match &entry.body {
+                    EntryBody::Assistant { chunks } => Some(
+                        chunks
+                            .iter()
+                            .map(|chunk| chunk.markdown.as_str())
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                })
+                .expect("a reply");
+            assert!(reply.contains("exit code 3"), "the exit code: {reply}");
+            assert!(reply.contains("out"), "stdout: {reply}");
+            assert!(reply.contains("err"), "stderr too: {reply}");
+            // Not `tool_call_status` — that takes this very lock, and asking
+            // for it here is a self-deadlock rather than a failed assertion.
+            let status = thread.entries.iter().find_map(|entry| match &entry.body {
+                EntryBody::ToolCall(call) if call.id == "t-3" => Some(call.status),
+                _ => None,
+            });
+            assert_eq!(status, Some(ToolStatus::Failed), "exit 3 is a failure");
+        }
 
         // ---- shutdown: EOF on its stdin is how the python process learns ---
         shutdown_agent(&shared);

@@ -1940,3 +1940,20 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpWrittenFile
 ) -> jstring {
     to_jstring(&env, engine().acp_written_files(since.max(0) as u64))
 }
+
+/// One agent terminal, for the card that draws it. Poll it with the
+/// `revision` you were last given: an unchanged terminal answers
+/// `{"revision": n}` and nothing else, which is what makes polling a
+/// megabyte-capable buffer cheap. `{"revision": 0}` means the engine no
+/// longer has it — the agent released it, or its session closed.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpTerminalOutput(
+    mut env: JNIEnv,
+    _class: JClass,
+    terminal_id: JString,
+    since: jlong,
+) -> jstring {
+    let terminal_id = get_string(&mut env, &terminal_id);
+    let json = engine().acp_terminal_output(&terminal_id, since.max(0) as u64);
+    to_jstring(&env, json)
+}
