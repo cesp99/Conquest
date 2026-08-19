@@ -2006,6 +2006,41 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpLogout(
     }
 }
 
+/// Interrupt the running turn and send this prompt as soon as it stops — the
+/// deliberate version of a follow-up. `acpPrompt` queues instead, which is
+/// what a follow-up typed mid-turn should do.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpPromptImmediately(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_id: jlong,
+    text: JString,
+    mentions_json: JString,
+) -> jboolean {
+    let text = get_string(&mut env, &text);
+    let mentions_json = get_string(&mut env, &mentions_json);
+    if engine().acp_prompt_immediately(session_id as u64, &text, &mentions_json) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Drop one queued prompt, by the `id` its row carries in `queue`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpRemoveQueuedPrompt(
+    _env: JNIEnv,
+    _class: JClass,
+    session_id: jlong,
+    queued_id: jlong,
+) -> jboolean {
+    if engine().acp_remove_queued_prompt(session_id as u64, queued_id.max(0) as u64) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
 /// Put away the notice saying why the last mode or config change did not
 /// take. False for a session the engine has forgotten.
 #[unsafe(no_mangle)]

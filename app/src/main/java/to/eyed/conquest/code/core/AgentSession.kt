@@ -848,6 +848,14 @@ data class AgentUsage(val used: Long, val size: Long, val cost: AgentCost? = nul
     val isNearlyFull: Boolean get() = (fraction ?: 0f) >= 0.85f
 }
 
+/**
+ * A prompt typed while the agent was busy, waiting its turn.
+ *
+ * Deliberately not a transcript entry: it has not been sent, and a
+ * transcript that shows messages the agent never received is one that lies.
+ */
+data class AgentQueuedPrompt(val id: Long, val text: String)
+
 /** One entry of the agent's plan. */
 data class AgentPlanEntry(
     val content: String,
@@ -1073,6 +1081,8 @@ data class AgentSessionState(
     val acpSessionId: String?,
     /** The agent's own timestamp for the conversation, as it wrote it. */
     val updatedAt: String?,
+    /** Prompts waiting for the running turn to end, oldest first. */
+    val queue: List<AgentQueuedPrompt>,
     val agent: AgentInfo?,
 ) {
     val isBusy: Boolean get() = phase == AgentPhase.Running
@@ -1101,6 +1111,7 @@ data class AgentSessionState(
             notice = null,
             acpSessionId = null,
             updatedAt = null,
+            queue = emptyList(),
             agent = null,
         )
 
@@ -1159,6 +1170,12 @@ data class AgentSessionState(
                 notice = root.stringOrNull("notice"),
                 acpSessionId = root.stringOrNull("acpSessionId"),
                 updatedAt = root.stringOrNull("updatedAt"),
+                queue = (root.optJSONArray("queue") ?: JSONArray()).let { queued ->
+                    (0 until queued.length()).mapNotNull { index ->
+                        val row = queued.optJSONObject(index) ?: return@mapNotNull null
+                        AgentQueuedPrompt(row.optLong("id"), row.optString("text"))
+                    }
+                },
                 agent = agent?.let {
                     val methods = it.optJSONArray("auth_methods") ?: JSONArray()
                     AgentInfo(

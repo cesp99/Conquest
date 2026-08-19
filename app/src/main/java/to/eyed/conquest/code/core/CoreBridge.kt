@@ -1012,4 +1012,23 @@ object CoreBridge {
      * the last mode or config change the user asked for did not happen.
      */
     external fun acpClearNotice(sessionId: Long): Boolean
+
+    /**
+     * Interrupts the running turn and sends [text] as soon as it stops.
+     *
+     * The deliberate version of a follow-up. [acpPrompt] **queues** one
+     * instead, which is what typing while the agent works should do: killing
+     * the turn to make room throws away the work it had done.
+     */
+    external fun acpPromptImmediately(
+        sessionId: Long,
+        text: String,
+        mentionsJson: String,
+    ): Boolean
+
+    /**
+     * Drops one queued prompt, by the `id` its row carries in the `queue` of
+     * [acpSessionState].
+     */
+    external fun acpRemoveQueuedPrompt(sessionId: Long, queuedId: Long): Boolean
 }

@@ -2053,6 +2053,26 @@ impl crate::Engine {
     /// @-mentioned; they become resource blocks beside the text. Anything
     /// that is not such an array means no mentions — a malformed list must
     /// not eat the message it rode in on.
+    /// Interrupt the running turn and send this prompt as soon as it stops.
+    ///
+    /// The deliberate version of what [`Self::acp_prompt`] used to do by
+    /// accident. Queued first, so a cancel that never lands leaves the prompt
+    /// where the user can still see and send it.
+    pub fn acp_prompt_immediately(&self, session: u64, text: &str, mentions_json: &str) -> bool {
+        if !self.acp_prompt(session, text, mentions_json) {
+            return false;
+        }
+        self.acp_cancel(session)
+    }
+
+    /// Drop one queued prompt, by the `id` its row carries in the state JSON.
+    pub fn acp_remove_queued_prompt(&self, session: u64, queued_id: u64) -> bool {
+        let Some(handle) = self.session_handle(session) else {
+            return false;
+        };
+        handle.update(|thread| thread.remove_queued_prompt(queued_id))
+    }
+
     pub fn acp_prompt(&self, session: u64, text: &str, mentions_json: &str) -> bool {
         let Some(handle) = self.session_handle(session) else {
             return false;
@@ -2079,12 +2099,15 @@ impl crate::Engine {
                 thread.queue_prompt(&prompt);
                 Route::Queue
             }
+            // **Queued, not interrupted.** This used to cancel the running
+            // turn to make room, so a follow-up typed while the agent was
+            // working killed the work — and on a phone, where the send button
+            // becomes Stop mid-turn, the user could not even mean to. Zed
+            // queues and never interrupts (thread_view.rs:1480);
+            // `acp_prompt_immediately` is the deliberate version.
             Phase::Running => {
                 thread.queue_prompt(&prompt);
-                match &thread.acp_id {
-                    Some(id) => Route::Interrupt(id.clone()),
-                    None => Route::Queue,
-                }
+                Route::Queue
             }
             Phase::Ready => {
                 thread.push_user_message(&prompt.text);

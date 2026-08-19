@@ -80,6 +80,7 @@ import to.eyed.conquest.code.core.AgentCapabilities
 import to.eyed.conquest.code.core.AgentElicitation
 import to.eyed.conquest.code.core.AgentErrorKind
 import to.eyed.conquest.code.core.AgentPlanEntry
+import to.eyed.conquest.code.core.AgentQueuedPrompt
 import to.eyed.conquest.code.core.AgentPastSession
 import to.eyed.conquest.code.core.AgentEntry
 import to.eyed.conquest.code.core.AgentThread
@@ -1226,7 +1227,7 @@ private fun ActivityStrip(
     val stopNotice = stopReasonNotice(state)
     val showError = state.error != null
     if (state.plan.isEmpty() && notices.isEmpty() && stopNotice == null &&
-        !showError && pendingCount == 0
+        !showError && pendingCount == 0 && state.queue.isEmpty()
     ) {
         return
     }
@@ -1255,9 +1256,46 @@ private fun ActivityStrip(
         for (notice in notices) {
             NoticeRow(notice, onDismiss = { AgentSessions.clearNotice() })
         }
+        // Prompts waiting their turn. They are not in the transcript because
+        // they have not been sent — this is where they live until they are,
+        // and where they can be taken back or pushed to the front.
+        for (queued in state.queue) {
+            QueuedRow(queued, sendNow = !state.isBusy)
+        }
         if (state.plan.isNotEmpty()) {
             PlanStrip(state)
         }
+    }
+}
+
+/** One prompt in the queue, with the two things to do about it. */
+@Composable
+private fun QueuedRow(queued: AgentQueuedPrompt, sendNow: Boolean) {
+    val theme = LocalZedTheme.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = RowStartPadding, vertical = 6.dp),
+    ) {
+        Text(
+            text = "queued",
+            style = MaterialTheme.typography.labelSmall,
+            color = theme.color("text.muted"),
+        )
+        Text(
+            text = queued.text,
+            style = MaterialTheme.typography.bodySmall,
+            color = theme.color("text"),
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        // Only when a turn is not running: "send now" while the agent is
+        // working would mean interrupting it, which is a different button.
+        if (sendNow) BarAction("Send now") { AgentSessions.sendQueuedNow() }
+        BarAction("✕") { AgentSessions.removeQueued(queued.id) }
     }
 }
 
@@ -2779,10 +2817,21 @@ private fun Composer(
                 }
             },
         )
-        if (isBusy) {
-            PanelButton("Stop", isPrimary = true, onClick = onStop)
-        } else {
-            PanelButton("Send", isPrimary = true, onClick = { send() })
+        // **Four ways, not two.** Stop used to *replace* Send whenever a turn
+        // was running, so on a phone — where the soft keyboard's Enter
+        // arrives as committed text rather than as a keystroke — a follow-up
+        // typed mid-turn could not be sent at all. Zed's send button has the
+        // same three live states (thread_view.rs:5397-5476).
+        val hasText = field.text.isNotBlank()
+        when {
+            isBusy && hasText -> PanelButton("Queue", isPrimary = true, onClick = { send() })
+            isBusy -> PanelButton("Stop", isPrimary = true, onClick = onStop)
+            else -> PanelButton(
+                label = "Send",
+                isPrimary = true,
+                enabled = hasText,
+                onClick = { send() },
+            )
         }
     }
 }

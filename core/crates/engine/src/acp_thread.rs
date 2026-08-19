@@ -325,11 +325,19 @@ pub enum PermissionDecision {
     Cancel,
 }
 
+/// One prompt waiting its turn.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct QueuedPrompt {
+    pub id: u64,
+    #[serde(flatten)]
+    pub prompt: PromptInput,
+}
+
 /// One prompt as the UI sends it: the text, plus the project-relative paths
 /// the user @-mentioned. Mentions ride the queue too, so a follow-up typed
 /// mid-turn keeps its context — Zed's message editor sends the same shape,
 /// text plus resource blocks (agent_ui/src/message_editor.rs:2140-2180).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct PromptInput {
     pub text: String,
     pub mentions: Vec<String>,
@@ -375,10 +383,18 @@ pub struct SessionThread {
     pub config_options: Vec<acp::SessionConfigOption>,
     /// How the last turn ended, snake_case (`end_turn`, `cancelled`, …).
     pub stop_reason: Option<String>,
-    /// A prompt sent while a turn was running: the running turn is cancelled
-    /// and this goes out when it settles — Zed's follow-up interrupt
-    /// (acp_thread.rs:3742-3752, where `run_turn` awaits `cancel_inner`).
-    pub queued_prompt: Option<PromptInput>,
+    /// Prompts typed while the agent was busy, in the order they were typed.
+    ///
+    /// **A queue, not a slot, and it does not interrupt.** It used to be one
+    /// `Option` that cancelled the running turn to make room — so a follow-up
+    /// typed while the agent was working *killed the work*, and a second
+    /// follow-up silently replaced the first. Zed queues and never interrupts
+    /// (thread_view.rs:1480); interrupting is a separate, deliberate act.
+    ///
+    /// Drained one at a time as turns settle.
+    pub queue: Vec<QueuedPrompt>,
+    /// Ids for the queue, so the panel can name a row to remove.
+    next_queued: u64,
     /// Bumped by every mutation; entry stamps come from it.
     ///
     /// **Starts at 1, not 0.** A live session must never report the version an
@@ -429,7 +445,8 @@ impl SessionThread {
             commands: Vec::new(),
             config_options: Vec::new(),
             stop_reason: None,
-            queued_prompt: None,
+            queue: Vec::new(),
+            next_queued: 0,
             revision: 1,
             needs_auth: false,
             updated_at: None,
@@ -498,73 +515,69 @@ impl SessionThread {
     /// enter, and nothing at all happens until the running turn settles.
     /// Deliberately does not touch `phase`: a session still starting is still
     /// starting, and a running turn is still the running turn's.
-    pub fn queue_prompt(&mut self, prompt: &PromptInput) {
-        self.queued_prompt = Some(prompt.clone());
-        self.push_entry(EntryBody::User {
-            markdown: prompt.text.clone(),
-            chunks: vec![prompt.text.clone()],
-            optimistic: true,
+    /// Put a prompt in the queue. Returns its id, so the panel can offer to
+    /// remove that row.
+    ///
+    /// **No transcript entry.** A queued prompt has not been sent, and the
+    /// one thing a transcript must not do is show a message the agent never
+    /// received. It lives in the pinned strip until it goes out, which is
+    /// also where it can be removed or pushed to the front.
+    pub fn queue_prompt(&mut self, prompt: &PromptInput) -> u64 {
+        self.next_queued += 1;
+        let id = self.next_queued;
+        self.queue.push(QueuedPrompt {
+            id,
+            prompt: prompt.clone(),
         });
+        self.bump();
+        id
     }
 
-    /// Take the queued prompt, ready to send it, making sure the entry showing
-    /// it is on screen.
-    ///
-    /// It normally is — [`Self::queue_prompt`] pushed it — but a refusal
-    /// truncates the transcript back past the last user message, which can
-    /// take this one with it. Re-pushing is cheap and keeps the invariant the
-    /// panel relies on: a prompt that is about to be sent is a prompt the user
-    /// can see.
+    /// Take the next queued prompt, ready to send it, and put it in the
+    /// transcript — which is now true, because it is going out.
     pub(crate) fn take_queued_prompt(&mut self) -> Option<PromptInput> {
-        let prompt = self.queued_prompt.take()?;
-        let shown = matches!(
-            self.entries.last(),
-            Some(Entry {
-                body: EntryBody::User {
-                    optimistic: true,
-                    markdown,
-                    ..
-                },
-                ..
-            }) if *markdown == prompt.text
-        );
-        if !shown {
-            self.push_entry(EntryBody::User {
-                markdown: prompt.text.clone(),
-                chunks: vec![prompt.text.clone()],
-                optimistic: true,
-            });
+        if self.queue.is_empty() {
+            return None;
         }
+        let queued = self.queue.remove(0);
+        self.push_entry(EntryBody::User {
+            markdown: queued.prompt.text.clone(),
+            chunks: vec![queued.prompt.text.clone()],
+            optimistic: true,
+        });
         self.phase = Phase::Running;
         self.stop_reason = None;
         self.error = None;
+        self.error_kind = None;
         self.turn_cancelled = false;
+        self.clear_stale_plan();
         self.bump();
-        Some(prompt)
+        Some(queued.prompt)
     }
 
-    /// Throw away a queued prompt that will now never be sent, and the entry
-    /// that was showing it — otherwise the transcript keeps a message the
-    /// agent never received, which is the one thing a transcript must not do.
-    pub fn discard_queued_prompt(&mut self) {
-        let Some(prompt) = self.queued_prompt.take() else {
-            return;
-        };
-        let trailing_is_ours = matches!(
-            self.entries.last(),
-            Some(Entry {
-                body: EntryBody::User {
-                    optimistic: true,
-                    markdown,
-                    ..
-                },
-                ..
-            }) if *markdown == prompt.text
-        );
-        if trailing_is_ours {
-            self.entries.pop();
+    /// Drop one queued prompt, by the id [`Self::queue_prompt`] gave it.
+    pub fn remove_queued_prompt(&mut self, id: u64) -> bool {
+        let before = self.queue.len();
+        self.queue.retain(|queued| queued.id != id);
+        if self.queue.len() != before {
+            self.bump();
+            true
+        } else {
+            false
         }
-        self.bump();
+    }
+
+    /// Throw away every queued prompt, for a session that is over.
+    ///
+    /// Only for a session that is *over* — a turn that merely failed keeps
+    /// its queue, because the follow-ups the user typed are still the
+    /// follow-ups they want, and silently dropping them is the bug the queue
+    /// exists to fix. The strip shows them with a way to send or remove each.
+    pub fn discard_queued_prompt(&mut self) {
+        if !self.queue.is_empty() {
+            self.queue.clear();
+            self.bump();
+        }
     }
 
     /// Feed one `session/update` through the same rules as Zed's
@@ -920,7 +933,10 @@ impl SessionThread {
         self.error_kind = Some(ErrorKind::guess(&message));
         self.error = Some(message);
         self.turn_cancelled = false;
-        self.discard_queued_prompt();
+        // The queue is **kept**: the follow-ups the user typed are still the
+        // follow-ups they want, and a rate limit is exactly the case where
+        // they will be sent again in a moment. The strip shows them with a
+        // way to send or drop each one.
         self.cancel_pending_tool_calls();
         self.bump();
     }
@@ -1022,6 +1038,11 @@ impl SessionThread {
             "modes": self.modes,
             "commands": self.commands,
             "configOptions": self.config_options,
+            // Prompts typed while the agent was busy, waiting their turn.
+            // They are deliberately *not* transcript entries: a queued prompt
+            // has not been sent, and a transcript that shows messages the
+            // agent never received is a transcript that lies.
+            "queue": self.queue,
             // What kind of failure `error` is, and whether trying again could
             // work — the panel needs both to say anything better than one red
             // sentence.
@@ -1837,10 +1858,10 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_prompt_survives_the_turn_it_interrupted() {
+    fn a_queued_prompt_survives_the_turn_it_waited_for() {
         let mut thread = thread();
         thread.push_user_message("first");
-        thread.queued_prompt = Some(PromptInput::text_only("follow-up"));
+        thread.queue_prompt(&PromptInput::text_only("follow-up"));
         assert_eq!(
             thread.end_turn(acp::StopReason::Cancelled),
             Some(PromptInput::text_only("follow-up"))
@@ -1915,47 +1936,88 @@ mod tests {
     /// A prompt typed while the agent is busy is shown at once and sent
     /// later — not held invisibly until the running turn happens to finish.
     #[test]
-    fn a_queued_prompt_is_visible_the_moment_it_is_typed() {
+    fn queued_prompts_wait_their_turn_in_order() {
         let mut thread = thread();
         thread.push_user_message("first");
         let before = thread.revision;
 
         thread.queue_prompt(&PromptInput::text_only("second"));
+        thread.queue_prompt(&PromptInput::text_only("third"));
         assert!(thread.revision > before, "the queue is news");
-        assert_eq!(thread.entries.len(), 2);
-        let EntryBody::User { markdown, .. } = &thread.entries[1].body else {
-            panic!("the queued prompt is on screen");
-        };
-        assert_eq!(markdown, "second");
+        // **Not** transcript entries: they have not been sent, and a
+        // transcript that shows messages the agent never received lies.
+        assert_eq!(thread.entries.len(), 1);
+        assert_eq!(thread.queue.len(), 2);
         // Queuing does not start the turn; the running one is still running.
         assert_eq!(thread.phase, Phase::Running);
 
-        // When the running turn ends, the queued one is handed over — and is
-        // not pushed a second time.
+        // One per settled turn, in the order they were typed, each becoming a
+        // transcript entry as it goes out — which is when it becomes true.
         assert_eq!(
             thread.end_turn(acp::StopReason::EndTurn),
             Some(PromptInput::text_only("second"))
         );
         assert_eq!(thread.entries.len(), 2);
+        assert_eq!(thread.queue.len(), 1);
+        assert_eq!(thread.phase, Phase::Running, "the queued turn is running");
+
         assert_eq!(
-            thread.phase,
-            Phase::Running,
-            "the queued turn is now running"
+            thread.end_turn(acp::StopReason::EndTurn),
+            Some(PromptInput::text_only("third"))
+        );
+        assert!(thread.queue.is_empty());
+        assert_eq!(thread.end_turn(acp::StopReason::EndTurn), None);
+    }
+
+    /// A turn that merely failed keeps the queue: the follow-ups the user
+    /// typed are still the follow-ups they want, and a rate limit is exactly
+    /// the case where they will go out in a moment. Only a session that is
+    /// over drops them.
+    #[test]
+    fn a_failed_turn_keeps_the_queue_and_a_dead_session_does_not() {
+        let mut thread = thread();
+        thread.push_user_message("first");
+        thread.queue_prompt(&PromptInput::text_only("still wanted"));
+
+        thread.fail_turn("rate limited".to_owned());
+        assert_eq!(thread.queue.len(), 1, "kept across a failed turn");
+        assert_eq!(thread.error_kind, Some(ErrorKind::RateLimit));
+        assert!(thread.error_kind.is_some_and(ErrorKind::can_retry));
+
+        thread.fail("the agent exited".to_owned());
+        assert!(thread.queue.is_empty(), "a dead session sends nothing");
+    }
+
+    /// A row the user removed is a row that never goes out.
+    #[test]
+    fn a_queued_prompt_can_be_taken_back() {
+        let mut thread = thread();
+        thread.push_user_message("first");
+        let first = thread.queue_prompt(&PromptInput::text_only("one"));
+        thread.queue_prompt(&PromptInput::text_only("two"));
+
+        assert!(thread.remove_queued_prompt(first));
+        assert!(!thread.remove_queued_prompt(first), "already gone");
+        assert_eq!(
+            thread.end_turn(acp::StopReason::EndTurn),
+            Some(PromptInput::text_only("two"))
         );
     }
 
     /// Cancelling takes the queued prompt *and* the entry showing it: a
     /// transcript must never keep a message the agent never received.
     #[test]
-    fn cancelling_takes_the_queued_prompt_off_the_screen_too() {
+    fn discarding_the_queue_leaves_the_transcript_alone() {
         let mut thread = thread();
         thread.push_user_message("first");
         thread.queue_prompt(&PromptInput::text_only("second"));
-        assert_eq!(thread.entries.len(), 2);
+        // Never an entry in the first place, so there is nothing to take back
+        // out of the transcript.
+        assert_eq!(thread.entries.len(), 1);
 
         thread.discard_queued_prompt();
         assert_eq!(thread.entries.len(), 1);
-        assert!(thread.queued_prompt.is_none());
+        assert!(thread.queue.is_empty());
         assert_eq!(thread.end_turn(acp::StopReason::Cancelled), None);
     }
 
@@ -1963,7 +2025,7 @@ mod tests {
     /// queued prompt's entry with it — the prompt is still sent, so the entry
     /// has to come back rather than the send going silent.
     #[test]
-    fn a_queued_prompt_survives_a_refusal_truncating_its_entry() {
+    fn a_queued_prompt_outlives_a_refusal_truncating_the_transcript() {
         let mut thread = thread();
         thread.push_user_message("something refused");
         thread.queue_prompt(&PromptInput::text_only("the follow-up"));

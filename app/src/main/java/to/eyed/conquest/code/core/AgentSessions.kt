@@ -415,6 +415,24 @@ object AgentSessions {
         }
     }
 
+    /**
+     * Interrupt the running turn and send the first queued prompt now.
+     *
+     * Only offered when nothing is running, in which case it merely nudges
+     * the queue along; interrupting *is* the deliberate act and lives on its
+     * own control.
+     */
+    fun sendQueuedNow() {
+        val session = sessionId.takeIf { it >= 0 } ?: return
+        scope.launch { runCatching { CoreBridge.acpCancel(session) } }
+    }
+
+    /** Take one queued prompt back before it goes out. */
+    fun removeQueued(queuedId: Long) {
+        val session = sessionId.takeIf { it >= 0 } ?: return
+        scope.launch { runCatching { CoreBridge.acpRemoveQueuedPrompt(session, queuedId) } }
+    }
+
     /** Change one of the agent's config options — model, effort, a toggle. */
     fun setConfigOption(configId: String, valueJson: String) {
         val session = sessionId.takeIf { it >= 0 } ?: return

@@ -251,9 +251,20 @@ toggles), each a tap-to-pick chip.
 | `Tab` | Take the first suggestion while the `/` or `@` strip is up |
 | `Esc` | Put the suggestion strip away; with none up, stop the agent mid-turn |
 
+Above the composer sits a strip with whatever needs you: the agent's plan
+(tap to unfold), anything queued, a turn that failed and what to do about it,
+and a **Waiting for you** line — with a **Show** that scrolls to it — whenever
+a permission prompt or a question has scrolled out of sight.
+
 On a phone `Enter` inserts a newline and **Send** is the button beside the box:
 a soft keyboard's Enter arrives as text rather than as a keystroke, so it
 cannot mean two things at once.
+
+**Typing while it works queues, it does not interrupt.** The button reads
+**Queue** while the agent is busy and there is something to send; queued
+messages wait above the composer, in order, with a ✕ to take one back, and go
+out one at a time as each turn ends. Stopping the agent is the separate
+**Stop** button — a follow-up should never throw away the work in progress.
 
 **The panel does not take the keyboard the way the terminal does.** Every
 workspace chord keeps working while the composer has focus — it is a text box
