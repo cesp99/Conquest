@@ -315,8 +315,10 @@ offers exactly that list. Add, edit and remove entries from **Settings** →
 }
 ```
 
-The command runs inside the Linux userland, so it is anything on Debian's
-PATH — or an absolute path in the guest — that speaks the Agent Client
+The command runs inside the Linux userland, with the environment a login
+shell would have — so it is anything you can start from the terminal by
+typing its name (`~/.local/bin` and whatever your profile adds to PATH
+included), or an absolute path in the guest, that speaks the Agent Client
 Protocol on stdin and stdout. Putting it there is yours to do, in the
 terminal. settings.json opens as an ordinary editor tab from `☰` → **Edit
 settings.json**, the palette's `zed: open settings file`, or the link at the

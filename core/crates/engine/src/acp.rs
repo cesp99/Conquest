@@ -107,8 +107,10 @@ const MAX_EARLY_UPDATES: usize = 256;
 
 /// What to launch, from the Kotlin side's agent configuration:
 /// `{"name": "Claude Code", "argv": ["claude-code-acp"], "env": {"K": "V"}}`.
-/// `argv` is the guest command line, program included — the agent must be on
-/// the guest PATH (installed with `npm -g`, P6-3).
+/// `argv` is the guest command line, program included — the agent must be
+/// findable on the *login shell's* PATH ([`guest::login_environment`]), which
+/// is the same PATH the user's terminal has: `npm -g` installs and
+/// `~/.local/bin` installers both qualify.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct AgentSpec {
     pub name: String,
@@ -1109,6 +1111,15 @@ fn start_agent(
 ) -> bool {
     let argv = spec.argv.iter().map(std::ffi::OsString::from).collect();
     let mut command = GuestCommand::new(format!("acp:{}", spec.name), argv).workdir(root);
+    // The login shell's environment underneath, the spec's on top — Zed's
+    // layering for a custom agent (project/src/agent_server_store.rs:
+    // 1485-1493), and the reason an agent installed into `~/.local/bin`
+    // starts from the panel exactly as it starts from the terminal. Last
+    // writer wins, so anything the user put in settings.json still beats
+    // what the shell said.
+    for (key, value) in guest::login_environment(&userland, root) {
+        command = command.env(key, value);
+    }
     for (key, value) in &spec.env {
         command = command.env(key, value);
     }
@@ -3429,10 +3440,22 @@ mod tests {
         let sessions: Sessions = Arc::default();
         let index: Index = Arc::default();
         // Long-lived: it says nothing and stays up until it is stopped, which
-        // is all this test needs of an "agent".
+        // is all this test needs of an "agent". SIGQUIT is ignored so that
+        // leaving takes the whole grace (`guest.rs::terminate`, QUIT_GRACE):
+        // an obedient sh died in milliseconds, and the overlap this test
+        // exists to observe was over before the replacement — which now runs
+        // a login-shell capture first — had finished starting. The `armed`
+        // file is how the test knows the trap is actually installed; a
+        // SIGQUIT sent while the shell is still starting up would beat the
+        // trap and the departure would be quick again.
+        let armed = dir.path().join("armed");
         let spec = AgentSpec {
             name: "quiet".to_owned(),
-            argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
+            argv: vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                format!("trap '' QUIT; : > {}; sleep 30", armed.display()),
+            ],
             env: HashMap::new(),
         };
 
@@ -3447,6 +3470,8 @@ mod tests {
             guest::RESERVED_FOR_AGENT.load(Ordering::Relaxed),
             PROCESSES_PER_AGENT
         );
+
+        wait_for("the old agent to arm its trap", || armed.exists());
 
         // The replacement arrives before the old one is gone, which is the
         // real sequence: `acp_start_session` asks the old one to stop and

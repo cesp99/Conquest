@@ -456,6 +456,80 @@ pub(crate) fn capture(
     Some(out)
 }
 
+/// How long the login shell gets to print its environment. The real thing
+/// measures 12–17 ms on the emulator, so this is not a budget but a backstop:
+/// a shell silent for ten seconds has hung in somebody's profile, and the
+/// caller is better served by the fixed environment than by waiting. It is
+/// held under the agent slot lock, which those milliseconds make immaterial
+/// and this ceiling would not.
+const LOGIN_ENV_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The environment a login shell would hand a program started in `workdir` —
+/// /etc/profile, ~/.profile, and the ~/.bashrc the installer wrote, which is
+/// where `~/.local/bin` joins PATH. `/bin/bash --login` because that is
+/// exactly what the terminal runs (`DebianUserland.inside`): a program the
+/// user can start by typing its name must be startable here too.
+///
+/// This is Zed's behaviour for external agents, ported: a custom agent's
+/// process gets the login shell's environment as its base and the settings
+/// env on top (zed project/src/agent_server_store.rs:1485-1493), captured by
+/// running the shell with `-l` (zed util/src/shell_env.rs:118) in the project
+/// directory (zed project/src/environment.rs:195). Zed caches the capture per
+/// project; we do not, because it is cheap enough not to be worth a cache
+/// that can go stale against an edited profile — **12–17 ms** measured on the
+/// emulator (proot, bash, /etc/profile, ~/.profile, ~/.bashrc, 31 variables
+/// back), against an agent start that spawns a whole language runtime
+/// immediately afterwards.
+///
+/// Failure — no bash, a profile that `exit`s, a timeout — is an empty vec,
+/// and the caller then runs with the fixed guest environment alone, which is
+/// exactly the behaviour from before this existed.
+pub(crate) fn login_environment(userland: &Userland, workdir: &Path) -> Vec<(String, String)> {
+    // The shell's profile scripts share stdout with `env -0` — a message of
+    // the day or a stray `echo` lands right in front of the first entry, the
+    // same noisy-output problem Zed parses its way around (zed
+    // util/src/shell_env.rs:9-18). The NUL printed first is the separator
+    // noise cannot forge: profiles emit text, and text has no NUL in it.
+    let argv = ["/bin/bash", "--login", "-c", "printf '\\000' && env -0"]
+        .map(OsString::from)
+        .into();
+    let command = GuestCommand::new("login-env", argv).workdir(workdir);
+    let Some(output) = capture(userland, &command, LOGIN_ENV_TIMEOUT) else {
+        log::warn!("the login shell did not answer; keeping the fixed guest environment");
+        return Vec::new();
+    };
+    parse_login_environment(&output)
+}
+
+/// Everything after the first NUL, as `KEY=VALUE` entries separated by NULs.
+/// NUL-separated because values legitimately contain newlines (a multi-line
+/// PS1, say) and `=` (any PATH-like list of options); a NUL is the one byte
+/// they cannot contain.
+fn parse_login_environment(output: &[u8]) -> Vec<(String, String)> {
+    let Some(marker) = output.iter().position(|&byte| byte == 0) else {
+        log::warn!("no environment in the login shell's output; keeping the fixed one");
+        return Vec::new();
+    };
+    output[marker + 1..]
+        .split(|&byte| byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let entry = match std::str::from_utf8(entry) {
+                Ok(entry) => entry,
+                Err(_) => {
+                    log::debug!("dropping a non-UTF-8 environment entry");
+                    return None;
+                }
+            };
+            let (key, value) = entry.split_once('=')?;
+            // The one engine-owned variable a capture must not echo back:
+            // each run gets a scratch directory of its own (see `invocation`),
+            // and the captured value names the *capture's*, already over.
+            (key != "PROOT_TMP_DIR").then(|| (key.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
 /// Start a resident program in the guest and hand back its handle, with all
 /// three pipes open.
 ///
@@ -982,6 +1056,48 @@ mod tests {
         assert!(argv.contains(&"/elsewhere/repo:/elsewhere/repo".to_owned()));
     }
 
+    /// The parser's whole job: profile noise before the marker is discarded,
+    /// and values keep the bytes a text protocol would have mangled — the
+    /// newline and the `=` — which is why the entries are NUL-separated.
+    #[test]
+    fn login_environment_entries_survive_noise_newlines_and_equals() {
+        let output = b"Welcome to Debian!\n\0PATH=/root/.local/bin:/usr/bin\0\
+                       PS1=\\w\n$ \0OPTS=--jobs=4\0";
+        assert_eq!(
+            parse_login_environment(output),
+            vec![
+                ("PATH".to_owned(), "/root/.local/bin:/usr/bin".to_owned()),
+                ("PS1".to_owned(), "\\w\n$ ".to_owned()),
+                ("OPTS".to_owned(), "--jobs=4".to_owned()),
+            ]
+        );
+    }
+
+    /// A profile that never let the command run — an `exit`, a `set -e`
+    /// casualty — produces no marker, and the answer is "nothing captured",
+    /// never a guess parsed out of noise.
+    #[test]
+    fn a_login_environment_without_its_marker_is_empty() {
+        assert_eq!(
+            parse_login_environment(b"Some message of the day\n"),
+            Vec::new()
+        );
+        assert_eq!(parse_login_environment(b""), Vec::new());
+    }
+
+    /// The capture ran under a scratch directory of its own, already over by
+    /// the time the agent starts; echoing it back would point proot's bind
+    /// scaffolding at a directory another run owns — the exact interaction
+    /// separate scratch directories exist to prevent (see `invocation`).
+    #[test]
+    fn a_login_environment_never_echoes_the_scratch_directory_back() {
+        let output = b"\0PROOT_TMP_DIR=/cache/guest-1-2\0HOME=/root\0";
+        assert_eq!(
+            parse_login_environment(output),
+            vec![("HOME".to_owned(), "/root".to_owned())]
+        );
+    }
+
     #[cfg(unix)]
     use super::testing::fake_userland;
 
@@ -1040,6 +1156,28 @@ mod tests {
         assert_eq!(capture(&guest, &command, Duration::from_millis(200)), None);
         // The deadline is what ended it, not the sleep.
         assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    /// The real capture, through the fake proot: a genuine `bash --login`
+    /// runs on the host, sources whatever profiles the host has — noise and
+    /// all — and the entries still come back. HOME is the witness: the fixed
+    /// guest environment sets it, the login shell inherits it, and `env -0`
+    /// must return it through the parser intact.
+    #[test]
+    #[cfg(unix)]
+    fn a_login_environment_is_captured_through_a_real_login_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let guest = fake_userland(dir.path());
+        let env = login_environment(&guest, dir.path());
+        assert!(
+            env.iter()
+                .any(|(key, value)| key == "HOME" && value == "/root"),
+            "HOME did not survive the round trip: {env:?}"
+        );
+        assert!(
+            env.iter().all(|(key, _)| key != "PROOT_TMP_DIR"),
+            "the capture's scratch directory leaked through"
+        );
     }
 
     #[test]
