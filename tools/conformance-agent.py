@@ -207,6 +207,20 @@ class Agent:
                 return message.get("result")
             self.handle_out_of_band(message)
 
+    # Requests that are safe to answer while a turn is in flight — they read
+    # or edit session bookkeeping and do not touch the running turn. Anything
+    # that would *start* work (session/prompt) is not here: serving it
+    # re-entrantly would run two turns in one agent.
+    REENTRANT = (
+        "session/list",
+        "session/delete",
+        "session/close",
+        "session/load",
+        "session/resume",
+        "session/set_config_option",
+        "logout",
+    )
+
     def handle_out_of_band(self, message):
         method = message.get("method")
         if method == "session/cancel":
@@ -214,6 +228,15 @@ class Agent:
             self.cancelled = True
         elif method == "$/cancel_request":
             pass
+        elif method in self.REENTRANT and "id" in message:
+            # **Served, not refused.** A client asks for the session list
+            # whenever the user opens their history, which is exactly the
+            # moment they are waiting on a permission prompt — so these
+            # arrive while this agent is blocked inside `request()`. Refusing
+            # them put "method not found: session/list" in the panel's
+            # history view, which is a conformance bug on this side and would
+            # be one in any agent that made it.
+            self.handle(message)
         elif "id" in message and method is not None:
             # A request this agent does not serve. Answer, or the client's
             # dispatch waits on it for ever.
