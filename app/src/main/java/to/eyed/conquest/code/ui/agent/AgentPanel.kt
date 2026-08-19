@@ -67,6 +67,7 @@ import org.json.JSONArray
 import to.eyed.conquest.code.core.AgentCommand
 import to.eyed.conquest.code.core.AgentConversation
 import to.eyed.conquest.code.core.AgentDefinition
+import to.eyed.conquest.code.core.AgentAuthMethod
 import to.eyed.conquest.code.core.AgentCapabilities
 import to.eyed.conquest.code.core.AgentElicitation
 import to.eyed.conquest.code.core.AgentPastSession
@@ -90,6 +91,7 @@ import to.eyed.conquest.code.core.ToolKind
 import to.eyed.conquest.code.core.rememberAgentSession
 import to.eyed.conquest.code.core.rememberAgentSessionList
 import to.eyed.conquest.code.core.rememberAgentTerminal
+import to.eyed.conquest.code.terminal.TerminalSessions
 import to.eyed.conquest.code.terminal.Userland
 import to.eyed.conquest.code.ui.theme.BufferFontFamily
 import to.eyed.conquest.code.ui.git.DiffLineRow
@@ -186,6 +188,11 @@ fun AgentPanel(
     val settings = LocalAppSettings.current
     val composer = remember { FocusRequester() }
     val panelScope = rememberCoroutineScope()
+    val context = LocalContext.current
+    // The dock, for a terminal sign-in. Reached here rather than threaded
+    // through the dock plumbing: it is one shared object per context, and
+    // this is the only panel that ever opens a session in it.
+    val terminals = remember(context) { TerminalSessions.of(context) }
 
     val agent = AgentSessions.agent
     val activeThread = AgentSessions.active
@@ -311,7 +318,39 @@ fun AgentPanel(
                     agent = agent,
                     onOpenPath = onOpenPath,
                     onRespond = AgentSessions::respondToPermission,
-                    onAuthenticate = AgentSessions::authenticate,
+                    onAuthenticate = { method ->
+                        // Two different things wear the same button. An
+                        // ordinary method means "ask the agent to sign in",
+                        // which is the `authenticate` request. A **terminal**
+                        // method means "run me with these arguments and let
+                        // the user answer" — sending `authenticate` for one
+                        // of those signs nobody in and says nothing about
+                        // why. It needs a real pty and a keyboard, which is
+                        // the terminal dock, not the pipe-shaped terminals
+                        // the agent itself drives.
+                        if (method.isTerminal) {
+                            val login = Userland.backend.execCommand(
+                                context,
+                                project.rootPath,
+                                agent?.argv.orEmpty() + method.args,
+                                (agent?.env.orEmpty() + method.env)
+                                    .map { (name, value) -> "$name=$value" },
+                            )
+                            if (login == null) {
+                                AgentSessions.reportRefusal(
+                                    "This build has no Linux userland to sign in with.",
+                                )
+                            } else {
+                                terminals.runSession(
+                                    project.rootPath,
+                                    method.name,
+                                    login,
+                                )
+                            }
+                        } else {
+                            AgentSessions.authenticate(method.id)
+                        }
+                    },
                     modifier = Modifier.weight(1f),
                 )
                 HorizontalDivider(color = theme.color("border"))
@@ -870,7 +909,7 @@ private fun Conversation(
     agent: AgentDefinition?,
     onOpenPath: (String) -> Unit,
     onRespond: (toolCall: String, option: String) -> Unit,
-    onAuthenticate: (String) -> Unit,
+    onAuthenticate: (AgentAuthMethod) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val list = rememberLazyListState()
@@ -1641,7 +1680,7 @@ private fun PermissionRow(options: List<PermissionOption>, onChoose: (Permission
 private fun Trouble(
     state: AgentSessionState,
     agent: AgentDefinition?,
-    onAuthenticate: (String) -> Unit,
+    onAuthenticate: (AgentAuthMethod) -> Unit,
 ) {
     val theme = LocalZedTheme.current
     Column(
@@ -1672,9 +1711,18 @@ private fun Trouble(
                     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         for (method in methods) {
                             PanelButton(method.name, isPrimary = true) {
-                                onAuthenticate(method.id)
+                                onAuthenticate(method)
                             }
                         }
+                    }
+                    if (methods.any { it.isTerminal }) {
+                        Text(
+                            text = "A terminal sign-in opens a terminal running the " +
+                                "agent's own command. Finish there, then start a new " +
+                                "thread.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = theme.color("text.muted"),
+                        )
                     }
                 }
             }

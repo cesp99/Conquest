@@ -29,6 +29,17 @@ class TerminalSessionHost(
     val cwd: String,
     /** Stable label for the session chip, e.g. "shell 1". */
     val label: String,
+    /**
+     * What to run instead of a shell.
+     *
+     * Null is the ordinary case: a login shell in [cwd]. Non-null is a
+     * session opened *for* one program — an agent's own `login` command,
+     * which ACP's terminal auth method asks the client to run so the user can
+     * sign in through its TUI. It still gets a pty and a keyboard, because
+     * that is the entire point; what it does not get is a shell around it, so
+     * the session ends when the program does.
+     */
+    private val command: ShellCommand? = null,
 ) : TerminalSessionClient {
 
     /** The title the shell set with an OSC sequence, if any. */
@@ -73,8 +84,8 @@ class TerminalSessionHost(
 
     private fun startSession(): TerminalSession {
         // Either a shell inside the Linux userland or the host's own — see
-        // ShellEnvironment.commandFor.
-        val command = ShellEnvironment.commandFor(context, cwd)
+        // ShellEnvironment.commandFor — unless the caller named a program.
+        val command = command ?: ShellEnvironment.commandFor(context, cwd)
         return TerminalSession(
             command.executable,
             cwd,

@@ -292,6 +292,15 @@ object AgentSessions {
     var lastRefusal by mutableStateOf<String?>(null)
         private set
 
+    /**
+     * Say why something the user asked for did not happen, from a caller
+     * outside this object — the panel's terminal sign-in, which needs a
+     * Context and so cannot live here.
+     */
+    fun reportRefusal(message: String) {
+        lastRefusal = message
+    }
+
     fun clearRefusal() {
         lastRefusal = null
     }

@@ -571,7 +571,32 @@ data class AgentConfigOption(
 }
 
 /** A way to sign in, as the agent advertised it. */
-data class AgentAuthMethod(val id: String, val name: String, val description: String?)
+/**
+ * One way in, from the agent's `authMethods`.
+ *
+ * The `type` discriminator matters, and its absence means `agent`. A plain
+ * `agent` method is answered with [CoreBridge.acpAuthenticate] — the agent
+ * does the signing in. A **terminal** method is not: it means "run me with
+ * these extra arguments in a terminal and let the user answer", so the client
+ * opens a real pty session on the agent's own command instead of sending
+ * anything. The engine advertises `auth.terminal`, so agents are entitled to
+ * offer it; answering one with `authenticate` would sign nobody in and say
+ * nothing about why.
+ */
+data class AgentAuthMethod(
+    val id: String,
+    val name: String,
+    val description: String?,
+    /** `agent` (the default), `terminal`, or `env_var`. */
+    val type: String,
+    /** Extra arguments for the agent's own command; `terminal` only. */
+    val args: List<String>,
+    /** Extra environment for it, as `NAME` to value; `terminal` only. */
+    val env: Map<String, String>,
+) {
+    /** Whether signing in means opening a terminal on the agent's command. */
+    val isTerminal: Boolean get() = type == "terminal"
+}
 
 /** What the agent said about itself when it initialized. */
 data class AgentInfo(
@@ -777,6 +802,8 @@ data class AgentSessionState(
                         agentVersion = it.stringOrNull("agent_version"),
                         authMethods = List(methods.length()) { index ->
                             val method = methods.getJSONObject(index)
+                            val args = method.optJSONArray("args") ?: JSONArray()
+                            val env = method.optJSONObject("env")
                             AgentAuthMethod(
                                 // ACP's shape again: camelCase, and the id may
                                 // sit under either name depending on variant.
@@ -784,6 +811,14 @@ data class AgentSessionState(
                                     ?: method.optString("id"),
                                 name = method.optString("name"),
                                 description = method.stringOrNull("description"),
+                                // Absent means `agent`, which the schema says
+                                // outright — an untagged variant, not a
+                                // missing field.
+                                type = method.stringOrNull("type") ?: "agent",
+                                args = (0 until args.length()).map { at -> args.optString(at) },
+                                env = env?.keys()?.asSequence()
+                                    ?.associateWith { key -> env.optString(key) }
+                                    .orEmpty(),
                             )
                         },
                         starting = it.optBoolean("starting"),

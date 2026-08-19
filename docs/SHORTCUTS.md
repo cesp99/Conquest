@@ -267,6 +267,12 @@ file the turn stops, the diff appears in the conversation, and **Allow** and
 **Deny** sit underneath it — the change and the choice on one screen. Diffs are
 unified, never side by side.
 
+**Signing in.** When an agent wants signing in to, the panel offers whatever
+methods *it* advertised. Most are a button the agent handles itself; one kind
+is not — a terminal sign-in opens a terminal running the agent's own command
+with its login arguments, so you can answer its prompts. Finish there, then
+start a new thread.
+
 **The agent can ask you things.** Not everything an agent needs is a
 yes-or-no about a file: it may want an API token, a choice between branches,
 or for you to sign in on a web page and come back. Those arrive as a card at

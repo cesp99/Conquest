@@ -59,6 +59,22 @@ class TerminalPanelState(context: Context) {
         syncService()
     }
 
+    /**
+     * Open a session running one program rather than a shell, and show it.
+     *
+     * The agent panel's terminal sign-in: ACP lets an agent offer an auth
+     * method whose meaning is "run me with these arguments and let the user
+     * answer" (`AuthMethod::Terminal`), which needs a real pty and a keyboard
+     * — this dock — and not the pipe-shaped terminals the agent itself
+     * drives. Must be called on the main thread.
+     */
+    fun runSession(cwd: String, label: String, command: ShellCommand) {
+        entries.add(TerminalSessionHost(context, cwd, label, command))
+        activeIndex = entries.lastIndex
+        isOpen = true
+        syncService()
+    }
+
     fun select(index: Int) {
         if (index !in entries.indices) return
         activeIndex = index
