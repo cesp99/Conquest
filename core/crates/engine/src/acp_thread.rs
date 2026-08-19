@@ -1434,6 +1434,47 @@ mod tests {
     /// model the agent changed on its own — a rate-limit downgrade, its own
     /// `/model` — left the selector chip showing the old value for ever, and
     /// the boolean toggle then computed what to send from that stale value.
+    /// The panel says a different sentence and offers a different way out for
+    /// each of these, so guessing wrong is worse than not guessing: an
+    /// unrecognised message must land on `Other`, which promises nothing and
+    /// offers no retry.
+    #[test]
+    fn an_errors_kind_is_guessed_only_when_it_is_plain() {
+        let cases = [
+            ("Rate limit exceeded, retry after 30s", ErrorKind::RateLimit),
+            ("HTTP 429 Too Many Requests", ErrorKind::RateLimit),
+            (
+                "prompt is too long for the context window",
+                ErrorKind::ContextWindow,
+            ),
+            ("maximum context length exceeded", ErrorKind::ContextWindow),
+            ("the agent wants you to sign in first", ErrorKind::Auth),
+            ("401 Unauthorized", ErrorKind::Auth),
+            ("the agent connection closed", ErrorKind::Transport),
+            ("agent exited (signal: 9)", ErrorKind::Transport),
+            ("something nobody has ever seen", ErrorKind::Other),
+            ("", ErrorKind::Other),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(ErrorKind::guess(message), expected, "for {message:?}");
+        }
+
+        // Only the two that a retry could plausibly fix offer one. Retrying a
+        // full context window or a dead process wastes the tap and the
+        // tokens.
+        assert!(ErrorKind::RateLimit.can_retry());
+        assert!(ErrorKind::Api.can_retry());
+        for kind in [
+            ErrorKind::ContextWindow,
+            ErrorKind::Transport,
+            ErrorKind::Auth,
+            ErrorKind::Refusal,
+            ErrorKind::Other,
+        ] {
+            assert!(!kind.can_retry(), "{kind:?} must not offer a retry");
+        }
+    }
+
     /// A plan that is finished is history, not a live plan.
     ///
     /// Nothing used to clear one, so a plan completed three turns ago still
