@@ -674,10 +674,12 @@ impl AgentShared {
     // ---- elicitations ---------------------------------------------------
 
     fn on_create_elicitation(
-        &self,
+        self: &Arc<Self>,
         request: acp::CreateElicitationRequest,
         responder: Responder<acp::CreateElicitationResponse>,
     ) {
+        // Taken before the responder is parked, because parking consumes it.
+        let cancellation = responder.cancellation();
         // Session scope names the conversation it belongs to; request scope
         // names one of *our* outstanding requests instead — `authenticate`,
         // in practice — and has no conversation at all. The store keeps both,
@@ -699,6 +701,22 @@ impl AgentShared {
         match self.elicitations.open(request, our_id, responder) {
             Ok(pending) => {
                 log::info!("acp: elicitation {} opened", pending.id);
+                // An agent may take its question back. Nothing else notices:
+                // the responder is parked until somebody answers, so without
+                // this the card stays up for ever and the user's answer goes
+                // to a request that is no longer live.
+                if let Some(cx) = self.connection() {
+                    let shared = self.clone();
+                    let id = pending.id.clone();
+                    let _ = cx.spawn(async move {
+                        cancellation.cancelled().await;
+                        if shared.elicitations.withdraw(&id) {
+                            log::info!("acp: elicitation {id} withdrawn by the agent");
+                            shared.bump_sessions(None);
+                        }
+                        Ok(())
+                    });
+                }
                 // The question rides the session state, so the revision has
                 // to move or the panel never asks for it.
                 self.bump_sessions(our_id);
@@ -3504,7 +3522,7 @@ mod tests {
             // gates each on exactly that — so this line *is* the capability
             // negotiation under test: `run` needs `terminal`, `ask` needs
             // `elicitation.form`, `login` needs `elicitation.url`.
-            assert_eq!(names, ["plan", "echo", "run", "ask", "login"]);
+            assert_eq!(names, ["plan", "echo", "run", "ask", "withdraw", "login"]);
             let ids: Vec<String> = thread
                 .config_options
                 .iter()
@@ -3838,6 +3856,22 @@ mod tests {
             let thread = handle.thread.lock().unwrap();
             assert!(last_reply(&thread).contains("Signed in"));
         }
+
+        // ---- a question the agent takes back -------------------------------
+        //
+        // `$/cancel_request` on an outstanding `elicitation/create`. Nothing
+        // else notices it: the responder is parked until somebody answers, so
+        // without watching the cancellation marker the card stays up for ever
+        // and the user's answer goes to a request that is no longer live.
+        handle.update(|thread| thread.push_user_message("/withdraw"));
+        start_prompt(&shared, &cx, 1, PromptInput::text_only("/withdraw"), false);
+        wait_for("the withdrawn turn to end", || {
+            let thread = handle.thread.lock().unwrap();
+            thread.phase == Phase::Ready && thread.stop_reason.as_deref() == Some("end_turn")
+        });
+        wait_for("the question to be taken back", || {
+            shared.elicitations.for_session(1).is_empty()
+        });
 
         // ---- the session lifecycle: list, load, delete ---------------------
         //

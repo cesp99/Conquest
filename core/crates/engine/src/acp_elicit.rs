@@ -77,6 +77,15 @@ impl PendingElicitation {
         true
     }
 
+    /// Close it with an error rather than an answer — for a question the
+    /// *agent* withdrew with `$/cancel_request`. `Cancel` would be a claim
+    /// about what the user did, and the user did nothing.
+    fn refuse(&self, error: acp::Error) {
+        if let Some(responder) = self.responder.lock().unwrap().take() {
+            let _ = responder.respond_with_error(error);
+        }
+    }
+
     fn view(&self) -> serde_json::Value {
         let mut value = self.json.clone();
         if let Some(object) = value.as_object_mut() {
@@ -211,6 +220,23 @@ impl Elicitations {
         } else {
             self.remove(id);
         }
+        true
+    }
+
+    /// The agent withdrew the question with `$/cancel_request`.
+    ///
+    /// The card goes and the request is closed as cancelled. Without this a
+    /// withdrawn question stays on screen for ever and the user's answer
+    /// would go to a request that is no longer live — Zed watches the same
+    /// marker (agent_servers/src/acp.rs:4996-5010).
+    pub(crate) fn withdraw(&self, id: &str) -> bool {
+        let mut live = self.live.lock().unwrap();
+        let Some(index) = live.iter().position(|pending| pending.id == id) else {
+            return false;
+        };
+        let pending = live.remove(index);
+        drop(live);
+        pending.refuse(acp::Error::request_cancelled());
         true
     }
 

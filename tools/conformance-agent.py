@@ -285,6 +285,8 @@ class Agent:
                 })
             if self.can("elicitation", "form"):
                 commands.append({"name": "ask", "description": "Ask a form question"})
+                commands.append({"name": "withdraw",
+                                 "description": "Ask, then take the question back"})
             if self.can("elicitation", "url"):
                 commands.append({"name": "login", "description": "Ask you to visit a URL"})
             self.update(session_id, {
@@ -391,6 +393,8 @@ class Agent:
                 return self.run_command(session_id, prompt[4:].strip())
             if prompt.startswith("/ask"):
                 return self.ask_form(session_id)
+            if prompt.startswith("/withdraw"):
+                return self.withdraw_question(session_id)
             if prompt.startswith("/login"):
                 return self.ask_url(session_id)
             if prompt.startswith("/plan"):
@@ -487,6 +491,37 @@ class Agent:
         except Cancelled:
             log("turn cancelled")
             return "cancelled"
+
+    def withdraw_question(self, session_id):
+        """Ask something and immediately take it back with `$/cancel_request`.
+
+        A client that parks the request and never watches for the withdrawal
+        leaves the card on screen for ever, and whatever the user then answers
+        goes to a request that is no longer live.
+        """
+        if not self.can("elicitation", "form"):
+            self.chunk(session_id, "agent_message_chunk", "This editor cannot show forms.")
+            return "end_turn"
+        self.next_request += 1
+        request_id = "conf-req-%d" % self.next_request
+        send({"jsonrpc": "2.0", "id": request_id, "method": "elicitation/create", "params": {
+            "mode": "form",
+            "message": "Changed my mind about this one.",
+            "sessionId": session_id,
+            "requestedSchema": {
+                "type": "object",
+                "properties": {"never": {"type": "string", "title": "Never mind"}},
+            },
+        }})
+        time.sleep(CHUNK_PAUSE_SECONDS)
+        # The field is `requestId`, not `id`: this is a notification whose
+        # payload names the request, not a request of its own.
+        send({"jsonrpc": "2.0", "method": "$/cancel_request",
+              "params": {"requestId": request_id}})
+        # The client may answer the cancelled request with an error; either
+        # way it is not our question any more, so stop waiting for it.
+        self.chunk(session_id, "agent_message_chunk", "Never mind, question withdrawn.")
+        return "end_turn"
 
     def ask_form(self, session_id):
         """A form elicitation, covering every property kind the schema has.
