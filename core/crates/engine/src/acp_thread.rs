@@ -348,6 +348,35 @@ pub struct QueuedPrompt {
 pub struct PromptInput {
     pub text: String,
     pub mentions: Vec<String>,
+    /// Images attached to this prompt, already decoded, downscaled and
+    /// base64-encoded by the platform layer — the engine has no image codec
+    /// and wants none. Empty for every prompt that carries no picture.
+    ///
+    /// **Serialized as a count, never as the bytes.** A queued prompt is part
+    /// of the session state, and the panel re-reads that state on every
+    /// revision: flattening a megabyte of base64 into it would put that
+    /// megabyte through JNI and into a Java string for every poll of a queue
+    /// that is only waiting. The panel wants to know an image is attached,
+    /// which is a number.
+    #[serde(serialize_with = "serialize_image_count")]
+    pub images: Vec<PromptImage>,
+}
+
+fn serialize_image_count<S: serde::Serializer>(
+    images: &[PromptImage],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u64(images.len() as u64)
+}
+
+/// One attached image, in the shape [`acp::ImageContent`] wants it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct PromptImage {
+    /// `image/png`, `image/jpeg` — what the bytes actually are, not what the
+    /// file was called.
+    pub mime_type: String,
+    /// The bytes, base64-encoded.
+    pub data: String,
 }
 
 impl PromptInput {
@@ -358,6 +387,7 @@ impl PromptInput {
         PromptInput {
             text: text.into(),
             mentions: Vec::new(),
+            images: Vec::new(),
         }
     }
 }

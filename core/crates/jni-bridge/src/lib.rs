@@ -1804,6 +1804,11 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpEntriesSinc
 
 /// Send a prompt. Returns at once; the turn arrives behind the counter. False
 /// for a forgotten id or a session that is over.
+///
+/// `images_json` is a JSON array of `{"mime_type", "data"}`, the data
+/// base64-encoded — attachments the platform layer has already decoded and
+/// shrunk, since the engine has no image codec. `[]` for a prompt with no
+/// picture in it.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpPrompt(
     mut env: JNIEnv,
@@ -1811,10 +1816,12 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpPrompt(
     session_id: jlong,
     text: JString,
     mentions_json: JString,
+    images_json: JString,
 ) -> jboolean {
     let text = get_string(&mut env, &text);
     let mentions_json = get_string(&mut env, &mentions_json);
-    if engine().acp_prompt(session_id as u64, &text, &mentions_json) {
+    let images_json = get_string(&mut env, &images_json);
+    if engine().acp_prompt(session_id as u64, &text, &mentions_json, &images_json) {
         JNI_TRUE
     } else {
         JNI_FALSE
@@ -2016,10 +2023,12 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpPromptImmed
     session_id: jlong,
     text: JString,
     mentions_json: JString,
+    images_json: JString,
 ) -> jboolean {
     let text = get_string(&mut env, &text);
     let mentions_json = get_string(&mut env, &mentions_json);
-    if engine().acp_prompt_immediately(session_id as u64, &text, &mentions_json) {
+    let images_json = get_string(&mut env, &images_json);
+    if engine().acp_prompt_immediately(session_id as u64, &text, &mentions_json, &images_json) {
         JNI_TRUE
     } else {
         JNI_FALSE

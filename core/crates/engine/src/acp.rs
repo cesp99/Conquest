@@ -288,6 +288,11 @@ struct AgentInfo {
     /// when it cannot — the same split Zed makes
     /// (agent_ui/src/message_editor.rs:2150-2161).
     embedded_context: bool,
+    /// Whether the agent takes [`acp::ContentBlock::Image`] prompt blocks.
+    /// Gates the composer's attach button: an agent that never said it reads
+    /// images is not sent one — the block would be dead weight in a prompt at
+    /// best, and an error at worst.
+    images: bool,
     /// The session-lifecycle capabilities, which decide what the panel may
     /// offer. Every one of these is a method that is an error to call
     /// unasked, so they gate buttons rather than decorate them.
@@ -490,6 +495,11 @@ impl AgentShared {
 
     fn supports_embedded_context(&self) -> bool {
         matches!(&*self.init.lock().unwrap(), InitPhase::Ready(info) if info.embedded_context)
+    }
+
+    /// Whether the agent said it reads image blocks.
+    fn supports_images(&self) -> bool {
+        matches!(&*self.init.lock().unwrap(), InitPhase::Ready(info) if info.images)
     }
 
     /// The one line of stderr worth showing a user, if there is one.
@@ -1505,6 +1515,7 @@ async fn agent_main(shared: Arc<AgentShared>, cx: ConnectionTo<Agent>) -> Result
             .agent_capabilities
             .prompt_capabilities
             .embedded_context,
+        images: response.agent_capabilities.prompt_capabilities.image,
         caps: AgentCaps::read(&response.agent_capabilities),
     };
     log::info!(
@@ -1691,7 +1702,12 @@ async fn run_prompt(
         if push {
             handle.update(|thread| thread.push_user_message(&prompt.text));
         }
-        let blocks = prompt_blocks(&root, shared.supports_embedded_context(), &prompt);
+        let blocks = prompt_blocks(
+            &root,
+            shared.supports_embedded_context(),
+            shared.supports_images(),
+            &prompt,
+        );
         let result = cx
             .send_request(acp::PromptRequest::new(acp_id, blocks))
             .block_task()
@@ -1752,8 +1768,32 @@ const MAX_EMBEDDED_MENTION_BYTES: u64 = 256 * 1024;
 /// own split (agent_ui/src/message_editor.rs:2150-2161). A mention that
 /// resolves outside the project is dropped: the same `resolves_inside`
 /// boundary the fs handlers enforce, applied before anything is read.
-fn prompt_blocks(root: &Path, embedded: bool, prompt: &PromptInput) -> Vec<acp::ContentBlock> {
+fn prompt_blocks(
+    root: &Path,
+    embedded: bool,
+    images: bool,
+    prompt: &PromptInput,
+) -> Vec<acp::ContentBlock> {
     let mut blocks = vec![acp::ContentBlock::from(prompt.text.clone())];
+    // Pictures first among the attachments, and only to an agent that said it
+    // reads them: `promptCapabilities.image` is the agent's own answer, and an
+    // image block sent to one that never claimed it is at best ignored and at
+    // worst a protocol error. The panel does not offer the button in that
+    // case either, so this is the second of two gates rather than the only
+    // one — the composer's draft can outlive a change of agent.
+    if images {
+        for image in &prompt.images {
+            blocks.push(acp::ContentBlock::Image(acp::ImageContent::new(
+                image.data.clone(),
+                image.mime_type.clone(),
+            )));
+        }
+    } else if !prompt.images.is_empty() {
+        log::warn!(
+            "acp: dropping {} image(s) — the agent does not take them",
+            prompt.images.len()
+        );
+    }
     for mention in &prompt.mentions {
         let path = root.join(mention);
         if !resolves_inside(root, &path) {
@@ -1996,6 +2036,10 @@ impl crate::Engine {
                         // call unasked, so they gate the panel's buttons.
                         "capabilities": info.caps,
                         "canOpenHistory": info.caps.can_open_history(),
+                        // Not one of `caps`: those are session methods, this
+                        // is what a *prompt* may carry. It gates the
+                        // composer's attach button.
+                        "images": info.images,
                     }),
                     InitPhase::Starting => serde_json::json!({"starting": true}),
                     InitPhase::Failed(message) => serde_json::json!({"error": message}),
@@ -2085,8 +2129,14 @@ impl crate::Engine {
     /// The deliberate version of what [`Self::acp_prompt`] used to do by
     /// accident. Queued first, so a cancel that never lands leaves the prompt
     /// where the user can still see and send it.
-    pub fn acp_prompt_immediately(&self, session: u64, text: &str, mentions_json: &str) -> bool {
-        if !self.acp_prompt(session, text, mentions_json) {
+    pub fn acp_prompt_immediately(
+        &self,
+        session: u64,
+        text: &str,
+        mentions_json: &str,
+        images_json: &str,
+    ) -> bool {
+        if !self.acp_prompt(session, text, mentions_json, images_json) {
             return false;
         }
         self.acp_cancel(session)
@@ -2100,7 +2150,13 @@ impl crate::Engine {
         handle.update(|thread| thread.remove_queued_prompt(queued_id))
     }
 
-    pub fn acp_prompt(&self, session: u64, text: &str, mentions_json: &str) -> bool {
+    pub fn acp_prompt(
+        &self,
+        session: u64,
+        text: &str,
+        mentions_json: &str,
+        images_json: &str,
+    ) -> bool {
         let Some(handle) = self.session_handle(session) else {
             return false;
         };
@@ -2110,6 +2166,10 @@ impl crate::Engine {
         let prompt = PromptInput {
             text: text.to_owned(),
             mentions: serde_json::from_str(mentions_json).unwrap_or_default(),
+            // Same rule as the mentions beside it: rubbish is no attachments,
+            // never a refused prompt. A dropped picture costs the user a
+            // retry; a prompt the panel will not send costs them the message.
+            images: serde_json::from_str(images_json).unwrap_or_default(),
         };
         enum Route {
             Refused,
@@ -2704,10 +2764,11 @@ mod tests {
                 "../escape.txt".to_owned(),
                 "missing.txt".to_owned(),
             ],
+            images: Vec::new(),
         };
 
         // An agent that takes embedded context gets the file's text.
-        let blocks = prompt_blocks(&root, true, &prompt);
+        let blocks = prompt_blocks(&root, true, false, &prompt);
         assert_eq!(blocks.len(), 3, "text + notes.md + missing.txt as a link");
         assert!(matches!(&blocks[0], acp::ContentBlock::Text(text) if text.text == "look at this"));
         match &blocks[1] {
@@ -2727,7 +2788,7 @@ mod tests {
         );
 
         // An agent without the capability gets links for everything.
-        let blocks = prompt_blocks(&root, false, &prompt);
+        let blocks = prompt_blocks(&root, false, false, &prompt);
         assert!(matches!(&blocks[1], acp::ContentBlock::ResourceLink(link)
                 if link.name == "notes.md" && link.uri.starts_with("file://")));
     }
@@ -2745,9 +2806,10 @@ mod tests {
         let prompt = PromptInput {
             text: "read it".to_owned(),
             mentions: vec!["RFC#42.md".to_owned()],
+            images: Vec::new(),
         };
 
-        let blocks = prompt_blocks(&root, false, &prompt);
+        let blocks = prompt_blocks(&root, false, false, &prompt);
         let acp::ContentBlock::ResourceLink(link) = &blocks[1] else {
             panic!("expected a resource link, got {:?}", blocks[1]);
         };
@@ -2760,6 +2822,63 @@ mod tests {
         // And it still round-trips to the file it names.
         let parsed = url::Url::parse(&link.uri).unwrap();
         assert_eq!(parsed.to_file_path().unwrap(), root.join("RFC#42.md"));
+    }
+
+    /// An attached picture becomes an `Image` block after the text — and only
+    /// for an agent that said it reads them. Sending one to an agent that
+    /// never advertised `promptCapabilities.image` is at best ignored and at
+    /// worst an error, so the block is dropped rather than gambled with.
+    #[test]
+    fn images_ride_the_prompt_only_when_the_agent_takes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let prompt = PromptInput {
+            text: "what is this".to_owned(),
+            mentions: Vec::new(),
+            images: vec![crate::acp_thread::PromptImage {
+                mime_type: "image/png".to_owned(),
+                data: "aGVsbG8=".to_owned(),
+            }],
+        };
+
+        let blocks = prompt_blocks(&root, false, true, &prompt);
+        assert_eq!(blocks.len(), 2, "the text, then the picture");
+        match &blocks[1] {
+            acp::ContentBlock::Image(image) => {
+                assert_eq!(image.mime_type, "image/png");
+                assert_eq!(image.data, "aGVsbG8=");
+            }
+            other => panic!("expected an image block, got {other:?}"),
+        }
+
+        // The same prompt to an agent that never claimed images: text only.
+        let blocks = prompt_blocks(&root, false, false, &prompt);
+        assert_eq!(blocks.len(), 1, "the picture is dropped, not sent anyway");
+    }
+
+    /// The queued-prompt state the panel polls carries the *number* of
+    /// attached images, never their bytes: a queue is re-read on every
+    /// revision, and a megabyte of base64 crossing JNI each time would be
+    /// paid over and over for a prompt that has not even been sent.
+    #[test]
+    fn a_queued_prompts_images_serialize_as_a_count() {
+        let prompt = PromptInput {
+            text: "look".to_owned(),
+            mentions: Vec::new(),
+            images: vec![
+                crate::acp_thread::PromptImage {
+                    mime_type: "image/png".to_owned(),
+                    data: "x".repeat(4096),
+                },
+                crate::acp_thread::PromptImage {
+                    mime_type: "image/jpeg".to_owned(),
+                    data: "y".repeat(4096),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&prompt).unwrap();
+        assert!(json.contains("\"images\":2"), "got {json}");
+        assert!(!json.contains("xxxx"), "the bytes must not be in the state");
     }
 
     fn shared_for_test(sessions: &Sessions, index: &Index) -> Arc<AgentShared> {
@@ -3704,6 +3823,7 @@ mod tests {
             PromptInput {
                 text: "/echo with context @notes.md".to_owned(),
                 mentions: vec!["notes.md".to_owned()],
+                images: Vec::new(),
             },
             false,
         );

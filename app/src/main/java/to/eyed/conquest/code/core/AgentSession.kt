@@ -974,6 +974,12 @@ data class AgentCapabilities(
     val close: Boolean = false,
     /** `logout` — sign out of what `authenticate` signed into. */
     val logout: Boolean = false,
+    /**
+     * `promptCapabilities.image` — whether a prompt may carry a picture.
+     * Gates the composer's attach button: an agent that never claimed it is
+     * not offered the choice, and the engine drops the block besides.
+     */
+    val images: Boolean = false,
 ) {
     /** Whether a past conversation can be reopened at all, either way round. */
     val canOpenHistory: Boolean get() = loadSession || resume
@@ -982,8 +988,13 @@ data class AgentCapabilities(
     val hasHistory: Boolean get() = list && canOpenHistory
 
     internal companion object {
-        fun parse(json: JSONObject?): AgentCapabilities {
-            val caps = json ?: return AgentCapabilities()
+        /**
+         * [json] is the agent's `capabilities` object — the session methods.
+         * [images] comes from beside it on the agent, because what a *prompt*
+         * may carry is a different question from what a session supports.
+         */
+        fun parse(json: JSONObject?, images: Boolean = false): AgentCapabilities {
+            val caps = json ?: return AgentCapabilities(images = images)
             return AgentCapabilities(
                 loadSession = caps.optBoolean("load_session"),
                 resume = caps.optBoolean("resume"),
@@ -991,6 +1002,7 @@ data class AgentCapabilities(
                 delete = caps.optBoolean("delete"),
                 close = caps.optBoolean("close"),
                 logout = caps.optBoolean("logout"),
+                images = images,
             )
         }
     }
@@ -1207,6 +1219,7 @@ data class AgentSessionState(
                         error = it.stringOrNull("error"),
                         capabilities = AgentCapabilities.parse(
                             it.optJSONObject("capabilities"),
+                            images = it.optBoolean("images"),
                         ),
                     )
                 },

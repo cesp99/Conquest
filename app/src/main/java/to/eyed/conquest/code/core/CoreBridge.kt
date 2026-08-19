@@ -908,8 +908,20 @@ object CoreBridge {
      * (embedded file text when the agent takes it, a `file://` link
      * otherwise). `[]` when there are none; a malformed list means none
      * rather than a lost message.
+     *
+     * [imagesJson] is a JSON array of `{"mime_type", "data"}` with the data
+     * base64-encoded — pictures the user attached, already decoded and shrunk
+     * on this side, because the engine has no image codec and is not getting
+     * one. `[]` when there are none, and the same forgiving parse: rubbish
+     * costs the attachment, never the message. The engine drops them anyway
+     * for an agent whose `promptCapabilities.image` is false.
      */
-    external fun acpPrompt(sessionId: Long, text: String, mentionsJson: String): Boolean
+    external fun acpPrompt(
+        sessionId: Long,
+        text: String,
+        mentionsJson: String,
+        imagesJson: String,
+    ): Boolean
 
     /**
      * Changes one of the agent's session configuration options — model,
@@ -1035,6 +1047,7 @@ object CoreBridge {
         sessionId: Long,
         text: String,
         mentionsJson: String,
+        imagesJson: String,
     ): Boolean
 
     /**

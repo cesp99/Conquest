@@ -64,6 +64,14 @@ class AgentThread internal constructor(
     var draft by mutableStateOf("")
 
     val draftMentions = mutableStateListOf<String>()
+
+    /**
+     * Pictures attached to the unsent message, held here for the same reason
+     * the draft is: the composer is a branch of the panel's `when`, and
+     * opening the threads view would otherwise throw away an attachment that
+     * cost the user a trip through the photo picker.
+     */
+    val draftImages = mutableStateListOf<PromptAttachment>()
 }
 
 /**
@@ -374,8 +382,8 @@ object AgentSessions {
      * is to be able to try again after one.
      */
     fun retryLastPrompt() {
-        val text = lastPrompt ?: return
-        prompt(text.first, text.second) { }
+        val last = lastPrompt ?: return
+        prompt(last.text, last.mentions, last.images) { }
     }
 
     /** Start a fresh thread on the project the active one is in. */
@@ -384,8 +392,18 @@ object AgentSessions {
         newThread(thread.projectId, thread.projectName)
     }
 
-    /** The last prompt sent, for [retryLastPrompt]. */
-    private var lastPrompt: Pair<String, List<String>>? = null
+    /**
+     * The last prompt sent, for [retryLastPrompt] — attachments included, so
+     * a retry after a rate limit sends the picture again rather than a
+     * question about a picture the agent was never given.
+     */
+    private var lastPrompt: SentPrompt? = null
+
+    private data class SentPrompt(
+        val text: String,
+        val mentions: List<String>,
+        val images: List<PromptAttachment>,
+    )
 
     fun clearRefusal() {
         lastRefusal = null
@@ -394,9 +412,17 @@ object AgentSessions {
     /**
      * Send a prompt; [onRefused] runs when the engine would not take it.
      * [mentions] are the project-relative paths the user @-mentioned; the
-     * engine turns each into a resource block beside the text.
+     * engine turns each into a resource block beside the text. [images] are
+     * the pictures attached to it, already shrunk and encoded by
+     * [PromptImages] — the engine drops them for an agent that did not
+     * advertise `promptCapabilities.image`.
      */
-    fun prompt(text: String, mentions: List<String>, onRefused: () -> Unit) {
+    fun prompt(
+        text: String,
+        mentions: List<String>,
+        images: List<PromptAttachment> = emptyList(),
+        onRefused: () -> Unit,
+    ) {
         val session = sessionId
         if (session < 0) {
             onRefused()
@@ -406,7 +432,7 @@ object AgentSessions {
         lastRefusal = null
         // Kept for `retryLastPrompt`: a refusal truncates the transcript past
         // the prompt it refused, so the transcript cannot be the source.
-        lastPrompt = text to mentions
+        lastPrompt = SentPrompt(text, mentions, images)
         // Name the thread after the first thing said in it, until the agent
         // sends a name of its own — Zed's provisional title, set at exactly
         // this moment (thread_view.rs:1720-1732). Without it every
@@ -416,8 +442,9 @@ object AgentSessions {
             if (thread.title == null) thread.title = provisionalTitle(text)
         }
         val mentionsJson = org.json.JSONArray(mentions).toString()
+        val imagesJson = PromptImages.toJson(images)
         scope.launch {
-            val sent = runCatching { CoreBridge.acpPrompt(session, text, mentionsJson) }
+            val sent = runCatching { CoreBridge.acpPrompt(session, text, mentionsJson, imagesJson) }
                 .getOrDefault(false)
             if (!sent) {
                 onRefused()

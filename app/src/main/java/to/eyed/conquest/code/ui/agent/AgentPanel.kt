@@ -8,6 +8,9 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Canvas
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.horizontalScroll
@@ -64,6 +67,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isCtrlPressed
 import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
@@ -107,6 +111,8 @@ import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.core.FileDiff
 import to.eyed.conquest.code.core.PermissionOption
 import to.eyed.conquest.code.core.ProjectSession
+import to.eyed.conquest.code.core.PromptImages
+import to.eyed.conquest.code.core.PromptAttachment
 import to.eyed.conquest.code.core.ProjectsRoot
 import to.eyed.conquest.code.core.ProjectSummary
 import to.eyed.conquest.code.core.ToolCallStatus
@@ -449,8 +455,8 @@ fun AgentPanel(
                     project = project,
                     thread = activeThread,
                     commands = state.commands,
-                    onSend = { text, mentions, onRefused ->
-                        AgentSessions.prompt(text, mentions, onRefused)
+                    onSend = { text, mentions, images, onRefused ->
+                        AgentSessions.prompt(text, mentions, images, onRefused)
                     },
                     onStop = AgentSessions::cancelTurn,
                 )
@@ -2836,7 +2842,12 @@ private fun Composer(
     /** The agent's slash commands, for the `/` popup. */
     commands: List<AgentCommand>,
     /** Send it, and put it back in the box if the engine would not take it. */
-    onSend: (text: String, mentions: List<String>, onRefused: () -> Unit) -> Unit,
+    onSend: (
+        text: String,
+        mentions: List<String>,
+        images: List<PromptAttachment>,
+        onRefused: () -> Unit,
+    ) -> Unit,
     onStop: () -> Unit,
 ) {
     val theme = LocalZedTheme.current
@@ -2862,6 +2873,10 @@ private fun Composer(
     val text = field.text
     /** Paths completed through the `@` popup, candidates for the send. */
     val mentioned = thread?.draftMentions ?: remember { mutableStateListOf() }
+    /** Pictures attached to this draft, on the thread for the same reason. */
+    val attached = thread?.draftImages ?: remember { mutableStateListOf() }
+    /** Only an agent that reads images is offered a way to send one. */
+    val canAttach = enabled && state.agent?.capabilities?.images == true
     /**
      * The *token* a popup was dismissed on — not the whole text, and cleared
      * the moment the token changes or the message is sent. Keyed on the whole
@@ -2923,7 +2938,10 @@ private fun Composer(
 
     fun send() {
         val message = text.trim()
-        if (message.isEmpty() || !enabled) return
+        // A picture on its own is a message — "what is this?" is the whole
+        // point of attaching one — so the guard is "nothing at all", not
+        // "no words".
+        if ((message.isEmpty() && attached.isEmpty()) || !enabled) return
         // Only mentions still standing in the text count: one deleted after
         // completion was deleted on purpose.
         //
@@ -2936,16 +2954,69 @@ private fun Composer(
         // agent a file the user had explicitly taken back.
         val present = mentionTokensIn(message)
         val mentions = mentioned.filter { it in present }
+        val images = attached.toList()
         // Cleared optimistically, because the transcript shows the message the
         // instant the engine takes it and two copies would be worse than a
         // moment's blank. Restored if it turns out nothing took it.
         replaceText("")
         mentioned.clear()
+        attached.clear()
         // The strip was dismissed for a message that no longer exists.
         dismissedToken = null
-        onSend(message, mentions) {
+        onSend(message, mentions, images) {
             replaceText(message)
             mentioned.addAll(mentions)
+            attached.addAll(images)
+        }
+    }
+
+    // The system photo picker: no permission, no gallery of our own, and on
+    // Android 13+ it is the OS's own sheet. `PickVisualMedia` rather than
+    // `GetContent` because it is the modern, scoped route — the user grants
+    // this one picture, not the photo library.
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var attachError by remember(thread) { mutableStateOf<String?>(null) }
+    val picker = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            // Decoding and re-encoding a photograph is tens of milliseconds
+            // and tens of megabytes; neither belongs on the frame thread.
+            val loaded = withContext(Dispatchers.IO) { PromptImages.load(context, uri) }
+            when {
+                loaded == null ->
+                    attachError = "That image could not be read."
+                !PromptImages.fits(attached.sumOf { it.approximateBytes }, loaded.approximateBytes) ->
+                    attachError = "That would make the message too big to send."
+                else -> {
+                    attached.add(loaded)
+                    attachError = null
+                }
+            }
+        }
+    }
+
+    // What is attached, above the box — with an ✕ each, because an attachment
+    // you cannot take back is a trap, and the same shape the queued-prompt
+    // rows already use.
+    if (attached.isNotEmpty() || attachError != null) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            for (image in attached) {
+                AttachmentChip(image) { attached.remove(image) }
+            }
+            attachError?.let { message ->
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = theme.color("error", theme.color("text.muted")),
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                )
+            }
         }
     }
 
@@ -3012,6 +3083,25 @@ private fun Composer(
                                 ?: fileChoices.firstOrNull()?.let(::completeMention)
                             true
                         }
+                        // Zed's own chord for the composer's add-context
+                        // control (`ctrl-;` → `agent::OpenAddContextMenu`,
+                        // default-linux.json:344). The button is the touch
+                        // and mouse route; this is the one for a DeX desk,
+                        // where there is no touch at all.
+                        event.key == Key.Semicolon && event.isCtrlPressed -> {
+                            if (canAttach) {
+                                attachError = null
+                                picker.launch(
+                                    PickVisualMediaRequest(
+                                        ActivityResultContracts.PickVisualMedia.ImageOnly
+                                    )
+                                )
+                            }
+                            // Swallowed either way: a `;` typed into the
+                            // message because the agent takes no pictures
+                            // would be a stray character, not a shortcut.
+                            true
+                        }
                         // Escape puts the suggestion strip away first; with no
                         // strip up it stops the turn rather than closing the
                         // panel — the panel is a dock with its own chord, and
@@ -3065,6 +3155,25 @@ private fun Composer(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.End,
         ) {
+            // **Leading the row, as in Zed**, whose composer puts its context
+            // controls on the left of the same line the send button ends
+            // (thread_view.rs:4431-4440). Offered only to an agent that said
+            // it reads images: a `+` that produces a picture the agent will
+            // never see is worse than no `+` at all.
+            if (state.agent?.capabilities?.images == true) {
+                ComposerIconButton(
+                    icon = R.drawable.ic_agent_attach,
+                    label = "Attach an image",
+                    tint = theme.color("text.muted"),
+                    enabled = canAttach,
+                    onClick = {
+                        attachError = null
+                        picker.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                        )
+                    },
+                )
+            }
             // Zed's bottom row: the mode, the model, whatever else the
             // agent's config options advertise — selectors, driven entirely
             // by what came over the wire. `fill = false` so a long row of
@@ -3157,6 +3266,54 @@ private fun ComposerIconButton(
                 else -> tint ?: theme.color("text.accent", MaterialTheme.colorScheme.primary)
             },
             modifier = Modifier.size(16.dp),
+        )
+    }
+}
+
+/**
+ * One attached picture: what it is called, what it weighs, and the ✕ that
+ * takes it back off the message before it goes.
+ */
+@Composable
+private fun AttachmentChip(image: PromptAttachment, onRemove: () -> Unit) {
+    val theme = LocalZedTheme.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(4.dp))
+            .background(theme.color("element.background", Color.Transparent))
+            .padding(horizontal = 6.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Icon(
+            painter = painterResource(R.drawable.ic_agent_attach),
+            contentDescription = null,
+            tint = theme.color("text.muted"),
+            modifier = Modifier.size(12.dp),
+        )
+        Text(
+            text = image.name,
+            style = MaterialTheme.typography.labelSmall,
+            color = theme.color("text"),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text = "${(image.approximateBytes + 1023) / 1024} KB",
+            style = MaterialTheme.typography.labelSmall,
+            color = theme.color("text.muted"),
+            maxLines = 1,
+        )
+        Text(
+            text = "✕",
+            style = MaterialTheme.typography.labelSmall,
+            color = theme.color("text.muted"),
+            modifier = Modifier
+                .pointerHoverIcon(PointerIcon.Hand)
+                .clickable(onClickLabel = "Remove ${image.name}", onClick = onRemove)
+                .padding(horizontal = 4.dp),
         )
     }
 }

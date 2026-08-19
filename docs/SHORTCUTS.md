@@ -247,6 +247,17 @@ have, and signs out of an agent that supports it.
 own slash commands (it advertises them; the strip completes them), and `@`
 anywhere for a file mention — the file travels with the prompt as context,
 embedded when the agent takes embedded context and as a link otherwise.
+
+**Attaching a picture.** The `+` at the start of the controls row opens the
+system photo picker; what you choose rides the message as an image. It is
+shown above the box with its size and an `✕` to take it back off again, and a
+picture on its own is a message — you do not have to type anything with it.
+Large images are shrunk before sending, because the whole prompt travels down
+one pipe to the agent.
+
+**The `+` appears only for an agent that reads images.** Whether it can is
+the agent's own answer, given when it starts, so an agent that never claimed
+it is not offered a button that would produce something it cannot see.
 In the row under the message box sit the agent's session controls, straight
 off the wire: its mode, and every config option it advertises (model, effort,
 toggles). A pick-one option is a chip that drops its choices; a yes/no one is
@@ -258,6 +269,7 @@ start of the same row.
 | `Ctrl` `Alt` `A` | Show/hide the agent panel |
 | `Enter` | Send the message |
 | `Shift` `Enter` | Start a new line instead |
+| `Ctrl` `;` | Attach an image (when the agent reads them) |
 | `Tab` | Take the first suggestion while the `/` or `@` strip is up |
 | `Esc` | Put the suggestion strip away; with none up, stop the agent mid-turn |
 
