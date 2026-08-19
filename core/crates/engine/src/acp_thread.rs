@@ -94,6 +94,13 @@ impl ErrorKind {
             || lower.contains("exited")
         {
             ErrorKind::Transport
+        } else if lower.contains("500")
+            || lower.contains("502")
+            || lower.contains("503")
+            || lower.contains("overloaded")
+            || lower.contains("api error")
+        {
+            ErrorKind::Api
         } else {
             ErrorKind::Other
         }
@@ -344,6 +351,9 @@ pub struct PromptInput {
 }
 
 impl PromptInput {
+    /// A prompt with no mentions. Used by the tests in this module and in
+    /// `acp.rs`; production always builds one from what the composer sent.
+    #[cfg(test)]
     pub fn text_only(text: impl Into<String>) -> Self {
         PromptInput {
             text: text.into(),
@@ -874,6 +884,11 @@ impl SessionThread {
         match stop_reason {
             acp::StopReason::Cancelled => self.cancel_pending_tool_calls(),
             acp::StopReason::Refusal => {
+                // A refusal is a *kind* of failure, not just a stop reason:
+                // the panel says something different about it and offers no
+                // retry, because trying the same prompt again will be refused
+                // again.
+                self.error_kind = Some(ErrorKind::Refusal);
                 // Zed truncates back to before the refused user message
                 // (acp_thread.rs:3852-3860); everything after it is gone from
                 // the agent's context, so keeping it would lie.
@@ -1452,6 +1467,8 @@ mod tests {
             ("401 Unauthorized", ErrorKind::Auth),
             ("the agent connection closed", ErrorKind::Transport),
             ("agent exited (signal: 9)", ErrorKind::Transport),
+            ("the provider returned 503", ErrorKind::Api),
+            ("upstream overloaded", ErrorKind::Api),
             ("something nobody has ever seen", ErrorKind::Other),
             ("", ErrorKind::Other),
         ];

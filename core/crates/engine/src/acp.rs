@@ -2103,7 +2103,6 @@ impl crate::Engine {
         enum Route {
             Refused,
             Queue,
-            Interrupt(acp::SessionId),
             Send,
         }
         let route = handle.update(|thread| match thread.phase {
@@ -2133,20 +2132,6 @@ impl crate::Engine {
         match route {
             Route::Refused => false,
             Route::Queue => true,
-            Route::Interrupt(acp_id) => {
-                // The running turn ends with `cancelled`; `run_prompt` then
-                // takes the queued text and sends it. Same ordering rule as
-                // `acp_cancel`: through the task queue.
-                handle.update(|thread| thread.turn_cancelled = true);
-                if let Some(cx) = shared.connection() {
-                    let notify = cx.clone();
-                    let _ = cx.spawn(async move {
-                        let _ = notify.send_notification(acp::CancelNotification::new(acp_id));
-                        Ok(())
-                    });
-                }
-                true
-            }
             Route::Send => {
                 let Some(cx) = shared.connection() else {
                     handle.update(|thread| {
