@@ -25,14 +25,17 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -47,6 +50,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -61,6 +65,7 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
@@ -72,6 +77,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
+import to.eyed.conquest.code.R
 import to.eyed.conquest.code.core.AgentCommand
 import to.eyed.conquest.code.core.AgentConversation
 import to.eyed.conquest.code.core.AgentDefinition
@@ -419,11 +425,8 @@ fun AgentPanel(
                     onScrollToPending = { scrollToPending++ },
                 )
                 HorizontalDivider(color = theme.color("border"))
-                // Zed's bottom row: the mode, the model, whatever else the
-                // agent's config options advertise — selectors, driven
-                // entirely by what came over the wire.
-                ComposerChrome(state)
                 Composer(
+                    state = state,
                     enabled = state.canPrompt,
                     isBusy = state.isBusy,
                     focus = composer,
@@ -959,13 +962,14 @@ private fun ThreadRow(
 }
 
 /**
- * The selectors under the conversation — Zed's bottom row (mode, model,
- * effort), rendered entirely from what the agent advertised: its session
- * modes, and its config options (`session/set_config_option` behind each).
- * Nothing is hardcoded; an agent with none gets no row.
+ * The selectors in the composer's bottom row — Zed's right-hand group (token
+ * usage, then mode, then config options; thread_view.rs:4441-4454), rendered
+ * entirely from what the agent advertised: its session modes, and its config
+ * options (`session/set_config_option` behind each). Nothing is hardcoded;
+ * an agent with none gets nothing here, and the send button stands alone.
  */
 @Composable
-private fun ComposerChrome(state: AgentSessionState) {
+private fun ComposerChrome(state: AgentSessionState, modifier: Modifier = Modifier) {
     val theme = LocalZedTheme.current
     val modes = state.modes
     // Gated on there being modes to *choose between*, not on the current one
@@ -973,18 +977,26 @@ private fun ComposerChrome(state: AgentSessionState) {
     // the whole strip — every config chip with it. Zed labels the unmatched
     // case and keeps the selector (mode_selector.rs:132-195).
     val hasModes = modes != null && modes.available.isNotEmpty()
-    if (!hasModes && state.configOptions.isEmpty()) return
+    if (!hasModes && state.configOptions.isEmpty() && state.usage?.cost == null) return
     // The agent is mid-turn: changing its model or mode underneath it is not
     // a thing it can honour, so the chips go quiet rather than lying.
     val live = !state.isBusy
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 8.dp),
+        modifier = modifier.horizontalScroll(rememberScrollState()),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(2.dp),
     ) {
+        // What the turn has cost, when the agent says. An agent that reports
+        // it and a client that drops it is a bill the user cannot see. First
+        // in the group, where Zed puts its token usage (thread_view.rs:4446).
+        state.usage?.cost?.let { cost ->
+            Text(
+                text = "%.2f %s".format(cost.amount, cost.currency),
+                style = MaterialTheme.typography.labelSmall,
+                color = theme.color("text.muted"),
+                modifier = Modifier.padding(horizontal = 6.dp),
+            )
+        }
         if (hasModes && modes != null) {
             SelectorChip(
                 label = modes.current?.name
@@ -1021,8 +1033,12 @@ private fun ComposerChrome(state: AgentSessionState) {
                         }
                     },
                 )
-                "boolean" -> BarAction(
-                    label = "${option.name}: ${if (option.currentBool == true) "On" else "Off"}",
+                // A switch with its label in front, not a "Name: Off" button
+                // — Zed renders a boolean option as exactly that
+                // (config_options.rs:579-587, SwitchLabelPosition::Start).
+                "boolean" -> SwitchChip(
+                    label = option.name,
+                    checked = option.currentBool == true,
                     enabled = live,
                 ) {
                     AgentSessions.setConfigOption(
@@ -1031,16 +1047,6 @@ private fun ComposerChrome(state: AgentSessionState) {
                     )
                 }
             }
-        }
-        // What the turn has cost, when the agent says. An agent that reports
-        // it and a client that drops it is a bill the user cannot see.
-        state.usage?.cost?.let { cost ->
-            Text(
-                text = "%.2f %s".format(cost.amount, cost.currency),
-                style = MaterialTheme.typography.labelSmall,
-                color = theme.color("text.muted"),
-                modifier = Modifier.padding(horizontal = 6.dp),
-            )
         }
     }
 }
@@ -1052,14 +1058,127 @@ private fun SelectorChip(
     items: List<ContextMenuItem>,
     enabled: Boolean = true,
 ) {
+    val theme = LocalZedTheme.current
     var open by remember { mutableStateOf(false) }
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
     Box {
-        BarAction(label, enabled = enabled) { if (enabled) open = true }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            modifier = Modifier
+                .pointerHoverIcon(PointerIcon.Hand)
+                .clickable(
+                    interactionSource = interaction,
+                    indication = null,
+                    onClickLabel = label,
+                ) { if (enabled) open = true }
+                .padding(horizontal = 4.dp, vertical = 4.dp),
+        ) {
+            Text(
+                // Zed cuts the value name at 32 graphemes with an ellipsis
+                // (config_options.rs:426-432); a select whose current value
+                // is a sentence would otherwise push the send button away.
+                text = if (label.length > 32) label.take(32) + "…" else label,
+                style = MaterialTheme.typography.labelSmall,
+                color = when {
+                    !enabled -> theme.color("text.disabled", theme.color("text.muted"))
+                    hovered -> theme.color("text")
+                    else -> theme.color("text.muted")
+                },
+                maxLines = 1,
+            )
+            // The chevron that says "this drops a menu", flipped while it is
+            // open — Zed's trigger button ends in the same icon
+            // (config_options.rs:419-423, 440).
+            Text(
+                text = if (open) "⌃" else "⌄",
+                style = MaterialTheme.typography.labelSmall,
+                color = theme.color("text.muted"),
+            )
+        }
         ContextMenu(
             expanded = open,
             onDismiss = { open = false },
             items = items,
         )
+    }
+}
+
+/**
+ * A boolean config option: the label, then a small switch — Zed's `Switch`
+ * with `SwitchLabelPosition::Start` (config_options.rs:579-587). Geometry
+ * and colours follow ui/src/components/toggle.rs:298-311 and 516-541: a
+ * rounded track, `element.disabled` when off and `info` at 40% when on, with
+ * a `text`-coloured thumb at half opacity while off.
+ */
+@Composable
+private fun SwitchChip(
+    label: String,
+    checked: Boolean,
+    enabled: Boolean = true,
+    onToggle: () -> Unit,
+) {
+    val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val track = if (checked) {
+        theme.color("info", theme.color("text.accent")).copy(alpha = 0.4f)
+    } else {
+        theme.color("element.disabled", theme.color("element.background"))
+    }
+    val outline = if (checked) {
+        theme.color("text.accent").copy(alpha = 0.2f)
+    } else {
+        theme.color("border")
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier
+            .pointerHoverIcon(PointerIcon.Hand)
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                enabled = enabled,
+                onClickLabel = label,
+                onClick = onToggle,
+            )
+            .padding(horizontal = 4.dp, vertical = 4.dp),
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = when {
+                !enabled -> theme.color("text.disabled", theme.color("text.muted"))
+                hovered -> theme.color("text")
+                else -> theme.color("text.muted")
+            },
+            maxLines = 1,
+        )
+        Box(
+            modifier = Modifier
+                .size(width = 30.dp, height = 16.dp)
+                .clip(CircleShape)
+                .background(track)
+                .border(1.dp, outline, CircleShape)
+                .padding(2.dp),
+            contentAlignment = if (checked) Alignment.CenterEnd else Alignment.CenterStart,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(11.dp)
+                    .clip(CircleShape)
+                    .background(theme.color("text"))
+                    .alpha(
+                        when {
+                            !enabled -> 0.2f
+                            checked -> 1f
+                            else -> 0.5f
+                        }
+                    ),
+            )
+        }
     }
 }
 
@@ -2607,6 +2726,8 @@ private fun tokenIn(text: String): String? =
 /** The composer. */
 @Composable
 private fun Composer(
+    /** For the bottom row's selectors, which live inside the composer now. */
+    state: AgentSessionState,
     enabled: Boolean,
     isBusy: Boolean,
     focus: FocusRequester,
@@ -2750,12 +2871,17 @@ private fun Composer(
         }
     }
 
-    Row(
+    // **The box on top, its controls underneath** — Zed's composer, where the
+    // message editor spans the panel and a single row beneath it carries the
+    // selectors on the left and the send button on the right
+    // (thread_view.rs:4390-4455). Ours used to sit the selectors in a strip
+    // *above* the divider and put a "Send" word-button beside the box, which
+    // read as two unrelated rows rather than as one composer.
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .padding(8.dp),
-        verticalAlignment = Alignment.Bottom,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         BasicTextField(
             value = field,
@@ -2765,7 +2891,7 @@ private fun Composer(
             cursorBrush = SolidColor(theme.color("editor.foreground")),
             maxLines = ComposerLines,
             modifier = Modifier
-                .weight(1f)
+                .fillMaxWidth()
                 .clip(RoundedCornerShape(FieldRadius))
                 .background(theme.color("editor.background", Color.Transparent))
                 .padding(horizontal = 8.dp, vertical = 6.dp)
@@ -2835,22 +2961,104 @@ private fun Composer(
                 }
             },
         )
-        // **Four ways, not two.** Stop used to *replace* Send whenever a turn
-        // was running, so on a phone — where the soft keyboard's Enter
-        // arrives as committed text rather than as a keystroke — a follow-up
-        // typed mid-turn could not be sent at all. Zed's send button has the
-        // same three live states (thread_view.rs:5397-5476).
-        val hasText = field.text.isNotBlank()
-        when {
-            isBusy && hasText -> PanelButton("Queue", isPrimary = true, onClick = { send() })
-            isBusy -> PanelButton("Stop", isPrimary = true, onClick = onStop)
-            else -> PanelButton(
-                label = "Send",
-                isPrimary = true,
-                enabled = hasText,
-                onClick = { send() },
-            )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.End,
+        ) {
+            // Zed's bottom row: the mode, the model, whatever else the
+            // agent's config options advertise — selectors, driven entirely
+            // by what came over the wire. `fill = false` so a long row of
+            // chips scrolls within what is left instead of pushing the send
+            // button off the panel.
+            ComposerChrome(state, modifier = Modifier.weight(1f, fill = false))
+            // **Four ways, not two.** Stop used to *replace* Send whenever a
+            // turn was running, so on a phone — where the soft keyboard's
+            // Enter arrives as committed text rather than as a keystroke — a
+            // follow-up typed mid-turn could not be sent at all. Zed's send
+            // button has the same three live states, and is an *icon*:
+            // paper plane to send, list-with-arrow to queue behind a running
+            // turn, a square to stop (thread_view.rs:5397-5476).
+            val hasText = field.text.isNotBlank()
+            when {
+                isBusy && hasText -> ComposerIconButton(
+                    icon = R.drawable.ic_agent_queue,
+                    label = "Queue",
+                    onClick = { send() },
+                )
+                isBusy -> ComposerIconButton(
+                    icon = R.drawable.ic_agent_stop,
+                    label = "Stop",
+                    // Zed tints stop with the error colour rather than the
+                    // accent, so the one destructive control in the row does
+                    // not look like the one that sends (thread_view.rs:5412-5414).
+                    tint = theme.color("error", theme.color("text.accent")),
+                    onClick = onStop,
+                )
+                else -> ComposerIconButton(
+                    icon = R.drawable.ic_agent_send,
+                    label = "Send",
+                    enabled = hasText,
+                    onClick = { send() },
+                )
+            }
         }
+    }
+}
+
+/**
+ * The composer's one icon button — Zed's `IconButton` at `ButtonSize::Default`
+ * (22px square, button_like.rs:469) holding a 16px icon, filled, with the
+ * accent tint the send button carries when it can act and the muted one it
+ * carries when it cannot (thread_view.rs:5426-5434).
+ */
+@Composable
+private fun ComposerIconButton(
+    @androidx.annotation.DrawableRes icon: Int,
+    label: String,
+    enabled: Boolean = true,
+    tint: Color? = null,
+    onClick: () -> Unit,
+) {
+    val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val pressed by interaction.collectIsPressedAsState()
+    // `ButtonStyle::Filled`'s four states, in Zed's own order
+    // (button_like.rs:217, 263-266, 317, 410): the filled background, faded
+    // by half on hover, `element.active` while pressed, and `element.disabled`
+    // when it cannot act — a disabled send still reads as a button, which is
+    // what tells you where to press once you have typed something.
+    val fill = when {
+        !enabled -> theme.color("element.disabled", Color.Transparent)
+        pressed -> theme.color("element.active", Color.Transparent)
+        hovered -> theme.color("element.background", Color.Transparent).copy(alpha = 0.5f)
+        else -> theme.color("element.background", Color.Transparent)
+    }
+    Box(
+        modifier = Modifier
+            .size(22.dp)
+            .clip(RoundedCornerShape(4.dp))
+            .background(fill)
+            .pointerHoverIcon(PointerIcon.Hand)
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                enabled = enabled,
+                onClickLabel = label,
+                onClick = onClick,
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            painter = painterResource(icon),
+            contentDescription = label,
+            tint = when {
+                !enabled -> theme.color("text.disabled", theme.color("text.muted"))
+                else -> tint ?: theme.color("text.accent", MaterialTheme.colorScheme.primary)
+            },
+            modifier = Modifier.size(16.dp),
+        )
     }
 }
 

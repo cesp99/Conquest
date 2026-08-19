@@ -240,9 +240,11 @@ have, and signs out of an agent that supports it.
 own slash commands (it advertises them; the strip completes them), and `@`
 anywhere for a file mention — the file travels with the prompt as context,
 embedded when the agent takes embedded context and as a link otherwise.
-Under the conversation sit the agent's session controls, straight off the
-wire: its mode, and every config option it advertises (model, effort,
-toggles), each a tap-to-pick chip.
+In the row under the message box sit the agent's session controls, straight
+off the wire: its mode, and every config option it advertises (model, effort,
+toggles). A pick-one option is a chip that drops its choices; a yes/no one is
+a switch. What the turn has cost, when the agent reports it, sits at the
+start of the same row.
 
 | Shortcut | Action |
 |---|---|
@@ -257,11 +259,11 @@ Above the composer sits a strip with whatever needs you: the agent's plan
 and a **Waiting for you** line — with a **Show** that scrolls to it — whenever
 a permission prompt or a question has scrolled out of sight.
 
-On a phone `Enter` inserts a newline and **Send** is the button beside the box:
-a soft keyboard's Enter arrives as text rather than as a keystroke, so it
-cannot mean two things at once.
+On a phone `Enter` inserts a newline and the send button — the paper plane at
+the end of the controls row — is how you send: a soft keyboard's Enter arrives
+as text rather than as a keystroke, so it cannot mean two things at once.
 
-**Typing while it works queues, it does not interrupt.** The button reads
+**Typing while it works queues, it does not interrupt.** The button becomes
 **Queue** while the agent is busy and there is something to send; queued
 messages wait above the composer, in order, with a ✕ to take one back, and go
 out one at a time as each turn ends. Stopping the agent is the separate
