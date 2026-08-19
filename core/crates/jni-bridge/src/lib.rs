@@ -2041,6 +2041,18 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpRemoveQueue
     }
 }
 
+/// The agent's questions that belong to no session — a JSON array in the same
+/// shape `elicitations` takes in `acpSessionState`. Poll it whenever an agent
+/// is running: one of these can be raised before any session exists, and an
+/// unanswered one blocks the agent.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpPendingElicitations(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    to_jstring(&env, engine().acp_pending_elicitations())
+}
+
 /// Put away the notice saying why the last mode or config change did not
 /// take. False for a session the engine has forgotten.
 #[unsafe(no_mangle)]

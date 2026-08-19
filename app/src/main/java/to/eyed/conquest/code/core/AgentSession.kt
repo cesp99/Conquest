@@ -1399,6 +1399,36 @@ fun rememberAgentSession(sessionId: Long?): AgentSessionSnapshot {
 }
 
 /**
+ * Poll the agent's questions that belong to no session.
+ *
+ * Separate from the session poll because there may *be* no session: an agent
+ * can ask for a token while authenticating, before any conversation exists,
+ * and one of those left unanswered blocks it for ever. The panel shows these
+ * wherever it is — over the agent picker, over the threads list, over
+ * "starting the agent".
+ */
+@Composable
+fun rememberPendingElicitations(enabled: Boolean): List<AgentElicitation> {
+    var questions by remember { mutableStateOf(emptyList<AgentElicitation>()) }
+    LaunchedEffect(enabled) {
+        if (!enabled) {
+            questions = emptyList()
+            return@LaunchedEffect
+        }
+        while (true) {
+            val fresh = withContext(Dispatchers.Default) {
+                parseElicitations(
+                    runCatching { JSONArray(CoreBridge.acpPendingElicitations()) }.getOrNull(),
+                )
+            }
+            if (fresh != questions) questions = fresh
+            delay(POLL_MS)
+        }
+    }
+    return questions
+}
+
+/**
  * Poll the agent's own past conversations while the threads view is open.
  *
  * [refreshToken] is what asks for a *fresh* list: change it (opening the

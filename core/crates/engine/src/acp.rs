@@ -2004,6 +2004,22 @@ impl crate::Engine {
         state.to_string()
     }
 
+    /// The agent's questions that belong to no session — the protocol's
+    /// *request* scope, as a JSON array in the same shape `elicitations`
+    /// takes in the session state.
+    ///
+    /// No session argument, because there may be no session: an agent can ask
+    /// for a token during `authenticate`, before any conversation exists.
+    /// Those used to be unreachable, so the agent blocked for ever with
+    /// nothing on screen.
+    pub fn acp_pending_elicitations(&self) -> String {
+        let shared = self.acp.agent.lock().unwrap().clone();
+        let questions = shared
+            .map(|shared| shared.elicitations.connection_level())
+            .unwrap_or_default();
+        serde_json::Value::Array(questions).to_string()
+    }
+
     /// Put away the one-line notice saying why the last thing the user asked
     /// for did not happen. False for a session the engine has forgotten.
     pub fn acp_clear_notice(&self, session: u64) -> bool {

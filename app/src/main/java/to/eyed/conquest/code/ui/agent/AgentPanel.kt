@@ -101,6 +101,7 @@ import to.eyed.conquest.code.core.ToolCallStatus
 import to.eyed.conquest.code.core.ToolKind
 import to.eyed.conquest.code.core.rememberAgentSession
 import to.eyed.conquest.code.core.rememberAgentSessionList
+import to.eyed.conquest.code.core.rememberPendingElicitations
 import to.eyed.conquest.code.core.rememberAgentTerminal
 import to.eyed.conquest.code.core.stripAnsi
 import to.eyed.conquest.code.terminal.TerminalSessions
@@ -211,6 +212,8 @@ fun AgentPanel(
     val sessionId = AgentSessions.sessionId.takeIf { it >= 0 }
     val snapshot = rememberAgentSession(sessionId)
     val state = snapshot.state
+    // Polled whenever an agent is running, session or no session.
+    val connectionQuestions = rememberPendingElicitations(agent != null)
     // Bumped by the strip's "Show", read by the transcript, which is the only
     // thing that can scroll itself.
     var scrollToPending by remember { mutableStateOf(0) }
@@ -291,6 +294,21 @@ fun AgentPanel(
             !isAgentPanelSupported -> Notice(
                 "This edition has no Linux userland, so it cannot run an agent.",
             )
+
+            // Questions that belong to no conversation, over everything else.
+            // One of these can be raised before any session exists — an
+            // `authenticate` that wants a token — and the agent is stuck
+            // until it is answered; drawing it only inside the transcript
+            // made it unreachable exactly then.
+            connectionQuestions.isNotEmpty() -> Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                for (question in connectionQuestions) ElicitationCard(question)
+            }
 
             agent == null -> AgentPicker(
                 agents = settings.agents,

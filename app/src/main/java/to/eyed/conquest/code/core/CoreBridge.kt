@@ -1014,6 +1014,17 @@ object CoreBridge {
     external fun acpClearNotice(sessionId: Long): Boolean
 
     /**
+     * The agent's questions that belong to no session — ACP's *request*
+     * scope, in the same shape as `elicitations` in [acpSessionState].
+     *
+     * No session argument because there may be no session: an agent can ask
+     * for a token while authenticating, before any conversation exists. One
+     * of these left unanswered blocks the agent, so the panel has to show it
+     * wherever it is — including over the agent picker.
+     */
+    external fun acpPendingElicitations(): String
+
+    /**
      * Interrupts the running turn and sends [text] as soon as it stops.
      *
      * The deliberate version of a follow-up. [acpPrompt] **queues** one

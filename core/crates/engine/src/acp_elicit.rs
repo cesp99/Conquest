@@ -176,6 +176,25 @@ impl Elicitations {
         Ok(pending)
     }
 
+    /// Every question that belongs to no session — the protocol's *request*
+    /// scope, raised about a request we made rather than about a
+    /// conversation.
+    ///
+    /// Reachable without a session id on purpose. An agent can ask one before
+    /// any session exists (an `authenticate` that wants a token is the
+    /// ordinary case), and until now there was no way to see or answer it:
+    /// the only reader took a session argument, so the agent blocked for ever
+    /// with nothing on screen.
+    pub(crate) fn connection_level(&self) -> Vec<serde_json::Value> {
+        self.live
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|pending| pending.session.is_none())
+            .map(|pending| pending.view())
+            .collect()
+    }
+
     /// The questions a given session's panel should show: its own, plus the
     /// connection-level ones.
     pub(crate) fn for_session(&self, session: u64) -> Vec<serde_json::Value> {
