@@ -193,6 +193,221 @@ data class AgentTerminalState(
     }
 }
 
+/** One choice in a select or multi-select elicitation field. */
+data class ElicitationOption(val value: String, val title: String, val description: String?)
+
+/**
+ * One field of a form elicitation, already flattened by the engine.
+ *
+ * The engine reads the schema and hands over exactly what a form needs, so
+ * these rules are implemented once rather than once per side of JNI —
+ * `type` is `string`/`number`/`integer`/`boolean`/`array`, and `options`
+ * turns a string field into a picker and an array field into a checklist.
+ */
+data class ElicitationField(
+    val key: String,
+    val type: String,
+    val title: String?,
+    val description: String?,
+    val required: Boolean,
+    val options: List<ElicitationOption>,
+    /** `email`, `uri`, `date` or `date-time`, when the schema said so. */
+    val format: String?,
+    val defaultString: String?,
+    val defaultNumber: Double?,
+    val defaultBoolean: Boolean?,
+    val defaultList: List<String>,
+    val minimum: Double?,
+    val maximum: Double?,
+    val minLength: Int?,
+    val maxLength: Int?,
+    val minItems: Int?,
+    val maxItems: Int?,
+) {
+    /** The label to show; the schema's title, else the property name. */
+    val label: String get() = title?.takeIf { it.isNotBlank() } ?: key
+
+    /** A field this build has no control for — shown, never silently dropped. */
+    val isUnsupported: Boolean get() = type == "unsupported"
+}
+
+/**
+ * A question the agent is waiting on.
+ *
+ * Two modes, and they behave differently on purpose. A **form** is over the
+ * moment it is answered. A **url** stays on screen after Accept, because the
+ * agent is watching for the sign-in and takes the card away itself with
+ * `elicitation/complete` — [accepted] is true in that gap, which is what the
+ * card shows as "waiting for the agent".
+ */
+data class AgentElicitation(
+    val id: String,
+    val mode: String,
+    val message: String,
+    val title: String?,
+    val description: String?,
+    val url: String?,
+    /** The tool call it belongs to, when the agent said. */
+    val toolCallId: String?,
+    val fields: List<ElicitationField>,
+    val accepted: Boolean,
+) {
+    val isForm: Boolean get() = mode == "form"
+    val isUrl: Boolean get() = mode == "url"
+}
+
+internal fun parseElicitations(array: JSONArray?): List<AgentElicitation> {
+    val items = array ?: return emptyList()
+    return (0 until items.length()).mapNotNull { index ->
+        val json = items.optJSONObject(index) ?: return@mapNotNull null
+        AgentElicitation(
+            id = json.optString("id"),
+            mode = json.optString("mode"),
+            message = json.optString("message"),
+            title = json.stringOrNull("title"),
+            description = json.stringOrNull("description"),
+            url = json.stringOrNull("url"),
+            toolCallId = json.stringOrNull("toolCallId"),
+            fields = parseElicitationFields(json.optJSONArray("fields")),
+            accepted = json.optBoolean("accepted"),
+        ).takeIf { it.id.isNotEmpty() }
+    }
+}
+
+private fun parseElicitationFields(array: JSONArray?): List<ElicitationField> {
+    val items = array ?: return emptyList()
+    return (0 until items.length()).mapNotNull { index ->
+        val json = items.optJSONObject(index) ?: return@mapNotNull null
+        val options = json.optJSONArray("options") ?: JSONArray()
+        val defaults = json.optJSONArray("default")
+        ElicitationField(
+            key = json.optString("key"),
+            type = json.optString("type"),
+            title = json.stringOrNull("title"),
+            description = json.stringOrNull("description"),
+            required = json.optBoolean("required"),
+            options = (0 until options.length()).mapNotNull { at ->
+                val option = options.optJSONObject(at) ?: return@mapNotNull null
+                ElicitationOption(
+                    value = option.optString("value"),
+                    title = option.optString("title").ifEmpty { option.optString("value") },
+                    description = option.stringOrNull("description"),
+                )
+            },
+            format = json.stringOrNull("format"),
+            // One `default` key carrying whatever the field's type is, so it
+            // is read by the field's type rather than guessed at.
+            defaultString = if (json.opt("default") is String) json.optString("default") else null,
+            defaultNumber = if (json.opt("default") is Number) json.optDouble("default") else null,
+            defaultBoolean = if (json.opt("default") is Boolean) {
+                json.optBoolean("default")
+            } else {
+                null
+            },
+            defaultList = defaults?.let { list ->
+                (0 until list.length()).mapNotNull { at -> list.optString(at).takeIf(String::isNotEmpty) }
+            } ?: emptyList(),
+            minimum = json.numberOrNull("minimum"),
+            maximum = json.numberOrNull("maximum"),
+            minLength = json.numberOrNull("minLength")?.toInt(),
+            maxLength = json.numberOrNull("maxLength")?.toInt(),
+            minItems = json.numberOrNull("minItems")?.toInt(),
+            maxItems = json.numberOrNull("maxItems")?.toInt(),
+        ).takeIf { it.key.isNotEmpty() }
+    }
+}
+
+/** `optDouble` returns NaN for a missing key, which is not the same as zero. */
+private fun JSONObject.numberOrNull(name: String): Double? =
+    if (isNull(name) || !has(name)) null else optDouble(name).takeIf { !it.isNaN() }
+
+/**
+ * Turning a filled-in form into the JSON [CoreBridge.acpRespondElicitation]
+ * takes, and deciding whether it is filled in at all.
+ *
+ * Here rather than in the panel because the *types* are the load-bearing
+ * part: an integer field must go back as a JSON number, not as the text the
+ * keyboard produced — the engine passes each value's JSON type straight
+ * through to the protocol's own variant, so a string there tells the agent it
+ * asked for an integer and got text. That is worth testing on a host, which
+ * a composable is not.
+ *
+ * The panel's values are: [String] for text and numbers, [Boolean] for
+ * switches, `List<String>` for multi-selects.
+ */
+object ElicitationAnswer {
+
+    /** `{"action":"accept","content":{…}}`. */
+    fun accept(fields: List<ElicitationField>, values: Map<String, Any?>): String {
+        val content = JSONObject()
+        for (field in fields) {
+            if (field.isUnsupported) continue
+            val value = values[field.key]
+            when (field.type) {
+                "boolean" -> content.put(field.key, value as? Boolean ?: false)
+
+                "array" -> {
+                    val chosen = (value as? List<*>)?.filterIsInstance<String>().orEmpty()
+                    // An empty optional multi-select is "nothing chosen", and
+                    // sending `[]` says that plainly; omitting it would say
+                    // "not answered", which is a different claim.
+                    content.put(field.key, JSONArray().apply { chosen.forEach { put(it) } })
+                }
+
+                "integer" -> (value as? String)?.trim()?.toLongOrNull()
+                    ?.let { content.put(field.key, it) }
+
+                "number" -> (value as? String)?.trim()?.toDoubleOrNull()
+                    ?.let { content.put(field.key, it) }
+
+                else -> (value as? String)?.takeIf { it.isNotEmpty() }
+                    ?.let { content.put(field.key, it) }
+            }
+        }
+        return JSONObject().put("action", "accept").put("content", content).toString()
+    }
+
+    fun decline(): String = JSONObject().put("action", "decline").toString()
+
+    fun cancel(): String = JSONObject().put("action", "cancel").toString()
+
+    /**
+     * The required fields that are not answered yet, so Accept can stay off
+     * rather than sending the agent a form it will have to reject.
+     *
+     * A number field whose text is not a number counts as missing: it cannot
+     * be sent as a number, and sending it as text is the lie above.
+     */
+    fun missing(fields: List<ElicitationField>, values: Map<String, Any?>): List<String> =
+        fields.filter { field ->
+            if (!field.required || field.isUnsupported) {
+                false
+            } else {
+                when (field.type) {
+                    // A switch always has an answer; false is one.
+                    "boolean" -> false
+                    "array" -> (values[field.key] as? List<*>).isNullOrEmpty()
+                    "integer" -> (values[field.key] as? String)?.trim()?.toLongOrNull() == null
+                    "number" -> (values[field.key] as? String)?.trim()?.toDoubleOrNull() == null
+                    else -> (values[field.key] as? String).isNullOrBlank()
+                }
+            }
+        }.map { it.label }
+
+    /** What a field starts at, from the schema's default. */
+    fun initialValue(field: ElicitationField): Any = when (field.type) {
+        "boolean" -> field.defaultBoolean ?: false
+        "array" -> field.defaultList
+        "integer" -> field.defaultNumber?.toLong()?.toString() ?: ""
+        "number" -> field.defaultNumber?.let { trimNumber(it) } ?: ""
+        else -> field.defaultString ?: ""
+    }
+
+    /** `3.0` from a JSON number is the integer 3 to everyone but a parser. */
+    private fun trimNumber(value: Double): String =
+        if (value == value.toLong().toDouble()) value.toLong().toString() else value.toString()
+}
+
 /** One chunk of the agent's reply; thoughts fold away. */
 data class AssistantChunk(val thought: Boolean, val markdown: String)
 
@@ -391,6 +606,13 @@ data class AgentSessionState(
     val commands: List<AgentCommand>,
     /** Config options, for the selector chips under the composer. */
     val configOptions: List<AgentConfigOption>,
+    /**
+     * Questions the agent is waiting on — `elicitation/create`, which is how
+     * ACP carries every ask that is not a permission. Nothing else can move
+     * until one is answered, so the panel puts them at the end of the
+     * transcript where the next thing to do is.
+     */
+    val elicitations: List<AgentElicitation>,
     val agent: AgentInfo?,
 ) {
     val isBusy: Boolean get() = phase == AgentPhase.Running
@@ -413,6 +635,7 @@ data class AgentSessionState(
             modes = null,
             commands = emptyList(),
             configOptions = emptyList(),
+            elicitations = emptyList(),
             agent = null,
         )
 
@@ -456,6 +679,7 @@ data class AgentSessionState(
                 },
                 commands = parseCommands(root.optJSONArray("commands")),
                 configOptions = parseConfigOptions(root.optJSONArray("configOptions")),
+                elicitations = parseElicitations(root.optJSONArray("elicitations")),
                 agent = agent?.let {
                     val methods = it.optJSONArray("auth_methods") ?: JSONArray()
                     AgentInfo(

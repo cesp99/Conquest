@@ -1941,6 +1941,28 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpWrittenFile
     to_jstring(&env, engine().acp_written_files(since.max(0) as u64))
 }
 
+/// Answer one of the agent's questions — `elicitation/create`, the shape
+/// every ask that is not a permission arrives in. `action_json` is
+/// `{"action":"accept","content":{…}}`, `{"action":"decline"}` or
+/// `{"action":"cancel"}`, and the content's JSON types are the protocol's, so
+/// a switch comes back as a bool and a number field as a number. False for a
+/// question that is already gone.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpRespondElicitation(
+    mut env: JNIEnv,
+    _class: JClass,
+    elicitation_id: JString,
+    action_json: JString,
+) -> jboolean {
+    let elicitation_id = get_string(&mut env, &elicitation_id);
+    let action_json = get_string(&mut env, &action_json);
+    if engine().acp_respond_elicitation(&elicitation_id, &action_json) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
 /// One agent terminal, for the card that draws it. Poll it with the
 /// `revision` you were last given: an unchanged terminal answers
 /// `{"revision": n}` and nothing else, which is what makes polling a

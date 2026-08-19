@@ -16,12 +16,14 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -30,6 +32,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -53,6 +56,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -63,12 +67,15 @@ import org.json.JSONArray
 import to.eyed.conquest.code.core.AgentCommand
 import to.eyed.conquest.code.core.AgentConversation
 import to.eyed.conquest.code.core.AgentDefinition
+import to.eyed.conquest.code.core.AgentElicitation
 import to.eyed.conquest.code.core.AgentEntry
 import to.eyed.conquest.code.core.AgentThread
 import to.eyed.conquest.code.core.AgentPhase
 import to.eyed.conquest.code.core.AgentSessionState
 import to.eyed.conquest.code.core.AgentSessions
 import to.eyed.conquest.code.core.AgentTerminalState
+import to.eyed.conquest.code.core.ElicitationAnswer
+import to.eyed.conquest.code.core.ElicitationField
 import to.eyed.conquest.code.core.Agents
 import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.core.FileDiff
@@ -768,6 +775,15 @@ private fun Conversation(
                 )
             }
         }
+        // The questions go last, under everything, because a question is the
+        // next thing to do: the agent is blocked on it and nothing further
+        // will arrive until it is answered.
+        items(
+            count = state.elicitations.size,
+            key = { "elicit:${state.elicitations[it].id}" },
+        ) { index ->
+            ElicitationCard(state.elicitations[index])
+        }
         if (state.phase == AgentPhase.Unavailable || state.needsAuth) {
             item(key = "trouble") {
                 Trouble(state, agent, onAuthenticate)
@@ -998,6 +1014,283 @@ private fun StatusChip(status: ToolCallStatus) {
         color = color,
         maxLines = 1,
     )
+}
+
+/**
+ * A question the agent is waiting on — ACP's elicitation, which is how every
+ * ask that is not a permission arrives.
+ *
+ * Two shapes, and they end differently. A **form** is a set of fields; Accept
+ * sends them and the card goes. A **url** is "sign in over there and come
+ * back"; Accept answers the agent immediately, and the card stays — greyed,
+ * saying it is waiting — until the agent confirms it saw the sign-in with
+ * `elicitation/complete`. Zed keeps the same distinction
+ * (acp_thread.rs:515-527), and it is not cosmetic: the user has said they
+ * did it, but only the agent knows whether it worked.
+ *
+ * Touch, keyboard and mouse together, as every control here must be: fields
+ * take the keyboard with `Tab` moving between them the way any Compose form
+ * does, every row is a tap target, and the buttons carry the hand cursor.
+ */
+@Composable
+private fun ElicitationCard(question: AgentElicitation) {
+    val theme = LocalZedTheme.current
+    val scope = rememberCoroutineScope()
+    // Keyed by the question: a second question arriving must not inherit the
+    // first one's half-typed answers.
+    val values = remember(question.id) {
+        mutableStateMapOf<String, Any>().apply {
+            question.fields.forEach { field -> put(field.key, ElicitationAnswer.initialValue(field)) }
+        }
+    }
+    var sending by remember(question.id) { mutableStateOf(false) }
+    val missing = ElicitationAnswer.missing(question.fields, values)
+
+    fun answer(json: String) {
+        if (sending) return
+        sending = true
+        scope.launch {
+            withContext(Dispatchers.Default) {
+                CoreBridge.acpRespondElicitation(question.id, json)
+            }
+            // Not reset on success: the card is either gone on the next poll
+            // or — a URL question — waiting on the agent, and in both cases
+            // pressing again would be a second answer to one question.
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp)
+            .clip(RoundedCornerShape(FieldRadius))
+            .background(theme.color("element.background", Color.Transparent))
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        question.title?.let { title ->
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelMedium,
+                color = theme.color("text"),
+                fontWeight = FontWeight.Medium,
+            )
+        }
+        Text(
+            text = question.message,
+            style = MaterialTheme.typography.bodySmall,
+            color = theme.color("text"),
+        )
+        question.description?.let { description ->
+            Text(
+                text = description,
+                style = MaterialTheme.typography.labelSmall,
+                color = theme.color("text.muted"),
+            )
+        }
+
+        when {
+            question.isUrl -> {
+                Text(
+                    text = question.url.orEmpty(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = theme.color("text.accent", MaterialTheme.colorScheme.primary),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (question.accepted) {
+                    Text(
+                        text = "Waiting for the agent to confirm…",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = theme.color("text.muted"),
+                    )
+                }
+            }
+
+            question.isForm -> {
+                for (field in question.fields) {
+                    ElicitationFieldRow(field, values[field.key]) { values[field.key] = it }
+                }
+            }
+
+            // A mode the engine accepted but this build cannot draw. It should
+            // not happen — the engine refuses unknown modes at the wire — but
+            // saying so beats a card with nothing in it.
+            else -> Notice("The agent asked something this version cannot show.")
+        }
+
+        if (!question.accepted) {
+            if (missing.isNotEmpty()) {
+                Text(
+                    text = "Still needed: ${missing.joinToString(", ")}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = theme.color("text.muted"),
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.End),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                PanelButton("Decline") { answer(ElicitationAnswer.decline()) }
+                if (missing.isEmpty()) {
+                    PanelButton(
+                        if (question.isUrl) "I've done that" else "Send",
+                        isPrimary = true,
+                    ) {
+                        answer(ElicitationAnswer.accept(question.fields, values))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** One field of a form question, drawn by what its type actually is. */
+@Composable
+private fun ElicitationFieldRow(
+    field: ElicitationField,
+    value: Any?,
+    onValue: (Any) -> Unit,
+) {
+    val theme = LocalZedTheme.current
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        if (field.type != "boolean") {
+            Text(
+                text = if (field.required) "${field.label} *" else field.label,
+                style = MaterialTheme.typography.labelSmall,
+                color = theme.color("text.muted"),
+            )
+        }
+        field.description?.takeIf { field.type != "boolean" }?.let { description ->
+            Text(
+                text = description,
+                style = MaterialTheme.typography.labelSmall,
+                color = theme.color("text.muted"),
+            )
+        }
+        when {
+            field.isUnsupported -> Notice("“${field.label}” is a kind of field this version cannot show.")
+
+            field.type == "boolean" -> {
+                val checked = value as? Boolean ?: false
+                CheckRow(field.label, checked) { onValue(!checked) }
+                field.description?.let { description ->
+                    Text(
+                        text = description,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = theme.color("text.muted"),
+                    )
+                }
+            }
+
+            field.type == "array" -> {
+                val chosen = (value as? List<*>)?.filterIsInstance<String>().orEmpty()
+                for (option in field.options) {
+                    val on = option.value in chosen
+                    CheckRow(option.title, on) {
+                        onValue(if (on) chosen - option.value else chosen + option.value)
+                    }
+                }
+                if (field.options.isEmpty()) {
+                    Notice("The agent offered no choices for this.")
+                }
+            }
+
+            // A string with a fixed set of answers is a picker, not a text
+            // box: the agent will only accept one of these, so typing is a
+            // way to get it wrong.
+            field.options.isNotEmpty() -> {
+                val current = value as? String
+                val chosen = field.options.firstOrNull { it.value == current }
+                SelectorChip(
+                    label = chosen?.title ?: "Choose…",
+                    items = field.options.map { option ->
+                        ContextMenuItem(
+                            // A tick, because a menu with no state shown
+                            // gives no way to see what is already picked.
+                            label = if (option.value == current) "✓ ${option.title}" else option.title,
+                            onClick = { onValue(option.value) },
+                        )
+                    },
+                )
+            }
+
+            else -> FormLine(
+                value = value as? String ?: "",
+                numeric = field.type == "integer" || field.type == "number",
+                onValue = onValue,
+            )
+        }
+    }
+}
+
+/** A tappable check row: touch, keyboard focus and a hand cursor, as always. */
+@Composable
+private fun CheckRow(label: String, checked: Boolean, onToggle: () -> Unit) {
+    val theme = LocalZedTheme.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(4.dp))
+            .pointerHoverIcon(PointerIcon.Hand)
+            .clickable(onClickLabel = label, onClick = onToggle)
+            .padding(vertical = 3.dp),
+    ) {
+        Text(
+            text = if (checked) "☑" else "☐",
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (checked) {
+                theme.color("text.accent", MaterialTheme.colorScheme.primary)
+            } else {
+                theme.color("text.muted")
+            },
+        )
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = theme.color("text"),
+        )
+    }
+}
+
+/**
+ * One line of text in a form question — Zed's input box: 32px minimum, 6px
+ * corners, one-pixel border, the editor's own background
+ * (external_agents_page.rs:558-576), which is the box the settings screen's
+ * fields already use.
+ */
+@Composable
+private fun FormLine(value: String, numeric: Boolean, onValue: (String) -> Unit) {
+    val theme = LocalZedTheme.current
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 32.dp)
+            .clip(RoundedCornerShape(FieldRadius))
+            .background(theme.color("editor.background"))
+            .border(1.dp, theme.color("border"), RoundedCornerShape(FieldRadius))
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        BasicTextField(
+            value = value,
+            onValueChange = onValue,
+            singleLine = true,
+            // A number field asks for the number keyboard, which on a phone
+            // is the difference between typing 7 and hunting for it.
+            keyboardOptions = KeyboardOptions(
+                keyboardType = if (numeric) KeyboardType.Number else KeyboardType.Text,
+            ),
+            textStyle = MaterialTheme.typography.bodySmall.copy(color = theme.color("text")),
+            cursorBrush = SolidColor(theme.color("editor.foreground")),
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
 }
 
 /**

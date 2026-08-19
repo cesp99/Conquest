@@ -950,4 +950,22 @@ object CoreBridge {
      * way — it is the live process that is gone.
      */
     external fun acpTerminalOutput(terminalId: String, since: Long): String
+
+    /**
+     * Answer one of the agent's questions — the `elicitations` in
+     * [acpSessionState], which is how ACP carries every ask that is not a
+     * permission: a token, a choice between branches, "open this URL and sign
+     * in".
+     *
+     * [actionJson] is `{"action":"accept","content":{…}}`,
+     * `{"action":"decline"}` or `{"action":"cancel"}`. The content's JSON
+     * types are the protocol's own, so a field drawn as a switch goes back as
+     * a boolean and a number field as a number — a string there would be a
+     * lie the agent cannot detect.
+     *
+     * A URL question stays listed after an accept: the agent is watching for
+     * the sign-in and takes the card away itself when it sees it. False for a
+     * question that is already gone.
+     */
+    external fun acpRespondElicitation(elicitationId: String, actionJson: String): Boolean
 }

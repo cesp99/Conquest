@@ -259,6 +259,15 @@ file the turn stops, the diff appears in the conversation, and **Allow** and
 **Deny** sit underneath it — the change and the choice on one screen. Diffs are
 unified, never side by side.
 
+**The agent can ask you things.** Not everything an agent needs is a
+yes-or-no about a file: it may want an API token, a choice between branches,
+or for you to sign in on a web page and come back. Those arrive as a card at
+the end of the conversation with the fields it asked for — text, numbers,
+switches, pick-one and pick-many — and **Send** or **Decline** underneath.
+Required fields are marked `*` and Send waits for them. A sign-in card stays
+up after you say you have done it: the agent is watching for the sign-in and
+takes the card away itself once it sees it.
+
 **Commands the agent runs are on screen.** An agent that wants to run
 `cargo test` asks the editor to run it rather than shelling out invisibly, so
 the command line, what it printed and how it exited appear on the tool call —

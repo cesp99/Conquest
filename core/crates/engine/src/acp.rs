@@ -65,6 +65,7 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1 as acp;
 use agent_client_protocol::{Agent, Client, ConnectionTo, Lines, Responder};
 
+use crate::acp_elicit::Elicitations;
 use crate::acp_terminal::{Terminals, snapshot_json};
 use crate::acp_thread::{PermissionDecision, Phase, PromptInput, SessionThread};
 use crate::guest::{self, GuestCommand};
@@ -286,6 +287,8 @@ struct AgentShared {
     userland: Arc<guest::Userland>,
     /// The agent's terminals, by their protocol id.
     terminals: Terminals,
+    /// The questions the agent is waiting on — `elicitation/create`.
+    elicitations: Elicitations,
     /// Ask the watcher to take the process down.
     shutdown: AtomicBool,
     /// The process is gone — observed dead, or killed on request.
@@ -318,6 +321,7 @@ impl AgentShared {
             stderr: Mutex::new(String::new()),
             userland,
             terminals: Terminals::default(),
+            elicitations: Elicitations::default(),
             shutdown: AtomicBool::new(false),
             dead: AtomicBool::new(false),
         })
@@ -421,6 +425,13 @@ impl AgentShared {
             }
         }
         *self.connection.lock().unwrap() = None;
+        // Whatever the agent was waiting on, it is not waiting any more: the
+        // terminals it started have no reader left, and its questions have
+        // nobody to answer them to. Both are left open otherwise — a
+        // build running in the guest against a dead connection, and a
+        // question card the user can never dismiss.
+        self.terminals.release_all();
+        self.elicitations.cancel_all();
         let mine = self.own_sessions();
         for (_, handle) in &mine {
             handle.cancel_permissions();
@@ -520,6 +531,72 @@ impl AgentShared {
     // (agent_servers/src/acp.rs:722-740); the mechanics are
     // [`crate::acp_terminal`], and what is here is the session lookup and the
     // protocol's error shapes.
+
+    // ---- elicitations ---------------------------------------------------
+
+    fn on_create_elicitation(
+        &self,
+        request: acp::CreateElicitationRequest,
+        responder: Responder<acp::CreateElicitationResponse>,
+    ) {
+        // Session scope names the conversation it belongs to; request scope
+        // names one of *our* outstanding requests instead — `authenticate`,
+        // in practice — and has no conversation at all. The store keeps both,
+        // and every session's panel shows the connection-level ones, because
+        // the agent is stuck on them whichever thread is open.
+        let session = match &request.mode {
+            acp::ElicitationMode::Form(mode) => scope_session(&mode.scope),
+            acp::ElicitationMode::Url(mode) => scope_session(&mode.scope),
+            _ => None,
+        };
+        let handle = session.as_ref().and_then(|id| self.session_for_acp_id(id));
+        let our_id = handle.as_ref().map(|(id, _)| *id);
+        if session.is_some() && handle.is_none() {
+            let _ = responder.respond_with_error(
+                acp::Error::invalid_params().data(serde_json::json!("unknown session")),
+            );
+            return;
+        }
+        match self.elicitations.open(request, our_id, responder) {
+            Ok(pending) => {
+                log::info!("acp: elicitation {} opened", pending.id);
+                // The question rides the session state, so the revision has
+                // to move or the panel never asks for it.
+                self.bump_sessions(our_id);
+            }
+            Err(err) => log::warn!("acp: elicitation refused: {err:?}"),
+        }
+    }
+
+    fn on_complete_elicitation(&self, notification: acp::CompleteElicitationNotification) {
+        if self
+            .elicitations
+            .complete(notification.elicitation_id.0.as_ref())
+        {
+            self.bump_sessions(None);
+        }
+    }
+
+    /// Move the revision of one session, or of all of ours when the change is
+    /// connection-level and every open panel needs to see it.
+    fn bump_sessions(&self, session: Option<u64>) {
+        match session {
+            Some(id) => {
+                if let Some(handle) = self.session(id) {
+                    handle.update(|thread| {
+                        thread.bump();
+                    });
+                }
+            }
+            None => {
+                for (_, handle) in self.own_sessions() {
+                    handle.update(|thread| {
+                        thread.bump();
+                    });
+                }
+            }
+        }
+    }
 
     fn on_create_terminal(
         &self,
@@ -985,6 +1062,14 @@ fn start_agent(
     true
 }
 
+/// The session an elicitation's scope names, if it names one.
+fn scope_session(scope: &acp::ElicitationScope) -> Option<acp::SessionId> {
+    match scope {
+        acp::ElicitationScope::Session(scope) => Some(scope.session_id.clone()),
+        _ => None,
+    }
+}
+
 fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) {
     thread::Builder::new()
         .name(name.to_owned())
@@ -1007,6 +1092,8 @@ async fn run_connection(
     let write_shared = shared.clone();
     let read_shared = shared.clone();
     let update_shared = shared.clone();
+    let elicit_shared = shared.clone();
+    let elicit_done_shared = shared.clone();
     let create_terminal_shared = shared.clone();
     let terminal_output_shared = shared.clone();
     let wait_terminal_shared = shared.clone();
@@ -1022,6 +1109,15 @@ async fn run_connection(
                         responder: Responder<acp::RequestPermissionResponse>,
                         _cx| {
                 permission_shared.on_permission(request, responder);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: acp::CreateElicitationRequest,
+                        responder: Responder<acp::CreateElicitationResponse>,
+                        _cx| {
+                elicit_shared.on_create_elicitation(request, responder);
                 Ok(())
             },
             agent_client_protocol::on_receive_request!(),
@@ -1096,6 +1192,13 @@ async fn run_connection(
             },
             agent_client_protocol::on_receive_notification!(),
         )
+        .on_receive_notification(
+            async move |notification: acp::CompleteElicitationNotification, _cx| {
+                elicit_done_shared.on_complete_elicitation(notification);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
         .connect_with(transport, async move |cx| agent_main(main_shared, cx).await)
         .await;
     if let Err(err) = result {
@@ -1124,6 +1227,13 @@ async fn agent_main(shared: Arc<AgentShared>, cx: ConnectionTo<Agent>) -> Result
         // to a client that has one. We do now, so agents whose login is a
         // command (`claude /login` and its kin) can say so.
         .auth(acp::AuthCapabilities::new().terminal(true))
+        // Both modes, because the panel draws both: a form from the schema,
+        // and a link with a "done" for the sign-in-and-come-back flow.
+        .elicitation(
+            acp::ElicitationCapabilities::new()
+                .form(acp::ElicitationFormCapabilities::new())
+                .url(acp::ElicitationUrlCapabilities::new()),
+        )
         .session(
             acp::ClientSessionCapabilities::new().config_options(
                 acp::SessionConfigOptionsCapabilities::new()
@@ -1578,9 +1688,13 @@ impl crate::Engine {
         let Some(handle) = self.session_handle(session) else {
             return "null".to_owned();
         };
-        let agent = {
+        let (agent, elicitations) = {
             let slot = self.acp.agent.lock().unwrap();
-            match slot.as_ref().map(|shared| shared.init.lock().unwrap()) {
+            let elicitations = slot
+                .as_ref()
+                .map(|shared| shared.elicitations.for_session(session))
+                .unwrap_or_default();
+            let agent = match slot.as_ref().map(|shared| shared.init.lock().unwrap()) {
                 Some(init) => match &*init {
                     InitPhase::Ready(info) => serde_json::json!({
                         "name": info.name,
@@ -1592,10 +1706,39 @@ impl crate::Engine {
                     InitPhase::Failed(message) => serde_json::json!({"error": message}),
                 },
                 None => serde_json::Value::Null,
-            }
+            };
+            (agent, elicitations)
         };
         let thread = handle.thread.lock().unwrap();
-        thread.state_json(agent).to_string()
+        let mut state = thread.state_json(agent);
+        // Questions live on the connection, not in the thread's own state
+        // machine — a request-scoped one belongs to no thread at all — so
+        // they are folded in here rather than kept in `SessionThread`.
+        if let Some(object) = state.as_object_mut() {
+            object.insert("elicitations".to_owned(), elicitations.into());
+        }
+        state.to_string()
+    }
+
+    /// Answer one of the agent's questions. `action_json` is
+    /// `{"action":"accept","content":{…}}`, `{"action":"decline"}` or
+    /// `{"action":"cancel"}`; the content's JSON types are the protocol's
+    /// types, so a field the panel drew as a switch comes back as a bool.
+    ///
+    /// A URL question stays on screen after an accept — the agent is
+    /// watching for the sign-in and takes it away with
+    /// `elicitation/complete`. False for a question that is gone or an
+    /// action that is not one of the three.
+    pub fn acp_respond_elicitation(&self, elicitation_id: &str, action_json: &str) -> bool {
+        let shared = self.acp.agent.lock().unwrap().clone();
+        let Some(shared) = shared else {
+            return false;
+        };
+        if !shared.elicitations.respond(elicitation_id, action_json) {
+            return false;
+        }
+        shared.bump_sessions(None);
+        true
     }
 
     /// The entries whose revision is newer than `since`, as JSON — see
@@ -1931,6 +2074,9 @@ impl crate::Engine {
             // thread mid-command — must not leave a build running in the
             // guest, and any `wait_for_exit` it parked must still be answered.
             shared.terminals.release_session(session);
+            // And every question it had open, answered `cancel`: a responder
+            // dropped without an answer is an agent waiting for ever.
+            shared.elicitations.cancel_session(session);
             // Tell the agent the turn is over, so it stops spending tokens.
             if let (Some(acp_id), Some(cx)) = (acp_id, shared.connection()) {
                 let _ = cx.send_notification(acp::CancelNotification::new(acp_id));
@@ -1991,6 +2137,7 @@ fn shutdown_agent(shared: &Arc<AgentShared>) {
     // proot does not take them with it, so an agent replaced mid-build would
     // otherwise leave that build running against the process budget.
     shared.terminals.release_all();
+    shared.elicitations.cancel_all();
     *shared.connection.lock().unwrap() = None;
 }
 
@@ -2894,6 +3041,26 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// The agent's last spoken reply, for tests that check what it said.
+    /// Takes the thread by reference: `handle.thread` is not reentrant, and
+    /// the caller is usually already holding it.
+    fn last_reply(thread: &SessionThread) -> String {
+        thread
+            .entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.body {
+                EntryBody::Assistant { chunks } => Some(
+                    chunks
+                        .iter()
+                        .map(|chunk| chunk.markdown.as_str())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .expect("a reply")
+    }
+
     fn tool_call_status(handle: &SessionHandle, id: &str) -> Option<ToolStatus> {
         let thread = handle.thread.lock().unwrap();
         thread
@@ -2997,10 +3164,12 @@ mod tests {
                 .iter()
                 .map(|command| command.name.as_str())
                 .collect();
-            // `run` is in the list only because the client advertised
-            // `terminal: true` — the conformance agent gates it on exactly
-            // that, so this line is the capability negotiation under test.
-            assert_eq!(names, ["plan", "echo", "run"]);
+            // Everything past `echo` is in the list only because the client
+            // advertised the capability behind it — the conformance agent
+            // gates each on exactly that — so this line *is* the capability
+            // negotiation under test: `run` needs `terminal`, `ask` needs
+            // `elicitation.form`, `login` needs `elicitation.url`.
+            assert_eq!(names, ["plan", "echo", "run", "ask", "login"]);
             let ids: Vec<String> = thread
                 .config_options
                 .iter()
@@ -3240,6 +3409,99 @@ mod tests {
                 _ => None,
             });
             assert_eq!(status, Some(ToolStatus::Failed), "exit 3 is a failure");
+        }
+
+        // ---- turn four: a form elicitation, answered ------------------------
+        //
+        // One field of every kind the schema has, so a type flattened on the
+        // way out or coerced on the way back shows up here rather than on a
+        // device. The agent prints Python's own type name for each value.
+        handle.update(|thread| thread.push_user_message("/ask"));
+        start_prompt(&shared, &cx, 1, PromptInput::text_only("/ask"), false);
+        let question = {
+            wait_for("the form question", || {
+                !shared.elicitations.for_session(1).is_empty()
+            });
+            let asked = shared.elicitations.for_session(1);
+            assert_eq!(asked.len(), 1);
+            asked[0].clone()
+        };
+        assert_eq!(question["mode"], "form");
+        assert_eq!(question["title"], "Conformance form");
+        let fields: std::collections::BTreeMap<&str, &serde_json::Value> = question["fields"]
+            .as_array()
+            .expect("fields")
+            .iter()
+            .map(|field| (field["key"].as_str().unwrap(), field))
+            .collect();
+        assert_eq!(fields["note"]["required"], true);
+        assert_eq!(fields["branch"]["options"][1]["title"], "development");
+        assert_eq!(fields["depth"]["type"], "integer");
+        assert_eq!(fields["tags"]["options"].as_array().unwrap().len(), 3);
+
+        let id = question["id"].as_str().unwrap();
+        assert!(shared.elicitations.respond(
+            id,
+            r#"{"action":"accept","content":{
+                 "note":"hello","branch":"dev","depth":7,"dry":false,"tags":["a","c"]}}"#,
+        ));
+        wait_for("the form turn to end", || {
+            let thread = handle.thread.lock().unwrap();
+            thread.phase == Phase::Ready && thread.stop_reason.as_deref() == Some("end_turn")
+        });
+        assert!(
+            shared.elicitations.for_session(1).is_empty(),
+            "an answered form question is over"
+        );
+        {
+            let thread = handle.thread.lock().unwrap();
+            let reply = last_reply(&thread);
+            // The types survived the round trip: an integer stayed an
+            // integer and a boolean stayed a boolean.
+            assert!(
+                reply.contains("depth=7 (int)"),
+                "integer stayed one: {reply}"
+            );
+            assert!(
+                reply.contains("dry=False (bool)"),
+                "boolean stayed one: {reply}"
+            );
+            assert!(reply.contains("branch='dev' (str)"), "the choice: {reply}");
+            assert!(
+                reply.contains("tags=['a', 'c'] (list)"),
+                "the multi-select: {reply}"
+            );
+        }
+
+        // ---- turn five: a URL elicitation ----------------------------------
+        //
+        // Accepting answers the agent but leaves the card up; only the
+        // agent's `elicitation/complete` takes it away, because only the
+        // agent can see whether the sign-in happened.
+        handle.update(|thread| thread.push_user_message("/login"));
+        start_prompt(&shared, &cx, 1, PromptInput::text_only("/login"), false);
+        wait_for("the URL question", || {
+            !shared.elicitations.for_session(1).is_empty()
+        });
+        let question = shared.elicitations.for_session(1)[0].clone();
+        assert_eq!(question["mode"], "url");
+        assert_eq!(question["url"], "https://example.com/conformance/login");
+        assert_eq!(question["accepted"], false);
+        assert!(
+            shared
+                .elicitations
+                .respond(question["id"].as_str().unwrap(), r#"{"action":"accept"}"#)
+        );
+        wait_for("the agent to take its question back", || {
+            shared.elicitations.for_session(1).is_empty()
+        });
+        wait_for("the login turn to end", || {
+            let thread = handle.thread.lock().unwrap();
+            thread.phase == Phase::Ready && thread.stop_reason.as_deref() == Some("end_turn")
+        });
+        {
+            let thread = handle.thread.lock().unwrap();
+            assert!(last_reply(&thread).contains("Signed in"));
         }
 
         // ---- shutdown: EOF on its stdin is how the python process learns ---

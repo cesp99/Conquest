@@ -265,6 +265,10 @@ class Agent:
                     "description": "Run a shell command in a terminal",
                     "input": {"hint": "shell command"},
                 })
+            if self.can("elicitation", "form"):
+                commands.append({"name": "ask", "description": "Ask a form question"})
+            if self.can("elicitation", "url"):
+                commands.append({"name": "login", "description": "Ask you to visit a URL"})
             self.update(session_id, {
                 "sessionUpdate": "available_commands_update",
                 "availableCommands": commands,
@@ -329,6 +333,10 @@ class Agent:
                 return "end_turn"
             if prompt.startswith("/run"):
                 return self.run_command(session_id, prompt[4:].strip())
+            if prompt.startswith("/ask"):
+                return self.ask_form(session_id)
+            if prompt.startswith("/login"):
+                return self.ask_url(session_id)
             if prompt.startswith("/plan"):
                 self.plan(session_id,
                           ("Look around", "in_progress"), ("Report back", "pending"))
@@ -423,6 +431,93 @@ class Agent:
         except Cancelled:
             log("turn cancelled")
             return "cancelled"
+
+    def ask_form(self, session_id):
+        """A form elicitation, covering every property kind the schema has.
+
+        One of each so a client that gets any of them wrong shows it: a
+        required free-text field, a titled single-select, an integer with
+        bounds, a boolean, and a multi-select. The reply names what came back
+        *and its Python type*, because the type is the half that silently
+        rots — an integer field answered with the string "3" looks identical
+        in a transcript.
+        """
+        if not self.can("elicitation", "form"):
+            self.chunk(session_id, "agent_message_chunk", "This editor cannot show forms.")
+            return "end_turn"
+        answer = self.request("elicitation/create", {
+            # The scope is *flattened* into the request beside the mode —
+            # `{"mode":"form","sessionId":…}` — not nested under a "scope"
+            # key. The schema flattens both `mode` and `scope`, and an
+            # untagged scope means a nested one simply fails to match.
+            "mode": "form",
+            "message": "The conformance agent would like some details.",
+            "sessionId": session_id,
+            "requestedSchema": {
+                "type": "object",
+                "title": "Conformance form",
+                "required": ["note"],
+                "properties": {
+                    "note": {"type": "string", "title": "A note",
+                             "description": "Anything at all."},
+                    "branch": {"type": "string", "title": "Branch",
+                               "oneOf": [
+                                   {"const": "main", "title": "main"},
+                                   {"const": "dev", "title": "development"},
+                               ]},
+                    "depth": {"type": "integer", "title": "Depth",
+                              "minimum": 1, "maximum": 9, "default": 3},
+                    "dry": {"type": "boolean", "title": "Dry run", "default": True},
+                    "tags": {"type": "array", "title": "Tags",
+                             "items": {"type": "string", "enum": ["a", "b", "c"]}},
+                },
+            },
+        })
+        if answer is None:
+            self.chunk(session_id, "agent_message_chunk", "The editor refused the question.")
+            return "end_turn"
+        action = answer.get("action")
+        if action != "accept":
+            self.chunk(session_id, "agent_message_chunk", "Fair enough — %s." % action)
+            return "end_turn"
+        content = answer.get("content") or {}
+        described = ", ".join(
+            "%s=%r (%s)" % (key, value, type(value).__name__)
+            for key, value in sorted(content.items())
+        )
+        self.chunk(session_id, "agent_message_chunk", "Form answered: %s" % described)
+        return "end_turn"
+
+    def ask_url(self, session_id):
+        """A URL elicitation: the sign-in-and-come-back shape.
+
+        The client answers as soon as the user says they have been; the card
+        stays until this agent — which is the only one that can see whether
+        the sign-in actually happened — sends `elicitation/complete` naming
+        the same id.
+        """
+        if not self.can("elicitation", "url"):
+            self.chunk(session_id, "agent_message_chunk", "This editor cannot show URL prompts.")
+            return "end_turn"
+        elicitation_id = "conf-login-%d" % self.next_request
+        answer = self.request("elicitation/create", {
+            "mode": "url",
+            "message": "Sign in to the conformance service, then come back.",
+            "sessionId": session_id,
+            "elicitationId": elicitation_id,
+            "url": "https://example.com/conformance/login",
+        })
+        action = (answer or {}).get("action")
+        if action != "accept":
+            self.chunk(session_id, "agent_message_chunk", "No sign-in then — %s." % action)
+            return "end_turn"
+        send({
+            "jsonrpc": "2.0",
+            "method": "elicitation/complete",
+            "params": {"elicitationId": elicitation_id},
+        })
+        self.chunk(session_id, "agent_message_chunk", "Signed in; carrying on.")
+        return "end_turn"
 
     def run_command(self, session_id, shell):
         """The `terminal/*` round trip, in the order an agent really uses it.
