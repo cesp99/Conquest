@@ -318,6 +318,8 @@ data class ElicitationField(
     val options: List<ElicitationOption>,
     /** `email`, `uri`, `date` or `date-time`, when the schema said so. */
     val format: String?,
+    /** A regex the answer must match, when the agent set one. */
+    val pattern: String?,
     val defaultString: String?,
     val defaultNumber: Double?,
     val defaultBoolean: Boolean?,
@@ -400,6 +402,7 @@ private fun parseElicitationFields(array: JSONArray?): List<ElicitationField> {
                 )
             },
             format = json.stringOrNull("format"),
+            pattern = json.stringOrNull("pattern"),
             // One `default` key carrying whatever the field's type is, so it
             // is read by the field's type rather than guessed at.
             defaultString = if (json.opt("default") is String) json.optString("default") else null,
@@ -477,11 +480,103 @@ object ElicitationAnswer {
     fun cancel(): String = JSONObject().put("action", "cancel").toString()
 
     /**
-     * The required fields that are not answered yet, so Accept can stay off
-     * rather than sending the agent a form it will have to reject.
+     * What is wrong with the form, per field key.
      *
-     * A number field whose text is not a number counts as missing: it cannot
-     * be sent as a number, and sending it as text is the lie above.
+     * Every constraint the agent sends was being discarded, so a `number`
+     * field with a fractional answer, or a string past its `maxLength`, was a
+     * form the user could submit and the agent would reject — with the
+     * failure arriving as a turn error rather than beside the field. Zed
+     * validates the same rules in the card (elicitation.rs:1103-1266).
+     *
+     * The messages are deliberately about the *value*, not the schema: "must
+     * be a whole number" beats "integer expected".
+     */
+    fun validate(
+        fields: List<ElicitationField>,
+        values: Map<String, Any?>,
+    ): Map<String, String> {
+        val errors = mutableMapOf<String, String>()
+        for (field in fields) {
+            if (field.isUnsupported) continue
+            when (field.type) {
+                // A switch always has an answer; false is one.
+                "boolean" -> {}
+
+                "array" -> {
+                    val chosen = (values[field.key] as? List<*>)?.filterIsInstance<String>().orEmpty()
+                    val min = field.minItems
+                    val max = field.maxItems
+                    when {
+                        field.required && chosen.isEmpty() -> errors[field.key] = "Choose at least one."
+                        min != null && chosen.size < min ->
+                            errors[field.key] = "Choose at least $min."
+                        max != null && chosen.size > max ->
+                            errors[field.key] = "Choose no more than $max."
+                    }
+                }
+
+                "integer", "number" -> {
+                    val text = (values[field.key] as? String)?.trim().orEmpty()
+                    if (text.isEmpty()) {
+                        if (field.required) errors[field.key] = "Required."
+                        continue
+                    }
+                    val number = if (field.type == "integer") {
+                        text.toLongOrNull()?.toDouble()
+                    } else {
+                        text.toDoubleOrNull()
+                    }
+                    val min = field.minimum
+                    val max = field.maximum
+                    when {
+                        number == null -> errors[field.key] = if (field.type == "integer") {
+                            "Must be a whole number."
+                        } else {
+                            "Must be a number."
+                        }
+                        min != null && number < min -> errors[field.key] = "Must be at least ${trim(min)}."
+                        max != null && number > max -> errors[field.key] = "Must be at most ${trim(max)}."
+                    }
+                }
+
+                else -> {
+                    val text = (values[field.key] as? String).orEmpty()
+                    if (text.isBlank()) {
+                        if (field.required) errors[field.key] = "Required."
+                        continue
+                    }
+                    val min = field.minLength
+                    val max = field.maxLength
+                    val pattern = field.pattern
+                    when {
+                        min != null && text.length < min ->
+                            errors[field.key] = "At least $min characters."
+                        max != null && text.length > max ->
+                            errors[field.key] = "At most $max characters."
+                        field.options.isNotEmpty() && field.options.none { it.value == text } ->
+                            errors[field.key] = "Choose one of the offered values."
+                        // A pattern the agent sent that this platform's regex
+                        // engine cannot compile is the agent's problem, not
+                        // the user's: do not block the form on it.
+                        pattern != null &&
+                            runCatching { !Regex(pattern).containsMatchIn(text) }.getOrDefault(false) ->
+                            errors[field.key] = "Not in the expected format."
+                    }
+                }
+            }
+        }
+        return errors
+    }
+
+    private fun trim(value: Double): String =
+        if (value == value.toLong().toDouble()) value.toLong().toString() else value.toString()
+
+    /**
+     * The required fields that are not answered yet, by label.
+     *
+     * Kept beside [validate] because it answers a different question: what is
+     * *still to do*, which is worth saying before the user has touched
+     * anything, rather than what is *wrong*, which is not.
      */
     fun missing(fields: List<ElicitationField>, values: Map<String, Any?>): List<String> =
         fields.filter { field ->
@@ -489,7 +584,6 @@ object ElicitationAnswer {
                 false
             } else {
                 when (field.type) {
-                    // A switch always has an answer; false is one.
                     "boolean" -> false
                     "array" -> (values[field.key] as? List<*>).isNullOrEmpty()
                     "integer" -> (values[field.key] as? String)?.trim()?.toLongOrNull() == null

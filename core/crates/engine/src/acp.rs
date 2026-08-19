@@ -2224,16 +2224,31 @@ impl crate::Engine {
         let request = acp::SetSessionModeRequest::new(acp_id, mode.clone());
         let task_cx = cx.clone();
         cx.spawn(async move {
-            if task_cx.send_request(request).block_task().await.is_ok() {
-                if let Some(handle) = task_shared.session(session_id) {
-                    handle.update(|thread| {
-                        if let Some(modes) = &mut thread.modes {
-                            modes.current_mode_id = mode;
-                        }
-                        // Without this the confirmed mode change is invisible
-                        // until something else happens to move the counter.
-                        thread.bump();
-                    });
+            match task_cx.send_request(request).block_task().await {
+                Ok(_) => {
+                    if let Some(handle) = task_shared.session(session_id) {
+                        handle.update(|thread| {
+                            if let Some(modes) = &mut thread.modes {
+                                modes.current_mode_id = mode;
+                            }
+                            // Without this the confirmed mode change is
+                            // invisible until something else happens to move
+                            // the counter.
+                            thread.bump();
+                        });
+                    }
+                }
+                // And a *refused* one used to be invisible too: the arm was
+                // missing entirely, so tapping a mode the agent would not
+                // take did nothing at all, for ever, with no way to tell that
+                // from a mode change that worked.
+                Err(err) => {
+                    log::warn!("acp: session/set_mode refused: {err}");
+                    if let Some(handle) = task_shared.session(session_id) {
+                        handle.update(|thread| {
+                            thread.notice(format!("The agent would not change mode: {err}"));
+                        });
+                    }
                 }
             }
             Ok(())
@@ -2275,14 +2290,28 @@ impl crate::Engine {
         let task_shared = shared.clone();
         let task_cx = cx.clone();
         cx.spawn(async move {
-            if let Ok(response) = task_cx.send_request(request).block_task().await {
-                if let Some(handle) = task_shared.session(session_id) {
-                    handle.update(|thread| {
-                        thread.config_options = response.config_options;
-                        // Without this the confirmed change is invisible until
-                        // something else happens to move the counter.
-                        thread.bump();
-                    });
+            match task_cx.send_request(request).block_task().await {
+                Ok(response) => {
+                    if let Some(handle) = task_shared.session(session_id) {
+                        handle.update(|thread| {
+                            thread.config_options = response.config_options;
+                            // Without this the confirmed change is invisible
+                            // until something else happens to move the
+                            // counter.
+                            thread.bump();
+                        });
+                    }
+                }
+                // Same missing arm as `set_mode`: a refused option change was
+                // silence, and the chip went on showing the old value with no
+                // hint that the agent had said no.
+                Err(err) => {
+                    log::warn!("acp: session/set_config_option refused: {err}");
+                    if let Some(handle) = task_shared.session(session_id) {
+                        handle.update(|thread| {
+                            thread.notice(format!("The agent would not change that: {err}"));
+                        });
+                    }
                 }
             }
             Ok(())

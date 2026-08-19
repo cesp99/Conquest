@@ -212,11 +212,11 @@ fun AgentPanel(
     // Bumped by the strip's "Show", read by the transcript, which is the only
     // thing that can scroll itself.
     var scrollToPending by remember { mutableStateOf(0) }
-    // Everything the agent is blocked on: a tool call at its permission gate,
-    // and any question it has asked. This is what the strip counts.
-    val pendingCount = snapshot.conversation.entries.count {
-        it is AgentEntry.ToolCall && it.status == ToolCallStatus.WaitingForConfirmation
-    } + state.elicitations.count { !it.accepted }
+    // How much the agent is blocked on that the reader cannot currently see.
+    // Reported by the transcript, which is the only thing that knows what is
+    // on screen: a permission prompt in front of you needs no banner, and one
+    // that has scrolled away stalls the turn with nothing to explain it.
+    var pendingCount by remember { mutableStateOf(0) }
     // The thread list — Zed's history view, toggled from the bar.
     var showThreads by remember { mutableStateOf(false) }
 
@@ -335,6 +335,7 @@ fun AgentPanel(
                     conversation = snapshot.conversation,
                     agent = agent,
                     scrollToPending = scrollToPending,
+                    onPendingOffscreen = { pendingCount = it },
                     onOpenPath = onOpenPath,
                     onRespond = AgentSessions::respondToPermission,
                     onAuthenticate = { method ->
@@ -450,8 +451,8 @@ private fun AgentBar(
         if (agent != null) {
             // Zed's bar: `+` starts a thread, the history icon lists them
             // (agent_panel.rs — the panel toolbar). Words, at this size.
-            BarAction("+ New", onNewThread)
-            BarAction(if (showingThreads) "Back" else "Threads", onToggleThreads)
+            BarAction("+ New", onClick = onNewThread)
+            BarAction(if (showingThreads) "Back" else "Threads", onClick = onToggleThreads)
             // A menu rather than a fourth word: the bar is 32px on a phone,
             // and everything in it is about *which agent this is*.
             SelectorChip(
@@ -468,14 +469,18 @@ private fun AgentBar(
 }
 
 @Composable
-private fun BarAction(label: String, onClick: () -> Unit) {
+private fun BarAction(label: String, enabled: Boolean = true, onClick: () -> Unit) {
     val theme = LocalZedTheme.current
     val interaction = remember { MutableInteractionSource() }
     val hovered by interaction.collectIsHoveredAsState()
     Text(
         text = label,
         style = MaterialTheme.typography.labelSmall,
-        color = if (hovered) theme.color("text") else theme.color("text.muted"),
+        color = when {
+            !enabled -> theme.color("text.disabled", theme.color("text.muted"))
+            hovered -> theme.color("text")
+            else -> theme.color("text.muted")
+        },
         maxLines = 1,
         modifier = Modifier
             .pointerHoverIcon(PointerIcon.Hand)
@@ -699,7 +704,7 @@ private fun ThreadsView(
             }
             if (name == currentProject.rootName) {
                 // The `+` in the bar, for a finger scrolling the list.
-                BarAction("+ New Thread", onNewThread)
+                BarAction("+ New Thread", onClick = onNewThread)
             }
         }
 
@@ -812,7 +817,7 @@ private fun PastSessionRow(
             )
         }
         if (canDelete) {
-            BarAction("Forget", onDelete)
+            BarAction("Forget", onClick = onDelete)
         }
     }
 }
@@ -856,7 +861,7 @@ private fun ThreadRow(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
-        BarAction("Close", onClose)
+        BarAction("Close", onClick = onClose)
     }
 }
 
@@ -868,8 +873,17 @@ private fun ThreadRow(
  */
 @Composable
 private fun ComposerChrome(state: AgentSessionState) {
+    val theme = LocalZedTheme.current
     val modes = state.modes
-    if (modes?.current == null && state.configOptions.isEmpty()) return
+    // Gated on there being modes to *choose between*, not on the current one
+    // resolving. One `currentModeId` the agent never listed used to remove
+    // the whole strip — every config chip with it. Zed labels the unmatched
+    // case and keeps the selector (mode_selector.rs:132-195).
+    val hasModes = modes != null && modes.available.isNotEmpty()
+    if (!hasModes && state.configOptions.isEmpty()) return
+    // The agent is mid-turn: changing its model or mode underneath it is not
+    // a thing it can honour, so the chips go quiet rather than lying.
+    val live = !state.isBusy
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -878,11 +892,15 @@ private fun ComposerChrome(state: AgentSessionState) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(2.dp),
     ) {
-        modes?.current?.let { current ->
+        if (hasModes && modes != null) {
             SelectorChip(
-                label = current.name,
+                label = modes.current?.name
+                    ?: modes.currentId.ifEmpty { "Unknown" },
+                enabled = live,
                 items = modes.available.map { mode ->
-                    ContextMenuItem(mode.name) { AgentSessions.setMode(mode.id) }
+                    ContextMenuItem(
+                        label = if (mode.id == modes.currentId) "✓ ${mode.name}" else mode.name,
+                    ) { AgentSessions.setMode(mode.id) }
                 },
             )
         }
@@ -890,8 +908,17 @@ private fun ComposerChrome(state: AgentSessionState) {
             when (option.kind) {
                 "select" -> SelectorChip(
                     label = option.currentLabel,
+                    enabled = live,
                     items = option.values.map { value ->
-                        ContextMenuItem(value.name) {
+                        ContextMenuItem(
+                            // A tick, so an open menu says which one is
+                            // already chosen.
+                            label = if (value.id == option.currentValueId) {
+                                "✓ ${value.name}"
+                            } else {
+                                value.name
+                            },
+                        ) {
                             // JSONObject.quote, because a value id is wire
                             // data and may carry anything.
                             AgentSessions.setConfigOption(
@@ -902,7 +929,8 @@ private fun ComposerChrome(state: AgentSessionState) {
                     },
                 )
                 "boolean" -> BarAction(
-                    "${option.name}: ${if (option.currentBool == true) "On" else "Off"}",
+                    label = "${option.name}: ${if (option.currentBool == true) "On" else "Off"}",
+                    enabled = live,
                 ) {
                     AgentSessions.setConfigOption(
                         option.id,
@@ -911,15 +939,29 @@ private fun ComposerChrome(state: AgentSessionState) {
                 }
             }
         }
+        // What the turn has cost, when the agent says. An agent that reports
+        // it and a client that drops it is a bill the user cannot see.
+        state.usage?.cost?.let { cost ->
+            Text(
+                text = "%.2f %s".format(cost.amount, cost.currency),
+                style = MaterialTheme.typography.labelSmall,
+                color = theme.color("text.muted"),
+                modifier = Modifier.padding(horizontal = 6.dp),
+            )
+        }
     }
 }
 
 /** A tappable label that drops the choices under itself. */
 @Composable
-private fun SelectorChip(label: String, items: List<ContextMenuItem>) {
+private fun SelectorChip(
+    label: String,
+    items: List<ContextMenuItem>,
+    enabled: Boolean = true,
+) {
     var open by remember { mutableStateOf(false) }
     Box {
-        BarAction(label) { open = true }
+        BarAction(label, enabled = enabled) { if (enabled) open = true }
         ContextMenu(
             expanded = open,
             onDismiss = { open = false },
@@ -940,6 +982,8 @@ private fun Conversation(
      * with nothing on screen to explain it.
      */
     scrollToPending: Int,
+    /** How many things waiting on the user are currently off screen. */
+    onPendingOffscreen: (Int) -> Unit,
     onOpenPath: (String) -> Unit,
     onRespond: (toolCall: String, option: String) -> Unit,
     onAuthenticate: (AgentAuthMethod) -> Unit,
@@ -979,14 +1023,34 @@ private fun Conversation(
         }
     }
 
+    // What the agent is blocked on, and whether any of it is on screen. The
+    // elicitation items sit after the entries in the same list, which is what
+    // makes the index arithmetic below work.
+    val pendingIndices = remember(conversation.entries, state.elicitations) {
+        val waiting = conversation.entries.mapIndexedNotNull { index, entry ->
+            index.takeIf {
+                entry is AgentEntry.ToolCall &&
+                    entry.status == ToolCallStatus.WaitingForConfirmation
+            }
+        }
+        val questions = state.elicitations.mapIndexedNotNull { index, question ->
+            (conversation.entries.size + index).takeIf { !question.accepted }
+        }
+        waiting + questions
+    }
+    val offscreen by remember {
+        derivedStateOf {
+            val visible = list.layoutInfo.visibleItemsInfo.map { it.index }.toSet()
+            pendingIndices.count { it !in visible }
+        }
+    }
+    LaunchedEffect(offscreen) { onPendingOffscreen(offscreen) }
+
     // Jump to whatever is waiting. Guarded on a non-zero token so it does not
     // fire on first composition.
     LaunchedEffect(scrollToPending) {
         if (scrollToPending == 0) return@LaunchedEffect
-        val waiting = conversation.entries.indexOfFirst {
-            it is AgentEntry.ToolCall && it.status == ToolCallStatus.WaitingForConfirmation
-        }
-        val target = if (waiting >= 0) waiting else conversation.entries.lastIndex
+        val target = pendingIndices.firstOrNull() ?: conversation.entries.lastIndex
         if (target >= 0) runCatching { list.animateScrollToItem(target) }
     }
 
@@ -1149,7 +1213,7 @@ private fun StripRow(
             },
             modifier = Modifier.weight(1f),
         )
-        if (action != null && onAction != null) BarAction(action, onAction)
+        if (action != null && onAction != null) BarAction(action, onClick = onAction)
     }
 }
 
@@ -1215,7 +1279,7 @@ private fun NoticeRow(text: String, onDismiss: (() -> Unit)?) {
             color = theme.color("text.muted"),
             modifier = Modifier.weight(1f),
         )
-        if (onDismiss != null) BarAction("✕", onDismiss)
+        if (onDismiss != null) BarAction("✕", onClick = onDismiss)
     }
 }
 
@@ -1687,6 +1751,10 @@ private fun ElicitationCard(question: AgentElicitation) {
         }
     }
     var sending by remember(question.id) { mutableStateOf(false) }
+    // Empty until Send is pressed. Showing every field's complaint before the
+    // user has touched anything is scolding, not helping — Zed validates on
+    // submit too (elicitation.rs:1985).
+    var errors by remember(question.id) { mutableStateOf(emptyMap<String, String>()) }
     val missing = ElicitationAnswer.missing(question.fields, values)
 
     fun answer(json: String) {
@@ -1751,7 +1819,17 @@ private fun ElicitationCard(question: AgentElicitation) {
 
             question.isForm -> {
                 for (field in question.fields) {
-                    ElicitationFieldRow(field, values[field.key]) { values[field.key] = it }
+                    ElicitationFieldRow(
+                        field = field,
+                        value = values[field.key],
+                        error = errors[field.key],
+                    ) {
+                        values[field.key] = it
+                        // Clear the complaint the moment the field changes:
+                        // a red box that stays red while you fix it is worse
+                        // than no box at all.
+                        if (errors.containsKey(field.key)) errors = errors - field.key
+                    }
                 }
             }
 
@@ -1762,24 +1840,34 @@ private fun ElicitationCard(question: AgentElicitation) {
         }
 
         if (!question.accepted) {
-            if (missing.isNotEmpty()) {
+            if (missing.isNotEmpty() && errors.isEmpty()) {
                 Text(
                     text = "Still needed: ${missing.joinToString(", ")}",
                     style = MaterialTheme.typography.labelSmall,
                     color = theme.color("text.muted"),
                 )
             }
+            // **Send is always here.** It used to appear only once every
+            // required field was filled, which meant the button moved as you
+            // typed — under a soft keyboard, on a phone — and a form you
+            // could not complete was a form with no way to find out why.
+            // Pressing it is how you learn what is wrong.
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.End),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                PanelButton("Decline") { answer(ElicitationAnswer.decline()) }
-                if (missing.isEmpty()) {
-                    PanelButton(
-                        if (question.isUrl) "I've done that" else "Send",
-                        isPrimary = true,
-                    ) {
+                PanelButton("Decline", enabled = !sending) {
+                    answer(ElicitationAnswer.decline())
+                }
+                PanelButton(
+                    label = if (question.isUrl) "I've done that" else "Send",
+                    isPrimary = true,
+                    enabled = !sending,
+                ) {
+                    val found = ElicitationAnswer.validate(question.fields, values)
+                    errors = found
+                    if (found.isEmpty()) {
                         answer(ElicitationAnswer.accept(question.fields, values))
                     }
                 }
@@ -1793,9 +1881,12 @@ private fun ElicitationCard(question: AgentElicitation) {
 private fun ElicitationFieldRow(
     field: ElicitationField,
     value: Any?,
+    /** What is wrong with this field's answer, once Send has been pressed. */
+    error: String?,
     onValue: (Any) -> Unit,
 ) {
     val theme = LocalZedTheme.current
+    val errorColor = theme.color("error", MaterialTheme.colorScheme.error)
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(2.dp),
@@ -1804,7 +1895,7 @@ private fun ElicitationFieldRow(
             Text(
                 text = if (field.required) "${field.label} *" else field.label,
                 style = MaterialTheme.typography.labelSmall,
-                color = theme.color("text.muted"),
+                color = if (error != null) errorColor else theme.color("text.muted"),
             )
         }
         field.description?.takeIf { field.type != "boolean" }?.let { description ->
@@ -1863,8 +1954,16 @@ private fun ElicitationFieldRow(
 
             else -> FormLine(
                 value = value as? String ?: "",
-                numeric = field.type == "integer" || field.type == "number",
+                field = field,
+                isError = error != null,
                 onValue = onValue,
+            )
+        }
+        error?.let { message ->
+            Text(
+                text = message,
+                style = MaterialTheme.typography.labelSmall,
+                color = errorColor,
             )
         }
     }
@@ -1908,7 +2007,12 @@ private fun CheckRow(label: String, checked: Boolean, onToggle: () -> Unit) {
  * fields already use.
  */
 @Composable
-private fun FormLine(value: String, numeric: Boolean, onValue: (String) -> Unit) {
+private fun FormLine(
+    value: String,
+    field: ElicitationField,
+    isError: Boolean,
+    onValue: (String) -> Unit,
+) {
     val theme = LocalZedTheme.current
     Box(
         modifier = Modifier
@@ -1916,7 +2020,15 @@ private fun FormLine(value: String, numeric: Boolean, onValue: (String) -> Unit)
             .heightIn(min = 32.dp)
             .clip(RoundedCornerShape(FieldRadius))
             .background(theme.color("editor.background"))
-            .border(1.dp, theme.color("border"), RoundedCornerShape(FieldRadius))
+            .border(
+                width = 1.dp,
+                color = if (isError) {
+                    theme.color("error", MaterialTheme.colorScheme.error)
+                } else {
+                    theme.color("border")
+                },
+                shape = RoundedCornerShape(FieldRadius),
+            )
             .padding(horizontal = 8.dp, vertical = 4.dp),
         contentAlignment = Alignment.CenterStart,
     ) {
@@ -1924,10 +2036,18 @@ private fun FormLine(value: String, numeric: Boolean, onValue: (String) -> Unit)
             value = value,
             onValueChange = onValue,
             singleLine = true,
-            // A number field asks for the number keyboard, which on a phone
-            // is the difference between typing 7 and hunting for it.
+            // The keyboard has to be able to type the answer. `Number` has no
+            // minus sign and no decimal point, so a `number` field with a
+            // fractional or negative answer — and an `integer` one that
+            // accepts negatives — was literally untypeable on a phone.
             keyboardOptions = KeyboardOptions(
-                keyboardType = if (numeric) KeyboardType.Number else KeyboardType.Text,
+                keyboardType = when {
+                    field.type == "number" -> KeyboardType.Decimal
+                    field.type == "integer" -> KeyboardType.Number
+                    field.format == "email" -> KeyboardType.Email
+                    field.format == "uri" -> KeyboardType.Uri
+                    else -> KeyboardType.Text
+                },
             ),
             textStyle = MaterialTheme.typography.bodySmall.copy(color = theme.color("text")),
             cursorBrush = SolidColor(theme.color("editor.foreground")),
@@ -1994,19 +2114,22 @@ private fun TerminalCard(terminalId: String, sealed: AgentTerminalState?) {
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             modifier = Modifier.fillMaxWidth(),
         ) {
-            if (terminal.cwd.isNotEmpty()) {
-                Text(
-                    // Start-ellipsised: the interesting end of a path is the
-                    // tail (Zed truncates the same way,
-                    // terminal_tool_header.rs:145-153).
-                    text = "…" + terminal.cwd.takeLast(34),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = theme.color("text.muted"),
-                    maxLines = 1,
-                    modifier = Modifier.weight(1f, fill = false),
-                )
-            }
-            Box(modifier = Modifier.weight(1f))
+            // Project-relative, and absent for the project root itself —
+            // which is where most commands run, and a line saying so every
+            // time would be noise. Start-ellipsised when it is long, because
+            // the interesting end of a path is the tail (Zed truncates the
+            // same way, terminal_tool_header.rs:145-153).
+            Text(
+                text = when {
+                    terminal.cwd.isEmpty() -> ""
+                    terminal.cwd.length > 34 -> "…" + terminal.cwd.takeLast(33)
+                    else -> terminal.cwd
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = theme.color("text.muted"),
+                maxLines = 1,
+                modifier = Modifier.weight(1f),
+            )
             terminal.elapsedLabel?.let { elapsed ->
                 Text(
                     text = elapsed,
@@ -2659,6 +2782,7 @@ private fun Notice(text: String, isError: Boolean = false) {
 private fun PanelButton(
     label: String,
     isPrimary: Boolean = false,
+    enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
     val theme = LocalZedTheme.current
@@ -2686,6 +2810,7 @@ private fun PanelButton(
             .clickable(
                 interactionSource = interaction,
                 indication = null,
+                enabled = enabled,
                 onClickLabel = label,
                 onClick = onClick,
             )
@@ -2695,10 +2820,10 @@ private fun PanelButton(
         Text(
             text = label,
             style = MaterialTheme.typography.labelMedium,
-            color = if (isPrimary) {
-                theme.color("text.accent", MaterialTheme.colorScheme.primary)
-            } else {
-                theme.color("text.muted")
+            color = when {
+                !enabled -> theme.color("text.disabled", theme.color("text.muted"))
+                isPrimary -> theme.color("text.accent", MaterialTheme.colorScheme.primary)
+                else -> theme.color("text.muted")
             },
             maxLines = 1,
         )

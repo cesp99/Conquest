@@ -101,10 +101,15 @@ pub(crate) struct AgentTerminal {
     /// back — `ToolCallContent::Terminal` carries only an id — so the client
     /// is the only one that can say what is running.
     pub(crate) label: String,
-    /// Where it ran, so the card can say so. A command's meaning depends on
-    /// its directory, and Zed puts it in the header
-    /// (terminal_tool_header.rs:136-171).
-    pub(crate) cwd: PathBuf,
+    /// Where it ran, **project-relative**, so the card can say so.
+    ///
+    /// A command's meaning depends on its directory, and Zed puts it in the
+    /// header (terminal_tool_header.rs:136-171). Relative because the
+    /// absolute path on Android is
+    /// `/data/user/0/to.eyed.conquest.code/files/projects/…`, forty
+    /// characters of which say nothing to anybody. Empty means the project
+    /// root itself, which is the common case and needs no line at all.
+    pub(crate) cwd: String,
     limit: usize,
     state: Mutex<TerminalState>,
     /// Parked `terminal/wait_for_exit` responders. More than one is legal:
@@ -162,7 +167,7 @@ impl Default for TerminalState {
 pub(crate) struct TerminalSnapshot {
     pub(crate) revision: u64,
     pub(crate) label: String,
-    pub(crate) cwd: PathBuf,
+    pub(crate) cwd: String,
     pub(crate) output: String,
     pub(crate) truncated: bool,
     pub(crate) dropped_bytes: u64,
@@ -369,7 +374,11 @@ impl Terminals {
             id: id.clone(),
             session,
             label,
-            cwd: cwd.clone(),
+            // Relative to the project, and empty for the root itself.
+            cwd: cwd
+                .strip_prefix(root)
+                .map(|rest| rest.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| cwd.to_string_lossy().into_owned()),
             limit,
             state: Mutex::new(TerminalState::default()),
             waiters: Mutex::new(Vec::new()),
@@ -598,9 +607,7 @@ pub(crate) fn snapshot_json(terminal: &AgentTerminal, since: u64) -> serde_json:
     serde_json::json!({
         "revision": snapshot.revision,
         "label": snapshot.label,
-        // Absolute, because the panel shows it start-ellipsised and the
-        // interesting end is the tail.
-        "cwd": snapshot.cwd.to_string_lossy(),
+        "cwd": snapshot.cwd,
         "output": snapshot.output,
         "truncated": snapshot.truncated,
         // How much was dropped, not merely that something was: a card that
@@ -641,7 +648,7 @@ mod tests {
             id: "term-1".to_owned(),
             session: 1,
             label: "sh -c :".to_owned(),
-            cwd: PathBuf::from("/p"),
+            cwd: String::new(),
             limit,
             state: Mutex::new(TerminalState::default()),
             waiters: Mutex::new(Vec::new()),

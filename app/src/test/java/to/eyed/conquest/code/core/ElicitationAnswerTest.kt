@@ -25,6 +25,13 @@ class ElicitationAnswerTest {
         defaultNumber: Double? = null,
         defaultBoolean: Boolean? = null,
         defaultList: List<String> = emptyList(),
+        pattern: String? = null,
+        minimum: Double? = null,
+        maximum: Double? = null,
+        minLength: Int? = null,
+        maxLength: Int? = null,
+        minItems: Int? = null,
+        maxItems: Int? = null,
     ) = ElicitationField(
         key = key,
         type = type,
@@ -33,16 +40,17 @@ class ElicitationAnswerTest {
         required = required,
         options = options,
         format = null,
+        pattern = pattern,
         defaultString = defaultString,
         defaultNumber = defaultNumber,
         defaultBoolean = defaultBoolean,
         defaultList = defaultList,
-        minimum = null,
-        maximum = null,
-        minLength = null,
-        maxLength = null,
-        minItems = null,
-        maxItems = null,
+        minimum = minimum,
+        maximum = maximum,
+        minLength = minLength,
+        maxLength = maxLength,
+        minItems = minItems,
+        maxItems = maxItems,
     )
 
     @Test
@@ -139,5 +147,84 @@ class ElicitationAnswerTest {
         val content = JSONObject(ElicitationAnswer.accept(fields, mapOf("mystery" to "x")))
             .getJSONObject("content")
         assertEquals(0, content.length())
+    }
+
+    /**
+     * Every constraint the agent sends used to be discarded, so a form the
+     * agent would certainly reject was one the user could happily submit —
+     * and the rejection arrived as a turn error rather than beside the field.
+     */
+    @Test
+    fun everyConstraintTheAgentSendsIsChecked() {
+        val fields = listOf(
+            field("depth", "integer", minimum = 1.0, maximum = 9.0),
+            field("ratio", "number"),
+            field("note", "string", minLength = 3, maxLength = 5),
+            field("ref", "string", pattern = "^[a-f0-9]{7}$"),
+            field("tags", "array", minItems = 2),
+        )
+        val errors = ElicitationAnswer.validate(
+            fields,
+            mapOf(
+                "depth" to "12",
+                "ratio" to "not a number",
+                "note" to "ab",
+                "ref" to "zzz",
+                "tags" to listOf("a"),
+            ),
+        )
+        assertEquals("Must be at most 9.", errors["depth"])
+        assertEquals("Must be a number.", errors["ratio"])
+        assertEquals("At least 3 characters.", errors["note"])
+        assertEquals("Not in the expected format.", errors["ref"])
+        assertEquals("Choose at least 2.", errors["tags"])
+    }
+
+    /** An integer field is not a number field: 1.5 is not a whole number. */
+    @Test
+    fun anIntegerFieldRefusesAFraction() {
+        val errors = ElicitationAnswer.validate(
+            listOf(field("depth", "integer")),
+            mapOf("depth" to "1.5"),
+        )
+        assertEquals("Must be a whole number.", errors["depth"])
+    }
+
+    /** A valid form has nothing to say. */
+    @Test
+    fun aFilledInFormValidates() {
+        val fields = listOf(
+            field("depth", "integer", minimum = 1.0, maximum = 9.0),
+            field("note", "string", required = true, minLength = 3),
+            field("tags", "array", minItems = 1),
+        )
+        val errors = ElicitationAnswer.validate(
+            fields,
+            mapOf("depth" to "4", "note" to "fine", "tags" to listOf("a")),
+        )
+        assertTrue(errors.toString(), errors.isEmpty())
+    }
+
+    /**
+     * A pattern this platform's regex engine cannot compile is the agent's
+     * problem, not the user's — it must not lock them out of the form.
+     */
+    @Test
+    fun anUncompilablePatternDoesNotBlockTheForm() {
+        val errors = ElicitationAnswer.validate(
+            listOf(field("ref", "string", pattern = "(?<incomplete")),
+            mapOf("ref" to "anything"),
+        )
+        assertTrue(errors.isEmpty())
+    }
+
+    /** Only what is required is required; an empty optional field is fine. */
+    @Test
+    fun anEmptyOptionalFieldIsNotAnError() {
+        val errors = ElicitationAnswer.validate(
+            listOf(field("note", "string", minLength = 3), field("depth", "integer")),
+            mapOf("note" to "", "depth" to ""),
+        )
+        assertTrue(errors.isEmpty())
     }
 }
