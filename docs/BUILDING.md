@@ -115,6 +115,12 @@ app/build/outputs/apk/full/debug/app-full-x86_64-debug.apk       ← emulators
 app/build/outputs/apk/full/debug/app-full-universal-debug.apk    ← both
 ```
 
+A release therefore ships six APKs — the two editions above, each in
+`arm64-v8a`, `x86_64` and `universal`. When publishing one, use
+`.github/RELEASE_NOTES_TEMPLATE.md` as the release body: it tells users
+which edition and architecture they need, so nobody installs the wrong
+file.
+
 Release builds additionally run R8 (code shrinking + obfuscation) and
 resource shrinking. **The JNI boundary must survive that**: a native
 symbol name encodes the Java class and method it binds to, so
