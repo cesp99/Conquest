@@ -116,10 +116,13 @@ app/build/outputs/apk/full/debug/app-full-universal-debug.apk    ← both
 ```
 
 A release therefore ships six APKs — the two editions above, each in
-`arm64-v8a`, `x86_64` and `universal`. When publishing one, use
-`.github/RELEASE_NOTES_TEMPLATE.md` as the release body: it tells users
-which edition and architecture they need, so nobody installs the wrong
-file.
+`arm64-v8a`, `x86_64` and `universal`. When publishing a release, tag it
+and the `.github/workflows/release.yml` workflow opens a **draft** GitHub
+release whose body explains which edition and architecture a user needs,
+and `app/build/outputs/apk/{full,play}/release/` is where the six signed
+APKs are attached to the draft before publishing. The body always carries
+the "Which APK" section (even with zero merged pull requests), so nobody
+installs the wrong file.
 
 Release builds additionally run R8 (code shrinking + obfuscation) and
 resource shrinking. **The JNI boundary must survive that**: a native

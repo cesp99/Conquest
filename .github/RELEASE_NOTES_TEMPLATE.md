@@ -1,68 +1,32 @@
 # Release notes template
 
 <!--
-How to use: copy everything below the horizontal line into the body of the
-new GitHub release (or `gh release create vX.Y.Z --notes-file …`), attach the
-six release APKs from app/build/outputs/apk/{full,play}/release/, and fill
-the "What's new" section — the "Generate release notes" button does it for
-you, configured by .github/release.yml.
+How to use. Two ways, same single source of truth:
 
-The "Which APK" section is boilerplate: leave it verbatim in every release.
-It exists because a release carries six files and most people only need one.
+  1. Auto (recommended): tag a release and the GitHub Actions workflow
+     `.github/workflows/release.yml` creates a *draft* release whose body
+     is: the "Which APK" section below (loaded from
+     RELEASE_NOTES_PART_APK.md, present in every release even with zero
+     PRs because it is unconditional) + the changelog, when any.
+     Then, on the draft's page: ✏️ edit if you like, 📎 attach the six
+     manually-signed APKs, 🚀 Publish. Push the tag with
+     `git push origin --tags`.
+
+  2. Manual: the workflow's `assemble` step prints the exact path of a
+     pre-assembled `RELEASE_NOTES.md`; feed that file to
+     `gh release create --notes-file RELEASE_NOTES.md --draft`.
+
+The template is intentionally one file: paste/assemble it and the
+section never has to be remembered — PR count (even 0) cannot drop it.
 -->
 
----
-
-## 📥 Which APK should I install?
-
-Every release ships **six APKs**: two editions × three architectures.
-Answer two questions and you know yours.
-
-### 1 · Pick an edition
-
-| | `full` | `play` |
-|---|---|---|
-| Terminal | real Debian — `apt install` works | Android's own shell |
-| Language servers & tools via `apt` | ✅ | ❌ |
-| Available on Google Play | ❌ (impossible by Android's rules, see note) | ✅ |
-
-Everything else — editor, git, themes, agent panel — is identical in both.
-
-- **I want everything this app can do** → `full`
-- **I use Google Play** → nothing to download; Play already serves the `play` edition, and the `play` APKs here are the same build for sideloading
-- **I need a build Play would accept** (modern target SDK, store policies) → `play`
-
-### 2 · Pick an architecture
-
-| APK contains | Install it on |
-|---|---|
-| `arm64-v8a` | virtually every real device — phones, tablets, foldables |
-| `x86_64` | emulators (Android Studio AVD on an Intel/AMD machine) |
-| `universal` | both at once — when in doubt, or `adb install` on an unknown device |
-
-`universal` always works but makes you download both engines (~12 MB more);
-the single-architecture APK is the lean choice when you know yours.
-
-### Cheat sheet
-
-| Your situation | Install |
-|---|---|
-| Real device, full features | `app-full-arm64-v8a-release.apk` |
-| Real device, Play edition | `app-play-arm64-v8a-release.apk` |
-| Emulator, full features | `app-full-x86_64-release.apk` |
-| Emulator, Play edition | `app-play-x86_64-release.apk` |
-| Architecture unknown, full features | `app-full-universal-release.apk` |
-| Architecture unknown, Play edition | `app-play-universal-release.apk` |
-
-> ℹ️ Android may flag the `full` edition as "built for an older version of
-> Android". That is intentional, not a defect: executing programs installed
-> by `apt` is only possible at the older target SDK, which is exactly what
-> makes the Debian userland work. The APK is signed and safe to install.
+{apk-section}
 
 ## ✨ What's new
 
 <!--
-Press "Generate release notes" to fill this from merged PRs (categories
-come from .github/release.yml), and add a one-line summary of the release
-on top if you like.
+Filled from Issue/PR history since the previous tag — merged PRs by
+label via .github/release.yml ("Generate release notes"), or commit
+subjects when there are none. When blank, this heading is the whole
+section and that is fine.
 -->
