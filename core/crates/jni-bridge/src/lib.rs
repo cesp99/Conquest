@@ -1941,6 +1941,71 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpWrittenFile
     to_jstring(&env, engine().acp_written_files(since.max(0) as u64))
 }
 
+/// Reopen one of the agent's own past conversations in a new thread —
+/// `session/load` when the agent can replay the history, `session/resume`
+/// when it can only continue. `session_id` comes from `acpSessionList`.
+/// Errors exactly as `acpStartSession` does.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpResumeSession(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    spec_json: JString,
+    session_id: JString,
+) -> jlong {
+    let spec_json = get_string(&mut env, &spec_json);
+    let session_id = get_string(&mut env, &session_id);
+    match engine().acp_resume_session(project_id as u64, &spec_json, &session_id) {
+        Ok(id) => id as jlong,
+        Err(err) => {
+            log::warn!("acpResumeSession refused: {err}");
+            -1
+        }
+    }
+}
+
+/// The agent's own past conversations — `session/list`, which not every agent
+/// has (`agent.capabilities.list` in `acpSessionState` says). Pass `refresh`
+/// when the user asked for the list; `false` while polling.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpSessionList(
+    env: JNIEnv,
+    _class: JClass,
+    refresh: jboolean,
+) -> jstring {
+    to_jstring(&env, engine().acp_session_list(refresh != JNI_FALSE))
+}
+
+/// Forget one of the agent's past conversations — `session/delete`. False
+/// when the agent has no such method or there is no agent.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpDeleteSession(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_id: JString,
+) -> jboolean {
+    let session_id = get_string(&mut env, &session_id);
+    if engine().acp_delete_session(&session_id) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Sign out of whatever `acpAuthenticate` signed into — `logout`. False when
+/// the agent has no such method or there is no agent.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpLogout(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    if engine().acp_logout() {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
 /// Answer one of the agent's questions — `elicitation/create`, the shape
 /// every ask that is not a permission arrives in. `action_json` is
 /// `{"action":"accept","content":{…}}`, `{"action":"decline"}` or

@@ -233,6 +233,36 @@ impl WrittenFiles {
     }
 }
 
+/// The cached answer to `session/list`.
+///
+/// One in flight at a time, and the version only moves when the answer
+/// actually changes — the panel polls this while the threads view is open,
+/// and a list that reports itself new every 120 ms would rebuild the view
+/// under the reader's finger.
+#[derive(Default)]
+struct SessionList {
+    version: u64,
+    loading: bool,
+    error: Option<String>,
+    /// `SessionInfo` in the protocol's own camelCase, passed through.
+    sessions: serde_json::Value,
+}
+
+impl SessionList {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "version": self.version,
+            "loading": self.loading,
+            "error": self.error,
+            "sessions": if self.sessions.is_null() {
+                serde_json::Value::Array(Vec::new())
+            } else {
+                self.sessions.clone()
+            },
+        })
+    }
+}
+
 /// Where an agent connection is in its life.
 enum InitPhase {
     Starting,
@@ -256,6 +286,49 @@ struct AgentInfo {
     /// when it cannot — the same split Zed makes
     /// (agent_ui/src/message_editor.rs:2150-2161).
     embedded_context: bool,
+    /// The session-lifecycle capabilities, which decide what the panel may
+    /// offer. Every one of these is a method that is an error to call
+    /// unasked, so they gate buttons rather than decorate them.
+    caps: AgentCaps,
+}
+
+/// What the agent said it can do with sessions, from `initialize`.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+struct AgentCaps {
+    /// `session/load`: replay a past session's history into a new thread.
+    load_session: bool,
+    /// `session/resume`: continue a past session *without* its history.
+    /// Zed prefers `load` and falls back to this
+    /// (agent_ui/src/conversation_view.rs:1110-1128).
+    resume: bool,
+    /// `session/list`: what past sessions the agent has kept.
+    list: bool,
+    /// `session/delete`: forget one of them.
+    delete: bool,
+    /// `session/close`: the polite end of a session, rather than a bare
+    /// cancel.
+    close: bool,
+    /// `logout`: sign out of whatever `authenticate` signed into.
+    logout: bool,
+}
+
+impl AgentCaps {
+    fn read(capabilities: &acp::AgentCapabilities) -> Self {
+        AgentCaps {
+            load_session: capabilities.load_session,
+            resume: capabilities.session_capabilities.resume.is_some(),
+            list: capabilities.session_capabilities.list.is_some(),
+            delete: capabilities.session_capabilities.delete.is_some(),
+            close: capabilities.session_capabilities.close.is_some(),
+            logout: capabilities.auth.logout.is_some(),
+        }
+    }
+
+    /// Whether a past session can be opened at all, either way round —
+    /// Zed's `supports_session_history` (acp_thread/src/connection.rs:158).
+    fn can_open_history(&self) -> bool {
+        self.load_session || self.resume
+    }
 }
 
 /// Everything the handlers and worker threads share for one agent process.
@@ -276,7 +349,7 @@ struct AgentShared {
     /// Sessions created before `initialize` answered; drained by the
     /// connection's main task. Guarded by `init`'s lock order: taken only
     /// while `init` is held, so a session cannot fall between the phases.
-    pending_sessions: Mutex<Vec<u64>>,
+    pending_sessions: Mutex<Vec<(u64, Option<String>)>>,
     /// Updates for an acp session id we have not indexed yet — see
     /// [`MAX_EARLY_UPDATES`].
     early_updates: Mutex<Vec<(acp::SessionId, acp::SessionUpdate)>>,
@@ -289,6 +362,11 @@ struct AgentShared {
     terminals: Terminals,
     /// The questions the agent is waiting on — `elicitation/create`.
     elicitations: Elicitations,
+    /// The agent's own past sessions, from `session/list`. A cache behind a
+    /// version counter, polled exactly like everything else the panel reads:
+    /// the request is a round trip to the agent and the threads view opens
+    /// often.
+    session_list: Mutex<SessionList>,
     /// Ask the watcher to take the process down.
     shutdown: AtomicBool,
     /// The process is gone — observed dead, or killed on request.
@@ -322,9 +400,60 @@ impl AgentShared {
             userland,
             terminals: Terminals::default(),
             elicitations: Elicitations::default(),
+            session_list: Mutex::new(SessionList::default()),
             shutdown: AtomicBool::new(false),
             dead: AtomicBool::new(false),
         })
+    }
+
+    /// Ask the agent for its past sessions, unless a request is already out.
+    ///
+    /// Silent when the agent has no `session/list`: the panel gates the view
+    /// on the capability anyway, and an error row for a method that was never
+    /// offered would say the agent is broken when it is merely simpler.
+    fn refresh_session_list(self: &Arc<Self>) {
+        if !self.caps().list {
+            return;
+        }
+        let Some(cx) = self.connection() else {
+            return;
+        };
+        {
+            let mut list = self.session_list.lock().unwrap();
+            if list.loading {
+                return;
+            }
+            list.loading = true;
+            list.version += 1;
+        }
+        let task_shared = self.clone();
+        let task_cx = cx.clone();
+        let _ = cx.spawn(async move {
+            let result = task_cx
+                .send_request(acp::ListSessionsRequest::new())
+                .block_task()
+                .await;
+            let mut list = task_shared.session_list.lock().unwrap();
+            list.loading = false;
+            list.version += 1;
+            match result {
+                Ok(response) => {
+                    list.error = None;
+                    list.sessions =
+                        serde_json::to_value(&response.sessions).unwrap_or(serde_json::Value::Null);
+                    // `nextCursor` is deliberately not followed. The panel
+                    // shows recent conversations, not an archive, and a
+                    // cursor loop against an agent with thousands of them is
+                    // a lot of round trips for a list nobody scrolls to the
+                    // end of.
+                }
+                Err(err) => {
+                    log::warn!("acp: session/list failed: {err}");
+                    list.error = Some(format!("{err}"));
+                }
+            }
+            Ok(())
+        });
     }
 
     fn connection(&self) -> Option<ConnectionTo<Agent>> {
@@ -333,6 +462,16 @@ impl AgentShared {
 
     fn initialized(&self) -> bool {
         !matches!(*self.init.lock().unwrap(), InitPhase::Starting)
+    }
+
+    /// What the agent said it can do with sessions. All false until
+    /// `initialize` has answered, which is the safe default: every one of
+    /// these gates a method that is an error to call unasked.
+    fn caps(&self) -> AgentCaps {
+        match &*self.init.lock().unwrap() {
+            InitPhase::Ready(info) => info.caps,
+            _ => AgentCaps::default(),
+        }
     }
 
     fn supports_embedded_context(&self) -> bool {
@@ -1062,6 +1201,18 @@ fn start_agent(
     true
 }
 
+/// Map an agent's session id onto ours. Idempotent, so the load path can
+/// call it before the request and the common path after the response.
+fn index_session(shared: &AgentShared, acp_id: &acp::SessionId, our_id: u64) {
+    if let Some(displaced) = shared.index.lock().unwrap().insert(acp_id.clone(), our_id)
+        && displaced != our_id
+    {
+        // The protocol requires unique session ids; an agent that reuses one
+        // has just stolen the older session's updates.
+        log::warn!("acp: agent reused session id {acp_id:?}; session {displaced} loses it");
+    }
+}
+
 /// The session an elicitation's scope names, if it names one.
 fn scope_session(scope: &acp::ElicitationScope) -> Option<acp::SessionId> {
     match scope {
@@ -1290,6 +1441,7 @@ async fn agent_main(shared: Arc<AgentShared>, cx: ConnectionTo<Agent>) -> Result
             .agent_capabilities
             .prompt_capabilities
             .embedded_context,
+        caps: AgentCaps::read(&response.agent_capabilities),
     };
     log::info!(
         "acp: \"{}\" initialized (agent {:?} {:?})",
@@ -1299,16 +1451,16 @@ async fn agent_main(shared: Arc<AgentShared>, cx: ConnectionTo<Agent>) -> Result
     );
     // Ready first, then drain: a session arriving between the two lands in
     // neither limbo — `acp_start_session` checks the phase under this lock.
-    let pending: Vec<u64> = {
+    let pending: Vec<(u64, Option<String>)> = {
         let mut init = shared.init.lock().unwrap();
         *init = InitPhase::Ready(info);
         shared.pending_sessions.lock().unwrap().drain(..).collect()
     };
-    for id in pending {
+    for (id, resume) in pending {
         let task_shared = shared.clone();
         let task_cx = cx.clone();
         let _ = cx.spawn(async move {
-            create_session(task_shared, task_cx, id).await;
+            create_session(task_shared, task_cx, id, resume).await;
             Ok(())
         });
     }
@@ -1329,34 +1481,75 @@ fn fail_startup(shared: &AgentShared, message: String) {
 
 /// Ask the agent for a session and wire the answer up. Runs as a task on the
 /// connection's event loop.
-async fn create_session(shared: Arc<AgentShared>, cx: ConnectionTo<Agent>, our_id: u64) {
+/// Ask the agent for a session and wire the answer up.
+///
+/// `resume` names a session the agent already has, in which case this is
+/// `session/load` — which replays the whole conversation back at us as
+/// ordinary `session/update`s, so the thread fills in on its own — or
+/// `session/resume`, which continues it with no history at all. Zed prefers
+/// load and falls back to resume (agent_ui/src/conversation_view.rs:1110-1128)
+/// for the same reason: an agent that can give the history back should.
+async fn create_session(
+    shared: Arc<AgentShared>,
+    cx: ConnectionTo<Agent>,
+    our_id: u64,
+    resume: Option<String>,
+) {
     let Some(handle) = shared.session(our_id) else {
         return;
     };
     let root = handle.thread.lock().unwrap().root.clone();
-    let result = cx
-        .send_request(acp::NewSessionRequest::new(root))
-        .block_task()
-        .await;
+    let caps = shared.caps();
+    let result = match resume {
+        Some(id) if caps.load_session => {
+            let id = acp::SessionId::new(id);
+            // Indexed *before* the request: `session/load` replays the
+            // history as updates, and an agent that starts replaying before
+            // its own response lands would otherwise be talking about a
+            // session we have not mapped yet. The id is the one we asked
+            // for, so there is nothing to wait for.
+            index_session(&shared, &id, our_id);
+            cx.send_request(acp::LoadSessionRequest::new(id.clone(), root))
+                .block_task()
+                .await
+                .map(|response: acp::LoadSessionResponse| {
+                    (id, response.modes, response.config_options)
+                })
+        }
+        Some(id) if caps.resume => {
+            let id = acp::SessionId::new(id);
+            index_session(&shared, &id, our_id);
+            cx.send_request(acp::ResumeSessionRequest::new(id.clone(), root))
+                .block_task()
+                .await
+                .map(|response: acp::ResumeSessionResponse| {
+                    (id, response.modes, response.config_options)
+                })
+        }
+        Some(_) => {
+            handle.update(|thread| {
+                thread.fail("this agent cannot reopen a past conversation".to_owned())
+            });
+            return;
+        }
+        None => cx
+            .send_request(acp::NewSessionRequest::new(root))
+            .block_task()
+            .await
+            .map(|response: acp::NewSessionResponse| {
+                (response.session_id, response.modes, response.config_options)
+            }),
+    };
     // The session may have been closed while `session/new` was in flight;
     // indexing it then would leave a mapping nothing can ever reach.
     if shared.session(our_id).is_none() {
         return;
     }
     match result {
-        Ok(response) => {
-            let acp_id = response.session_id.clone();
-            if let Some(displaced) = shared.index.lock().unwrap().insert(acp_id.clone(), our_id) {
-                // The protocol requires unique session ids; an agent that
-                // reuses one has just stolen the older session's updates.
-                log::warn!("acp: agent reused session id {acp_id:?}; session {displaced} loses it");
-            }
+        Ok((acp_id, modes, config_options)) => {
+            index_session(&shared, &acp_id, our_id);
             handle.update(|thread| {
-                thread.ready(
-                    acp_id.clone(),
-                    response.modes,
-                    response.config_options.unwrap_or_default(),
-                )
+                thread.ready(acp_id.clone(), modes, config_options.unwrap_or_default())
             });
             // Updates that raced the response are still in arrival order.
             let early: Vec<acp::SessionUpdate> = {
@@ -1550,6 +1743,35 @@ impl crate::Engine {
     /// path for "here is what went wrong" and never a second kind of failure
     /// to render.
     pub fn acp_start_session(&self, project: ProjectId, spec_json: &str) -> Result<u64, String> {
+        self.start_session(project, spec_json, None)
+    }
+
+    /// Reopen one of the agent's own past sessions in a new thread.
+    ///
+    /// `acp_session_id` is a `sessionId` from [`Self::acp_session_list`]. The
+    /// agent decides what that means: with `loadSession` it replays the whole
+    /// conversation back as `session/update`s and the transcript fills in on
+    /// its own; with only `session/resume` it continues the conversation with
+    /// no history, which is why the panel says so. Errors exactly as
+    /// [`Self::acp_start_session`] does.
+    pub fn acp_resume_session(
+        &self,
+        project: ProjectId,
+        spec_json: &str,
+        acp_session_id: &str,
+    ) -> Result<u64, String> {
+        if acp_session_id.is_empty() {
+            return Err("no session to reopen".to_owned());
+        }
+        self.start_session(project, spec_json, Some(acp_session_id.to_owned()))
+    }
+
+    fn start_session(
+        &self,
+        project: ProjectId,
+        spec_json: &str,
+        resume: Option<String>,
+    ) -> Result<u64, String> {
         let spec: AgentSpec =
             serde_json::from_str(spec_json).map_err(|err| format!("bad agent spec: {err}"))?;
         if spec.argv.is_empty() {
@@ -1635,13 +1857,18 @@ impl crate::Engine {
         // init lock so it cannot fall between the two.
         let init = shared.init.lock().unwrap();
         match &*init {
-            InitPhase::Starting => shared.pending_sessions.lock().unwrap().push(id),
+            InitPhase::Starting => shared
+                .pending_sessions
+                .lock()
+                .unwrap()
+                .push((id, resume.clone())),
             InitPhase::Ready(_) => match shared.connection() {
                 Some(cx) => {
                     let task_shared = shared.clone();
                     let task_cx = cx.clone();
+                    let resume = resume.clone();
                     let _ = cx.spawn(async move {
-                        create_session(task_shared, task_cx, id).await;
+                        create_session(task_shared, task_cx, id, resume).await;
                         Ok(())
                     });
                 }
@@ -1701,6 +1928,10 @@ impl crate::Engine {
                         "agent_name": info.agent_name,
                         "agent_version": info.agent_version,
                         "auth_methods": info.auth_methods,
+                        // Every one of these is a method it is an error to
+                        // call unasked, so they gate the panel's buttons.
+                        "capabilities": info.caps,
+                        "canOpenHistory": info.caps.can_open_history(),
                     }),
                     InitPhase::Starting => serde_json::json!({"starting": true}),
                     InitPhase::Failed(message) => serde_json::json!({"error": message}),
@@ -2031,7 +2262,9 @@ impl crate::Engine {
                         .map(|(id, _)| id)
                         .collect();
                     for id in waiting {
-                        create_session(task_shared.clone(), task_cx.clone(), id).await;
+                        // A retry after signing in is a fresh session: the
+                        // one that failed never existed on the agent's side.
+                        create_session(task_shared.clone(), task_cx.clone(), id, None).await;
                     }
                 }
                 Err(err) => {
@@ -2077,9 +2310,24 @@ impl crate::Engine {
             // And every question it had open, answered `cancel`: a responder
             // dropped without an answer is an agent waiting for ever.
             shared.elicitations.cancel_session(session);
-            // Tell the agent the turn is over, so it stops spending tokens.
+            // Tell the agent it is over. `session/close` is the method for
+            // exactly this and is what Zed sends (agent_servers/src/acp.rs
+            // :1845-1878) — but it is gated on a capability, so an agent
+            // without it gets the cancel that has always been sent instead:
+            // either way the turn stops and it stops spending tokens.
             if let (Some(acp_id), Some(cx)) = (acp_id, shared.connection()) {
-                let _ = cx.send_notification(acp::CancelNotification::new(acp_id));
+                if shared.caps().close {
+                    let request = acp::CloseSessionRequest::new(acp_id);
+                    let task_cx = cx.clone();
+                    let _ = cx.spawn(async move {
+                        if let Err(err) = task_cx.send_request(request).block_task().await {
+                            log::warn!("acp: session/close failed: {err}");
+                        }
+                        Ok(())
+                    });
+                } else {
+                    let _ = cx.send_notification(acp::CancelNotification::new(acp_id));
+                }
             }
             // Only *its* sessions: the map may still hold sessions of an agent
             // being replaced, and those are not a reason to keep this one
@@ -2089,6 +2337,93 @@ impl crate::Engine {
                 *slot = None;
             }
         }
+        true
+    }
+
+    /// The agent's own past conversations — `session/list`, which not every
+    /// agent has (`agent.capabilities.list` says).
+    ///
+    /// `{"version", "loading", "error", "sessions": [{sessionId, cwd, title,
+    /// updatedAt, …}]}`, the session objects in the protocol's own camelCase.
+    /// Pass `refresh` when the user asked for the list — opening the threads
+    /// view, or after a delete — and `false` while polling: a refresh is a
+    /// round trip to the agent, and the answer is cached behind `version` the
+    /// way every other read here is.
+    pub fn acp_session_list(&self, refresh: bool) -> String {
+        let shared = self.acp.agent.lock().unwrap().clone();
+        let Some(shared) = shared else {
+            return serde_json::json!({
+                "version": 0, "loading": false, "error": null, "sessions": []
+            })
+            .to_string();
+        };
+        if refresh {
+            shared.refresh_session_list();
+        }
+        shared.session_list.lock().unwrap().json().to_string()
+    }
+
+    /// Forget one of the agent's past conversations — `session/delete`, when
+    /// the agent has it. The list refreshes itself afterwards, so the row
+    /// goes on the next poll rather than on a guess.
+    pub fn acp_delete_session(&self, acp_session_id: &str) -> bool {
+        let shared = self.acp.agent.lock().unwrap().clone();
+        let Some(shared) = shared else {
+            return false;
+        };
+        if !shared.caps().delete {
+            return false;
+        }
+        let Some(cx) = shared.connection() else {
+            return false;
+        };
+        let request =
+            acp::DeleteSessionRequest::new(acp::SessionId::new(acp_session_id.to_owned()));
+        let task_shared = shared.clone();
+        let task_cx = cx.clone();
+        let _ = cx.spawn(async move {
+            match task_cx.send_request(request).block_task().await {
+                Ok(_) => task_shared.refresh_session_list(),
+                Err(err) => {
+                    log::warn!("acp: session/delete failed: {err}");
+                    let mut list = task_shared.session_list.lock().unwrap();
+                    list.error = Some(format!("{err}"));
+                    list.version += 1;
+                }
+            }
+            Ok(())
+        });
+        true
+    }
+
+    /// Sign out of whatever `authenticate` signed into — `logout`, when the
+    /// agent has it (`agent.capabilities.logout`).
+    ///
+    /// Deliberately does not tear the sessions down: the agent decides what
+    /// signing out means for a conversation in flight, and the next thing it
+    /// refuses will come back through the ordinary auth-required path.
+    pub fn acp_logout(&self) -> bool {
+        let shared = self.acp.agent.lock().unwrap().clone();
+        let Some(shared) = shared else {
+            return false;
+        };
+        if !shared.caps().logout {
+            return false;
+        }
+        let Some(cx) = shared.connection() else {
+            return false;
+        };
+        let task_cx = cx.clone();
+        let _ = cx.spawn(async move {
+            if let Err(err) = task_cx
+                .send_request(acp::LogoutRequest::new())
+                .block_task()
+                .await
+            {
+                log::warn!("acp: logout failed: {err}");
+            }
+            Ok(())
+        });
         true
     }
 
@@ -2668,7 +3003,7 @@ mod tests {
             SessionThread::new(1, root.to_path_buf()),
         ));
         sessions.lock().unwrap().insert(7, handle.clone());
-        shared.pending_sessions.lock().unwrap().push(7);
+        shared.pending_sessions.lock().unwrap().push((7, None));
 
         let (client_transport, agent_transport) = transport_pair();
         let file = agent_file.to_path_buf();
@@ -2939,7 +3274,7 @@ mod tests {
             SessionThread::new(1, dir.path().to_path_buf()),
         ));
         sessions.lock().unwrap().insert(1, handle.clone());
-        shared.pending_sessions.lock().unwrap().push(1);
+        shared.pending_sessions.lock().unwrap().push((1, None));
 
         assert!(start_agent(shared.clone(), userland, &spec, dir.path()));
         assert_eq!(
@@ -3141,7 +3476,7 @@ mod tests {
             SessionThread::new(1, project.clone()),
         ));
         sessions.lock().unwrap().insert(1, handle.clone());
-        shared.pending_sessions.lock().unwrap().push(1);
+        shared.pending_sessions.lock().unwrap().push((1, None));
         assert!(start_agent(shared.clone(), userland, &spec, &project));
 
         // initialize and session/new run over the real pipes; fake_proot does
@@ -3503,6 +3838,76 @@ mod tests {
             let thread = handle.thread.lock().unwrap();
             assert!(last_reply(&thread).contains("Signed in"));
         }
+
+        // ---- the session lifecycle: list, load, delete ---------------------
+        //
+        // These four methods are the difference between threads that live as
+        // long as the agent process and threads the agent itself remembers.
+        assert!(shared.caps().list && shared.caps().load_session && shared.caps().delete);
+        shared.refresh_session_list();
+        wait_for("the session list", || {
+            let list = shared.session_list.lock().unwrap();
+            !list.loading && list.sessions.as_array().is_some_and(|s| !s.is_empty())
+        });
+        let listed = {
+            let list = shared.session_list.lock().unwrap();
+            assert_eq!(list.error, None);
+            list.sessions.clone()
+        };
+        let past_id = listed[0]["sessionId"].as_str().unwrap().to_owned();
+        assert_eq!(listed[0]["title"], "Conformance conversation");
+
+        // Reopen it as a *second* thread. `session/load` replays the
+        // conversation as ordinary updates, so the new thread fills itself in
+        // — that is what distinguishes it from `session/resume`.
+        let second = Arc::new(SessionHandle::new(
+            shared.id,
+            SessionThread::new(1, project.clone()),
+        ));
+        sessions.lock().unwrap().insert(2, second.clone());
+        futures::executor::block_on(create_session(
+            shared.clone(),
+            cx.clone(),
+            2,
+            Some(past_id.clone()),
+        ));
+        {
+            let thread = second.thread.lock().unwrap();
+            assert_eq!(thread.phase, Phase::Ready);
+            // One entry, not many: the replayed chunks are consecutive agent
+            // messages and the state machine merges those, exactly as it does
+            // live. What proves the replay happened is what is *in* it.
+            let replayed = last_reply(&thread);
+            assert!(
+                replayed.contains("Done — `notes.md` updated."),
+                "the first turn came back: {replayed}"
+            );
+            assert!(
+                replayed.contains("Signed in"),
+                "and the last one: {replayed}"
+            );
+        }
+
+        // And forgetting one takes it off the list.
+        assert!(shared.caps().delete);
+        {
+            let request = acp::DeleteSessionRequest::new(acp::SessionId::new(past_id));
+            let task_shared = shared.clone();
+            let task_cx = cx.clone();
+            let _ = cx.spawn(async move {
+                let _ = task_cx.send_request(request).block_task().await;
+                task_shared.refresh_session_list();
+                Ok(())
+            });
+        }
+        wait_for("the deleted session to go", || {
+            let list = shared.session_list.lock().unwrap();
+            !list.loading
+                && list
+                    .sessions
+                    .as_array()
+                    .is_some_and(|sessions| sessions.len() == 1)
+        });
 
         // ---- shutdown: EOF on its stdin is how the python process learns ---
         shutdown_agent(&shared);

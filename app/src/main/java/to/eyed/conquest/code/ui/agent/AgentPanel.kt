@@ -67,7 +67,9 @@ import org.json.JSONArray
 import to.eyed.conquest.code.core.AgentCommand
 import to.eyed.conquest.code.core.AgentConversation
 import to.eyed.conquest.code.core.AgentDefinition
+import to.eyed.conquest.code.core.AgentCapabilities
 import to.eyed.conquest.code.core.AgentElicitation
+import to.eyed.conquest.code.core.AgentPastSession
 import to.eyed.conquest.code.core.AgentEntry
 import to.eyed.conquest.code.core.AgentThread
 import to.eyed.conquest.code.core.AgentPhase
@@ -86,6 +88,7 @@ import to.eyed.conquest.code.core.ProjectSummary
 import to.eyed.conquest.code.core.ToolCallStatus
 import to.eyed.conquest.code.core.ToolKind
 import to.eyed.conquest.code.core.rememberAgentSession
+import to.eyed.conquest.code.core.rememberAgentSessionList
 import to.eyed.conquest.code.core.rememberAgentTerminal
 import to.eyed.conquest.code.terminal.Userland
 import to.eyed.conquest.code.ui.theme.BufferFontFamily
@@ -182,6 +185,7 @@ fun AgentPanel(
     val theme = LocalZedTheme.current
     val settings = LocalAppSettings.current
     val composer = remember { FocusRequester() }
+    val panelScope = rememberCoroutineScope()
 
     val agent = AgentSessions.agent
     val activeThread = AgentSessions.active
@@ -217,6 +221,15 @@ fun AgentPanel(
             thread = activeThread,
             showingThreads = showThreads,
             onChangeAgent = { AgentSessions.reset() },
+            onSignOut = {
+                // Deliberately does not end the open threads: what signing
+                // out means for a conversation in flight is the agent's call,
+                // and the next thing it refuses arrives through the ordinary
+                // "needs signing in" path the panel already draws.
+                panelScope.launch {
+                    withContext(Dispatchers.Default) { CoreBridge.acpLogout() }
+                }
+            },
             onNewThread = {
                 // Re-resolved by name first: settings.json may have been
                 // edited since this definition was captured, and "+" should
@@ -254,11 +267,16 @@ fun AgentPanel(
             // (agent_ui/src/threads_archive_view.rs).
             showThreads -> ThreadsView(
                 currentProject = project,
+                capabilities = state.agent?.capabilities ?: AgentCapabilities(),
                 onSelect = { thread ->
                     AgentSessions.select(thread)
                     showThreads = false
                 },
                 onClose = { thread -> AgentSessions.closeThread(thread) },
+                onReopen = { past ->
+                    AgentSessions.resumeThread(project.id, project.rootName, past.sessionId)
+                    showThreads = false
+                },
                 onNewThread = {
                     AgentSessions.newThread(project.id, project.rootName)
                     showThreads = false
@@ -326,6 +344,7 @@ private fun AgentBar(
     thread: AgentThread?,
     showingThreads: Boolean,
     onChangeAgent: () -> Unit,
+    onSignOut: () -> Unit,
     onNewThread: () -> Unit,
     onToggleThreads: () -> Unit,
 ) {
@@ -367,7 +386,17 @@ private fun AgentBar(
             // (agent_panel.rs — the panel toolbar). Words, at this size.
             BarAction("+ New", onNewThread)
             BarAction(if (showingThreads) "Back" else "Threads", onToggleThreads)
-            BarAction("Change", onChangeAgent)
+            // A menu rather than a fourth word: the bar is 32px on a phone,
+            // and everything in it is about *which agent this is*.
+            SelectorChip(
+                label = "Agent",
+                items = buildList {
+                    add(ContextMenuItem("Change agent…", onClick = onChangeAgent))
+                    if (state.agent?.capabilities?.logout == true) {
+                        add(ContextMenuItem("Sign out", onClick = onSignOut))
+                    }
+                },
+            )
         }
     }
 }
@@ -508,17 +537,25 @@ private fun AgentChoice(agent: AgentDefinition, onClick: () -> Unit) {
 @Composable
 private fun ThreadsView(
     currentProject: ProjectSession,
+    /** What the agent said it can do, so history is offered only when it exists. */
+    capabilities: AgentCapabilities,
     onSelect: (AgentThread) -> Unit,
     onClose: (AgentThread) -> Unit,
     onNewThread: () -> Unit,
+    onReopen: (AgentPastSession) -> Unit,
 ) {
     val theme = LocalZedTheme.current
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var query by remember { mutableStateOf("") }
     var projects by remember { mutableStateOf(emptyList<ProjectSummary>()) }
     LaunchedEffect(Unit) {
         projects = withContext(Dispatchers.IO) { ProjectsRoot.list(context) }
     }
+    // Bumped after a delete, which is what asks for a fresh `session/list`
+    // rather than another read of the same cache.
+    var refreshToken by remember { mutableStateOf(0) }
+    val history = rememberAgentSessionList(capabilities.hasHistory, refreshToken)
 
     Column(
         modifier = Modifier
@@ -598,6 +635,118 @@ private fun ThreadsView(
                 // The `+` in the bar, for a finger scrolling the list.
                 BarAction("+ New Thread", onNewThread)
             }
+        }
+
+        // The agent's own memory, which is a different thing from the threads
+        // above: those are conversations this app is holding open, these are
+        // ones the agent kept and can hand back. Only shown when it says it
+        // can both list and reopen them — `session/list` without
+        // `session/load` or `session/resume` is a list of rows that do
+        // nothing.
+        if (capabilities.hasHistory) {
+            HorizontalDivider(
+                color = theme.color("border"),
+                modifier = Modifier.padding(vertical = 8.dp),
+            )
+            Text(
+                text = "Kept by the agent",
+                style = MaterialTheme.typography.bodyMedium,
+                color = theme.color("text"),
+            )
+            if (!capabilities.loadSession) {
+                Text(
+                    text = "This agent reopens a conversation without its transcript.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = theme.color("text.muted"),
+                )
+            }
+            val past = history.sessions.filter {
+                query.isBlank() || it.label.contains(query, ignoreCase = true)
+            }
+            when {
+                history.error != null -> Notice(history.error, isError = true)
+                past.isEmpty() && history.loading -> Text(
+                    text = "Asking the agent…",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = theme.color("text.muted"),
+                    modifier = Modifier.padding(start = 10.dp),
+                )
+                past.isEmpty() -> Text(
+                    text = "Nothing kept",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = theme.color("text.muted"),
+                    modifier = Modifier.padding(start = 10.dp),
+                )
+                else -> for (session in past) {
+                    PastSessionRow(
+                        session = session,
+                        canDelete = capabilities.delete,
+                        onOpen = { onReopen(session) },
+                        onDelete = {
+                            scope.launch {
+                                withContext(Dispatchers.Default) {
+                                    CoreBridge.acpDeleteSession(session.sessionId)
+                                }
+                                // The engine refreshes the list itself when
+                                // the delete lands; this asks the poller to
+                                // stop coasting on the cache it has.
+                                refreshToken++
+                            }
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** One of the agent's own past conversations, in the threads view. */
+@Composable
+private fun PastSessionRow(
+    session: AgentPastSession,
+    canDelete: Boolean,
+    onOpen: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(4.dp))
+            .background(
+                if (hovered) theme.color("element.hover", Color.Transparent) else Color.Transparent,
+            )
+            .pointerHoverIcon(PointerIcon.Hand)
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                onClickLabel = session.label,
+                onClick = onOpen,
+            )
+            .padding(start = RowStartPadding, end = 4.dp, top = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            text = session.label,
+            style = MaterialTheme.typography.bodySmall,
+            color = theme.color("text"),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        session.updatedAt?.take(10)?.let { day ->
+            Text(
+                text = day,
+                style = MaterialTheme.typography.labelSmall,
+                color = theme.color("text.muted"),
+                maxLines = 1,
+            )
+        }
+        if (canDelete) {
+            BarAction("Forget", onDelete)
         }
     }
 }

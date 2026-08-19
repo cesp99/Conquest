@@ -227,6 +227,14 @@ can see where threads would live. Tap a thread to return to it — its whole
 transcript is kept — and **Close** to end it. Threads live with the agent
 process: they survive the panel closing, not the app.
 
+**What the agent itself remembers.** Some agents keep their conversations on
+their own side. When yours does, the Threads view has a *Kept by the agent*
+section under your own threads: tap one to reopen it — with its transcript
+where the agent can replay it, without where it can only continue — and
+**Forget** to delete it for good. Agents that keep nothing simply have no such
+section. **Agent** in the bar changes which agent you are talking to, and
+signs out of one that supports it.
+
 **The composer speaks the protocol.** Type `/` at the start for the agent's
 own slash commands (it advertises them; the strip completes them), and `@`
 anywhere for a file mention — the file travels with the prompt as context,

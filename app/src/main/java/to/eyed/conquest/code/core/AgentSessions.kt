@@ -22,6 +22,14 @@ class AgentThread internal constructor(
     val projectName: String,
     /** Creation order, newest last — the list shows newest first. */
     val ordinal: Int,
+    /**
+     * Whether this thread was reopened from the agent's own history rather
+     * than started fresh. Worth saying in the list, because an agent that
+     * could only `session/resume` gave the conversation back *without* its
+     * transcript: the thread is genuinely a continuation of something the
+     * panel cannot show.
+     */
+    val isReopened: Boolean = false,
 ) {
     /**
      * The agent's own name for the conversation, once it sends one
@@ -154,6 +162,22 @@ object AgentSessions {
      * the one showing; the others stay live in [threads].
      */
     fun newThread(project: Long, projectName: String) {
+        startThread(project, projectName, null)
+    }
+
+    /**
+     * Reopen one of the agent's *own* past conversations as a thread —
+     * `session/load` where the agent can replay the history, `session/resume`
+     * where it can only continue.
+     *
+     * Only offered when `agent.capabilities.hasHistory` says both halves are
+     * there; the panel gates the view on that.
+     */
+    fun resumeThread(project: Long, projectName: String, pastSessionId: String) {
+        startThread(project, projectName, pastSessionId)
+    }
+
+    private fun startThread(project: Long, projectName: String, resume: String?) {
         val agent = agent ?: return
         // A start already in flight is **superseded, never ignored**. It used
         // to `return` here without bumping the generation, so a project
@@ -179,11 +203,16 @@ object AgentSessions {
             // Blocking: it spawns proot and the agent behind it. Anything that
             // throws out of the bridge — a JNI failure — must leave the panel
             // saying so rather than stuck on "starting" for ever.
-            val id = runCatching { CoreBridge.acpStartSession(project, spec) }
-                .getOrElse { error ->
-                    Log.e(TAG, "could not start an agent session", error)
-                    -1L
+            val id = runCatching {
+                if (resume == null) {
+                    CoreBridge.acpStartSession(project, spec)
+                } else {
+                    CoreBridge.acpResumeSession(project, spec, resume)
                 }
+            }.getOrElse { error ->
+                Log.e(TAG, "could not start an agent session", error)
+                -1L
+            }
             if (generation != mine) {
                 // Abandoned while we were spawning: this session belongs to
                 // nobody, so close it rather than leak the process behind it.
@@ -195,7 +224,7 @@ object AgentSessions {
                 isStarting = false
                 return@launch
             }
-            val thread = AgentThread(id, project, projectName, nextOrdinal++)
+            val thread = AgentThread(id, project, projectName, nextOrdinal++, resume != null)
             threads.add(thread)
             active = thread
             isStarting = false

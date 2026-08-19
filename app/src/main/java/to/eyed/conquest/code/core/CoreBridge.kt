@@ -797,6 +797,44 @@ object CoreBridge {
     external fun acpStartSession(projectId: Long, specJson: String): Long
 
     /**
+     * Reopens one of the agent's *own* past conversations as a new thread.
+     *
+     * [sessionId] is a `sessionId` from [acpSessionList]. What reopening means
+     * is the agent's to decide: one that supports `session/load` replays the
+     * whole conversation back as updates, so the transcript fills in by
+     * itself; one that only supports `session/resume` continues it with no
+     * history at all. `agent.capabilities` in [acpSessionState] says which,
+     * and `canOpenHistory` says whether either is possible.
+     *
+     * **Blocking** — it may spawn a process. Call it off the main thread.
+     */
+    external fun acpResumeSession(projectId: Long, specJson: String, sessionId: String): Long
+
+    /**
+     * The agent's own past conversations — `session/list`.
+     *
+     * `{"version", "loading", "error", "sessions": [{sessionId, cwd, title,
+     * updatedAt, …}]}`, the session objects in the protocol's own camelCase.
+     * Poll it with `refresh = false` and pass `refresh = true` only when the
+     * user asked — opening the threads view, or after a delete — because a
+     * refresh is a round trip to the agent. Empty for an agent whose
+     * `capabilities.list` is false; the view is gated on that.
+     */
+    external fun acpSessionList(refresh: Boolean): String
+
+    /** Forgets one of the agent's past conversations — `session/delete`. */
+    external fun acpDeleteSession(sessionId: String): Boolean
+
+    /**
+     * Signs out of whatever [acpAuthenticate] signed into — `logout`.
+     *
+     * Does not end the open sessions: what signing out means for a
+     * conversation in flight is the agent's call, and the next thing it
+     * refuses arrives through the ordinary `needsAuth` path.
+     */
+    external fun acpLogout(): Boolean
+
+    /**
      * Generation counter for a session; it moves whenever anything about the
      * conversation does. 0 means one thing only: an id the engine has
      * forgotten. Poll it exactly like [projectSearchVersion].

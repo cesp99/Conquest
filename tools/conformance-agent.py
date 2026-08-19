@@ -104,7 +104,11 @@ class Agent:
         """The state for `session_id`, created on first sight."""
         return self.state.setdefault(
             session_id,
-            {"cwd": os.getcwd(), "model": "conf-one", "verbose": False},
+            # `history` is what makes `session/load` possible: an agent that
+            # kept nothing would have nothing to replay, and a client that
+            # never checks would look identical either way.
+            {"cwd": os.getcwd(), "model": "conf-one", "verbose": False,
+             "history": [], "title": None, "closed": False},
         )
 
     def can(self, *path):
@@ -158,10 +162,14 @@ class Agent:
     def chunk(self, session_id, kind, text):
         if self.cancelled:
             raise Cancelled()
-        self.update(session_id, {
-            "sessionUpdate": kind,
-            "content": {"type": "text", "text": text},
-        })
+        update = {"sessionUpdate": kind, "content": {"type": "text", "text": text}}
+        # Remembered so `session/load` has something to replay. Only the
+        # message-shaped updates: a plan or a tool call belongs to the turn
+        # that produced it, and replaying a permission request would ask the
+        # user to allow a write that happened days ago.
+        if kind in ("user_message_chunk", "agent_message_chunk"):
+            self.session(session_id)["history"].append(update)
+        self.update(session_id, update)
         time.sleep(CHUNK_PAUSE_SECONDS)
 
     def plan(self, session_id, *entries):
@@ -234,7 +242,17 @@ class Agent:
                 "id": request_id,
                 "result": {
                     "protocolVersion": 1,
-                    "agentCapabilities": {},
+                    # The whole session lifecycle, so a client that implements
+                    # only `session/new` has somewhere to be caught out. Each
+                    # of these is "present means yes"; `{}` is the
+                    # affirmative.
+                    "agentCapabilities": {
+                        "loadSession": True,
+                        "sessionCapabilities": {
+                            "list": {}, "delete": {}, "close": {}, "resume": {},
+                        },
+                        "auth": {"logout": {}},
+                    },
                     "authMethods": [],
                     "agentInfo": {"name": "conformance-agent", "version": "1.0.0"},
                 },
@@ -286,6 +304,44 @@ class Agent:
                 state["model"] = value
             elif config == "verbose":
                 state["verbose"] = bool(value)
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"configOptions": self.config_options(session_id)}})
+        elif method == "session/list":
+            listed = [
+                {"sessionId": sid,
+                 "cwd": state["cwd"],
+                 "title": state["title"] or "Conformance conversation",
+                 "updatedAt": "2026-08-19T00:00:00Z"}
+                for sid, state in sorted(self.state.items())
+                if not state["closed"]
+            ]
+            send({"jsonrpc": "2.0", "id": request_id, "result": {"sessions": listed}})
+        elif method == "session/delete":
+            self.state.pop(params.get("sessionId"), None)
+            send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+        elif method == "session/close":
+            state = self.state.get(params.get("sessionId"))
+            if state is not None:
+                state["closed"] = True
+            send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+        elif method == "logout":
+            log("logged out")
+            send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+        elif method in ("session/load", "session/resume"):
+            session_id = params.get("sessionId")
+            state = self.state.get(session_id)
+            if state is None:
+                send({"jsonrpc": "2.0", "id": request_id,
+                      "error": {"code": -32602, "message": "no such session"}})
+                return
+            state["closed"] = False
+            # `session/load` replays the conversation as ordinary updates
+            # *before* it answers; `session/resume` does not. That is the
+            # whole difference between them, and a client that treats them
+            # alike would show an empty transcript for one of the two.
+            if method == "session/load":
+                for update in state["history"]:
+                    self.update(session_id, update)
             send({"jsonrpc": "2.0", "id": request_id,
                   "result": {"configOptions": self.config_options(session_id)}})
         elif method == "session/prompt":

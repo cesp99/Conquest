@@ -585,7 +585,96 @@ data class AgentInfo(
     val starting: Boolean,
     /** It will not start, and this is why. */
     val error: String?,
+    /**
+     * What it said it can do with sessions, at `initialize`.
+     *
+     * Every one of these is a method it is an error to call unasked, so they
+     * gate buttons rather than decorate them: an agent that keeps no history
+     * must not be offered a history view.
+     */
+    val capabilities: AgentCapabilities,
 )
+
+/** The session-lifecycle methods an agent has; all false until it says. */
+data class AgentCapabilities(
+    /** `session/load` — reopen a past conversation *with* its history. */
+    val loadSession: Boolean = false,
+    /** `session/resume` — reopen one without its history. */
+    val resume: Boolean = false,
+    /** `session/list` — what past conversations it has kept. */
+    val list: Boolean = false,
+    /** `session/delete` — forget one. */
+    val delete: Boolean = false,
+    /** `session/close` — the polite end, rather than a bare cancel. */
+    val close: Boolean = false,
+    /** `logout` — sign out of what `authenticate` signed into. */
+    val logout: Boolean = false,
+) {
+    /** Whether a past conversation can be reopened at all, either way round. */
+    val canOpenHistory: Boolean get() = loadSession || resume
+
+    /** Whether the history view is worth offering: it can be listed and opened. */
+    val hasHistory: Boolean get() = list && canOpenHistory
+
+    internal companion object {
+        fun parse(json: JSONObject?): AgentCapabilities {
+            val caps = json ?: return AgentCapabilities()
+            return AgentCapabilities(
+                loadSession = caps.optBoolean("load_session"),
+                resume = caps.optBoolean("resume"),
+                list = caps.optBoolean("list"),
+                delete = caps.optBoolean("delete"),
+                close = caps.optBoolean("close"),
+                logout = caps.optBoolean("logout"),
+            )
+        }
+    }
+}
+
+/** One of the agent's own past conversations, from `session/list`. */
+data class AgentPastSession(
+    val sessionId: String,
+    val cwd: String,
+    val title: String?,
+    /** An ISO-8601 timestamp, as the agent wrote it. */
+    val updatedAt: String?,
+) {
+    /** What to put in a row: the agent's title, else the directory's name. */
+    val label: String
+        get() = title?.takeIf { it.isNotBlank() }
+            ?: cwd.trimEnd('/').substringAfterLast('/').ifEmpty { sessionId }
+}
+
+/** The cached `session/list`, as [CoreBridge.acpSessionList] reports it. */
+data class AgentSessionList(
+    val version: Long = 0,
+    val loading: Boolean = false,
+    val error: String? = null,
+    val sessions: List<AgentPastSession> = emptyList(),
+) {
+    companion object {
+        val NONE = AgentSessionList()
+
+        fun parse(text: String): AgentSessionList = runCatching {
+            val root = JSONObject(text)
+            val items = root.optJSONArray("sessions") ?: JSONArray()
+            AgentSessionList(
+                version = root.optLong("version"),
+                loading = root.optBoolean("loading"),
+                error = root.stringOrNull("error"),
+                sessions = (0 until items.length()).mapNotNull { index ->
+                    val item = items.optJSONObject(index) ?: return@mapNotNull null
+                    AgentPastSession(
+                        sessionId = item.optString("sessionId"),
+                        cwd = item.optString("cwd"),
+                        title = item.stringOrNull("title"),
+                        updatedAt = item.stringOrNull("updatedAt"),
+                    ).takeIf { it.sessionId.isNotEmpty() }
+                },
+            )
+        }.getOrDefault(NONE)
+    }
+}
 
 /** Everything about a session except its rows. */
 data class AgentSessionState(
@@ -699,6 +788,9 @@ data class AgentSessionState(
                         },
                         starting = it.optBoolean("starting"),
                         error = it.stringOrNull("error"),
+                        capabilities = AgentCapabilities.parse(
+                            it.optJSONObject("capabilities"),
+                        ),
                     )
                 },
             )
@@ -887,6 +979,39 @@ fun rememberAgentSession(sessionId: Long?): AgentSessionSnapshot {
         }
     }
     return snapshot
+}
+
+/**
+ * Poll the agent's own past conversations while the threads view is open.
+ *
+ * [refreshToken] is what asks for a *fresh* list: change it (opening the
+ * view, finishing a delete) and the next tick makes the round trip to the
+ * agent. Every other tick reads the engine's cache, so an open view costs a
+ * version compare rather than a request.
+ */
+@Composable
+fun rememberAgentSessionList(enabled: Boolean, refreshToken: Int): AgentSessionList {
+    var list by remember { mutableStateOf(AgentSessionList.NONE) }
+    LaunchedEffect(enabled, refreshToken) {
+        if (!enabled) {
+            list = AgentSessionList.NONE
+            return@LaunchedEffect
+        }
+        var refresh = true
+        var seen = -1L
+        while (true) {
+            val fresh = withContext(Dispatchers.Default) {
+                AgentSessionList.parse(CoreBridge.acpSessionList(refresh))
+            }
+            refresh = false
+            if (fresh.version != seen) {
+                seen = fresh.version
+                list = fresh
+            }
+            delay(POLL_MS)
+        }
+    }
+    return list
 }
 
 /**
