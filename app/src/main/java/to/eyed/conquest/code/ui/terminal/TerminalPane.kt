@@ -62,6 +62,7 @@ import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.termux.terminal.TerminalEmulator
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TextStyle
 import com.termux.view.TerminalView
@@ -140,7 +141,7 @@ private fun terminalActionFor(event: AndroidKeyEvent): TerminalAction? {
 }
 
 /**
- * Frame around the terminal view whose only job is to see hardware keys first.
+ * Frame around the terminal view that sees hardware keys first.
  *
  * The vendored view drops the text selection at the top of its own `onKeyDown`,
  * *before* the client callback runs, so a `Ctrl+Shift+C` arriving that way
@@ -152,6 +153,19 @@ private class TerminalKeyFrame(context: Context) : FrameLayout(context) {
 
     /** Returns true when the chord belongs to the dock rather than the shell. */
     var onKey: ((AndroidKeyEvent) -> Boolean)? = null
+
+    /**
+     * What the last `update` pass pushed into the view, so a recomposition
+     * that changed none of it — a bell, a title, a latched modifier — does
+     * not call through again: `setTextSize` allocates a whole new renderer
+     * per call, and `applyPalette` invalidates the screen. The palette is
+     * written into the emulator, so a fresh emulator — session switch,
+     * restart, first layout — needs it applied again even under the same
+     * theme; hence the emulator is tracked next to the theme.
+     */
+    var lastTextSizePx = 0
+    var lastTheme: ZedTheme? = null
+    var lastEmulator: TerminalEmulator? = null
 
     init {
         addView(
@@ -303,6 +317,7 @@ fun TerminalDock(
                         // Order matters: setTextSize builds the renderer that
                         // setTypeface then reads its size from.
                         terminal.setTextSize(textSizePx)
+                        lastTextSizePx = textSizePx
                         terminal.setTypeface(Typeface.MONOSPACE)
                         terminal.setOnFocusChangeListener { _, hasFocus ->
                             onFocusChanged(hasFocus)
@@ -316,11 +331,26 @@ fun TerminalDock(
                     }
                 },
                 update = { frame ->
-                    frame.terminal.setTextSize(textSizePx)
+                    // Runs on every recomposition — a bell, a title, a sticky
+                    // modifier — so the expensive calls only go through when
+                    // what they would push has actually changed.
+                    if (frame.lastTextSizePx != textSizePx) {
+                        frame.terminal.setTextSize(textSizePx)
+                        frame.lastTextSizePx = textSizePx
+                    }
                     if (frame.terminal.currentSession !== host.session) {
                         host.attach(frame.terminal)
                     }
-                    applyPalette(frame.terminal, theme)
+                    // The emulator only exists once the view has a size, so
+                    // keep retrying until the first application lands.
+                    val emulator = frame.terminal.mEmulator
+                    if (emulator != null &&
+                        (frame.lastTheme !== theme || frame.lastEmulator !== emulator)
+                    ) {
+                        applyPalette(frame.terminal, theme)
+                        frame.lastTheme = theme
+                        frame.lastEmulator = emulator
+                    }
                 },
                 onRelease = { frame -> host.detach(frame.terminal) },
                 modifier = Modifier.fillMaxSize(),
