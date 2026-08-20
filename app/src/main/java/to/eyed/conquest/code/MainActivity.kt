@@ -39,7 +39,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // Before anything else reaches the engine: it needs to know where the
         // app's private storage is (Android gives a process no $HOME, and the
-        // Zed crates require one).
+        // Zed crates require one). Returns without waiting for the engine's
+        // gpui runtime — that boots on its own thread while the first frame
+        // composes, and the workspace's version-counter polling covers the
+        // gap. What this call does pay for is loading the native library.
         CoreBridge.initialize(filesDir.absolutePath, BuildConfig.DEBUG)
         // Read once, synchronously: the theme is chosen from it, and loading
         // it asynchronously would mean painting the wrong theme first and

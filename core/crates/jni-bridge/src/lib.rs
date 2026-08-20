@@ -55,7 +55,10 @@ fn engine() -> &'static Engine {
 
 /// Route panics to the log. Android discards a process's stderr, so without
 /// this a panic on an engine thread — the runtime thread, a worktree scan —
-/// is completely silent: the work simply never finishes.
+/// leaves no trace. Release builds set `panic = "abort"`, so the panic then
+/// takes the whole process down; this hook runs before the abort, which is
+/// what turns a bare SIGABRT in the crash report into a message with a thread
+/// name and location in logcat.
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -82,6 +85,12 @@ fn to_jstring(env: &JNIEnv, text: String) -> jstring {
 
 /// Hand the engine the app's private files directory, then bring it up.
 /// Must be the first call into the bridge — see `engine::initialize`.
+///
+/// Cheap on the calling thread: paths, logging and the `Engine` struct are
+/// set up here, and the expensive part — booting the gpui runtime — is only
+/// *kicked off*, onto the runtime's own thread. Work that reaches the runtime
+/// before it is up queues on its job channel, so callers gate on the same
+/// version counters they always poll, never on this call.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_initialize(
     mut env: JNIEnv,
@@ -92,7 +101,9 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_initialize(
     let files_dir = get_string(&mut env, &files_dir);
     VERBOSE_LOG.store(verbose_logging != JNI_FALSE, Ordering::Relaxed);
     engine::initialize(Path::new(&files_dir));
-    engine();
+    // Warm the gpui runtime now, while the app is still composing its first
+    // frame, instead of paying the boot when the first project opens.
+    engine().start_runtime();
 }
 
 #[unsafe(no_mangle)]

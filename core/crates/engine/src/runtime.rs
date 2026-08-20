@@ -12,6 +12,12 @@
 //! - **Out**: results are mirrored into ordinary `Mutex`-guarded state that
 //!   JNI reads without touching gpui at all (see `project.rs`). Reads are
 //!   therefore lock-free of the runtime and safe from the UI thread.
+//!
+//! Bring-up is asynchronous: [`Runtime::new`] returns as soon as the thread
+//! is spawned, and the job channel is the ready gate — jobs sent before the
+//! `App` is up wait in it, because the loop that drains them only starts once
+//! startup setup has run. No caller ever blocks on the boot, and no job can
+//! observe a half-configured `App`.
 
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,12 +44,14 @@ pub struct Runtime {
 const ENGINE_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 impl Runtime {
-    /// Start the runtime thread and wait for the app to come up. `init` runs
-    /// on the runtime thread before any job, for global setup
-    /// (`settings::init` and the like).
+    /// Start the runtime thread. Returns as soon as the thread is spawned —
+    /// the gpui `Application` boots on it, off the caller's critical path.
+    /// `init` runs on the runtime thread before any job, for global setup
+    /// (`settings::init` and the like); jobs spawned before then queue in the
+    /// channel, so nothing can observe a half-configured App and nothing
+    /// waits for one either.
     pub fn new(init: impl FnOnce(&mut App) + Send + 'static) -> Runtime {
         let (jobs, mut incoming) = mpsc::unbounded::<Job>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
 
         thread::Builder::new()
             .name("conquest-engine".to_owned())
@@ -52,9 +60,8 @@ impl Runtime {
                 let app = Application::with_platform(Rc::new(HeadlessPlatform::new()));
                 app.run(move |cx| {
                     init(cx);
-                    // Only signal readiness once init has run, so callers
-                    // can't observe a half-configured App.
-                    let _ = ready_tx.send(());
+                    // Only drain jobs once init has run; queueing until here
+                    // is what stands in for a readiness signal.
                     cx.spawn(async move |cx| {
                         while let Some(job) = incoming.next().await {
                             cx.update(|cx| job(cx));
@@ -64,10 +71,6 @@ impl Runtime {
                 });
             })
             .expect("failed to spawn the engine runtime thread");
-
-        ready_rx
-            .recv()
-            .expect("the engine runtime thread died during startup");
 
         Runtime { jobs }
     }

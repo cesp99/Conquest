@@ -28,6 +28,14 @@ object CoreBridge {
      * exists — a worktree scan panics without one. The engine points `HOME`
      * (and the trash) at this directory.
      *
+     * Cheap on the calling thread: paths, logging and the engine's own state
+     * are set up synchronously, and the expensive part — the gpui runtime —
+     * is only *kicked off*, onto a thread of its own. Nothing here or later
+     * waits for that boot: work reaching the runtime before it is up queues
+     * inside the engine, and the UI gates on the version counters it already
+     * polls ([projectVersion] and friends), which stay 0 until there is
+     * something to show.
+     *
      * [verboseLogging] raises the engine's log level from Info to Debug, which
      * is where its git and scan diagnostics live. Pass `BuildConfig.DEBUG`: the
      * Rust library cannot tell a debug APK from a release one on its own,
