@@ -31,7 +31,7 @@ pub(crate) fn with_query_cursor<T>(f: impl FnOnce(&mut QueryCursor) -> T) -> T {
         .lock()
         .unwrap()
         .pop()
-        .unwrap_or_else(QueryCursor::new);
+        .unwrap_or_default();
     let result = f(&mut cursor);
     cursor.set_byte_range(0..usize::MAX);
     QUERY_CURSORS.lock().unwrap().push(cursor);
