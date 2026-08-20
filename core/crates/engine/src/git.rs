@@ -1252,7 +1252,7 @@ impl crate::Engine {
     /// Without this the panel would sit on the pre-command status until the
     /// worktree happened to change — and staging a file changes the index, not
     /// the worktree, so for staging that is *never*.
-    fn git_state_changed(&self, id: ProjectId) {
+    pub(crate) fn git_state_changed(&self, id: ProjectId) {
         if let Some(cache) = self.git.projects.lock().unwrap().get(&id).cloned() {
             cache.lock().unwrap().scanned = false;
         }
@@ -1459,23 +1459,155 @@ impl crate::Engine {
     /// --allow-empty-message` is not passed, so git would refuse it too, but it
     /// would do so after a process spawn and with a sentence about editors. A
     /// message that is only whitespace is empty — git strips it and ends up in
-    /// the same place.
-    pub fn git_commit(&self, id: ProjectId, message: &str) -> Result<(), String> {
+    /// the same place. That refusal covers amending too: Zed's editor arrives
+    /// prefilled with the old message, so a blank one is still a mistake.
+    ///
+    /// The three flags are the three of Zed's `CommitOptions` its panel can
+    /// set: the split-button's Amend, Signoff and Skip Hooks entries
+    /// (git_panel.rs:5568-5610). See [`commit_args`] for the argv.
+    pub fn git_commit(
+        &self,
+        id: ProjectId,
+        message: &str,
+        amend: bool,
+        signoff: bool,
+        no_verify: bool,
+    ) -> Result<(), String> {
         if message.trim().is_empty() {
             return Err("Write a commit message first".to_owned());
         }
         let repo = self.repo_for(id)?;
-        let args: Vec<OsString> = vec![
-            OsString::from("commit"),
-            OsString::from("--quiet"),
-            OsString::from("-m"),
-            OsString::from(message),
-        ];
+        let args = commit_args(message, amend, signoff, no_verify);
         let run = run_git(
             &repo.userland,
             &repo.repo_root,
             "git commit",
             git_argv(&repo.project_root, &args),
+        )?;
+        self.git_state_changed(id);
+        if run.status == 0 {
+            Ok(())
+        } else {
+            Err(run.message())
+        }
+    }
+
+    /// Undo the last commit, keeping everything it held staged — Zed's
+    /// Uncommit. What runs is exactly `git reset --soft HEAD^`
+    /// (git_panel.rs:3164, repository.rs:1501-1504): always `--soft`, whatever
+    /// the button's tooltip implies about a mixed reset. Blocking.
+    ///
+    /// Nothing here asks anything. The caller is expected to have warned when
+    /// the commit was already pushed — [`Engine::git_head_pushed_remotes`] is
+    /// that check — and to have read the old message back for the commit box
+    /// *before* resetting, while HEAD still names it.
+    pub fn git_uncommit(&self, id: ProjectId) -> Result<(), String> {
+        let repo = self.repo_for(id)?;
+        let args: Vec<OsString> = ["reset", "--soft", "HEAD^"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let run = run_git(
+            &repo.userland,
+            &repo.repo_root,
+            "git reset",
+            git_argv(&repo.project_root, &args),
+        )?;
+        self.git_state_changed(id);
+        if run.status == 0 {
+            Ok(())
+        } else {
+            Err(run.message())
+        }
+    }
+
+    /// Every `remote/branch` whose remote-tracking ref already contains HEAD —
+    /// the commit Uncommit is about to undo has been pushed there, and the
+    /// user should be asked first. Zed's `check_for_pushed_commit`
+    /// (repository.rs:2907-2933): `git for-each-ref --format=%(refname)
+    /// --contains HEAD refs/remotes/`, minus every `…/HEAD` symref. A repo
+    /// with no remotes answers with an empty list, and so does a failed run —
+    /// Zed proceeds silently there, and refusing to uncommit because a *check*
+    /// failed would be worse than not asking. **Blocking**.
+    pub fn git_head_pushed_remotes(&self, id: ProjectId) -> Result<Vec<String>, String> {
+        let repo = self.repo_for(id)?;
+        let args: Vec<OsString> = [
+            "for-each-ref",
+            "--format=%(refname)",
+            "--contains",
+            "HEAD",
+            "refs/remotes/",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        let run = run_git(
+            &repo.userland,
+            &repo.repo_root,
+            "git for-each-ref",
+            git_argv(&repo.project_root, &args),
+        )?;
+        if run.status != 0 {
+            // An unborn HEAD makes `--contains HEAD` fail, and there is
+            // nothing pushed in that world either.
+            return Ok(Vec::new());
+        }
+        Ok(parse_pushed_remotes(&run.output))
+    }
+
+    /// Make the project a repository — the panel's "Initialize Repository"
+    /// empty state. Zed's two commands exactly (fs.rs:1208-1235): ask
+    /// `git config --global --get init.defaultBranch` first, use its answer
+    /// when there is one, and fall back to the caller's name — Zed's setting
+    /// defaults it to `main` — for `git init -b <branch>`. **Blocking**.
+    ///
+    /// The one git operation that must not go through [`Engine::repo_for`],
+    /// whose "Not a git repository" is the very state this fixes.
+    pub fn git_init(&self, id: ProjectId, fallback_branch: &str) -> Result<(), String> {
+        let project = self
+            .projects
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| "That project is not open".to_owned())?;
+        let project_root = project.lock().unwrap().root.clone();
+        let userland = self
+            .userland()
+            .filter(|userland| userland.is_installed())
+            .ok_or_else(|| "The Linux userland is not installed".to_owned())?;
+
+        let config_args: Vec<OsString> = ["config", "--global", "--get", "init.defaultBranch"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let configured = run_git(
+            &userland,
+            &project_root,
+            "git config",
+            git_argv(&project_root, &config_args),
+        )
+        .ok()
+        // Exit 1 with no output is "unset", which is an answer; and a value
+        // this could not hand to git as an argument falls back too, rather
+        // than making the empty state unusable over one odd config line.
+        .filter(|run| run.status == 0)
+        .and_then(|run| checked_branch(run.output.trim()).ok());
+        let branch = match configured {
+            Some(branch) => branch,
+            None => checked_branch(fallback_branch)?,
+        };
+
+        let args: Vec<OsString> = vec![
+            OsString::from("init"),
+            OsString::from("-b"),
+            OsString::from(&branch),
+        ];
+        let run = run_git(
+            &userland,
+            &project_root,
+            "git init",
+            git_argv(&project_root, &args),
         )?;
         self.git_state_changed(id);
         if run.status == 0 {
@@ -1617,6 +1749,52 @@ impl crate::Engine {
         }
         Ok(())
     }
+}
+
+/// The commit argv, flag for flag as Zed builds it (repository.rs:2638-2663):
+/// `--cleanup=strip` right after the message, then `--amend`, `--signoff`,
+/// `--no-verify`, in that order. Zed's order also holds `--allow-empty` and
+/// `--author` between the last two, which its panel never passes — it commits
+/// with `allow_empty: false` and `name_and_email: None` (git_panel.rs:3046-
+/// 3053) — so neither exists here.
+pub(crate) fn commit_args(
+    message: &str,
+    amend: bool,
+    signoff: bool,
+    no_verify: bool,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        OsString::from("commit"),
+        OsString::from("--quiet"),
+        OsString::from("-m"),
+        OsString::from(message),
+        OsString::from("--cleanup=strip"),
+    ];
+    if amend {
+        args.push(OsString::from("--amend"));
+    }
+    if signoff {
+        args.push(OsString::from("--signoff"));
+    }
+    if no_verify {
+        args.push(OsString::from("--no-verify"));
+    }
+    args
+}
+
+/// `for-each-ref --format=%(refname) --contains HEAD refs/remotes/`, read the
+/// way Zed reads it (repository.rs:2927-2933): every line is a remote-tracking
+/// ref that already holds HEAD, `…/HEAD` symrefs dropped — `origin/HEAD` names
+/// the remote's default branch, not a place anything was pushed — and the
+/// `refs/remotes/` prefix stripped, leaving `origin/main`.
+pub(crate) fn parse_pushed_remotes(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.ends_with("/HEAD"))
+        .filter_map(|line| line.strip_prefix("refs/remotes/"))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// A branch or remote name this will hand to git as an argument.
@@ -2329,7 +2507,7 @@ mod tests {
         // Refused before anything is resolved — there is no userland here, and
         // the message says nothing about one.
         assert_eq!(
-            engine.git_commit(id, "   \n\t "),
+            engine.git_commit(id, "   \n\t ", false, false, false),
             Err("Write a commit message first".to_owned())
         );
     }
@@ -2345,7 +2523,7 @@ mod tests {
             engine.git_stage(id, &paths),
             engine.git_unstage(id, &paths),
             engine.git_discard(id, &paths),
-            engine.git_commit(id, "a message"),
+            engine.git_commit(id, "a message", false, false, false),
         ] {
             assert_eq!(
                 result,
@@ -2728,6 +2906,125 @@ mod tests {
         );
     }
 
+    /// Zed's flag order, exactly — the tooltip previews `git commit --amend
+    /// --signoff --no-verify` in that order and the argv must be the command
+    /// it previews (git_panel.rs:6097-6109, repository.rs:2638-2663).
+    #[test]
+    fn the_commit_argv_carries_zeds_flags_in_zeds_order() {
+        let all: Vec<OsString> = [
+            "commit",
+            "--quiet",
+            "-m",
+            "msg",
+            "--cleanup=strip",
+            "--amend",
+            "--signoff",
+            "--no-verify",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(commit_args("msg", true, true, true), all);
+
+        let plain: Vec<OsString> = ["commit", "--quiet", "-m", "msg", "--cleanup=strip"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(commit_args("msg", false, false, false), plain);
+
+        // Each flag stands alone: skipping hooks must not imply amending.
+        assert!(
+            commit_args("msg", false, false, true)
+                .contains(&OsString::from("--no-verify"))
+        );
+        assert!(
+            !commit_args("msg", false, false, true)
+                .contains(&OsString::from("--amend"))
+        );
+    }
+
+    /// The uncommit confirmation's evidence: remote refs that hold HEAD, with
+    /// the two shapes that must *not* count — a `…/HEAD` symref, and a local
+    /// ref that somehow got in.
+    #[test]
+    fn pushed_remotes_drop_head_symrefs_and_keep_the_short_names() {
+        assert_eq!(
+            parse_pushed_remotes(
+                "refs/remotes/origin/HEAD\nrefs/remotes/origin/main\n  refs/remotes/fork/main  \nrefs/heads/main\n"
+            ),
+            vec!["origin/main".to_owned(), "fork/main".to_owned()]
+        );
+        assert!(parse_pushed_remotes("").is_empty());
+    }
+
+    /// The new command argvs — commit with Zed's flags, uncommit, init —
+    /// through the real binary, for the same reason as the test above: every
+    /// flag test asserts about strings we wrote ourselves.
+    #[test]
+    fn real_git_accepts_the_commit_flags_uncommit_and_init() {
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: no git on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+
+        // `git init -b <branch>` is the argv `git_init` sends.
+        let argv: Vec<OsString> = ["init", "-b", "trunk"].iter().map(OsString::from).collect();
+        let out = run_argv(repo, git_argv(repo, &argv));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        std::fs::write(repo.join("README"), "one\n").unwrap();
+        assert!(host_git(repo, &["add", "README"]).status.success());
+        let out = run_argv(repo, git_argv(repo, &commit_args("first", false, false, false)));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        std::fs::write(repo.join("README"), "two\n").unwrap();
+        assert!(host_git(repo, &["add", "README"]).status.success());
+        let out = run_argv(repo, git_argv(repo, &commit_args("second", false, false, false)));
+        assert!(out.status.success());
+
+        // Uncommit: exactly `git reset --soft HEAD^`, and the undone commit's
+        // content stays staged — that is what "soft" promises the panel.
+        let argv: Vec<OsString> = ["reset", "--soft", "HEAD^"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let out = run_argv(repo, git_argv(repo, &argv));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let staged = host_git(repo, &["diff", "--cached", "--name-only"]);
+        assert!(String::from_utf8_lossy(&staged.stdout).contains("README"));
+
+        // And amend with every flag: the staged change folds into `first`.
+        let out = run_argv(repo, git_argv(repo, &commit_args("first, again", true, true, true)));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let log = host_git(repo, &["log", "--format=%s"]);
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).trim(),
+            "first, again",
+            "one commit, the amended one"
+        );
+        // `--signoff` really was in effect: the trailer names the committer.
+        let body = host_git(repo, &["log", "-1", "--format=%b"]);
+        assert!(String::from_utf8_lossy(&body.stdout).contains("Signed-off-by: test"));
+    }
+
     #[test]
     fn the_branch_header_is_read_in_every_shape_git_writes_it() {
         let branch = |header: &str| parse_branch(&porcelain(&[header])).unwrap();
@@ -2925,7 +3222,9 @@ mod tests {
 
         // Committing with nothing staged is git's own refusal, in git's own
         // words — which is the whole reason the wrapper exists.
-        let refused = engine.git_commit(id, "nothing here").unwrap_err();
+        let refused = engine
+            .git_commit(id, "nothing here", false, false, false)
+            .unwrap_err();
         assert!(
             refused.to_lowercase().contains("nothing"),
             "expected git's own complaint, got {refused:?}"
@@ -2934,7 +3233,7 @@ mod tests {
         // And a real commit lands.
         std::fs::write(repo.join("README"), "three\n").unwrap();
         engine.git_stage(id, &["README".to_owned()]).unwrap();
-        engine.git_commit(id, "second").unwrap();
+        engine.git_commit(id, "second", false, false, false).unwrap();
         let log = host_git(&repo, &["log", "--format=%s"]);
         assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "second\nfirst");
     }

@@ -730,16 +730,167 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitDiscard(
 }
 
 /// Commit what is staged. An empty or whitespace-only message is refused here
-/// rather than becoming an empty commit. **Blocking**.
+/// rather than becoming an empty commit. The three flags are Zed's Amend,
+/// Signoff and Skip Hooks menu entries, appended to the argv in Zed's order.
+/// **Blocking**.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitCommit(
     mut env: JNIEnv,
     _class: JClass,
     project_id: jlong,
     message: JString,
+    amend: jboolean,
+    signoff: jboolean,
+    no_verify: jboolean,
 ) -> jstring {
     let message = get_string(&mut env, &message);
-    command_result(&env, engine().git_commit(project_id as u64, &message))
+    command_result(
+        &env,
+        engine().git_commit(
+            project_id as u64,
+            &message,
+            amend != 0,
+            signoff != 0,
+            no_verify != 0,
+        ),
+    )
+}
+
+/// Undo the last commit, keeping its changes staged — exactly `git reset
+/// --soft HEAD^`, Zed's Uncommit. Nothing here asks anything: read
+/// `gitHeadPushedRemotes` and the old message *first*. Null when it worked.
+/// **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitUncommit(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    command_result(&env, engine().git_uncommit(project_id as u64))
+}
+
+/// Every `remote/branch` that already holds HEAD, as JSON `{"remotes":[…]}` —
+/// the uncommit confirmation's evidence that the commit was pushed. Empty for
+/// nothing pushed *and* for a check git could not run, as in Zed, which
+/// proceeds silently there; `{"error":…}` only when there is no repository to
+/// ask. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitHeadPushedRemotes(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    let json = match engine().git_head_pushed_remotes(project_id as u64) {
+        Ok(remotes) => serde_json::json!({ "remotes": remotes }).to_string(),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    };
+    to_jstring(&env, json)
+}
+
+/// Make the project a repository — the panel's "Initialize Repository". Runs
+/// Zed's two commands: the guest's `init.defaultBranch` names the branch when
+/// it is set, [fallback_branch] when it is not, then `git init -b <branch>`.
+/// Null when it worked. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitInit(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    fallback_branch: JString,
+) -> jstring {
+    let fallback_branch = get_string(&mut env, &fallback_branch);
+    command_result(&env, engine().git_init(project_id as u64, &fallback_branch))
+}
+
+/// Every local and remote-tracking branch, as JSON — `{"branches":[{name,
+/// is_remote, is_head, sha, subject, committer_date, author, has_parent,
+/// upstream, ahead, behind, upstream_gone}], "error":…}`. `error` is null
+/// unless git could only list some of them, in which case the partial listing
+/// is kept and the message rides beside it, as in Zed's picker banner.
+/// `{"error":…}` alone when there is no repository at all. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitBranches(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    let json = match engine().git_branches(project_id as u64) {
+        Ok(list) => serde_json::to_string(&list)
+            .unwrap_or_else(|_| "{\"error\":\"could not encode the branches\"}".to_owned()),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    };
+    to_jstring(&env, json)
+}
+
+/// Check out a branch by the name `gitBranches` listed. A remote name
+/// (`origin/feature`) grows a local tracking branch named after it first,
+/// exactly as Zed does. Null when it worked, git's refusal — a dirty worktree
+/// above all — when it did not. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitChangeBranch(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    name: JString,
+) -> jstring {
+    let name = get_string(&mut env, &name);
+    command_result(&env, engine().git_change_branch(project_id as u64, &name))
+}
+
+/// Create a branch and switch to it — `git switch -c <name> [<base>]`. An
+/// empty [base] branches off HEAD, which is what the picker's plain Create
+/// does. Null when it worked. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitCreateBranch(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    name: JString,
+    base: JString,
+) -> jstring {
+    let name = get_string(&mut env, &name);
+    let base = get_string(&mut env, &base);
+    let base = Some(base.as_str()).filter(|base| !base.is_empty());
+    command_result(
+        &env,
+        engine().git_create_branch(project_id as u64, &name, base),
+    )
+}
+
+/// Delete a branch — `git branch -d|-D|-dr|-Dr <name>`, Zed's flag table. An
+/// unmerged branch comes back with git's "not fully merged", which is the
+/// picker's cue to offer force. Null when it worked. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitDeleteBranch(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    name: JString,
+    is_remote: jboolean,
+    force: jboolean,
+) -> jstring {
+    let name = get_string(&mut env, &name);
+    command_result(
+        &env,
+        engine().git_delete_branch(project_id as u64, &name, is_remote != 0, force != 0),
+    )
+}
+
+/// The repository's default branch — Zed's chain: `upstream/HEAD`, then
+/// `origin/HEAD`, then `init.defaultBranch` if that local branch exists, then
+/// local `main`, then `master`. Null when nothing matches or git could not be
+/// asked; the picker simply drops its "Create New From" entry then.
+/// **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitDefaultBranch(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    match engine().git_default_branch(project_id as u64) {
+        Ok(Some(branch)) => to_jstring(&env, branch),
+        Ok(None) | Err(_) => std::ptr::null_mut(),
+    }
 }
 
 /// Push the named branch to `origin`, setting its upstream when it has none —

@@ -296,9 +296,86 @@ object CoreBridge {
      * Commits what is staged. An empty or whitespace-only message is refused
      * rather than becoming an empty commit, and nothing is staged implicitly —
      * a commit with an empty index comes back with git's own "nothing added to
-     * commit". **Blocking**.
+     * commit". The three flags are the split-button menu's Amend, Signoff and
+     * Skip Hooks, appended to the argv in Zed's own order. **Blocking**.
      */
-    external fun gitCommit(projectId: Long, message: String): String?
+    external fun gitCommit(
+        projectId: Long,
+        message: String,
+        amend: Boolean,
+        signoff: Boolean,
+        noVerify: Boolean,
+    ): String?
+
+    /**
+     * Undoes the last commit, keeping its changes staged — exactly `git reset
+     * --soft HEAD^`, Zed's Uncommit. Nothing below this call asks anything:
+     * read [gitHeadPushedRemotes] and the old message *before* resetting,
+     * while HEAD still names the commit. Null when it worked. **Blocking**.
+     */
+    external fun gitUncommit(projectId: Long): String?
+
+    /**
+     * Every `remote/branch` that already holds HEAD, as JSON
+     * `{"remotes":[…]}` — the evidence the uncommit confirmation shows that
+     * the commit was pushed. Empty both for "nothing pushed" and for a check
+     * git could not run — Zed proceeds silently there, and a failed *check*
+     * must not block the reset. **Blocking**.
+     */
+    external fun gitHeadPushedRemotes(projectId: Long): String
+
+    /**
+     * Makes the project a repository — the panel's "Initialize Repository"
+     * empty state. Zed's two commands: the guest's `init.defaultBranch` names
+     * the branch when it is set, [fallbackBranch] when it is not, then
+     * `git init -b <branch>`. Null when it worked. **Blocking**.
+     */
+    external fun gitInit(projectId: Long, fallbackBranch: String): String?
+
+    /**
+     * Every local and remote-tracking branch with its tip commit, as JSON —
+     * see [GitBranchList] for the shape. A partial listing keeps what parsed
+     * and carries git's complaint beside it, which is the picker's warning
+     * banner. **Blocking** — it runs git; the picker reads it once on open,
+     * not on a poll loop.
+     */
+    external fun gitBranches(projectId: Long): String
+
+    /**
+     * Checks out a branch by the name [gitBranches] listed. A remote name
+     * (`origin/feature`) grows a local tracking branch named after it first —
+     * minus the remote prefix — exactly as Zed does. Null when it worked;
+     * git's refusal, a dirty worktree above all, when it did not. **Blocking**.
+     */
+    external fun gitChangeBranch(projectId: Long, name: String): String?
+
+    /**
+     * Creates a branch and switches to it — `git switch -c <name> [<base>]`.
+     * An empty [base] branches off HEAD, which is what the picker's plain
+     * Create does; "Create New From" passes the default branch. Null when it
+     * worked. **Blocking**.
+     */
+    external fun gitCreateBranch(projectId: Long, name: String, base: String): String?
+
+    /**
+     * Deletes a branch — `git branch -d|-D|-dr|-Dr <name>`, Zed's flag table.
+     * An unmerged branch is git's own "not fully merged", the picker's cue to
+     * offer force-delete. Null when it worked. **Blocking**.
+     */
+    external fun gitDeleteBranch(
+        projectId: Long,
+        name: String,
+        isRemote: Boolean,
+        force: Boolean,
+    ): String?
+
+    /**
+     * The repository's default branch, by Zed's chain: `upstream/HEAD`, then
+     * `origin/HEAD`, then `init.defaultBranch` if that local branch exists,
+     * then local `main`, then `master`. Null when nothing matches — the
+     * picker simply drops its "Create New From" entry. **Blocking**.
+     */
+    external fun gitDefaultBranch(projectId: Long): String?
 
     /**
      * Push [branch] to `origin`, setting its upstream when it has none. Null
