@@ -586,8 +586,8 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitStatusVersi
 }
 
 /// The branch record the project is on, from the cached status run, as JSON —
-/// `{name, ahead, behind, unborn, upstream}`, the same object `gitChanges`
-/// nests — with no JSON of the changed files and no git run: the title bar's
+/// `{name, ahead, behind, unborn, upstream, upstream_gone}`, the same object
+/// `gitChanges` nests — with no JSON of the changed files and no git run: the title bar's
 /// drift arrows and the history views' reload keys ride the same half-second
 /// poll the name does. Null when nothing is known: no repository, or no
 /// completed run yet. A detached HEAD is a present object whose `name` is
@@ -647,7 +647,8 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitStatus(
 }
 
 /// Everything the git panel draws, as JSON: `scanned`, `has_repo`, `branch`
-/// (`{name, ahead, behind, unborn, upstream}` or null), `head` (the commit id
+/// (`{name, ahead, behind, unborn, upstream, upstream_gone}` or null), `head`
+/// (the commit id
 /// it names, or null when unknown) and `entries`, each
 /// `{path, staged, unstaged, conflicted, in_head}` with the two statuses using
 /// the same names `gitStatus` does, or null.
@@ -893,20 +894,127 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitDefaultBran
     }
 }
 
-/// Push the named branch to `origin`, setting its upstream when it has none —
-/// Zed's "Publish". Null when it worked (git's own output is logged), and the
-/// reason when it did not. **Blocking**: it talks to the network.
+/// What a remote command (fetch, pull, push) said, as JSON — never null:
+/// `{"remote":…, "stdout":…, "stderr":…, "error":…}`. `remote` is the remote
+/// it ran against (null for fetch-all), the two streams are git's own words —
+/// which the UI formats into Zed's toasts, whose rules read the streams
+/// *separately* — and `error` is null on success, the one-line reason
+/// otherwise, with the streams still alongside for the log view.
+fn remote_result(
+    env: &JNIEnv,
+    result: Result<engine::RemoteOutput, String>,
+) -> jstring {
+    let json = match result {
+        Ok(output) => serde_json::json!({
+            "remote": output.remote,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+            "error": (!output.ok()).then(|| output.message()),
+        })
+        .to_string(),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    };
+    to_jstring(env, json)
+}
+
+/// Every remote with its fetch URL, as JSON — `{"remotes":[{name, url}]}`,
+/// in `git remote -v`'s (alphabetical) order, or `{"error":…}`. The Fetch
+/// From / Push To pickers' listing, and where github.com detection reads the
+/// URL. **Blocking**: it runs git.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitRemotes(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    let json = match engine().git_remotes(project_id as u64) {
+        Ok(remotes) => serde_json::json!({ "remotes": remotes }).to_string(),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    };
+    to_jstring(&env, json)
+}
+
+/// The remote the branch is configured to push to ([is_push]) or pull from,
+/// or null when none is — the caller's cue to list `gitRemotes` and ask,
+/// Zed's `get_remote` flow. Null also when git could not be asked: a failed
+/// *question* falls back to the listing rather than blocking the command.
+/// **Blocking**: it runs git.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitBranchRemote(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    branch: JString,
+    is_push: jboolean,
+) -> jstring {
+    let branch = get_string(&mut env, &branch);
+    match engine().git_branch_remote(project_id as u64, &branch, is_push != 0) {
+        Ok(Some(remote)) => to_jstring(&env, remote),
+        Ok(None) | Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Fetch from one remote, or — [remote] empty — from all of them, Zed's
+/// `git fetch --all`. Returns the remote-command JSON (see [remote_result]).
+/// **Blocking**: it talks to the network.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitFetch(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    remote: JString,
+) -> jstring {
+    let remote = get_string(&mut env, &remote);
+    let remote = Some(remote.as_str()).filter(|remote| !remote.is_empty());
+    remote_result(&env, engine().git_fetch(project_id as u64, remote))
+}
+
+/// Pull [branch] from [remote], with `--rebase` when asked — Zed's Pull and
+/// Pull (Rebase). The branch name joins the argv only when the branch has no
+/// upstream. Returns the remote-command JSON. **Blocking**: network.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitPull(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    branch: JString,
+    remote: JString,
+    rebase: jboolean,
+) -> jstring {
+    let branch = get_string(&mut env, &branch);
+    let remote = get_string(&mut env, &remote);
+    remote_result(
+        &env,
+        engine().git_pull(project_id as u64, &branch, &remote, rebase != 0),
+    )
+}
+
+/// Push [branch] to [remote] — with `--set-upstream` for Zed's Publish and
+/// Republish, or `--force-with-lease` (never plain `--force`) for its Force
+/// Push; force wins when both are set, as in Zed. Returns the remote-command
+/// JSON. **Blocking**: it talks to the network.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitPush(
     mut env: JNIEnv,
     _class: JClass,
     project_id: jlong,
     branch: JString,
+    remote: JString,
     set_upstream: jboolean,
+    force: jboolean,
 ) -> jstring {
     let branch = get_string(&mut env, &branch);
-    let result = engine().git_push(project_id as u64, &branch, set_upstream != 0);
-    command_result(&env, result.map(|_| ()))
+    let remote = get_string(&mut env, &remote);
+    remote_result(
+        &env,
+        engine().git_push(
+            project_id as u64,
+            &branch,
+            &remote,
+            set_upstream != 0,
+            force != 0,
+        ),
+    )
 }
 
 /// The working tree's diff as a patch, as JSON — `{"files":[…]}` with each

@@ -223,7 +223,8 @@ object CoreBridge {
 
     /**
      * The branch record the project is on, from the cached status run, as
-     * JSON — `{name, ahead, behind, unborn, upstream}`, the same object
+     * JSON — `{name, ahead, behind, unborn, upstream, upstream_gone}`, the
+     * same object
      * [gitChanges] nests — with no JSON of the changed files and no git run:
      * the title bar's drift arrows and the history views' reload keys ride
      * the same half-second poll the name does. Null when nothing is known:
@@ -378,10 +379,50 @@ object CoreBridge {
     external fun gitDefaultBranch(projectId: Long): String?
 
     /**
-     * Push [branch] to `origin`, setting its upstream when it has none. Null
-     * when it worked, the reason when it did not. **Blocking** — network.
+     * Every remote with its fetch URL, as JSON — `{"remotes":[{name, url}]}`
+     * in `git remote -v`'s order, or `{"error":…}`. The Fetch From / Push To
+     * pickers' listing, and where github.com detection reads the URL.
+     * **Blocking** — it runs git.
      */
-    external fun gitPush(projectId: Long, branch: String, setUpstream: Boolean): String?
+    external fun gitRemotes(projectId: Long): String
+
+    /**
+     * The remote [branch] is configured to push to ([isPush]) or pull from —
+     * Zed's `get_remote` asks `<branch>@{push}` or `branch.<branch>.remote`
+     * respectively — or null when none is configured (or git could not be
+     * asked): the cue to fall back to [gitRemotes] and a picker. **Blocking**.
+     */
+    external fun gitBranchRemote(projectId: Long, branch: String, isPush: Boolean): String?
+
+    /**
+     * Fetch from [remote], or from all remotes when it is empty — Zed's
+     * `git fetch --all`. Returns the remote-command JSON [RemoteOpResult]
+     * parses: git's stdout and stderr kept apart for the toast rules, plus
+     * `error` when it failed. Never null. **Blocking** — network.
+     */
+    external fun gitFetch(projectId: Long, remote: String): String
+
+    /**
+     * Pull [branch] from [remote], with `--rebase` when [rebase] — Zed's Pull
+     * and Pull (Rebase). The branch name joins the argv only when the branch
+     * has no upstream. Returns the remote-command JSON. **Blocking** —
+     * network.
+     */
+    external fun gitPull(projectId: Long, branch: String, remote: String, rebase: Boolean): String
+
+    /**
+     * Push [branch] to [remote] — with `--set-upstream` for Zed's Publish and
+     * Republish when [setUpstream], or `--force-with-lease` (never plain
+     * `--force`) when [force]; force wins when both are set, as in Zed.
+     * Returns the remote-command JSON. **Blocking** — network.
+     */
+    external fun gitPush(
+        projectId: Long,
+        branch: String,
+        remote: String,
+        setUpstream: Boolean,
+        force: Boolean,
+    ): String
 
     /**
      * The working tree's diff as a patch, as JSON. An empty [path] means every

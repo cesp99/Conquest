@@ -44,11 +44,51 @@ class GitSession(private val project: ProjectSession) {
         CoreBridge.gitStage(project.id, JSONArray(paths).toString())
 
     /**
-     * Send this branch's commits to `origin`; publish it when it has no
-     * upstream yet. Null when it worked. **Blocking** — it uses the network.
+     * Send this branch's commits to [remote] — Zed's push, its Publish and
+     * Republish when [setUpstream] (the branch has no upstream, or its
+     * upstream is gone), its Force Push when [force]: `--force-with-lease`,
+     * never plain `--force`, and the lease is the only safety Zed puts in
+     * front of it. The remote comes from the caller: resolve it with
+     * [branchRemote] and fall back to [remotes] and a picker, which is Zed's
+     * own order. **Blocking** — it uses the network.
      */
-    fun push(branch: String, setUpstream: Boolean): String? =
-        CoreBridge.gitPush(project.id, branch, setUpstream)
+    fun push(
+        branch: String,
+        remote: String,
+        setUpstream: Boolean,
+        force: Boolean = false,
+    ): RemoteOpResult =
+        RemoteOpResult.parse(CoreBridge.gitPush(project.id, branch, remote, setUpstream, force))
+
+    /**
+     * Fetch from one [remote], or — null — from every one of them, Zed's
+     * plain Fetch (`git fetch --all`). **Blocking** — network.
+     */
+    fun fetch(remote: String? = null): RemoteOpResult =
+        RemoteOpResult.parse(CoreBridge.gitFetch(project.id, remote.orEmpty()))
+
+    /**
+     * Pull [branch] from [remote], rebasing when [rebase] — Zed's Pull and
+     * Pull (Rebase). The branch name joins the argv only when the branch has
+     * no upstream, exactly as Zed passes it. **Blocking** — network.
+     */
+    fun pull(branch: String, remote: String, rebase: Boolean = false): RemoteOpResult =
+        RemoteOpResult.parse(CoreBridge.gitPull(project.id, branch, remote, rebase))
+
+    /**
+     * Every remote, with the fetch URL github.com detection reads — the
+     * Fetch From and Push To pickers' listing. **Blocking** — it runs git.
+     */
+    fun remotes(): GitRemoteList = GitRemoteList.parse(CoreBridge.gitRemotes(project.id))
+
+    /**
+     * The remote [branch] is configured to talk to in that direction, or null
+     * when none is — the cue to fall back to [remotes] and a picker (one
+     * remote picks itself; several ask), which is Zed's `get_remote` flow.
+     * **Blocking** — it runs git.
+     */
+    fun branchRemote(branch: String, forPush: Boolean): String? =
+        CoreBridge.gitBranchRemote(project.id, branch, forPush)
 
     /**
      * What changed, line by line — the whole patch, or one file's.
@@ -251,6 +291,12 @@ data class GitBranch(
      * is the difference between a push and Zed's "Publish".
      */
     val upstream: String? = null,
+    /**
+     * The upstream is configured but its ref is gone — deleted on the remote.
+     * Zed's `UpstreamTracking::Gone`: the remote button reads "Republish",
+     * and pushing re-creates the branch with `--set-upstream`.
+     */
+    val upstreamGone: Boolean = false,
 ) {
     val hasUpstream: Boolean get() = upstream != null
 
@@ -265,7 +311,68 @@ data class GitBranch(
             behind = json.optInt("behind"),
             unborn = json.optBoolean("unborn"),
             upstream = if (json.isNull("upstream")) null else json.getString("upstream"),
+            upstreamGone = json.optBoolean("upstream_gone"),
         )
+    }
+}
+
+/**
+ * One remote, as `git remote -v` lists it: the name every remote argv takes,
+ * and the fetch URL — which is what tells a github.com remote from any other.
+ */
+data class GitRemote(val name: String, val url: String) {
+    /** The remote is on github.com — what gates the open-on-web actions. */
+    val isGithub: Boolean
+        get() = url.contains("github.com/") || url.contains("github.com:")
+}
+
+/** Every remote, or why the listing failed. */
+data class GitRemoteList(
+    val remotes: List<GitRemote> = emptyList(),
+    val error: String? = null,
+) {
+    internal companion object {
+        fun parse(json: String): GitRemoteList {
+            val root = JSONObject(json)
+            val remotes = root.optJSONArray("remotes") ?: JSONArray()
+            return GitRemoteList(
+                remotes = List(remotes.length()) { index ->
+                    val remote = remotes.getJSONObject(index)
+                    GitRemote(name = remote.optString("name"), url = remote.optString("url"))
+                },
+                error = if (root.isNull("error")) null else root.getString("error"),
+            )
+        }
+    }
+}
+
+/**
+ * What a remote command (fetch, pull, push) said. The two streams are kept
+ * apart because Zed's toast rules read them separately — a pull's file count
+ * is parsed off stdout while the fetch progress lands on stderr, and a push's
+ * "Everything up-to-date" is a stderr sentence. [error] is null on success;
+ * on failure it is the one-line reason, with the streams still here for the
+ * log view.
+ */
+data class RemoteOpResult(
+    /** The remote the command ran against; null for fetch-all. */
+    val remote: String? = null,
+    val stdout: String = "",
+    val stderr: String = "",
+    val error: String? = null,
+) {
+    val ok: Boolean get() = error == null
+
+    internal companion object {
+        fun parse(json: String): RemoteOpResult {
+            val root = JSONObject(json)
+            return RemoteOpResult(
+                remote = if (root.isNull("remote")) null else root.getString("remote"),
+                stdout = root.optString("stdout"),
+                stderr = root.optString("stderr"),
+                error = if (root.isNull("error")) null else root.getString("error"),
+            )
+        }
     }
 }
 

@@ -187,6 +187,11 @@ pub struct BranchInfo {
     /// that has never been pushed — the difference between "push" and Zed's
     /// "Publish".
     pub upstream: Option<String>,
+    /// The upstream is configured but its ref is gone — git's `[gone]`,
+    /// usually a branch deleted on the remote. Zed's `UpstreamTracking::Gone`:
+    /// the remote button reads "Republish", and a push re-creates the branch
+    /// with `--set-upstream` (git_ui.rs:822-829, git_panel.rs:3920-3929).
+    pub upstream_gone: bool,
 }
 
 /// Everything the git panel draws, as one snapshot.
@@ -242,7 +247,9 @@ pub(crate) struct ProjectGit {
     statuses: Arc<BTreeMap<String, GitStatus>>,
     /// The same run's output, unreduced, for the git panel.
     pub(crate) changes: Arc<Vec<FileChange>>,
-    branch: Option<BranchInfo>,
+    /// Read by the remote commands too: a push's refspec names the upstream's
+    /// branch, which this already knows.
+    pub(crate) branch: Option<BranchInfo>,
     /// The commit HEAD named when the run finished — see [`read_head`].
     head: Option<String>,
     /// Where the enclosing repository is, once a run has looked. `None` after
@@ -931,6 +938,14 @@ pub(crate) fn parse_branch(output: &[u8]) -> Option<BranchInfo> {
                 info.upstream = Some(upstream.to_owned());
             }
         }
+        // `main...origin/main [gone]` — the upstream is configured but its
+        // ref no longer exists. Only ever written whole, and only ever with
+        // an upstream to be gone.
+        if info.upstream.is_some()
+            && let Some((_, bracket)) = rest.split_once('[')
+        {
+            info.upstream_gone = bracket.trim_end_matches(']').trim() == "gone";
+        }
     }
     Some(info)
 }
@@ -1079,6 +1094,12 @@ fn summary(tier: u8, from: GitStatus) -> GitStatus {
 /// button, and a spinner that never ends is worse than an error.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The deadline for fetch, pull and push, which move commits over a network
+/// that may be a phone's. Thirty seconds kills a legitimate first fetch of a
+/// real repository; two minutes is still an ending, which Zed's (deadline-less)
+/// remote commands do not promise at all.
+pub(crate) const REMOTE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// What the shell wrapper prints after the command it ran.
 const EXIT_MARKER: &str = "conquest-exit:";
 
@@ -1119,20 +1140,25 @@ impl GitRun {
     /// sentence with `fatal:` or `error:` when there is one, and that when
     /// there is not — the commit case — it is the last thing said.
     pub fn message(&self) -> String {
-        let lines: Vec<&str> = self
-            .output
-            .lines()
-            .map(str::trim_end)
-            .filter(|line| !line.trim().is_empty())
-            .collect();
-        let marked = lines.iter().find_map(|line| {
-            line.strip_prefix("fatal: ")
-                .or_else(|| line.strip_prefix("error: "))
-        });
-        match marked.or_else(|| lines.last().copied()) {
-            Some(line) => line.trim().to_owned(),
-            None => format!("git exited with {}", self.status),
-        }
+        failure_line(&self.output, self.status)
+    }
+}
+
+/// The shared body of [`GitRun::message`] — also what a split-stream command
+/// ([`run_git_split`]) summarizes its two streams through.
+pub(crate) fn failure_line(output: &str, status: i32) -> String {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let marked = lines.iter().find_map(|line| {
+        line.strip_prefix("fatal: ")
+            .or_else(|| line.strip_prefix("error: "))
+    });
+    match marked.or_else(|| lines.last().copied()) {
+        Some(line) => line.trim().to_owned(),
+        None => format!("git exited with {status}"),
     }
 }
 
@@ -1205,6 +1231,105 @@ fn parse_run(output: &[u8]) -> Result<GitRun, String> {
     Ok(GitRun {
         status: after.trim().parse().unwrap_or(-1),
         output: before.to_owned(),
+    })
+}
+
+/// What the split wrapper prints between the two streams.
+const STDERR_MARKER: &str = "conquest-stderr:";
+
+/// A second wrapper, for the commands whose two streams *mean* different
+/// things. Zed's remote-output toasts read them separately — a pull's file
+/// count is parsed off stdout while the fetch progress scrolls by on stderr,
+/// and a push's "Everything up-to-date" is a stderr sentence
+/// (`crates/git_ui/src/remote_output.rs:82-186`) — so merging them the way
+/// [`WRAPPER`] does would leave nothing to format.
+///
+/// stderr is parked in a file while stdout streams through, then replayed
+/// after its marker; both markers are printed with no added newline so each
+/// stream comes back byte-for-byte, trailing newlines included — the toast
+/// rules end on `\n` and have to keep matching.
+const SPLIT_WRAPPER: &str = r#"t="${TMPDIR:-/tmp}/conquest-stderr.$$"; "$@" 2>"$t"; s=$?; printf 'conquest-stderr:'; cat "$t" 2>/dev/null; rm -f "$t"; printf 'conquest-exit:%d' "$s""#;
+
+/// What one split-stream command did.
+pub(crate) struct GitSplitRun {
+    pub status: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// [`run_git`] with the two streams kept apart — for fetch, pull and push,
+/// whose output the UI formats rather than merely shows. Same guest, same
+/// retry, longer deadline ([`REMOTE_TIMEOUT`]): these talk to a network.
+pub(crate) fn run_git_split(
+    userland: &Userland,
+    repo_root: &Path,
+    label: &str,
+    argv: Vec<OsString>,
+) -> Result<GitSplitRun, String> {
+    log::debug!("{label}: {argv:?}");
+    let retry_argv = argv.clone();
+    let output = guest::capture(
+        userland,
+        &git_command(label, repo_root, split_wrapped_argv(argv)),
+        REMOTE_TIMEOUT,
+    )
+    .ok_or_else(|| "Could not run git in the Linux userland".to_owned())?;
+    let run = parse_split_run(&output)?;
+    if run.status == 0 {
+        return Ok(run);
+    }
+    log::debug!(
+        "{label} exited {}: stdout {:?} stderr {:?}",
+        run.status,
+        run.stdout,
+        run.stderr
+    );
+    // The same not-ready-guest retry `run_git` documents.
+    if run.stderr.contains("cannot change to") {
+        log::debug!("{label}: the guest lost the project; running it once more");
+        let output = guest::capture(
+            userland,
+            &git_command(label, repo_root, split_wrapped_argv(retry_argv)),
+            REMOTE_TIMEOUT,
+        )
+        .ok_or_else(|| "Could not run git in the Linux userland".to_owned())?;
+        return parse_split_run(&output);
+    }
+    Ok(run)
+}
+
+/// git's argv under the split wrapper — [`wrapped_argv`]'s twin.
+fn split_wrapped_argv(argv: Vec<OsString>) -> Vec<OsString> {
+    let mut wrapped: Vec<OsString> = vec![
+        OsString::from("/bin/sh"),
+        OsString::from("-c"),
+        OsString::from(SPLIT_WRAPPER),
+        OsString::from("conquest-git"),
+    ];
+    wrapped.extend(argv);
+    wrapped
+}
+
+/// Split the split wrapper's output back into stdout, stderr and the status.
+///
+/// The exit marker is taken from the *last* occurrence for the same reason
+/// [`parse_run`] does. The stderr marker is taken from the *first*: the
+/// wrapper prints it exactly once, between the streams, so an occurrence git
+/// itself wrote can only sit inside one of them — and a remote command's
+/// stdout containing the literal is a curiosity, not a failure mode worth a
+/// byte-count protocol.
+fn parse_split_run(output: &[u8]) -> Result<GitSplitRun, String> {
+    let output = String::from_utf8_lossy(output).into_owned();
+    let (before, after) = output
+        .rsplit_once(EXIT_MARKER)
+        .ok_or_else(|| "git produced no result".to_owned())?;
+    let (stdout, stderr) = before
+        .split_once(STDERR_MARKER)
+        .ok_or_else(|| "git produced no result".to_owned())?;
+    Ok(GitSplitRun {
+        status: after.trim().parse().unwrap_or(-1),
+        stdout: stdout.to_owned(),
+        stderr: stderr.to_owned(),
     })
 }
 
@@ -1612,59 +1737,6 @@ impl crate::Engine {
         self.git_state_changed(id);
         if run.status == 0 {
             Ok(())
-        } else {
-            Err(run.message())
-        }
-    }
-
-    /// Send commits to the remote — Zed's push, and its "Publish" when the
-    /// branch has no upstream yet (that is the only difference: `-u`).
-    ///
-    /// There is no credential helper inside the guest and nothing here can
-    /// answer a password prompt, so `GIT_TERMINAL_PROMPT=0` (already set by
-    /// [`git_command`]) makes an HTTPS remote fail immediately with git's own
-    /// explanation rather than hanging until the deadline. SSH with a key in
-    /// the userland's `~/.ssh` works.
-    ///
-    /// **Blocking**: it talks to the network.
-    pub fn git_push(
-        &self,
-        id: ProjectId,
-        branch: &str,
-        set_upstream: bool,
-    ) -> Result<String, String> {
-        let branch = checked_branch(branch)?;
-        let repo = self.repo_for(id)?;
-        // The remote the branch actually tracks, when it tracks one: pushing
-        // `fork/main` to `origin` would send it to a different repository from
-        // the one the ahead count was measured against.
-        let remote = self
-            .with_git(id, |git| git.branch.clone())
-            .flatten()
-            .and_then(|branch| branch.upstream)
-            .and_then(|upstream| {
-                upstream
-                    .split_once('/')
-                    .map(|(remote, _)| remote.to_owned())
-            })
-            .unwrap_or_else(|| "origin".to_owned());
-        let mut args: Vec<OsString> = vec![OsString::from("push")];
-        if set_upstream {
-            args.push(OsString::from("--set-upstream"));
-        }
-        args.push(OsString::from(checked_branch(&remote)?));
-        args.push(OsString::from(&branch));
-        let run = run_git(
-            &repo.userland,
-            &repo.repo_root,
-            "git push",
-            git_argv(&repo.project_root, &args),
-        )?;
-        self.git_state_changed(id);
-        if run.status == 0 {
-            // git writes its progress to stderr and says nothing on stdout;
-            // the wrapper merges them, so this is what actually happened.
-            Ok(run.output.trim().to_owned())
         } else {
             Err(run.message())
         }
@@ -2417,6 +2489,60 @@ mod tests {
     }
 
     #[test]
+    fn a_split_run_keeps_the_two_streams_apart() {
+        let run = parse_split_run(
+            b"Updating abc..def\n 1 file changed\nconquest-stderr:From github.com:x/y\nconquest-exit:0",
+        )
+        .unwrap();
+        assert_eq!(run.status, 0);
+        assert_eq!(run.stdout, "Updating abc..def\n 1 file changed\n");
+        assert_eq!(run.stderr, "From github.com:x/y\n");
+
+        // Both streams empty is still an answer — a fetch with nothing to
+        // say, which is exactly the "Already up to date" toast's evidence.
+        let run = parse_split_run(b"conquest-stderr:conquest-exit:0").unwrap();
+        assert_eq!(run.status, 0);
+        assert!(run.stdout.is_empty() && run.stderr.is_empty());
+
+        // A failure's one-liner comes off stderr, where git says why — the
+        // shared summarizer over stdout-then-stderr finds the marked line.
+        let run = parse_split_run(
+            b"conquest-stderr:fatal: could not read from remote repository\nconquest-exit:128",
+        )
+        .unwrap();
+        assert_eq!(run.status, 128);
+        assert_eq!(
+            failure_line(&format!("{}\n{}", run.stdout, run.stderr), run.status),
+            "could not read from remote repository"
+        );
+
+        // Half a wrapper is no wrapper: without both markers there is
+        // nothing to believe.
+        assert!(parse_split_run(b"conquest-exit:0").is_err());
+        assert!(parse_split_run(b"killed").is_err());
+    }
+
+    /// The split wrapper through the host's real `sh`, with a command that
+    /// writes to both streams — every assertion above is about bytes we wrote
+    /// ourselves, and the wrapper is shell this test can actually run.
+    #[test]
+    fn the_real_shell_runs_the_split_wrapper() {
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(SPLIT_WRAPPER)
+            .arg("conquest-git")
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("printf 'out\\n'; printf 'err\\n' >&2; exit 3")
+            .output()
+            .expect("failed to run sh");
+        let run = parse_split_run(&out.stdout).unwrap();
+        assert_eq!(run.status, 3);
+        assert_eq!(run.stdout, "out\n");
+        assert_eq!(run.stderr, "err\n");
+    }
+
+    #[test]
     fn a_message_is_the_line_git_marked_or_the_last_thing_it_said() {
         // git's own shape for an identity it cannot guess: a heading, a
         // paragraph of advice, and the actual reason at the bottom.
@@ -3041,6 +3167,14 @@ mod tests {
 
         let ahead = branch("## main...origin/main [ahead 1]");
         assert_eq!((ahead.ahead, ahead.behind), (1, 0));
+        assert!(!ahead.upstream_gone);
+
+        // The upstream is configured but deleted on the remote — the shape
+        // that turns the remote button into "Republish".
+        let gone = branch("## feature...origin/feature [gone]");
+        assert_eq!(gone.upstream.as_deref(), Some("origin/feature"));
+        assert!(gone.upstream_gone);
+        assert_eq!((gone.ahead, gone.behind), (0, 0));
 
         let unborn = branch("## No commits yet on main");
         assert_eq!(unborn.name.as_deref(), Some("main"));

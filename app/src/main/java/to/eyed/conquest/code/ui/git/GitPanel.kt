@@ -391,7 +391,23 @@ fun GitPanel(
      */
     fun push() {
         val branch = state.branch ?: return
-        perform({ session.push(branch.name.orEmpty(), setUpstream = !branch.hasUpstream) })
+        perform({
+            // Zed's get_remote: the branch's configured push remote first,
+            // then the remote list — where a single remote picks itself
+            // (picker_prompt.rs:27-31; the several-remotes picker is the
+            // split button's, not this plain button's).
+            val remote = session.branchRemote(branch.name.orEmpty(), forPush = true)
+                ?: session.remotes().remotes.firstOrNull()?.name
+                // Zed git_panel.rs:3941
+                ?: return@perform "No remote available to push to. Add a remote to be able to publish changes."
+            session.push(
+                branch.name.orEmpty(),
+                remote,
+                // Publish and Republish both: no upstream, or an upstream
+                // whose remote branch is gone (git_panel.rs:3920-3929).
+                setUpstream = !branch.hasUpstream || branch.upstreamGone,
+            ).error
+        })
     }
 
     /** Save the identity, then commit — which is what the user asked for. */
