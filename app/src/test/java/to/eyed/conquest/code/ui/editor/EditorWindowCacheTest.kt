@@ -68,6 +68,32 @@ class EditorWindowCacheTest {
     }
 
     @Test
+    fun aConcurrentEditForcesARefetchInsteadOfTheInPlacePatch() {
+        val (state, buffer) = editorOf()
+        state.setCarets(listOf(Caret(10, 4)), Caret(10, 4))
+        state.linesWindow(0, 40)
+
+        // A second writer's edit lands between the keystroke's staleness
+        // check and its own edit reaching the engine, so the keystroke's
+        // edit comes back at checked-version + 2. The patched window does
+        // not hold what the other writer wrote, so serving it as current
+        // would show row 20's old text forever.
+        buffer.beforeNextEdit = {
+            val start = buffer.rowStart(20)
+            buffer.edit(start, start + "line 20".length, "agent wrote this")
+        }
+        state.insertAtCursor("X")
+        val lineCalls = buffer.lineCalls
+
+        val window = state.linesWindow(0, 40)
+
+        assertTrue("the ambiguous stamp forced a real refetch",
+            buffer.lineCalls > lineCalls)
+        assertEquals("lineX 10", window[10])
+        assertEquals("agent wrote this", window[20])
+    }
+
+    @Test
     fun aStructuralEditStillRefetchesTheWindow() {
         val (state, buffer) = editorOf()
         state.setCarets(listOf(Caret(10, 4)), Caret(10, 4))

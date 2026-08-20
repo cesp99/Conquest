@@ -53,6 +53,17 @@ internal class FakeEditorBuffer(
     /** Edits the buffer refused, in the order it refused them. */
     val refusedEdits = mutableListOf<Triple<Long, Long, String>>()
 
+    /**
+     * Runs once, at the top of the next [edit] — the stand-in for a second
+     * writer (an agent's `on_write_text_file`, the disk-change reload)
+     * whose engine-side edit lands between the editor's staleness check
+     * and the editor's own edit reaching the engine. A hook that edits the
+     * buffer makes the editor's edit come back with a version two past the
+     * one it checked, which is exactly what the window cache's patch guard
+     * has to notice.
+     */
+    var beforeNextEdit: (() -> Unit)? = null
+
     private val rows: List<String> get() = text.split('\n')
 
     override val lineCount: Int get() = rows.size
@@ -126,23 +137,23 @@ internal class FakeEditorBuffer(
         return (row shl 32) or (at - rowStart).toLong()
     }
 
-    override fun edit(start: Long, end: Long, replacement: String): Boolean {
+    override fun edit(start: Long, end: Long, replacement: String): Long {
+        beforeNextEdit?.also { beforeNextEdit = null }?.invoke()
         val bytes = utf8(text)
         if (start < 0 || end < start || end > bytes.size) {
             refusedEdits.add(Triple(start, end, replacement))
-            return false
+            return -1L
         }
         val from = start.toInt()
         val to = end.toInt()
         if (isContinuation(bytes, from) || isContinuation(bytes, to)) {
             refusedEdits.add(Triple(start, end, replacement))
-            return false
+            return -1L
         }
         text = String(bytes, 0, from, Charsets.UTF_8) +
             replacement +
             String(bytes, to, bytes.size - to, Charsets.UTF_8)
-        version++
-        return true
+        return ++version
     }
 
     override fun undo(): Boolean = false

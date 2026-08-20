@@ -49,11 +49,16 @@ internal interface EditorBuffer {
     fun pointOf(offset: Long): Long
 
     /**
-     * Replace the byte range [start, end) with [replacement]. False when the
-     * engine refused it — an offset off a code-point boundary or past the
-     * end of the buffer — in which case nothing changed.
+     * Replace the byte range [start, end) with [replacement]. Returns the
+     * buffer version this edit produced — the engine bumps the version by
+     * exactly one per edit, under the buffer's lock, which is what lets
+     * [EditorState.applyLineDiff]'s in-place window patch tell a lone edit
+     * (returned == checked version + 1) from one that a concurrent writer
+     * slipped in ahead of. Returns -1 when the engine refused the edit —
+     * an offset off a code-point boundary or past the end of the buffer —
+     * in which case nothing changed.
      */
-    fun edit(start: Long, end: Long, replacement: String): Boolean
+    fun edit(start: Long, end: Long, replacement: String): Long
 
     fun undo(): Boolean
 
@@ -83,7 +88,7 @@ internal class SessionBuffer(private val session: BufferSession) : EditorBuffer 
 
     override fun pointOf(offset: Long): Long = CoreBridge.offsetToPoint(session.id, offset)
 
-    override fun edit(start: Long, end: Long, replacement: String): Boolean =
+    override fun edit(start: Long, end: Long, replacement: String): Long =
         session.editBytes(start, end, replacement)
 
     override fun undo(): Boolean = session.undo()

@@ -1825,7 +1825,7 @@ class EditorState private constructor(
             // engine: an empty edit would bump the version and litter the
             // undo history for no change at all.
             if (edit.start == edit.end && edit.replacement.isEmpty()) continue
-            if (!buffer.edit(edit.start, edit.end, edit.replacement)) {
+            if (buffer.edit(edit.start, edit.end, edit.replacement) < 0) {
                 // The engine refused this range, so the buffer is exactly as
                 // it was. Letting the edit stay in the batch would count its
                 // length against every caret after it and put all of them at
@@ -1911,10 +1911,12 @@ class EditorState private constructor(
         // Whether the window cache holds this row at the pre-edit version,
         // decided *before* the edit moves the version out from under it.
         val patchable = buffer.version == cachedVersion && row in cachedFirst until cachedLast
-        var edited = false
+        var editedVersion = -1L
         if (edit != null) {
-            edited = buffer.edit(lineStart + edit.start, lineStart + edit.end, edit.replacement)
+            editedVersion =
+                buffer.edit(lineStart + edit.start, lineStart + edit.end, edit.replacement)
         }
+        val edited = editedVersion >= 0
         val structural = '\n' in newLine
         if (structural) {
             val cursorOffset = lineStart +
@@ -1938,9 +1940,23 @@ class EditorState private constructor(
             // [linesWindow] re-reads only the spans. A stale span reaching
             // past a shortened line is clamped to the drawn text by the
             // renderer ([spansIn] / `TextLayoutCache.annotate`).
-            if (edited && patchable) {
+            //
+            // The stamp comes from the edit's own return, never from a
+            // re-read of [EditorBuffer.version]: the buffer is edited from
+            // other threads too (an agent's `on_write_text_file` writing
+            // through the open buffer, the disk-change reload), and a write
+            // landing between the [patchable] check and this stamp would be
+            // absorbed into a re-read version without its content — the
+            // cache then serves stale rows as current forever, since the
+            // stamped version matches. The engine bumps the version by
+            // exactly one per edit under the buffer's lock (`Engine::edit`),
+            // so a return of exactly checked-version + 1 proves ours was the
+            // only edit since the cache was valid; anything else means a
+            // concurrent write slipped in, and leaving [cachedVersion]
+            // behind makes the next [linesWindow] miss and refetch.
+            if (edited && patchable && editedVersion == cachedVersion + 1) {
                 cachedLines[row - cachedFirst] = newLine
-                cachedVersion = buffer.version
+                cachedVersion = editedVersion
             }
         }
         refreshLineCount(row, row)
