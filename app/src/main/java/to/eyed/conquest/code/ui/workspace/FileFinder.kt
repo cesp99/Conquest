@@ -61,6 +61,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import to.eyed.conquest.code.core.FileMatch
 import to.eyed.conquest.code.core.ProjectSession
@@ -68,6 +69,15 @@ import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import to.eyed.conquest.code.ui.theme.rem
 
 private const val MAX_RESULTS = 50
+
+/**
+ * How long a keystroke waits before the worktree is matched. The match is a
+ * blocking call that takes the engine's project mutex, so firing on every
+ * keystroke queues stale searches that contend with the fresh one. Shorter
+ * than project search's 250ms: this reads a snapshot already in memory, not
+ * the disk.
+ */
+private const val QUERY_DEBOUNCE_MS = 120L
 
 /**
  * Elevated surfaces are `rounded_lg` = 8px with a 1px `border.variant`
@@ -289,8 +299,10 @@ internal val PickerListPadding = PaddingValues(vertical = 4.dp)
  * Matching happens in the engine against the worktree snapshot already in
  * memory, so a keystroke costs one coarse JNI call and no directory walk.
  * The query runs off the main thread — it is blocking on the engine side —
- * and results are only published if the query hasn't moved on, so a slow
- * result can't overwrite a newer one.
+ * behind a short debounce, so a typing burst becomes one call rather than a
+ * queue of stale ones on the project mutex, and results are only published
+ * if the query hasn't moved on, so a slow result can't overwrite a newer
+ * one.
  *
  * Keyboard-first by design (see docs/SHORTCUTS.md), but every row is also a
  * touch target and shows a hand cursor under a mouse.
@@ -311,6 +323,9 @@ fun FileFinder(
 
     LaunchedEffect(query.text, project) {
         val text = query.text
+        // The empty query is the finder opening; its first paint must not
+        // wait on a debounce that exists for typing.
+        if (text.isNotEmpty()) delay(QUERY_DEBOUNCE_MS)
         val found = withContext(Dispatchers.Default) { project.findFiles(text, MAX_RESULTS) }
         // The user may have typed on while this ran; a stale answer must not
         // replace a fresher one.

@@ -47,6 +47,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import to.eyed.conquest.code.core.BufferMatch
 import to.eyed.conquest.code.core.SearchQuery
@@ -83,17 +84,29 @@ private val ButtonBox = 20.dp
 private val CountMinWidth = 40.dp
 
 /**
+ * How long the search waits after its keys move. The search itself is cheap,
+ * but the keys include the buffer's revision, so typing in the *editor* while
+ * the bar is open re-runs it too — this folds a burst of edits, or of query
+ * keystrokes, into one scan. Short, because until it fires the highlights sit
+ * over text that may have moved.
+ */
+private const val SEARCH_DEBOUNCE_MS = 150L
+
+/**
  * Find within the open buffer — Zed's buffer search, in its shape: a row above
  * the editor with the query (the three toggles live *inside* its right edge,
  * as in Zed), the prev/next arrows behind a hairline, the match count and the
  * close button.
  *
  * The search itself is an engine call that scans the whole buffer in a few
- * milliseconds even at 100k lines, so it runs on every keystroke rather than
- * behind a debounce, and there is no incremental state to get wrong. It still
+ * milliseconds even at 100k lines, and there is no incremental state to get
+ * wrong. It re-runs behind a short debounce — not for its own cost, but
+ * because it also re-runs on every edit to the buffer while the bar is open,
+ * and a typing burst should cost one scan, not one per keystroke. It still
  * goes through [withContext] on the default dispatcher, because "a few
  * milliseconds" is measured on a desktop and the main thread has 16 of them
- * for everything.
+ * for everything. Enter/F3 walk matches already computed, so stepping never
+ * waits on the debounce.
  *
  * The matches are handed to [EditorState] rather than drawn here: only the
  * canvas can paint over the text.
@@ -145,6 +158,7 @@ fun BufferSearchBar(
             editor.clearSearchMatches()
             return@LaunchedEffect
         }
+        delay(SEARCH_DEBOUNCE_MS)
         val search = SearchQuery(
             query = text,
             regex = regex,
