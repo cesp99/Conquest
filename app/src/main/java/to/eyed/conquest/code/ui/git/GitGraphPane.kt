@@ -154,10 +154,14 @@ fun GitGraphPane(
     // through the same counter everything else uses — but the counter also
     // bumps on every save, and each reload here is `git log` under proot, so
     // a move only reloads when what history depends on has moved: HEAD, or
-    // the branch, both read from the same cached run the counter versions. A
-    // reload resets the list rather than appending, since history can be
-    // rewritten as well as added to. When the engine cannot name HEAD, every
-    // move reloads — the old trigger: eager, but never stale.
+    // the branch record — name, ahead/behind, upstream, so a fetch or push
+    // that moves upstream refs without touching HEAD redraws the ref chips —
+    // both read from the same cached run the counter versions. A pure `git
+    // tag` moves neither and still does not reload, which is the one residual
+    // this key accepts. A reload resets the list rather than appending, since
+    // history can be rewritten as well as added to. When the engine cannot
+    // name HEAD, every move reloads — the old trigger: eager, but never
+    // stale.
     //
     // The baseline survives the lifecycle block's restarts on purpose: a
     // commit made while the app was in the background (an agent, a shell)
@@ -167,8 +171,11 @@ fun GitGraphPane(
     // above just loaded.
     var seenGraph by remember(session) { mutableStateOf<Pair<String?, String?>?>(null) }
     ResumedEffect(session) {
+        // The branch half is the record's JSON verbatim: serialization is
+        // stable for equal values, so comparing the strings is comparing the
+        // fields, with nothing to parse on a poll that mostly finds no change.
         fun graphKey(): Pair<String?, String?> =
-            CoreBridge.gitHead(project.id) to CoreBridge.gitBranch(project.id)
+            CoreBridge.gitHead(project.id) to CoreBridge.gitBranchInfo(project.id)
         withContext(Dispatchers.Default) {
             var seen = Long.MIN_VALUE
             while (true) {

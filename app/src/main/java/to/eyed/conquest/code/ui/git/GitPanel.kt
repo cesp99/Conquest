@@ -267,10 +267,14 @@ fun GitPanel(
     // Loaded when the History tab is opened, and again whenever the commit
     // graph could have moved — a commit made in this panel changes HEAD, so
     // it appears at the top without asking the user to come back, while a
-    // save only replaces the status snapshot and reloads nothing. When the
-    // engine cannot name HEAD, the snapshot itself is the key, which is the
-    // old trigger: eager, but never stale.
-    LaunchedEffect(session, tab, state.branch?.name, head ?: state) {
+    // save only replaces the status snapshot and reloads nothing. The branch
+    // is keyed whole — name, ahead/behind, upstream — because a fetch or push
+    // moves upstream refs without touching HEAD, and the ref chips beside the
+    // subjects would otherwise go stale. A pure `git tag` moves neither and
+    // still does not reload, which is the one residual this key accepts. When
+    // the engine cannot name HEAD, the snapshot itself is the key, which is
+    // the old trigger: eager, but never stale.
+    LaunchedEffect(session, tab, state.branch, head ?: state) {
         if (tab != GitPanelTab.History) return@LaunchedEffect
         history = withContext(Dispatchers.IO) { session.log() }
     }

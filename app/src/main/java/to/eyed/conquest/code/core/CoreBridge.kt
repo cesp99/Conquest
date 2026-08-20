@@ -222,12 +222,17 @@ object CoreBridge {
     external fun gitStatusVersion(projectId: Long): Long
 
     /**
-     * The branch the project is on, from the cached status run — no JSON of
-     * the changed files, no git. Null when it is not known: no repository, no
-     * completed run yet, or a detached HEAD, which is on no branch. Versioned
-     * by [gitStatusVersion], like every other read of that cache.
+     * The branch record the project is on, from the cached status run, as
+     * JSON — `{name, ahead, behind, unborn, upstream}`, the same object
+     * [gitChanges] nests — with no JSON of the changed files and no git run:
+     * the title bar's drift arrows and the history views' reload keys ride
+     * the same half-second poll the name does. Null when nothing is known:
+     * no repository, or no completed run yet. A detached HEAD is a present
+     * object whose `name` is null — on no branch, which is not the same
+     * answer as no repository. Versioned by [gitStatusVersion], like every
+     * other read of that cache.
      */
-    external fun gitBranch(projectId: Long): String?
+    external fun gitBranchInfo(projectId: Long): String?
 
     /**
      * The commit HEAD points at, from the same cache — the staleness key for

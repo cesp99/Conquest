@@ -361,14 +361,16 @@ impl crate::Engine {
     ///
     /// A title bar that only names the branch has no business paying for
     /// [`Engine::git_changes`], which clones and serializes every changed
-    /// file. `None` when it is not known: no repository, no completed run yet,
-    /// or a detached HEAD, which is on no branch.
-    pub fn git_branch(&self, id: ProjectId) -> Option<String> {
+    /// file. The whole [`BranchInfo`] rather than the name alone, because the
+    /// same cheap read feeds the title bar's ↑↓ drift arrows and the reload
+    /// keys of the history views, which go stale when a fetch or push moves
+    /// the upstream without touching HEAD. `None` when nothing is known: no
+    /// repository, or no completed run yet. A detached HEAD is `Some` with a
+    /// `name` of `None` — still a repository, just on no branch — which a
+    /// caller must keep distinct from `None`.
+    pub fn git_branch(&self, id: ProjectId) -> Option<BranchInfo> {
         self.refresh_git_status(id);
-        self.with_git(id, |git| {
-            git.branch.as_ref().and_then(|branch| branch.name.clone())
-        })
-        .flatten()
+        self.with_git(id, |git| git.branch.clone()).flatten()
     }
 
     /// The commit HEAD names, from the same cache — the staleness key for the
@@ -2956,6 +2958,27 @@ mod tests {
         panic!("git status never reported {path}");
     }
 
+    /// Wait for the cached branch record to satisfy `pred` — the cache refills
+    /// behind the same debounce [`await_change`] describes, and reading it is
+    /// what schedules the run.
+    #[cfg(unix)]
+    fn await_branch(
+        engine: &crate::Engine,
+        id: ProjectId,
+        pred: impl Fn(&BranchInfo) -> bool,
+    ) -> BranchInfo {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if let Some(branch) = engine.git_branch(id)
+                && pred(&branch)
+            {
+                return branch;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("git status never reported the expected branch");
+    }
+
     /// Is there a git to test against at all?
     fn has_git() -> bool {
         if Command::new("git").arg("--version").output().is_ok() {
@@ -3254,10 +3277,12 @@ mod tests {
         assert_eq!(plain_status(&repo), "");
     }
 
-    /// The cheap reads answer from the status run's cache: the branch a title
-    /// bar polls every half second, and the head a history pane keys its
-    /// reloads on, both without a JSON snapshot of every changed file — and
-    /// both agreeing with what git itself says about the same repository.
+    /// The cheap reads answer from the status run's cache: the branch record a
+    /// title bar polls every half second — name, drift and upstream, since the
+    /// ↑↓ arrows and the history panes' reload keys are built from it — and
+    /// the head a history pane keys its reloads on, both without a JSON
+    /// snapshot of every changed file, and both agreeing with what git itself
+    /// says about the same repository.
     #[test]
     #[cfg(unix)]
     fn the_branch_and_head_are_cached_for_cheap_reads() {
@@ -3278,13 +3303,61 @@ mod tests {
         let id = engine.open_project(&repo);
         await_change(&engine, id, "README");
 
-        assert_eq!(engine.git_branch(id).as_deref(), Some("main"));
+        let branch = engine.git_branch(id).expect("a run has completed");
+        assert_eq!(branch.name.as_deref(), Some("main"));
+        assert_eq!((branch.ahead, branch.behind), (0, 0));
+        assert_eq!(branch.upstream, None);
         let head = engine.git_head(id).expect("a commit exists to name");
         let out = host_git(&repo, &["rev-parse", "HEAD"]);
         assert_eq!(head, String::from_utf8_lossy(&out.stdout).trim());
         // The panel's snapshot carries the same key, so a caller already
         // holding one pays nothing extra for it.
         assert_eq!(engine.git_changes(id).head.as_deref(), Some(head.as_str()));
+
+        // Publish the branch and commit past it: the cheap read has to carry
+        // the drift and the upstream, because a fetch or push moves these
+        // without moving HEAD and the views keyed on this read must see it.
+        assert!(
+            host_git(dir.path(), &["init", "--quiet", "--bare", "remote.git"])
+                .status
+                .success()
+        );
+        let remote = dir.path().join("remote.git");
+        let remote = remote.to_str().unwrap();
+        assert!(
+            host_git(&repo, &["remote", "add", "origin", remote])
+                .status
+                .success()
+        );
+        assert!(
+            host_git(&repo, &["push", "--quiet", "-u", "origin", "main"])
+                .status
+                .success()
+        );
+        assert!(
+            host_git(&repo, &["commit", "--allow-empty", "-qm", "ahead"])
+                .status
+                .success()
+        );
+        // Host git moved refs behind the engine's back; the engine's own
+        // commands do this for themselves.
+        engine.git_state_changed(id);
+        let ahead = await_branch(&engine, id, |branch| branch.ahead == 1);
+        assert_eq!(ahead.name.as_deref(), Some("main"));
+        assert_eq!((ahead.ahead, ahead.behind), (1, 0));
+        assert_eq!(ahead.upstream.as_deref(), Some("origin/main"));
+
+        // A detached HEAD is a *present* record with no name: on no branch is
+        // not the same answer as no repository, and the title bar's "no
+        // branch" chip hangs on the difference.
+        assert!(
+            host_git(&repo, &["checkout", "--quiet", "--detach"])
+                .status
+                .success()
+        );
+        engine.git_state_changed(id);
+        let detached = await_branch(&engine, id, |branch| branch.name.is_none());
+        assert_eq!(detached.name, None);
     }
 
     #[test]

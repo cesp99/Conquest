@@ -5,6 +5,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import org.json.JSONObject
 import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.core.GitBranch
 import to.eyed.conquest.code.core.ProjectSession
@@ -19,12 +20,15 @@ private const val POLL_MS = 500L
  *
  * It reads the *same* status run the project panel's colours and the git panel
  * both use — one `git status` per project, one counter to poll — through
- * [CoreBridge.gitBranch], which hands back the cached name alone. The full
+ * [CoreBridge.gitBranchInfo], which hands back the cached branch record alone:
+ * name, ahead/behind drift, upstream. The full
  * [to.eyed.conquest.code.core.GitSession.state] read serializes and parses
  * every changed file, which a title bar has no use for.
  *
- * Null when no branch can be named — no repository, no status run yet, or a
- * detached HEAD — and the title bar shows nothing rather than guessing.
+ * Null when nothing is known — no repository, or no status run yet — and the
+ * title bar shows nothing rather than guessing. A detached HEAD arrives as a
+ * branch whose [GitBranch.name] is null, so the title bar still draws its
+ * clickable "no branch" chip rather than losing the way into the git panel.
  */
 @Composable
 fun rememberGitBranch(project: ProjectSession?): GitBranch? {
@@ -34,7 +38,9 @@ fun rememberGitBranch(project: ProjectSession?): GitBranch? {
         pollVersion(
             intervalMs = POLL_MS,
             version = { project.gitStatusVersion },
-            read = { _ -> CoreBridge.gitBranch(project.id)?.let { GitBranch(name = it) } },
+            read = { _ ->
+                CoreBridge.gitBranchInfo(project.id)?.let { GitBranch.parse(JSONObject(it)) }
+            },
             apply = { branch = it },
         )
     }

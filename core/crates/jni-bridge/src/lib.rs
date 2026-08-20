@@ -585,18 +585,28 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitStatusVersi
     engine().git_status_version(project_id as u64) as jlong
 }
 
-/// The branch the project is on, from the cached status run — no JSON of the
-/// changed files, no git. Null when it is not known: no repository, no
-/// completed run yet, or a detached HEAD, which is on no branch. Versioned by
-/// `gitStatusVersion`, like every other read of that cache.
+/// The branch record the project is on, from the cached status run, as JSON —
+/// `{name, ahead, behind, unborn, upstream}`, the same object `gitChanges`
+/// nests — with no JSON of the changed files and no git run: the title bar's
+/// drift arrows and the history views' reload keys ride the same half-second
+/// poll the name does. Null when nothing is known: no repository, or no
+/// completed run yet. A detached HEAD is a present object whose `name` is
+/// null — on no branch, which is not the same answer as no repository.
+/// Versioned by `gitStatusVersion`, like every other read of that cache.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitBranch(
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitBranchInfo(
     env: JNIEnv,
     _class: JClass,
     project_id: jlong,
 ) -> jstring {
     match engine().git_branch(project_id as u64) {
-        Some(name) => to_jstring(&env, name),
+        Some(branch) => {
+            let json = serde_json::to_string(&branch).unwrap_or_else(|err| {
+                log::warn!("gitBranchInfo failed to serialize: {err}");
+                "{}".to_owned()
+            });
+            to_jstring(&env, json)
+        }
         None => std::ptr::null_mut(),
     }
 }
@@ -637,8 +647,8 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitStatus(
 }
 
 /// Everything the git panel draws, as JSON: `scanned`, `has_repo`, `branch`
-/// (`{name, ahead, behind, unborn}` or null), `head` (the commit id it names,
-/// or null when unknown) and `entries`, each
+/// (`{name, ahead, behind, unborn, upstream}` or null), `head` (the commit id
+/// it names, or null when unknown) and `entries`, each
 /// `{path, staged, unstaged, conflicted, in_head}` with the two statuses using
 /// the same names `gitStatus` does, or null.
 ///

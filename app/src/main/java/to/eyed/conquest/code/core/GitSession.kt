@@ -170,6 +170,20 @@ data class GitBranch(
     val upstream: String? = null,
 ) {
     val hasUpstream: Boolean get() = upstream != null
+
+    internal companion object {
+        /**
+         * From the bridge's JSON: the `branch` object [CoreBridge.gitChanges]
+         * nests, and the one [CoreBridge.gitBranchInfo] hands back whole.
+         */
+        fun parse(json: JSONObject): GitBranch = GitBranch(
+            name = if (json.isNull("name")) null else json.optString("name"),
+            ahead = json.optInt("ahead"),
+            behind = json.optInt("behind"),
+            unborn = json.optBoolean("unborn"),
+            upstream = if (json.isNull("upstream")) null else json.getString("upstream"),
+        )
+    }
 }
 
 /**
@@ -252,15 +266,7 @@ data class GitPanelState(
                 scanned = root.optBoolean("scanned"),
                 ran = root.optBoolean("ran"),
                 hasRepo = root.optBoolean("has_repo"),
-                branch = branch?.let {
-                    GitBranch(
-                        name = if (it.isNull("name")) null else it.optString("name"),
-                        ahead = it.optInt("ahead"),
-                        behind = it.optInt("behind"),
-                        unborn = it.optBoolean("unborn"),
-                        upstream = if (it.isNull("upstream")) null else it.getString("upstream"),
-                    )
-                },
+                branch = branch?.let { GitBranch.parse(it) },
                 entries = List(entries.length()) { index ->
                     val entry = entries.getJSONObject(index)
                     GitChange(
