@@ -1,17 +1,18 @@
-# CodeQL, without a build.
+# CodeQL, with the smallest build that satisfies it.
 #
-# Autobuild would run `./gradlew assemble`, which needs rustup's Android
-# targets and cargo-ndk to cross-compile the engine — none of which a
-# hosted runner has, and none of which the Java/Kotlin extractor needs.
-# `build-mode: none` reads the sources directly instead.
+# The Kotlin extractor rides the compiler, so `build-mode: none` sees no
+# Kotlin at all — and the app is Kotlin throughout. Autobuild's guess,
+# `./gradlew assemble`, fails the other way: packaging needs rustup's
+# Android targets and cargo-ndk to cross-compile the engine, which a
+# hosted runner does not have. `:app:compileFullDebugKotlin` is the line
+# between the two: every Kotlin file compiles, nothing native runs.
+#
+# The Gradle and Kotlin daemons would compile outside the tracer's reach,
+# so both are kept in-process.
 #
 # The vendored Termux libraries under vendor/ are analyzed upstream and
-# only carry `CONQUEST PATCH` edits here, so they are excluded rather
-# than reported as ours.
-#
-# NOTE: GitHub rejects results from this workflow while the repository's
-# *default setup* is still enabled — turn it off first under
-# Settings → Code security → Code scanning.
+# only carry `CONQUEST PATCH` edits here, so their alerts are excluded
+# rather than reported as ours.
 
 name: CodeQL
 
@@ -36,10 +37,22 @@ jobs:
       matrix:
         include:
           - language: java-kotlin
-            build-mode: none
+            build-mode: manual
 
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install the pinned NDK
+        # The vendored terminal modules declare the pin even though no
+        # native task runs here; AGP checks it exists at configuration.
+        run: |
+          NDK_VERSION="$(sed -n 's/^conquest\.ndkVersion=//p' gradle.properties)"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION" >/dev/null
 
       - uses: github/codeql-action/init@v3
         with:
@@ -49,6 +62,12 @@ jobs:
             paths-ignore:
               - vendor
               - core/vendor
+
+      - name: Compile the Kotlin under the tracer
+        run: |
+          ./gradlew --no-daemon \
+            -Dkotlin.compiler.execution.strategy=in-process \
+            :app:compileFullDebugKotlin
 
       - uses: github/codeql-action/analyze@v3
         with:
