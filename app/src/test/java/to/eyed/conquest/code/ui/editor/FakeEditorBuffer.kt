@@ -44,7 +44,11 @@ internal class FakeEditorBuffer(
     override var version: Long = 1L
         private set
 
-    override val highlightVersion: Long get() = 0L
+    /**
+     * Settable so a test can play the engine's background reparse landing —
+     * the one event that must cost a span read and nothing else.
+     */
+    override var highlightVersion: Long = 0L
 
     /** Edits the buffer refused, in the order it refused them. */
     val refusedEdits = mutableListOf<Triple<Long, Long, String>>()
@@ -78,7 +82,14 @@ internal class FakeEditorBuffer(
         return all.subList(first, last).joinToString("\n")
     }
 
-    override fun highlights(firstRow: Int, lastRow: Int): IntArray? = IntArray(0)
+    /** Times the highlight query crossed, counted like [lineCalls]. */
+    var highlightCalls = 0
+        private set
+
+    override fun highlights(firstRow: Int, lastRow: Int): IntArray? {
+        highlightCalls++
+        return IntArray(0)
+    }
 
     override fun bracketScopes(offsets: LongArray): LongArray {
         scopeQueries++

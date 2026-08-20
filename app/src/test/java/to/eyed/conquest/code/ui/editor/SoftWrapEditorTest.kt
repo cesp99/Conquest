@@ -339,7 +339,7 @@ class SoftWrapEditorTest {
     }
 
     @Test
-    fun aKeystrokeReadsTheRowsTheNextFrameDraws() {
+    fun aKeystrokeReadsAtMostOneBlock() {
         val buffer = FakeEditorBuffer(
             List(400) { "the quick brown fox jumps over it" }.joinToString("\n"),
         )
@@ -352,11 +352,19 @@ class SoftWrapEditorTest {
 
         val before = buffer.lineCalls
         state.insertAtCursor("X")
-        val afterEdit = buffer.lineCalls
         state.drawFrame()
 
-        assertEquals("the keystroke reads once", before + 1, afterEdit)
-        assertEquals("and the frame after it reads nothing", afterEdit, buffer.lineCalls)
+        // A one-line edit is patched into the window in place, so the
+        // keystroke itself marshals nothing; all that can remain is a single
+        // read where the display map's 64-row block being re-measured pokes
+        // past the cached window's edge.
+        assertTrue(
+            "keystroke cost ${buffer.lineCalls - before} reads",
+            buffer.lineCalls - before <= 1,
+        )
+        val afterFrame = buffer.lineCalls
+        state.drawFrame()
+        assertEquals("and the frame after it reads nothing", afterFrame, buffer.lineCalls)
     }
 
     @Test

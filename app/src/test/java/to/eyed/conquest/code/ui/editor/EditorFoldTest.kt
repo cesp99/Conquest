@@ -316,7 +316,7 @@ class EditorFoldTest {
         // One top-level block over a whole file, folded: the first row the
         // frame draws and the last are twenty thousand apart, and reading
         // between them would put the file on the UI thread of every frame —
-        // and of every keystroke, because an edit drops the window.
+        // and of every keystroke whose edit drops the window.
         val text = buildString {
             append("class Big {\n")
             for (row in 1..20_001) append("    row $row\n")
