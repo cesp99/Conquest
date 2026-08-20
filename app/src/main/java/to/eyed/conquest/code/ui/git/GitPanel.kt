@@ -1,5 +1,6 @@
 package to.eyed.conquest.code.ui.git
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -60,16 +61,19 @@ import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextDecoration
@@ -80,6 +84,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import to.eyed.conquest.code.R
 import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.core.GitChange
 import to.eyed.conquest.code.core.GitFileStatus
@@ -236,6 +241,19 @@ fun GitPanel(
     var identityName by remember(project) { mutableStateOf(TextFieldValue()) }
     var identityEmail by remember(project) { mutableStateOf(TextFieldValue()) }
     var messageFocused by remember { mutableStateOf(false) }
+    // The split button's three toggles, seeded from the objects that outlive
+    // the composition — the panel is removed by Escape, and losing a pending
+    // amend that way would quietly turn the next Ctrl+Enter into a plain
+    // commit. Every write goes back through the object.
+    var amendPending by remember(project) { mutableStateOf(AmendDrafts.pending(project.id)) }
+    var signoffEnabled by remember(project) { mutableStateOf(CommitToggles.signoff) }
+    var skipHooks by remember(project) { mutableStateOf(CommitToggles.skipHooks) }
+    /**
+     * Zed's pre-flight warnings are blocking prompts with a single OK —
+     * `window.prompt(PromptLevel::Warning, …, ["OK"])` (git_panel.rs:3072-3079,
+     * 3109-3112) — not toasts, so ours are a dialog and not the error strip.
+     */
+    var warning by remember(project) { mutableStateOf<String?>(null) }
 
     val listState = rememberLazyListState()
     // History's own scroll survives a round trip through the Changes tab.
@@ -337,7 +355,54 @@ fun GitPanel(
         }
     }
 
+    /**
+     * Leave amend mode, or enter it — Zed's `set_amend_pending`
+     * (git_panel.rs:8029-8049). Entering saves whatever is typed as the
+     * original message and replaces it with HEAD's full message
+     * (`load_last_commit_message`, git_panel.rs:2971-2991); leaving — by the
+     * Cancel button, by unticking the menu entry, or by the amend commit
+     * landing — puts the saved draft back.
+     */
+    fun setAmendPending(on: Boolean) {
+        if (on == amendPending) return
+        if (on) {
+            val sha = head ?: return
+            AmendDrafts.enter(project.id, message.text)
+            amendPending = true
+            scope.launch {
+                val details = withContext(Dispatchers.IO) { session.commitDetails(sha) }
+                val last = details?.message?.trimEnd('\n')
+                // Only while the amend is still pending: the HEAD message
+                // arriving after a quick Cancel must not stamp on the restored
+                // draft.
+                if (last != null && AmendDrafts.pending(project.id)) {
+                    message = TextFieldValue(last, TextRange(last.length))
+                    CommitDrafts.put(project.id, last)
+                }
+            }
+        } else {
+            val original = AmendDrafts.original(project.id)
+            AmendDrafts.clear(project.id)
+            amendPending = false
+            message = TextFieldValue(original, TextRange(original.length))
+            CommitDrafts.put(project.id, original)
+        }
+    }
+
+    /**
+     * Zed's `commit_changes` (git_panel.rs:3055-3148), which is what both the
+     * button and Ctrl+Enter run: commit the index when anything is staged;
+     * otherwise stage every *tracked* change first — never the untracked ones —
+     * and commit that, which is what the "Commit Tracked" label promises.
+     */
     fun commit() {
+        // Zed's guard and its words (git_panel.rs:3072-3079). Ours has no
+        // staged half of a conflict — staging the resolution clears the
+        // conflict — so any conflict at all is an unstaged one.
+        if (state.conflicts.isNotEmpty()) {
+            warning = "There are still conflicts. You must stage these before committing"
+            return
+        }
         val text = message.text
         // Refused here as well as in the engine, so the button can say why
         // before it is pressed rather than after.
@@ -345,10 +410,33 @@ fun GitPanel(
             error = "Write a commit message first"
             return
         }
+        val amend = amendPending
+        val hasStaged = state.staged.isNotEmpty()
+        val tracked = if (hasStaged) emptyList() else trackedCommitPaths(state.entries)
+        // Zed's words (git_panel.rs:3109-3112) — and amend is excused, because
+        // folding a better message into HEAD changes nothing on disk.
+        if (!hasStaged && tracked.isEmpty() && !amend) {
+            warning = "No changes to commit"
+            return
+        }
         // The message is cleared only on success: one the user would have to
         // retype because git refused the commit is the wrong thing to lose.
         perform(
-            action = { session.commit(text) },
+            action = {
+                if (tracked.isNotEmpty()) {
+                    // Stage-then-commit, as Zed's stage_entries-before-commit
+                    // (git_panel.rs:3114-3122); a stage that failed is the
+                    // whole answer, and the commit is not attempted after it.
+                    val failure = session.stage(tracked)
+                    if (failure != null) return@perform failure
+                }
+                session.commit(
+                    text,
+                    amend = amend,
+                    signoff = signoffEnabled,
+                    noVerify = skipHooks,
+                )
+            },
             onFailure = { failure ->
                 // A fresh Debian has no git identity, guesses one from the
                 // hostname and refuses to use it. Every commit in a new
@@ -372,9 +460,41 @@ fun GitPanel(
                 }
             },
         ) {
-            message = TextFieldValue()
-            CommitDrafts.clear(project.id)
+            // Skip Hooks is spent by the commit it was armed for
+            // (git_panel.rs:3131); Signoff, deliberately, is not.
+            skipHooks = false
+            CommitToggles.skipHooks = false
+            if (amend) {
+                // Leaving amend mode is what restores the pre-amend draft:
+                // Zed does not clear the editor in the amend branch
+                // (git_panel.rs:3132-3133).
+                setAmendPending(false)
+            } else {
+                message = TextFieldValue()
+                CommitDrafts.clear(project.id)
+            }
         }
+    }
+
+    /**
+     * The `git::Amend` action, two-phase as in Zed (git_panel.rs:2944-2963):
+     * the first Ctrl+Shift+Enter only *enters* amend mode — the button relabels
+     * and HEAD's message fills the editor for editing — and the second performs
+     * the commit. Nothing to amend in a repository with no commits.
+     */
+    fun amend() {
+        if (head == null) return
+        if (amendPending) commit() else setAmendPending(true)
+    }
+
+    fun toggleSignoff() {
+        signoffEnabled = !signoffEnabled
+        CommitToggles.signoff = signoffEnabled
+    }
+
+    fun toggleSkipHooks() {
+        skipHooks = !skipHooks
+        CommitToggles.skipHooks = skipHooks
     }
 
     /**
@@ -463,11 +583,12 @@ fun GitPanel(
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 if (event.isCtrlPressed) {
-                    // Zed's `ctrl-enter` for commit, and it works from the
-                    // message box as well — that is where it is wanted.
+                    // Zed's `ctrl-enter` for commit and `ctrl-shift-enter` for
+                    // amend (default-linux.json:1054-1055), and both work from
+                    // the message box as well — that is where they are wanted.
                     val isEnter = event.key == Key.Enter || event.key == Key.NumPadEnter
                     if (isEnter) {
-                        commit()
+                        if (event.isShiftPressed) amend() else commit()
                         return@onPreviewKeyEvent true
                     }
                     return@onPreviewKeyEvent false
@@ -670,8 +791,53 @@ fun GitPanel(
                 onFocusChanged = { messageFocused = it },
                 stagedCount = state.staged.size,
                 busy = busy,
+                commitLabel = commitButtonLabel(
+                    amendPending = amendPending,
+                    hasStaged = state.staged.isNotEmpty(),
+                    hasTracked = hasTrackedChanges(state.entries),
+                ),
+                // The menu's Amend entry exists only where a commit does
+                // (`has_previous_commit`, git_panel.rs:5563, 5574).
+                hasHeadCommit = head != null,
+                amendPending = amendPending,
+                signoffEnabled = signoffEnabled,
+                skipHooks = skipHooks,
                 onCommit = ::commit,
+                onToggleAmend = { setAmendPending(!amendPending) },
+                onToggleSignoff = ::toggleSignoff,
+                onToggleSkipHooks = ::toggleSkipHooks,
             )
+            // While an amend is pending a banner says what the button will now
+            // do, with the way out beside it (git_panel.rs:6125-6150) — Zed
+            // hangs it under the commit footer too (git_panel.rs:8356-8361).
+            if (amendPending) {
+                HorizontalDivider(color = theme.color("border.variant"))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(theme.color("editor.background"))
+                        // `py_1p5 px_2 gap_1p5 justify_between` (git_panel.rs:6131-6136).
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        // Zed's banner label (git_panel.rs:6139-6141).
+                        text = "This will update your most recent commit.",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = theme.color("text.muted"),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    GhostButton(
+                        // Its "Cancel" (git_panel.rs:6143-6148).
+                        label = "Cancel",
+                        enabled = !busy,
+                        onClick = { setAmendPending(false) },
+                    )
+                }
+            }
             }
         }
     }
@@ -685,6 +851,16 @@ fun GitPanel(
                 confirming = null
                 perform({ session.discard(listOf(pending.path)) })
             },
+        )
+    }
+
+    // A commit turned back before it ran — Zed's blocking warning prompt with
+    // its single "OK" (git_panel.rs:3072-3079, 3109-3112).
+    warning?.let { text ->
+        AlertDialog(
+            onDismissRequest = { warning = null },
+            text = { Text(text) },
+            confirmButton = { TextButton(onClick = { warning = null }) { Text("OK") } },
         )
     }
 }
@@ -1056,7 +1232,17 @@ private fun CommitBox(
     onFocusChanged: (Boolean) -> Unit,
     stagedCount: Int,
     busy: Boolean,
+    /** What the split button's left half reads — see [commitButtonLabel]. */
+    commitLabel: String,
+    /** Whether HEAD names a commit at all, which is what Amend needs. */
+    hasHeadCommit: Boolean,
+    amendPending: Boolean,
+    signoffEnabled: Boolean,
+    skipHooks: Boolean,
     onCommit: () -> Unit,
+    onToggleAmend: () -> Unit,
+    onToggleSignoff: () -> Unit,
+    onToggleSkipHooks: () -> Unit,
 ) {
     val theme = LocalZedTheme.current
     // sp treated as dp, which at font scale 1 is what Zed's px-per-line rule
@@ -1118,14 +1304,20 @@ private fun CommitBox(
                 color = theme.color("text.muted"),
                 modifier = Modifier.weight(1f),
             )
-            FilledButton(
-                label = "Commit",
+            CommitSplitButton(
+                label = commitLabel,
                 // Enabled with nothing staged on purpose: git's refusal is the
                 // honest explanation, and a button that greys out for reasons
                 // the user cannot see is worse than one that answers.
                 enabled = !busy && message.text.isNotBlank(),
-                shortcut = "Ctrl Enter",
-                onClick = onCommit,
+                hasHeadCommit = hasHeadCommit,
+                amendPending = amendPending,
+                signoffEnabled = signoffEnabled,
+                skipHooks = skipHooks,
+                onCommit = onCommit,
+                onToggleAmend = onToggleAmend,
+                onToggleSignoff = onToggleSignoff,
+                onToggleSkipHooks = onToggleSkipHooks,
             )
         }
     }
@@ -1264,6 +1456,154 @@ private fun FilledButton(
 }
 
 /**
+ * Zed's `SplitButton` around the commit action (git_panel.rs:6071-6122): the
+ * left half is the commit button in [FilledButton]'s clothes, rounded only on
+ * its left; the right half a 20px chevron that deploys the picker menu — down
+ * while closed, up while it is open (git_ui.rs:1150-1167). One ring of
+ * `border` at 0.8 wraps both halves, with a matching divider between them
+ * (split_button.rs:71-95). The menu anchors below with Zed's 2px drop
+ * (git_panel.rs:5613-5617).
+ */
+@Composable
+private fun CommitSplitButton(
+    label: String,
+    enabled: Boolean,
+    hasHeadCommit: Boolean,
+    amendPending: Boolean,
+    signoffEnabled: Boolean,
+    skipHooks: Boolean,
+    onCommit: () -> Unit,
+    onToggleAmend: () -> Unit,
+    onToggleSignoff: () -> Unit,
+    onToggleSkipHooks: () -> Unit,
+) {
+    val theme = LocalZedTheme.current
+    var menuOpen by remember { mutableStateOf(false) }
+    val leftInteraction = remember { MutableInteractionSource() }
+    val leftHovered by leftInteraction.collectIsHoveredAsState()
+    val leftPressed by leftInteraction.collectIsPressedAsState()
+    val rightInteraction = remember { MutableInteractionSource() }
+    val rightHovered by rightInteraction.collectIsHoveredAsState()
+    val rightPressed by rightInteraction.collectIsPressedAsState()
+    val fill = theme.color("background")
+    val ring = theme.color("border").copy(alpha = 0.8f)
+    val shape = RoundedCornerShape(4.dp)
+    // As [FilledButton]: the 18dp pill is the visual, the tap target is the
+    // taller invisible wrapper (density decision, DECISIONS.md).
+    Box(
+        modifier = Modifier
+            .heightIn(min = 30.dp)
+            .padding(horizontal = 2.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(
+            modifier = Modifier
+                .height(18.dp)
+                .clip(shape)
+                .border(1.dp, ring, shape),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .then(
+                        if (enabled) {
+                            Modifier
+                                .pointerHoverIcon(PointerIcon.Hand)
+                                .clickable(
+                                    interactionSource = leftInteraction,
+                                    indication = null,
+                                    onClickLabel = "$label (Ctrl Enter)",
+                                    onClick = onCommit,
+                                )
+                        } else {
+                            Modifier
+                        }
+                    )
+                    .background(
+                        when {
+                            leftPressed && enabled -> theme.color("element.active")
+                            leftHovered && enabled -> fill.copy(alpha = fill.alpha * 0.5f)
+                            else -> fill
+                        }
+                    )
+                    // The label wears `mr_0p5` inside its half (git_panel.rs:6077-6080).
+                    .padding(start = 4.dp, end = 6.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = theme.color(if (enabled) "text" else "text.disabled"),
+                )
+            }
+            // `border_l` between the halves (split_button.rs:88-95).
+            Box(Modifier.width(1.dp).fillMaxHeight().background(ring))
+            Box(
+                modifier = Modifier
+                    .width(20.dp)
+                    .fillMaxHeight()
+                    .pointerHoverIcon(PointerIcon.Hand)
+                    .clickable(
+                        interactionSource = rightInteraction,
+                        indication = null,
+                        onClickLabel = "Commit options",
+                    ) { menuOpen = !menuOpen }
+                    .background(
+                        when {
+                            rightPressed || menuOpen -> theme.color("element.active")
+                            rightHovered -> fill.copy(alpha = fill.alpha * 0.5f)
+                            else -> fill
+                        }
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Image(
+                    painter = painterResource(
+                        if (menuOpen) R.drawable.ic_ui_chevron_up else R.drawable.ic_ui_chevron_down
+                    ),
+                    contentDescription = if (menuOpen) "Close commit options" else "Commit options",
+                    colorFilter = ColorFilter.tint(theme.color("text")),
+                    // `IconSize::XSmall` = 12px (git_ui.rs:1160).
+                    modifier = Modifier.size(12.dp),
+                )
+            }
+        }
+        ContextMenu(
+            expanded = menuOpen,
+            onDismiss = { menuOpen = false },
+            offset = DpOffset(0.dp, 2.dp),
+            items = listOfNotNull(
+                // Only where a commit exists to amend (git_panel.rs:5563, 5574);
+                // ticking it is `toggle_amend_pending` (git_panel.rs:5575-5590).
+                if (hasHeadCommit) {
+                    ContextMenuItem(
+                        label = "Amend",
+                        shortcut = "Ctrl Shift Enter",
+                        checked = amendPending,
+                        onClick = onToggleAmend,
+                    )
+                } else {
+                    null
+                },
+                // No default binding, so no chord (git_panel.rs:5592-5598).
+                ContextMenuItem(
+                    label = "Signoff",
+                    checked = signoffEnabled,
+                    onClick = onToggleSignoff,
+                ),
+                // Aside and all: the literal flag it arms (git_panel.rs:5599-5608).
+                ContextMenuItem(
+                    label = "Skip Hooks",
+                    checked = skipHooks,
+                    aside = "git commit --no-verify",
+                    onClick = onToggleSkipHooks,
+                ),
+            ),
+        )
+    }
+}
+
+/**
  * The confirmation. It names the file, and it says which of discard's three
  * meanings this one is — restored from the last commit, moved to the trash, or
  * a rename undone, which is both at once. They are not the same promise, and
@@ -1390,6 +1730,94 @@ internal object CommitDrafts {
         drafts.remove(project)
     }
 }
+
+/**
+ * A pending amend, one per project, outliving the composition as
+ * [CommitDrafts] does — Zed keeps `amend_pending` and the pre-amend
+ * `original_message` per work directory and restores both on load
+ * (`SerializedCommitMessage`, git_panel.rs:496-504, 1541-1558). Presence in
+ * the map *is* the pending flag; the value is the draft the amend displaced,
+ * put back when the amend is cancelled or lands. Main thread only, like the
+ * composition that reads it.
+ */
+internal object AmendDrafts {
+    private val originals = mutableMapOf<Long, String>()
+
+    fun pending(project: Long): Boolean = project in originals
+
+    fun original(project: Long): String = originals[project] ?: ""
+
+    fun enter(project: Long, original: String) {
+        originals[project] = original
+    }
+
+    fun clear(project: Long) {
+        originals.remove(project)
+    }
+}
+
+/**
+ * The split button's other two toggles. Signoff keeps its setting the way a
+ * draft keeps its words — Zed serializes `signoff_enabled` and never resets it
+ * after a commit (git_panel.rs:489-494, 1466-1495). Skip Hooks is deliberately
+ * weaker: never persisted, and *spent* — reset to false — by every commit that
+ * lands (git_panel.rs:3131, 8059-8064), because `--no-verify` is a decision
+ * about one commit, not a policy.
+ */
+internal object CommitToggles {
+    var signoff: Boolean = false
+    var skipHooks: Boolean = false
+}
+
+/**
+ * The split button's title — Zed's `commit_button_title()`
+ * (git_panel.rs:5642-5656). Exactly four labels: staging anything makes it a
+ * plain "Commit"/"Amend" of the index; with nothing staged the button promises
+ * to stage every tracked change first — except that an amend with nothing
+ * tracked either is still just "Amend", since amending needs no changes at
+ * all. "Commit Tracked" shows even over a clean tree; whether it is *enabled*
+ * is a different function's answer, there as here.
+ */
+internal fun commitButtonLabel(
+    amendPending: Boolean,
+    hasStaged: Boolean,
+    hasTracked: Boolean,
+): String = when {
+    !amendPending -> if (hasStaged) "Commit" else "Commit Tracked"
+    hasStaged || !hasTracked -> "Amend"
+    else -> "Amend Tracked"
+}
+
+/**
+ * Zed's `FileStatus::is_created` (crates/git/src/status.rs:183-192): untracked,
+ * or Added on either half of the pair. A conflict is its own category and never
+ * "created" — Zed's Unmerged variant falls through the same match arm.
+ */
+internal fun isCreatedChange(change: GitChange): Boolean {
+    if (change.conflicted) return false
+    return change.staged == GitFileStatus.Added || change.staged == GitFileStatus.Untracked ||
+        change.unstaged == GitFileStatus.Added || change.unstaged == GitFileStatus.Untracked
+}
+
+/**
+ * What "Commit Tracked" stages before it commits — Zed's
+ * `change_entries_by_path()` filtered to `!status.is_created()`
+ * (git_panel.rs:3103-3107): every changed path *except* the untracked and
+ * newly added ones. A conflicted path passes the filter there as here; the
+ * conflicts guard has already turned the commit back before this list is
+ * asked for.
+ */
+internal fun trackedCommitPaths(entries: List<GitChange>): List<String> =
+    entries.filterNot(::isCreatedChange).map { it.path }
+
+/**
+ * Zed's `has_tracked_changes()` = `tracked_count > 0` (git_panel.rs:5162-5164),
+ * whose count buckets conflicted and created entries elsewhere
+ * (git_panel.rs:5129-5139) — so for the *label*, a conflict is not a tracked
+ * change, even though the commit filter above would carry it.
+ */
+internal fun hasTrackedChanges(entries: List<GitChange>): Boolean =
+    entries.any { !it.conflicted && !isCreatedChange(it) }
 
 /**
  * Which section a row belongs to. The titles are Zed's own for grouping by
