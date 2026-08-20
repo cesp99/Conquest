@@ -259,6 +259,13 @@ class EditorState private constructor(
     var highlightVersion by mutableLongStateOf(0L)
         private set
 
+    /**
+     * The engine's current span version, straight off the buffer — the cheap
+     * read the poll loop compares off the main thread before it asks
+     * [refreshHighlightVersion] to publish anything.
+     */
+    val engineHighlightVersion: Long get() = buffer.highlightVersion
+
     /** True if the engine has newer spans than the ones last drawn. */
     fun refreshHighlightVersion(): Boolean {
         val version = buffer.highlightVersion
@@ -313,7 +320,14 @@ class EditorState private constructor(
     // viewport asked for, so scrolling only crosses the JNI boundary (and
     // re-runs the highlight query) every few dozen rows instead of every
     // row.
-    private var cachedLines: List<String> = emptyList()
+    //
+    // Text and spans carry separate keys — [cachedVersion] guards the lines,
+    // [cachedHighlightVersion] the spans — because they go stale at different
+    // moments: an edit moves the text at once, while the reparse that moves
+    // the highlights lands a beat later. One key for both made every
+    // keystroke marshal the window's text twice. Mutable so [applyLineDiff]
+    // can patch a one-line edit into the window it already holds.
+    private var cachedLines: MutableList<String> = mutableListOf()
     private var cachedSpans: List<List<HighlightSpan>> = emptyList()
     private var cachedFirst = -1
     private var cachedLast = -1
@@ -676,14 +690,20 @@ class EditorState private constructor(
 
     /**
      * The lines of rows [first, last) — cached, re-fetched over JNI only
-     * when the window or the buffer version changed.
+     * when the window or the buffer version changed. A highlight version
+     * that moved on its own re-reads only the spans: the reparse landing
+     * after a keystroke must not marshal a window of unchanged text a
+     * second time.
      */
     fun linesWindow(first: Int, last: Int): List<String> {
         val miss = buffer.version != cachedVersion ||
-            highlightVersion != cachedHighlightVersion ||
             first < cachedFirst ||
             last > cachedLast
-        if (miss) fetchWindow(first, last)
+        if (miss) {
+            fetchWindow(first, last)
+        } else if (highlightVersion != cachedHighlightVersion) {
+            refetchSpans()
+        }
         requestedFirst = first.coerceIn(cachedFirst, cachedLast)
         requestedLast = last.coerceIn(requestedFirst, cachedLast)
         return cachedLines.subList(requestedFirst - cachedFirst, requestedLast - cachedFirst)
@@ -694,14 +714,14 @@ class EditorState private constructor(
         val paddedFirst = (first - WINDOW_PADDING).coerceAtLeast(0)
         val paddedLast = (last + WINDOW_PADDING).coerceAtMost(lineCount)
         if (paddedLast > paddedFirst) {
-            cachedLines = buffer.lines(paddedFirst, paddedLast).split('\n')
+            cachedLines = buffer.lines(paddedFirst, paddedLast).split('\n').toMutableList()
             cachedSpans = groupSpans(
                 buffer.highlights(paddedFirst, paddedLast),
                 paddedFirst,
                 cachedLines.size,
             )
         } else {
-            cachedLines = emptyList()
+            cachedLines = mutableListOf()
             cachedSpans = emptyList()
         }
         cachedFirst = paddedFirst
@@ -712,6 +732,21 @@ class EditorState private constructor(
         // about to read inside it.
         requestedFirst = requestedFirst.coerceIn(cachedFirst, cachedLast)
         requestedLast = requestedLast.coerceIn(requestedFirst, cachedLast)
+    }
+
+    /**
+     * Re-read only the highlight spans of the window already cached. The
+     * text the cache holds is still the buffer's — only the reparse landed —
+     * so `bufferLines` and the hundred-string split it costs would answer a
+     * question nothing asked.
+     */
+    private fun refetchSpans() {
+        cachedSpans = if (cachedLast > cachedFirst) {
+            groupSpans(buffer.highlights(cachedFirst, cachedLast), cachedFirst, cachedLines.size)
+        } else {
+            emptyList()
+        }
+        cachedHighlightVersion = highlightVersion
     }
 
     /**
@@ -846,10 +881,12 @@ class EditorState private constructor(
         if (buffer.version == cachedVersion && from >= cachedFirst && to <= cachedLast) {
             return cachedLines.subList(from - cachedFirst, to - cachedFirst)
         }
-        // An edit drops the window, and the block the map has to re-measure
-        // afterwards is the one the caret is in — the very rows the draw pass
-        // is about to ask for again. Reading them as a window rather than as
-        // a bare block turns two bridge round trips per keystroke into one.
+        // A structural or multi-caret edit drops the window ([applyLineDiff]
+        // patches the one-line case in place instead), and the block the map
+        // has to re-measure afterwards is the one the caret is in — the very
+        // rows the draw pass is about to ask for again. Reading them as a
+        // window rather than as a bare block turns two bridge round trips
+        // per such edit into one.
         // A block nowhere near the window is a jump or a drag into a far part
         // of the file: that one is read on its own, so a query into a
         // 100k-line file still costs a block and not a window around it.
@@ -1788,7 +1825,7 @@ class EditorState private constructor(
             // engine: an empty edit would bump the version and litter the
             // undo history for no change at all.
             if (edit.start == edit.end && edit.replacement.isEmpty()) continue
-            if (!buffer.edit(edit.start, edit.end, edit.replacement)) {
+            if (buffer.edit(edit.start, edit.end, edit.replacement) < 0) {
                 // The engine refused this range, so the buffer is exactly as
                 // it was. Letting the edit stay in the batch would count its
                 // length against every caret after it and put all of them at
@@ -1871,9 +1908,15 @@ class EditorState private constructor(
         clearSelection()
         val edit = Utf8Diff.diff(oldLine.encodeToByteArray(), newLine.encodeToByteArray())
         val lineStart = lineStartOffset(row)
+        // Whether the window cache holds this row at the pre-edit version,
+        // decided *before* the edit moves the version out from under it.
+        val patchable = buffer.version == cachedVersion && row in cachedFirst until cachedLast
+        var editedVersion = -1L
         if (edit != null) {
-            buffer.edit(lineStart + edit.start, lineStart + edit.end, edit.replacement)
+            editedVersion =
+                buffer.edit(lineStart + edit.start, lineStart + edit.end, edit.replacement)
         }
+        val edited = editedVersion >= 0
         val structural = '\n' in newLine
         if (structural) {
             val cursorOffset = lineStart +
@@ -1886,6 +1929,35 @@ class EditorState private constructor(
         } else {
             cursorRow = row
             cursorCol = selUtf16.coerceIn(0, newLine.length)
+            // A one-line edit is the one case the cache can absorb without
+            // the bridge: [newLine] *is* the row's post-edit text and every
+            // other cached row is untouched, so the window is patched in
+            // place and the keystroke marshals no window at all. The row's
+            // cached spans are deliberately left as they are — stale against
+            // the new text, the same way the engine keeps serving shifted
+            // old spans until the background reparse lands (highlight.rs
+            // shifts synchronously, reparses later); when it does,
+            // [linesWindow] re-reads only the spans. A stale span reaching
+            // past a shortened line is clamped to the drawn text by the
+            // renderer ([spansIn] / `TextLayoutCache.annotate`).
+            //
+            // The stamp comes from the edit's own return, never from a
+            // re-read of [EditorBuffer.version]: the buffer is edited from
+            // other threads too (an agent's `on_write_text_file` writing
+            // through the open buffer, the disk-change reload), and a write
+            // landing between the [patchable] check and this stamp would be
+            // absorbed into a re-read version without its content — the
+            // cache then serves stale rows as current forever, since the
+            // stamped version matches. The engine bumps the version by
+            // exactly one per edit under the buffer's lock (`Engine::edit`),
+            // so a return of exactly checked-version + 1 proves ours was the
+            // only edit since the cache was valid; anything else means a
+            // concurrent write slipped in, and leaving [cachedVersion]
+            // behind makes the next [linesWindow] miss and refetch.
+            if (edited && patchable && editedVersion == cachedVersion + 1) {
+                cachedLines[row - cachedFirst] = newLine
+                cachedVersion = editedVersion
+            }
         }
         refreshLineCount(row, row)
         ensureCursorVisible()

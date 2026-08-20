@@ -44,10 +44,25 @@ internal class FakeEditorBuffer(
     override var version: Long = 1L
         private set
 
-    override val highlightVersion: Long get() = 0L
+    /**
+     * Settable so a test can play the engine's background reparse landing —
+     * the one event that must cost a span read and nothing else.
+     */
+    override var highlightVersion: Long = 0L
 
     /** Edits the buffer refused, in the order it refused them. */
     val refusedEdits = mutableListOf<Triple<Long, Long, String>>()
+
+    /**
+     * Runs once, at the top of the next [edit] — the stand-in for a second
+     * writer (an agent's `on_write_text_file`, the disk-change reload)
+     * whose engine-side edit lands between the editor's staleness check
+     * and the editor's own edit reaching the engine. A hook that edits the
+     * buffer makes the editor's edit come back with a version two past the
+     * one it checked, which is exactly what the window cache's patch guard
+     * has to notice.
+     */
+    var beforeNextEdit: (() -> Unit)? = null
 
     private val rows: List<String> get() = text.split('\n')
 
@@ -78,7 +93,14 @@ internal class FakeEditorBuffer(
         return all.subList(first, last).joinToString("\n")
     }
 
-    override fun highlights(firstRow: Int, lastRow: Int): IntArray? = IntArray(0)
+    /** Times the highlight query crossed, counted like [lineCalls]. */
+    var highlightCalls = 0
+        private set
+
+    override fun highlights(firstRow: Int, lastRow: Int): IntArray? {
+        highlightCalls++
+        return IntArray(0)
+    }
 
     override fun bracketScopes(offsets: LongArray): LongArray {
         scopeQueries++
@@ -115,23 +137,23 @@ internal class FakeEditorBuffer(
         return (row shl 32) or (at - rowStart).toLong()
     }
 
-    override fun edit(start: Long, end: Long, replacement: String): Boolean {
+    override fun edit(start: Long, end: Long, replacement: String): Long {
+        beforeNextEdit?.also { beforeNextEdit = null }?.invoke()
         val bytes = utf8(text)
         if (start < 0 || end < start || end > bytes.size) {
             refusedEdits.add(Triple(start, end, replacement))
-            return false
+            return -1L
         }
         val from = start.toInt()
         val to = end.toInt()
         if (isContinuation(bytes, from) || isContinuation(bytes, to)) {
             refusedEdits.add(Triple(start, end, replacement))
-            return false
+            return -1L
         }
         text = String(bytes, 0, from, Charsets.UTF_8) +
             replacement +
             String(bytes, to, bytes.size - to, Charsets.UTF_8)
-        version++
-        return true
+        return ++version
     }
 
     override fun undo(): Boolean = false

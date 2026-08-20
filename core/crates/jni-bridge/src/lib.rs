@@ -55,7 +55,10 @@ fn engine() -> &'static Engine {
 
 /// Route panics to the log. Android discards a process's stderr, so without
 /// this a panic on an engine thread — the runtime thread, a worktree scan —
-/// is completely silent: the work simply never finishes.
+/// leaves no trace. Release builds set `panic = "abort"`, so the panic then
+/// takes the whole process down; this hook runs before the abort, which is
+/// what turns a bare SIGABRT in the crash report into a message with a thread
+/// name and location in logcat.
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -82,6 +85,12 @@ fn to_jstring(env: &JNIEnv, text: String) -> jstring {
 
 /// Hand the engine the app's private files directory, then bring it up.
 /// Must be the first call into the bridge — see `engine::initialize`.
+///
+/// Cheap on the calling thread: paths, logging and the `Engine` struct are
+/// set up here, and the expensive part — booting the gpui runtime — is only
+/// *kicked off*, onto the runtime's own thread. Work that reaches the runtime
+/// before it is up queues on its job channel, so callers gate on the same
+/// version counters they always poll, never on this call.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_initialize(
     mut env: JNIEnv,
@@ -92,7 +101,9 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_initialize(
     let files_dir = get_string(&mut env, &files_dir);
     VERBOSE_LOG.store(verbose_logging != JNI_FALSE, Ordering::Relaxed);
     engine::initialize(Path::new(&files_dir));
-    engine();
+    // Warm the gpui runtime now, while the app is still composing its first
+    // frame, instead of paying the boot when the first project opens.
+    engine().start_runtime();
 }
 
 #[unsafe(no_mangle)]
@@ -574,6 +585,48 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitStatusVersi
     engine().git_status_version(project_id as u64) as jlong
 }
 
+/// The branch record the project is on, from the cached status run, as JSON —
+/// `{name, ahead, behind, unborn, upstream}`, the same object `gitChanges`
+/// nests — with no JSON of the changed files and no git run: the title bar's
+/// drift arrows and the history views' reload keys ride the same half-second
+/// poll the name does. Null when nothing is known: no repository, or no
+/// completed run yet. A detached HEAD is a present object whose `name` is
+/// null — on no branch, which is not the same answer as no repository.
+/// Versioned by `gitStatusVersion`, like every other read of that cache.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitBranchInfo(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    match engine().git_branch(project_id as u64) {
+        Some(branch) => {
+            let json = serde_json::to_string(&branch).unwrap_or_else(|err| {
+                log::warn!("gitBranchInfo failed to serialize: {err}");
+                "{}".to_owned()
+            });
+            to_jstring(&env, json)
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// The commit HEAD points at, from the same cache — the staleness key for the
+/// commit graph: history needs reloading when this moves, not on every status
+/// change. Null when it is not known, which a caller must read as "assume it
+/// moved", never as "nothing changed". Versioned by `gitStatusVersion`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitHead(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    match engine().git_head(project_id as u64) {
+        Some(head) => to_jstring(&env, head),
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// The whole status map as a JSON object of project-relative path to status
 /// (`modified`, `added`, `deleted`, `renamed`, `conflicted`, `untracked`,
 /// `ignored`). Ancestor directories are included, so the panel needs one
@@ -594,7 +647,8 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitStatus(
 }
 
 /// Everything the git panel draws, as JSON: `scanned`, `has_repo`, `branch`
-/// (`{name, ahead, behind, unborn}` or null) and `entries`, each
+/// (`{name, ahead, behind, unborn, upstream}` or null), `head` (the commit id
+/// it names, or null when unknown) and `entries`, each
 /// `{path, staged, unstaged, conflicted, in_head}` with the two statuses using
 /// the same names `gitStatus` does, or null.
 ///
@@ -1983,6 +2037,19 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpSessionList
     to_jstring(&env, engine().acp_session_list(refresh != JNI_FALSE))
 }
 
+/// Version counter for `acpSessionList` — the cached list's own `version`
+/// field, without serializing the list to learn it. Poll this single load and
+/// make the full read only when it moves; it covers `loading` flipping as
+/// well as the answer landing. 0 means no agent is running, and a replaced
+/// agent never repeats a value already seen.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpSessionListVersion(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    engine().acp_session_list_version() as jlong
+}
+
 /// Forget one of the agent's past conversations — `session/delete`. False
 /// when the agent has no such method or there is no agent.
 #[unsafe(no_mangle)]
@@ -2050,10 +2117,23 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpRemoveQueue
     }
 }
 
+/// Version counter for `acpPendingElicitations` — poll this single load and
+/// read the list only when it moves, the `acpSessionVersion` contract. It
+/// moves whenever any of the agent's questions changes, session-scoped ones
+/// included. 0 means no agent is running, and a replaced agent never repeats
+/// a value already seen.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpElicitationsVersion(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    engine().acp_elicitations_version() as jlong
+}
+
 /// The agent's questions that belong to no session — a JSON array in the same
-/// shape `elicitations` takes in `acpSessionState`. Poll it whenever an agent
-/// is running: one of these can be raised before any session exists, and an
-/// unanswered one blocks the agent.
+/// shape `elicitations` takes in `acpSessionState`. Read it when
+/// `acpElicitationsVersion` moves: one of these can be raised before any
+/// session exists, and an unanswered one blocks the agent.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_acpPendingElicitations(
     env: JNIEnv,

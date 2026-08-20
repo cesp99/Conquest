@@ -103,9 +103,23 @@ impl PendingElicitation {
 pub(crate) struct Elicitations {
     next: AtomicU64,
     live: Mutex<Vec<Arc<PendingElicitation>>>,
+    /// Moves whenever what a reader would see changes: a question opening,
+    /// being answered, being withdrawn or completed — including a URL
+    /// question's `accepted` flag flipping, which changes the view without
+    /// changing the set. The panel polls this one integer at 8 Hz; without it
+    /// every tick serialized the whole list to find out nothing had happened.
+    version: AtomicU64,
 }
 
 impl Elicitations {
+    /// The change counter — see the field. Never moves on a pure read.
+    pub(crate) fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    fn bump(&self) {
+        self.version.fetch_add(1, Ordering::Release);
+    }
     /// Record a new question, or refuse one we cannot render.
     ///
     /// Refusing is the honest answer for a mode we do not understand: the
@@ -173,6 +187,7 @@ impl Elicitations {
             accepted: AtomicBool::new(false),
         });
         self.live.lock().unwrap().push(pending.clone());
+        self.bump();
         Ok(pending)
     }
 
@@ -239,6 +254,9 @@ impl Elicitations {
         } else {
             self.remove(id);
         }
+        // Both arms changed what a reader sees — the accepted card is drawn
+        // differently, not just kept.
+        self.bump();
         true
     }
 
@@ -255,6 +273,7 @@ impl Elicitations {
         };
         let pending = live.remove(index);
         drop(live);
+        self.bump();
         pending.refuse(acp::Error::request_cancelled());
         true
     }
@@ -271,6 +290,8 @@ impl Elicitations {
             return false;
         };
         live.remove(index);
+        drop(live);
+        self.bump();
         true
     }
 
@@ -285,6 +306,9 @@ impl Elicitations {
             *live = kept;
             doomed
         };
+        if !doomed.is_empty() {
+            self.bump();
+        }
         for pending in doomed {
             pending.answer(acp::ElicitationAction::Cancel);
         }
@@ -293,6 +317,9 @@ impl Elicitations {
     /// Everything, for a connection that is going away.
     pub(crate) fn cancel_all(&self) {
         let doomed: Vec<Arc<PendingElicitation>> = self.live.lock().unwrap().drain(..).collect();
+        if !doomed.is_empty() {
+            self.bump();
+        }
         for pending in doomed {
             pending.answer(acp::ElicitationAction::Cancel);
         }

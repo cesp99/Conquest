@@ -25,6 +25,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -374,7 +375,13 @@ class HoverCardState internal constructor(private val editor: EditorState) {
 internal fun rememberHoverCard(state: EditorState): HoverCardState {
     val card = remember(state) { HoverCardState(state) }
     // Typing under a card makes it describe text that is no longer there.
-    LaunchedEffect(state.revision) { card.clear() }
+    // Watched through [snapshotFlow] rather than passed as an effect key: a
+    // key is read during composition, and this helper returns a value, so it
+    // composes in the pane's own scope — keying on [EditorState.revision]
+    // recomposed the whole pane on every keystroke.
+    LaunchedEffect(state) {
+        snapshotFlow { state.revision }.collect { card.clear() }
+    }
     card.Poller()
     return card
 }

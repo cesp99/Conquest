@@ -17,14 +17,16 @@ class BufferSession private constructor(val id: Long) {
 
     /**
      * Replace the byte range [start, end) with [replacement]. Offsets must
-     * lie on UTF-8 code-point boundaries. Returns false if the engine
+     * lie on UTF-8 code-point boundaries. Returns the version this edit
+     * produced — the engine bumps it by exactly one per edit, under the
+     * buffer's lock, so the caller can tell a lone edit from one that
+     * another writer's edit slipped in ahead of — or -1 if the engine
      * rejected the edit.
      */
-    fun editBytes(start: Long, end: Long, replacement: String): Boolean {
+    fun editBytes(start: Long, end: Long, replacement: String): Long {
         val newVersion = CoreBridge.applyEdit(id, start, end, replacement)
-        if (newVersion < 0) return false
-        version = newVersion
-        return true
+        if (newVersion >= 0) version = newVersion
+        return newVersion
     }
 
     /**

@@ -62,6 +62,7 @@ import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.termux.terminal.TerminalEmulator
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TextStyle
 import com.termux.view.TerminalView
@@ -140,7 +141,7 @@ private fun terminalActionFor(event: AndroidKeyEvent): TerminalAction? {
 }
 
 /**
- * Frame around the terminal view whose only job is to see hardware keys first.
+ * Frame around the terminal view that sees hardware keys first.
  *
  * The vendored view drops the text selection at the top of its own `onKeyDown`,
  * *before* the client callback runs, so a `Ctrl+Shift+C` arriving that way
@@ -152,6 +153,22 @@ private class TerminalKeyFrame(context: Context) : FrameLayout(context) {
 
     /** Returns true when the chord belongs to the dock rather than the shell. */
     var onKey: ((AndroidKeyEvent) -> Boolean)? = null
+
+    /**
+     * What the last `update` pass pushed into the view, so a recomposition
+     * that changed none of it — a bell, a title, a latched modifier — does
+     * not call through again: `setTextSize` allocates a whole new renderer
+     * per call, and `applyPalette` invalidates the screen. The palette is
+     * written into the emulator, so a fresh emulator — session switch,
+     * restart, first layout — needs it applied again even under the same
+     * theme; hence the emulator is tracked next to the theme. Neither
+     * reference catches a program resetting the colours *in place* (RIS,
+     * OSC 104), so the guard also probes the emulator's actual colour state
+     * via [paletteSentinelsMatch] before trusting these.
+     */
+    var lastTextSizePx = 0
+    var lastTheme: ZedTheme? = null
+    var lastEmulator: TerminalEmulator? = null
 
     init {
         addView(
@@ -303,6 +320,7 @@ fun TerminalDock(
                         // Order matters: setTextSize builds the renderer that
                         // setTypeface then reads its size from.
                         terminal.setTextSize(textSizePx)
+                        lastTextSizePx = textSizePx
                         terminal.setTypeface(Typeface.MONOSPACE)
                         terminal.setOnFocusChangeListener { _, hasFocus ->
                             onFocusChanged(hasFocus)
@@ -316,11 +334,32 @@ fun TerminalDock(
                     }
                 },
                 update = { frame ->
-                    frame.terminal.setTextSize(textSizePx)
+                    // Runs on every recomposition — a bell, a title, a sticky
+                    // modifier — so the expensive calls only go through when
+                    // what they would push has actually changed.
+                    if (frame.lastTextSizePx != textSizePx) {
+                        frame.terminal.setTextSize(textSizePx)
+                        frame.lastTextSizePx = textSizePx
+                    }
                     if (frame.terminal.currentSession !== host.session) {
                         host.attach(frame.terminal)
                     }
-                    applyPalette(frame.terminal, theme)
+                    // The emulator only exists once the view has a size, so
+                    // keep retrying until the first application lands. The
+                    // sentinel probe is there because identity alone lies: a
+                    // program can reset the palette in place (see
+                    // [paletteSentinelsMatch]) without either tracked
+                    // reference changing.
+                    val emulator = frame.terminal.mEmulator
+                    if (emulator != null &&
+                        (frame.lastTheme !== theme ||
+                            frame.lastEmulator !== emulator ||
+                            !paletteSentinelsMatch(emulator, theme))
+                    ) {
+                        applyPalette(frame.terminal, theme)
+                        frame.lastTheme = theme
+                        frame.lastEmulator = emulator
+                    }
                 },
                 onRelease = { frame -> host.detach(frame.terminal) },
                 modifier = Modifier.fillMaxSize(),
@@ -803,11 +842,47 @@ private fun ExtraKey(label: String, latched: Boolean = false, onClick: () -> Uni
     )
 }
 
+/** The theme's terminal foreground, exactly as [applyPalette] writes it. */
+private fun terminalForeground(theme: ZedTheme): Color =
+    theme.color("terminal.foreground", theme.color("editor.foreground"))
+
+/** The theme's terminal background, exactly as [applyPalette] writes it. */
+private fun terminalBackground(theme: ZedTheme): Color =
+    theme.color("terminal.background", theme.color("editor.background"))
+
+/**
+ * Whether the emulator still holds the palette [applyPalette] wrote for this
+ * theme, probed through the foreground and background slots — the two entries
+ * the theme alone determines (the sixteen ANSI lookups fall back to whatever
+ * the slot already holds, so their target values cannot be predicted without
+ * doing the work this probe exists to skip).
+ *
+ * The probe exists because a running program can restore the vendored Termux
+ * defaults *in place* — `reset`/`tput reset` (RIS, `ESC c`) and a bare OSC 104
+ * both call `TerminalColors.reset()` on the same emulator instance — which no
+ * identity comparison in the update pass can see. When the slots diverge the
+ * whole palette is rewritten, stomping deliberate OSC 4/10/11 recolouring just
+ * as the old apply-every-recomposition code did; only ANSI-slot-only tweaks
+ * outlive this probe, and merely until the next full reapply.
+ *
+ * Both sides are ARGB ints: the vendored parser packs `0xFF << 24 | r g b`
+ * and [toArgb] packs the same, so plain equality is exact.
+ */
+private fun paletteSentinelsMatch(emulator: TerminalEmulator, theme: ZedTheme): Boolean {
+    val colors = emulator.mColors.mCurrentColors
+    return colors[TextStyle.COLOR_INDEX_FOREGROUND] == terminalForeground(theme).toArgb() &&
+        colors[TextStyle.COLOR_INDEX_BACKGROUND] == terminalBackground(theme).toArgb()
+}
+
 /**
  * Paint the emulator with the Zed theme's terminal palette, which the theme
  * JSON already carries: 16 ANSI colours plus foreground, background and
  * cursor. Without this the terminal would be the only surface in the app not
  * following the theme.
+ *
+ * The foreground and background written here double as the sentinels
+ * [paletteSentinelsMatch] probes, which is why their derivation lives in
+ * [terminalForeground] and [terminalBackground] rather than inline.
  */
 private fun applyPalette(view: TerminalView, theme: ZedTheme) {
     val emulator = view.mEmulator ?: return
@@ -818,9 +893,8 @@ private fun applyPalette(view: TerminalView, theme: ZedTheme) {
         colors[index + 8] =
             theme.color("terminal.ansi.bright_$name", Color(colors[index + 8])).toArgb()
     }
-    val background = theme.color("terminal.background", theme.color("editor.background"))
-    colors[TextStyle.COLOR_INDEX_FOREGROUND] =
-        theme.color("terminal.foreground", theme.color("editor.foreground")).toArgb()
+    val background = terminalBackground(theme)
+    colors[TextStyle.COLOR_INDEX_FOREGROUND] = terminalForeground(theme).toArgb()
     colors[TextStyle.COLOR_INDEX_BACKGROUND] = background.toArgb()
     colors[TextStyle.COLOR_INDEX_CURSOR] = theme.cursor.toArgb()
     view.setBackgroundColor(background.toArgb())

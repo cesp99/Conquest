@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use rope::Point;
 use sum_tree::Bias;
@@ -99,17 +99,30 @@ pub fn initialize(files_dir: &Path) {
 
 pub type BufferId = u64;
 
+/// The open buffers, keyed by id and shared with the worker threads.
+///
+/// The map is write-locked only to open or close a buffer; everything else
+/// takes the read lock, clones the one buffer's `Arc` out, and locks just
+/// that buffer. So the UI reading one buffer's highlights never waits on the
+/// worker installing another buffer's parse — under one map-wide mutex they
+/// serialized, which showed up as stutter during fast typing. Lock order: a
+/// buffer's mutex may be taken while the map's read lock is held, never the
+/// reverse.
+pub(crate) type Buffers = Arc<RwLock<HashMap<BufferId, Arc<Mutex<BufferState>>>>>;
+
 static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
 pub struct Engine {
     /// Shared so the worktree watcher can reach open buffers from the
     /// runtime thread without a handle on the whole engine (see file.rs).
-    buffers: Arc<Mutex<HashMap<BufferId, BufferState>>>,
+    buffers: Buffers,
     projects: Mutex<HashMap<ProjectId, Arc<Mutex<project::ProjectState>>>>,
     next_project_id: AtomicU64,
     /// Started on the first `open_project`, so buffer-only use (and most
-    /// tests) never pays for a gpui App.
+    /// tests) never pays for a gpui App. The platform layer may start it
+    /// earlier with [`Engine::start_runtime`]; either way the boot happens on
+    /// the runtime's own thread and nobody blocks on it (see runtime.rs).
     runtime: OnceLock<runtime::Runtime>,
     /// Started when a buffer first gets a language. Reparsing happens here,
     /// never on the caller's thread — see highlight_worker.rs.
@@ -185,6 +198,17 @@ impl Engine {
             .get_or_init(|| runtime::Runtime::new(project::init_globals))
     }
 
+    /// Start the gpui runtime now rather than on the first project open.
+    ///
+    /// Returns at once — it only spawns the runtime thread, on which the
+    /// `Application` then boots by itself — so the platform layer can warm the
+    /// runtime during startup without keeping anything waiting. Work handed
+    /// over before the boot finishes queues on the runtime's job channel
+    /// (see runtime.rs); nothing needs to check readiness.
+    pub fn start_runtime(&self) {
+        self.runtime();
+    }
+
     /// Ask the highlight worker to bring a buffer's tree up to date.
     fn request_highlight(&self, id: BufferId) {
         self.highlight_worker
@@ -200,14 +224,14 @@ impl Engine {
         let id = NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed);
         let remote_id = text::BufferId::new(id).expect("buffer ids start at 1");
         let buffer = text::Buffer::new(clock::ReplicaId::LOCAL, remote_id, initial_text);
-        self.buffers.lock().unwrap().insert(
+        self.buffers.write().unwrap().insert(
             id,
-            BufferState {
+            Arc::new(Mutex::new(BufferState {
                 buffer,
                 version: 0,
                 highlight: None,
                 file: None,
-            },
+            })),
         );
         id
     }
@@ -215,8 +239,8 @@ impl Engine {
     /// Assign a tree-sitter language (by grammar name, e.g. "rust") to the
     /// buffer and parse it. Returns false for unknown language names.
     pub fn set_language(&self, id: BufferId, language: &str) -> Result<bool, EngineError> {
-        let mut buffers = self.buffers.lock().unwrap();
-        let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
+        let state = self.buffer(id)?;
+        let mut state = state.lock().unwrap();
         let rope = state.buffer.as_rope().clone();
         state.highlight = highlight::HighlightState::new(language, &rope);
         Ok(state.highlight.is_some())
@@ -227,7 +251,7 @@ impl Engine {
         // registry it keeps, but a request still in flight against this buffer
         // has to be retired here rather than left holding a slot forever.
         self.lsp_did_close(id);
-        self.buffers.lock().unwrap().remove(&id).is_some()
+        self.buffers.write().unwrap().remove(&id).is_some()
     }
 
     /// Replace the byte range `start..end` with `text`, returning the new
@@ -240,8 +264,9 @@ impl Engine {
         end: usize,
         text: &str,
     ) -> Result<u64, EngineError> {
-        let mut buffers = self.buffers.lock().unwrap();
-        let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
+        let buffer = self.buffer(id)?;
+        let mut guard = buffer.lock().unwrap();
+        let state = &mut *guard;
         let snapshot = state.buffer.snapshot();
         if start > end
             || end > snapshot.len()
@@ -293,7 +318,7 @@ impl Engine {
             buffer_version: version,
         });
         // Release the lock before touching the worker.
-        drop(buffers);
+        drop(guard);
         if needs_highlight {
             self.request_highlight(id);
         }
@@ -306,8 +331,8 @@ impl Engine {
     /// Undo the most recent transaction. Returns the new version, or `None`
     /// if there was nothing to undo.
     pub fn undo(&self, id: BufferId) -> Result<Option<u64>, EngineError> {
-        let mut buffers = self.buffers.lock().unwrap();
-        let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
+        let state = self.buffer(id)?;
+        let mut state = state.lock().unwrap();
         let old_end = self
             .lsp_is_live()
             .then(|| state.buffer.snapshot().max_point_utf16());
@@ -318,9 +343,9 @@ impl Engine {
         });
         let lsp_change = result
             .is_some()
-            .then(|| self.history_change(state, old_end))
+            .then(|| self.history_change(&state, old_end))
             .flatten();
-        drop(buffers);
+        drop(state);
         if let Some(change) = lsp_change {
             self.lsp_did_change(id, change);
         }
@@ -355,8 +380,8 @@ impl Engine {
     /// Redo the most recently undone transaction. Returns the new version,
     /// or `None` if there was nothing to redo.
     pub fn redo(&self, id: BufferId) -> Result<Option<u64>, EngineError> {
-        let mut buffers = self.buffers.lock().unwrap();
-        let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
+        let state = self.buffer(id)?;
+        let mut state = state.lock().unwrap();
         let old_end = self
             .lsp_is_live()
             .then(|| state.buffer.snapshot().max_point_utf16());
@@ -367,9 +392,9 @@ impl Engine {
         });
         let lsp_change = result
             .is_some()
-            .then(|| self.history_change(state, old_end))
+            .then(|| self.history_change(&state, old_end))
             .flatten();
-        drop(buffers);
+        drop(state);
         if let Some(change) = lsp_change {
             self.lsp_did_change(id, change);
         }
@@ -473,8 +498,8 @@ impl Engine {
     /// takes every caret's offset at once and why the UI must only call it
     /// when a pair character is actually typed.
     pub fn bracket_scopes(&self, id: BufferId, offsets: &[usize]) -> Result<Vec<u64>, EngineError> {
-        let mut buffers = self.buffers.lock().unwrap();
-        let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
+        let state = self.buffer(id)?;
+        let mut state = state.lock().unwrap();
         let rope = state.buffer.as_rope().clone();
         let Some(highlighter) = &mut state.highlight else {
             return Ok(vec![u64::MAX; offsets.len()]);
@@ -577,14 +602,26 @@ impl Engine {
         })
     }
 
+    /// The shared handle of one buffer. The `Arc` is cloned out from under
+    /// the map's read lock, so whatever the caller then does under the
+    /// buffer's own lock holds up neither the map nor any other buffer.
+    fn buffer(&self, id: BufferId) -> Result<Arc<Mutex<BufferState>>, EngineError> {
+        self.buffers
+            .read()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or(EngineError::UnknownBuffer(id))
+    }
+
     fn with_buffer<T>(
         &self,
         id: BufferId,
         f: impl FnOnce(&BufferState) -> T,
     ) -> Result<T, EngineError> {
-        let buffers = self.buffers.lock().unwrap();
-        let state = buffers.get(&id).ok_or(EngineError::UnknownBuffer(id))?;
-        Ok(f(state))
+        let state = self.buffer(id)?;
+        let state = state.lock().unwrap();
+        Ok(f(&state))
     }
 }
 

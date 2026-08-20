@@ -1,47 +1,48 @@
 package to.eyed.conquest.code.ui.git
 
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.core.GitBranch
-import to.eyed.conquest.code.core.GitSession
 import to.eyed.conquest.code.core.ProjectSession
+import to.eyed.conquest.code.core.ResumedEffect
+import to.eyed.conquest.code.core.pollVersion
 
-/** How often the shared status counter is re-read. Cheap; see [GitSession]. */
+/** How often the shared status counter is re-read. Cheap; see [GitBranch]. */
 private const val POLL_MS = 500L
 
 /**
  * The branch the project is on, for the title bar.
  *
  * It reads the *same* status run the project panel's colours and the git panel
- * both use — one `git status` per project, one counter to poll — so putting
- * the branch in the title bar costs a long read every half second and no git
- * at all.
+ * both use — one `git status` per project, one counter to poll — through
+ * [CoreBridge.gitBranchInfo], which hands back the cached branch record alone:
+ * name, ahead/behind drift, upstream. The full
+ * [to.eyed.conquest.code.core.GitSession.state] read serializes and parses
+ * every changed file, which a title bar has no use for.
+ *
+ * Null when nothing is known — no repository, or no status run yet — and the
+ * title bar shows nothing rather than guessing. A detached HEAD arrives as a
+ * branch whose [GitBranch.name] is null, so the title bar still draws its
+ * clickable "no branch" chip rather than losing the way into the git panel.
  */
 @Composable
 fun rememberGitBranch(project: ProjectSession?): GitBranch? {
     var branch by remember(project) { mutableStateOf<GitBranch?>(null) }
-    LaunchedEffect(project) {
-        if (project == null) {
-            branch = null
-            return@LaunchedEffect
-        }
-        val session = GitSession(project)
-        var seen = -1L
-        while (true) {
-            val version = withContext(Dispatchers.Default) { session.version }
-            if (version != seen) {
-                seen = version
-                branch = withContext(Dispatchers.Default) { session.state().branch }
-            }
-            delay(POLL_MS)
-        }
+    ResumedEffect(project) {
+        if (project == null) return@ResumedEffect
+        pollVersion(
+            intervalMs = POLL_MS,
+            version = { project.gitStatusVersion },
+            read = { _ ->
+                CoreBridge.gitBranchInfo(project.id)?.let { GitBranch.parse(JSONObject(it)) }
+            },
+            apply = { branch = it },
+        )
     }
     return branch
 }

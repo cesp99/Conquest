@@ -50,14 +50,14 @@ the engine supplies a headless `Platform` that cannot draw (see
 | `gpui_macros` | Apache-2.0 | unpatched |
 | `fs` | GPL-3.0-or-later | patched (see below) |
 | `worktree` | GPL-3.0-or-later | unpatched — no OS-specific cfgs at all |
-| `language` | GPL-3.0-or-later | unpatched |
+| `language` | GPL-3.0-or-later | patched (see below) |
 | `lsp` | GPL-3.0-or-later | unpatched (unused until phase 5) |
 | `git` | GPL-3.0-or-later | unpatched |
 | `settings` | GPL-3.0-or-later | patched (see below) |
-| `settings_content`, `settings_json`, `settings_macros` | GPL-3.0-or-later | unpatched |
+| `settings_content`, `settings_json`, `settings_macros` | GPL-3.0-or-later | `settings_json` patched (see below), the others unpatched |
 | `release_channel` | GPL-3.0-or-later | patched (see below) |
 | `theme`, `syntax_theme` | GPL-3.0-or-later | unpatched |
-| `task`, `migrator`, `zed_actions`, `zeta_prompt` | GPL-3.0-or-later | unpatched |
+| `task`, `migrator`, `zed_actions`, `zeta_prompt` | GPL-3.0-or-later | `migrator` patched (see below), the others unpatched |
 | `paths`, `fuzzy`, `fuzzy_nucleo`, `watch`, `net`, `askpass` | GPL-3.0-or-later / Apache-2.0 | unpatched |
 | `proto`, `rpc`, `http_client`, `scheduler` | GPL-3.0-or-later / Apache-2.0 | unpatched |
 | `telemetry`, `telemetry_events` | GPL-3.0-or-later | unpatched; nothing calls them — the engine sends nothing anywhere |
@@ -141,6 +141,29 @@ Tier 1 — de-Zed-ing:
   `gpui/test-support` and crates outside this closure
   (`gpui_platform`, `reqwest_client`, `theme_settings`). Tier-0 crates
   keep their tests, which is where the vendoring confidence comes from.
+
+Tier 1 — binary size (perf/optimizations):
+
+- `settings_json`, `migrator`, `language`: tree-sitter's `wasm` feature is
+  dropped from all three manifests — it pulls the whole Cranelift/Wasmtime
+  stack into libconquestcore.so for a .wasm-grammar-loading path this app
+  never takes (all grammars are statically linked via `grammars`'s
+  `load-grammars` feature). `language` additionally loses the code that used
+  the wasm API: `with_parser` no longer attaches a `WasmStore`
+  (`src/language.rs`), and `LanguageRegistry`'s `AvailableGrammar` loses its
+  `Loaded`/`Loading` variants — a registered `.wasm` grammar now fails to
+  load with an error naming the unsupported path
+  (`src/language_registry.rs`).
+- `gpui`: image decoding and SVG rasterization sit behind a new off-by-default
+  `images` cargo feature. `resvg`, `usvg` and `ttf-parser` become optional
+  dependencies of that feature; `image` stays required but codec-free (the
+  workspace pin's codec features move into the feature list), because
+  `RenderImage` and the paint API use its core types. Gated sites are marked
+  in `Cargo.toml`, `src/svg_renderer.rs`, `src/app.rs`, `src/window.rs`,
+  `src/platform.rs`, `src/elements/mod.rs` (the `svg` element module) and
+  `src/elements/img.rs`, where the two asset loaders return an error instead
+  of decoding when the feature is off. No build of this app enables it — the
+  engine drives gpui headless.
 
 Also relevant, though not a source patch: `rust-embed` gains the
 `debug-embed` feature in `core/Cargo.toml`. Without it, debug builds

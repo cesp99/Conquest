@@ -13,6 +13,7 @@ import to.eyed.conquest.code.core.BlameLine
 import to.eyed.conquest.code.core.FileBlame
 import to.eyed.conquest.code.core.GitDiff
 import to.eyed.conquest.code.core.GitHunk
+import to.eyed.conquest.code.core.ResumedEffect
 import to.eyed.conquest.code.ui.editor.EditorState
 
 /** How often the engine's hunk counter is re-read. */
@@ -59,27 +60,36 @@ fun rememberGitAnnotations(editor: EditorState, showBlame: Boolean): GitAnnotati
     var savedToken by remember(session) { mutableStateOf(0) }
     var isDirty by remember(session) { mutableStateOf(false) }
 
-    LaunchedEffect(session) {
-        if (session == null) return@LaunchedEffect
-        var seenHunks = -1L
-        var wasDirty = false
-        while (true) {
-            // Both of these are JNI calls that take the engine's locks; neither
-            // belongs on the frame's thread, cheap as they are.
-            val update = withContext(Dispatchers.Default) {
+    ResumedEffect(session) {
+        if (session == null) return@ResumedEffect
+        // The whole loop stays here on Default — both reads are JNI calls
+        // that take the engine's locks, and neither belongs on the frame's
+        // thread, cheap as they are — and the main thread is touched only
+        // when something moved.
+        withContext(Dispatchers.Default) {
+            var seenHunks = -1L
+            // From the state, not `false`: this block restarts on every
+            // return to the foreground, and a re-baseline would miss the
+            // buffer having been saved (or dirtied) while the app was away.
+            var wasDirty = isDirty
+            while (true) {
                 val version = GitDiff.hunksVersion(session.id)
                 val dirty = session.isDirty
                 val rows = if (version != seenHunks) GitDiff.hunks(session.id) else null
-                Triple(version, dirty, rows)
+                seenHunks = version
+                if (rows != null || dirty != wasDirty) {
+                    val dirtyChanged = dirty != wasDirty
+                    wasDirty = dirty
+                    withContext(Dispatchers.Main) {
+                        rows?.let { hunks = it }
+                        if (dirtyChanged) {
+                            isDirty = dirty
+                            if (!dirty) savedToken++
+                        }
+                    }
+                }
+                delay(HUNK_POLL_MS)
             }
-            seenHunks = update.first
-            update.third?.let { hunks = it }
-            if (update.second != wasDirty) {
-                wasDirty = update.second
-                isDirty = update.second
-                if (!update.second) savedToken++
-            }
-            delay(HUNK_POLL_MS)
         }
     }
 

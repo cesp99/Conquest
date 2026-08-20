@@ -306,27 +306,33 @@ fun ProjectSearchPanel(
                 return@LaunchedEffect
             }
             progress = SearchProgress(state = ProjectSearchState.Scanning)
-            var seen = 0L
-            while (true) {
-                val version = started.version
-                // 0 means forgotten, never "not yet": nothing more is coming.
-                if (version == 0L) break
-                if (version != seen) {
-                    seen = version
-                    val results = withContext(Dispatchers.Default) { started.poll() }
-                    files.addAll(results.newFiles)
-                    progress = SearchProgress(
-                        state = results.state,
-                        filesSearched = results.filesSearched,
-                        totalFiles = results.totalFiles,
-                        fileCount = results.fileCount,
-                        matchCount = results.matchCount,
-                        truncated = results.truncated,
-                        error = results.error,
-                    )
-                    if (!results.state.isLive) break
+            // The whole wait lives on Default — the counter is one JNI read
+            // per tick — and the main thread sees only the merges.
+            withContext(Dispatchers.Default) {
+                var seen = 0L
+                while (true) {
+                    val version = started.version
+                    // 0 means forgotten, never "not yet": nothing more is coming.
+                    if (version == 0L) break
+                    if (version != seen) {
+                        seen = version
+                        val results = started.poll()
+                        withContext(Dispatchers.Main) {
+                            files.addAll(results.newFiles)
+                            progress = SearchProgress(
+                                state = results.state,
+                                filesSearched = results.filesSearched,
+                                totalFiles = results.totalFiles,
+                                fileCount = results.fileCount,
+                                matchCount = results.matchCount,
+                                truncated = results.truncated,
+                                error = results.error,
+                            )
+                        }
+                        if (!results.state.isLive) break
+                    }
+                    delay(POLL_MS)
                 }
-                delay(POLL_MS)
             }
         } finally {
             // Every result is in `files` by now, and the engine is holding its

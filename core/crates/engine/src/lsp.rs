@@ -74,7 +74,7 @@ use rope::PointUtf16;
 
 use crate::guest::{self, GuestCommand};
 use crate::project::ProjectId;
-use crate::{BufferId, BufferState};
+use crate::{BufferId, Buffers};
 
 /// How long `initialize` gets. rust-analyzer on a cold page cache, inside
 /// proot, on a phone, is slow enough that Zed's own 120 s default is not
@@ -1853,7 +1853,7 @@ impl crate::Engine {
         let known: Vec<BufferId> = self.lsp.docs.lock().unwrap().keys().copied().collect();
         let candidates: Vec<BufferId> = self
             .buffers
-            .lock()
+            .read()
             .unwrap()
             .keys()
             .copied()
@@ -1951,7 +1951,7 @@ struct StartRequest {
     binary: LanguageServerBinary,
     root: PathBuf,
     store: Arc<DiagnosticStore>,
-    buffers: Arc<Mutex<HashMap<BufferId, BufferState>>>,
+    buffers: Buffers,
     slots: Slots,
     docs: Docs,
     wants_full_text: Arc<AtomicBool>,
@@ -2113,7 +2113,7 @@ fn open_pending_docs(
     project: ProjectId,
     name: &'static str,
     docs: &Docs,
-    buffers: &Arc<Mutex<HashMap<BufferId, BufferState>>>,
+    buffers: &Buffers,
     store: &DiagnosticStore,
 ) {
     let pending: Vec<(BufferId, Uri, PathBuf, &'static str, i32)> = {
@@ -2136,12 +2136,10 @@ fn open_pending_docs(
             .collect()
     };
     for (buffer, uri, path, language_id, version) in pending {
-        let Some((text, buffer_version)) = buffers
-            .lock()
-            .unwrap()
-            .get(&buffer)
-            .map(|state| (state.buffer.text(), state.version))
-        else {
+        let Some((text, buffer_version)) = buffers.read().unwrap().get(&buffer).map(|state| {
+            let state = state.lock().unwrap();
+            (state.buffer.text(), state.version)
+        }) else {
             continue;
         };
         store.note_sent(&path, version, buffer_version);

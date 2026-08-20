@@ -28,6 +28,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -286,9 +287,11 @@ internal suspend fun requestLsp(
     if (id <= 0L) return null
     var settled = false
     try {
-        while (true) {
-            val answer = withContext(Dispatchers.Default) {
-                when (CoreBridge.lspRequestVersion(id)) {
+        // One hop for the whole wait, not one per tick: the loop stays on
+        // Default and the caller gets the answer when it lands.
+        return withContext(Dispatchers.Default) {
+            while (true) {
+                val answer = when (CoreBridge.lspRequestVersion(id)) {
                     // Forgotten: superseded, cancelled, or its buffer closed.
                     // Nothing more is coming, exactly like a search whose
                     // version reads 0.
@@ -296,12 +299,15 @@ internal suspend fun requestLsp(
                     2L -> LspAnswer.parse(CoreBridge.lspRequestResult(id)) ?: LspAnswer.forgotten(id)
                     else -> null
                 }
+                if (answer != null) {
+                    settled = true
+                    return@withContext answer
+                }
+                delay(REQUEST_POLL_MILLIS)
             }
-            if (answer != null) {
-                settled = true
-                return answer
-            }
-            delay(REQUEST_POLL_MILLIS)
+            // The loop only ends through the return above.
+            @Suppress("UNREACHABLE_CODE")
+            LspAnswer.forgotten(id)
         }
     } finally {
         if (!settled) {
@@ -930,8 +936,14 @@ internal fun rememberCompletionMenu(state: EditorState): CompletionMenuState {
         onDispose { state.onTextTyped = null }
     }
     // Everything else the caret does: growing the query, leaving the word,
-    // undoing the edit that opened the menu.
-    LaunchedEffect(state.cursorRow, state.cursorCol, state.revision) { menu.caretMoved() }
+    // undoing the edit that opened the menu. Watched through [snapshotFlow]
+    // rather than passed as effect keys: keys are read during composition,
+    // and this helper returns a value, so it composes in the pane's own scope
+    // — keys here recomposed the whole pane on every caret move.
+    LaunchedEffect(state) {
+        snapshotFlow { Triple(state.cursorRow, state.cursorCol, state.revision) }
+            .collect { menu.caretMoved() }
+    }
     menu.Poller()
     return menu
 }

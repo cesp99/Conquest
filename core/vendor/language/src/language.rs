@@ -94,7 +94,9 @@ pub use toolchain::{
     LanguageToolchainStore, LocalLanguageToolchainStore, Toolchain, ToolchainList, ToolchainLister,
     ToolchainMetadata, ToolchainScope,
 };
-use tree_sitter::{self, QueryCursor, WasmStore, wasmtime};
+// CONQUEST PATCH: WasmStore/wasmtime imports dropped with tree-sitter's "wasm"
+// feature — all grammars in this app are statically linked.
+use tree_sitter::{self, QueryCursor};
 use util::rel_path::RelPath;
 
 pub use available_languages::AvailableLanguage;
@@ -131,13 +133,10 @@ pub fn with_parser<F, R>(func: F) -> R
 where
     F: FnOnce(&mut Parser) -> R,
 {
-    let mut parser = PARSERS.lock().pop().unwrap_or_else(|| {
-        let mut parser = Parser::new();
-        parser
-            .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
-            .unwrap();
-        parser
-    });
+    // CONQUEST PATCH: upstream attaches a WasmStore to every pooled parser so
+    // .wasm grammars can load; with tree-sitter's "wasm" feature off (all
+    // grammars are statically linked) a plain parser is all there is.
+    let mut parser = PARSERS.lock().pop().unwrap_or_else(Parser::new);
     // Tree-sitter auto-resets the parser at the end of a successful parse,
     // but the cancellation paths (progress callback returning `Break`,
     // cancelled balancing) leave outstanding state on the parser. The next
@@ -157,10 +156,6 @@ where
     let mut cursor = QueryCursorHandle::new();
     func(cursor.deref_mut())
 }
-
-static WASM_ENGINE: LazyLock<wasmtime::Engine> = LazyLock::new(|| {
-    wasmtime::Engine::new(&wasmtime::Config::new()).expect("Failed to create Wasmtime engine")
-});
 
 /// A shared grammar for plain text, exposed for reuse by downstream crates.
 pub static PLAIN_TEXT: LazyLock<Arc<Language>> = LazyLock::new(|| {

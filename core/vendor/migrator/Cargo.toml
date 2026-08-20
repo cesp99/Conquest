@@ -22,7 +22,10 @@ convert_case.workspace = true
 log.workspace = true
 streaming-iterator.workspace = true
 tree-sitter-json.workspace = true
-tree-sitter = { workspace = true, features = ["wasm"] }
+# CONQUEST PATCH: the "wasm" feature is dropped — it pulls the whole
+# Cranelift/Wasmtime stack into the .so for a .wasm-grammar path this app
+# never takes (all grammars are statically linked via `grammars`).
+tree-sitter.workspace = true
 serde_json_lenient.workspace = true
 serde_json.workspace = true
 settings_content.workspace = true

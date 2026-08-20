@@ -39,7 +39,7 @@ use std::time::Duration;
 use imara_diff::{Algorithm, Diff, InternedInput};
 
 use crate::guest::Userland;
-use crate::{BufferId, BufferState, git};
+use crate::{BufferId, Buffers, git};
 
 /// How long the buffer rests before it is diffed. Long enough that a burst of
 /// typing costs one diff rather than one per keystroke, short enough that the
@@ -164,7 +164,7 @@ impl crate::Engine {
         // here rather than in `close_buffer` because nothing polls a closed
         // buffer's version, so this is the only moment anybody looks.
         {
-            let live = self.buffers.lock().unwrap();
+            let live = self.buffers.read().unwrap();
             let mut diffs = self.diffs.buffers.lock().unwrap();
             // Not guarded on the two lengths matching: closing one buffer and
             // opening another leaves them equal with a dead entry inside, and a
@@ -281,7 +281,7 @@ fn diff_until_settled(
     id: BufferId,
     userland: &Userland,
     path: &Path,
-    buffers: &Arc<Mutex<HashMap<BufferId, BufferState>>>,
+    buffers: &Buffers,
     cache: &Arc<Mutex<BufferDiff>>,
 ) {
     for _ in 0..MAX_CHAINED_RUNS {
@@ -341,12 +341,9 @@ fn diff_until_settled(
 }
 
 /// The buffer's text and version, or `None` if it has been closed.
-fn snapshot(
-    buffers: &Arc<Mutex<HashMap<BufferId, BufferState>>>,
-    id: BufferId,
-) -> Option<(String, u64)> {
-    let buffers = buffers.lock().unwrap();
-    let state = buffers.get(&id)?;
+fn snapshot(buffers: &Buffers, id: BufferId) -> Option<(String, u64)> {
+    let buffers = buffers.read().unwrap();
+    let state = buffers.get(&id)?.lock().unwrap();
     Some((state.buffer.text(), state.version))
 }
 

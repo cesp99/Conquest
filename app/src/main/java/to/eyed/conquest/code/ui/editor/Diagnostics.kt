@@ -1,16 +1,14 @@
 package to.eyed.conquest.code.ui.editor
 
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import to.eyed.conquest.code.core.CoreBridge
+import to.eyed.conquest.code.core.ResumedEffect
+import to.eyed.conquest.code.core.pollVersion
 
 
 /**
@@ -483,31 +481,20 @@ data class LspState(
 @Composable
 fun rememberLspState(projectId: Long?): LspState {
     var state by remember(projectId) { mutableStateOf(LspState.EMPTY) }
-    LaunchedEffect(projectId) {
-        if (projectId == null || projectId < 0) return@LaunchedEffect
-        var seen = -1L
-        while (true) {
-            val fresh = withContext(Dispatchers.Default) {
-                // The counter first: a bump between here and the payloads
-                // means the next poll picks the change up, rather than this
-                // one recording a new version against older rows.
-                val version = CoreBridge.lspVersion(projectId)
-                if (version == seen) {
-                    null
-                } else {
-                    LspState(
-                        version = version,
-                        summary = DiagnosticSummary.parse(CoreBridge.lspDiagnostics(projectId)),
-                        servers = parseLspServers(CoreBridge.lspServers(projectId)),
-                    )
-                }
-            }
-            if (fresh != null) {
-                seen = fresh.version
-                state = fresh
-            }
-            delay(PROJECT_POLL_MILLIS)
-        }
+    ResumedEffect(projectId) {
+        if (projectId == null || projectId < 0) return@ResumedEffect
+        pollVersion(
+            intervalMs = PROJECT_POLL_MILLIS,
+            version = { CoreBridge.lspVersion(projectId) },
+            read = { version ->
+                LspState(
+                    version = version,
+                    summary = DiagnosticSummary.parse(CoreBridge.lspDiagnostics(projectId)),
+                    servers = parseLspServers(CoreBridge.lspServers(projectId)),
+                )
+            },
+            apply = { state = it },
+        )
     }
     return state
 }
@@ -518,9 +505,9 @@ fun rememberLspState(projectId: Long?): LspState {
  * `bufferDiagnosticsVersion` is a hash lookup that does *not* move when the
  * user types — the bridge is explicit that a UI must not be woken by its own
  * typing — so this reads the (potentially large) row payload only when a
- * server has actually published something. Everything runs on
- * [Dispatchers.Default]; nothing here touches the main thread but the final
- * assignment, which Compose does on the caller's dispatcher.
+ * server has actually published something. The loop lives on the default
+ * dispatcher and touches the main thread only for the
+ * [EditorState.showDiagnostics] write — [pollVersion]'s contract.
  *
  * Staleness is *not* read from the payload's `stale` flag on every frame,
  * because that flag would then need a read per keystroke to stay true.
@@ -530,23 +517,13 @@ fun rememberLspState(projectId: Long?): LspState {
  */
 suspend fun pollBufferDiagnostics(state: EditorState) {
     val bufferId = state.sessionOrNull?.id ?: return
-    var seen = -1L
-    while (true) {
-        val fresh = withContext(Dispatchers.Default) {
-            // The counter is what "seen" records, not the payload's own
-            // `version` field: they agree, but only the counter is still the
-            // truth if a payload ever arrives unreadable.
-            val version = CoreBridge.bufferDiagnosticsVersion(bufferId)
-            if (version == seen) {
-                null
-            } else {
-                version to BufferDiagnostics.parse(CoreBridge.bufferDiagnostics(bufferId))
-            }
-        }
-        if (fresh != null) {
-            seen = fresh.first
-            state.showDiagnostics(fresh.second)
-        }
-        delay(BUFFER_POLL_MILLIS)
-    }
+    // The counter is what the loop records, not the payload's own `version`
+    // field: they agree, but only the counter is still the truth if a
+    // payload ever arrives unreadable.
+    pollVersion(
+        intervalMs = BUFFER_POLL_MILLIS,
+        version = { CoreBridge.bufferDiagnosticsVersion(bufferId) },
+        read = { BufferDiagnostics.parse(CoreBridge.bufferDiagnostics(bufferId)) },
+        apply = { state.showDiagnostics(it) },
+    )
 }

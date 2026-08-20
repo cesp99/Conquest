@@ -2,22 +2,29 @@ use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
     Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
     Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
-    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_static_image,
-    decode_static_image_from_decoder, px,
+    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, px,
 };
+// CONQUEST PATCH: decoding is behind the off-by-default `images` feature — see
+// Cargo.toml. Without it the asset loaders return an error instead.
+#[cfg(feature = "images")]
+use crate::{decode_static_image, decode_static_image_from_decoder};
 use anyhow::Result;
 
 use futures::Future;
 use gpui_util::ResultExt;
+use image::ImageError;
+#[cfg(feature = "images")]
 use image::{
-    AnimationDecoder, ImageError, ImageFormat, Rgba,
+    AnimationDecoder, ImageFormat, Rgba,
     codecs::{gif::GifDecoder, webp::WebPDecoder},
 };
 use scheduler::Instant;
+#[cfg(feature = "images")]
 use smallvec::SmallVec;
+#[cfg(feature = "images")]
+use std::{fs, io::Cursor};
 use std::{
-    fs,
-    io::{self, Cursor},
+    io,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     str::FromStr,
@@ -603,12 +610,30 @@ impl Asset for ImageDecoder {
     type Source = Arc<Image>;
     type Output = Result<Arc<RenderImage>, ImageCacheError>;
 
+    // CONQUEST PATCH: decoding is behind the off-by-default `images` feature.
+    #[cfg(feature = "images")]
     fn load(
         source: Self::Source,
         cx: &mut App,
     ) -> impl Future<Output = Self::Output> + Send + 'static {
         let renderer = cx.svg_renderer();
         async move { source.to_image_data(renderer).map_err(Into::into) }
+    }
+
+    // CONQUEST PATCH: without the `images` feature there are no codecs and no
+    // SVG renderer, so loading an image can only fail.
+    #[cfg(not(feature = "images"))]
+    fn load(
+        source: Self::Source,
+        _cx: &mut App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        async move {
+            Err(ImageCacheError::Other(Arc::new(anyhow::anyhow!(
+                "cannot decode image {:?}: this build has no image decoding \
+                 (gpui's `images` feature is off)",
+                source.id
+            ))))
+        }
     }
 }
 
@@ -620,6 +645,8 @@ impl Asset for ImageAssetLoader {
     type Source = Resource;
     type Output = Result<Arc<RenderImage>, ImageCacheError>;
 
+    // CONQUEST PATCH: decoding is behind the off-by-default `images` feature.
+    #[cfg(feature = "images")]
     fn load(
         source: Self::Source,
         cx: &mut App,
@@ -743,6 +770,21 @@ impl Asset for ImageAssetLoader {
             }
         }
     }
+
+    // CONQUEST PATCH: without the `images` feature there are no codecs and no
+    // SVG renderer, so fetching the resource would only feed a failing decode.
+    #[cfg(not(feature = "images"))]
+    fn load(
+        source: Self::Source,
+        _cx: &mut App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        async move {
+            Err(ImageCacheError::Other(Arc::new(anyhow::anyhow!(
+                "cannot load image {source:?}: this build has no image decoding \
+                 (gpui's `images` feature is off)"
+            ))))
+        }
+    }
 }
 
 /// An error that can occur when interacting with the image cache.
@@ -771,6 +813,9 @@ pub enum ImageCacheError {
     #[error("image error: {0}")]
     Image(Arc<ImageError>),
     /// An error that occurred while processing an SVG.
+    // CONQUEST PATCH: behind the off-by-default `images` feature — usvg is
+    // optional.
+    #[cfg(feature = "images")]
     #[error("svg error: {0}")]
     Usvg(Arc<usvg::Error>),
 }
@@ -787,6 +832,9 @@ impl From<io::Error> for ImageCacheError {
     }
 }
 
+// CONQUEST PATCH: behind the off-by-default `images` feature — usvg is
+// optional.
+#[cfg(feature = "images")]
 impl From<usvg::Error> for ImageCacheError {
     fn from(value: usvg::Error) -> Self {
         Self::Usvg(Arc::new(value))

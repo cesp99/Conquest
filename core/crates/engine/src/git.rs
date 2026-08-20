@@ -202,6 +202,12 @@ pub struct GitChanges {
     /// The project is inside a git repository at all.
     pub has_repo: bool,
     pub branch: Option<BranchInfo>,
+    /// The commit HEAD names — see [`read_head`]. A staleness key for views of
+    /// the commit *graph*: a history pane that reloads on every status change
+    /// re-runs `git log` on every save, when what it actually depends on is
+    /// this. `None` when it is not known, which a caller must treat as
+    /// "reload", never as "nothing changed".
+    pub head: Option<String>,
     pub entries: Vec<ChangedFile>,
 }
 
@@ -237,6 +243,8 @@ pub(crate) struct ProjectGit {
     /// The same run's output, unreduced, for the git panel.
     pub(crate) changes: Arc<Vec<FileChange>>,
     branch: Option<BranchInfo>,
+    /// The commit HEAD named when the run finished — see [`read_head`].
+    head: Option<String>,
     /// Where the enclosing repository is, once a run has looked. `None` after
     /// a completed run means the project is not in a repository.
     repo_root: Option<PathBuf>,
@@ -332,6 +340,7 @@ impl crate::Engine {
             ran: git.ran,
             has_repo: git.repo_root.is_some(),
             branch: git.branch.clone(),
+            head: git.head.clone(),
             entries: git
                 .changes
                 .iter()
@@ -346,6 +355,31 @@ impl crate::Engine {
                 .collect(),
         })
         .unwrap_or_default()
+    }
+
+    /// The branch the project is on, from the same cache — and nothing else.
+    ///
+    /// A title bar that only names the branch has no business paying for
+    /// [`Engine::git_changes`], which clones and serializes every changed
+    /// file. The whole [`BranchInfo`] rather than the name alone, because the
+    /// same cheap read feeds the title bar's ↑↓ drift arrows and the reload
+    /// keys of the history views, which go stale when a fetch or push moves
+    /// the upstream without touching HEAD. `None` when nothing is known: no
+    /// repository, or no completed run yet. A detached HEAD is `Some` with a
+    /// `name` of `None` — still a repository, just on no branch — which a
+    /// caller must keep distinct from `None`.
+    pub fn git_branch(&self, id: ProjectId) -> Option<BranchInfo> {
+        self.refresh_git_status(id);
+        self.with_git(id, |git| git.branch.clone()).flatten()
+    }
+
+    /// The commit HEAD names, from the same cache — the staleness key for the
+    /// commit graph, without the rest of [`Engine::git_changes`]. `None` when
+    /// it is not known; see [`GitChanges::head`] for what a caller must make
+    /// of that.
+    pub fn git_head(&self, id: ProjectId) -> Option<String> {
+        self.refresh_git_status(id);
+        self.with_git(id, |git| git.head.clone()).flatten()
     }
 
     /// Start a run if one is warranted and none is in flight.
@@ -452,11 +486,13 @@ fn run_until_settled(
             // a panel watching this counter has to see that.
             if *git.changes != outcome.changes
                 || git.branch != outcome.branch
+                || git.head != outcome.head
                 || git.repo_root != outcome.repo_root
             {
                 git.statuses = Arc::new(outcome.statuses);
                 git.changes = Arc::new(outcome.changes);
                 git.branch = outcome.branch;
+                git.head = outcome.head;
                 git.repo_root = outcome.repo_root;
                 git.version += 1;
                 bump_generation();
@@ -486,6 +522,8 @@ struct RunOutcome {
     repo_root: Option<PathBuf>,
     changes: Vec<FileChange>,
     branch: Option<BranchInfo>,
+    /// Answered by the host filesystem, like `repo_root` — see [`read_head`].
+    head: Option<String>,
     statuses: BTreeMap<String, GitStatus>,
     /// git ran and its output was parsed. See [`GitChanges::ran`].
     ran: bool,
@@ -501,6 +539,7 @@ fn status_for(id: ProjectId, userland: &Userland, root: &Path) -> RunOutcome {
     };
     let outcome = RunOutcome {
         repo_root: Some(repo_root.clone()),
+        head: read_head(&repo_root),
         ..RunOutcome::default()
     };
     let Some(prefix) = relative_prefix(&repo_root, root) else {
@@ -645,6 +684,71 @@ pub(crate) fn repo_root_of(project: &Path) -> Option<PathBuf> {
         dir = candidate.parent();
     }
     None
+}
+
+/// The commit HEAD names, read from the repository's own files on the host.
+///
+/// Why not ask git: the `--branch` header of porcelain v1 carries no commit
+/// id, and a `rev-parse` of its own would be a second proot spawn per refresh
+/// — the process spawn being the expensive part of everything this module
+/// does. `HEAD` plus one ref file is a handful of host reads, done on the same
+/// worker thread as the status run.
+///
+/// The answer is only ever a *staleness key* — "has the commit graph moved?" —
+/// so a layout this cannot resolve degrades to `None`, which callers must
+/// read as "unknown, assume moved", never as a wrong-but-confident id. An
+/// unborn branch is `None` too: there is no commit to name yet, and the first
+/// commit changes the answer, which is exactly what a key must do.
+pub(crate) fn read_head(repo_root: &Path) -> Option<String> {
+    let dot_git = repo_root.join(".git");
+    // A worktree or submodule has a `.git` *file* naming the real git dir,
+    // relative to the directory holding it.
+    let git_dir = if dot_git.is_file() {
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        let target = Path::new(text.strip_prefix("gitdir:")?.trim());
+        if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            repo_root.join(target)
+        }
+    } else {
+        dot_git
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    // A detached HEAD holds the commit id itself.
+    let Some(refname) = head.strip_prefix("ref:").map(str::trim) else {
+        return Some(head.to_owned()).filter(|head| !head.is_empty());
+    };
+    // A linked worktree has a HEAD of its own but shares its refs through
+    // `commondir`, which names the main repository's git dir.
+    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(text) => {
+            let target = Path::new(text.trim());
+            if target.is_absolute() {
+                target.to_path_buf()
+            } else {
+                git_dir.join(target)
+            }
+        }
+        Err(_) => git_dir,
+    };
+    // A loose ref is a file holding the id; a packed one is a line in
+    // `packed-refs`. Loose first, because git itself resolves in that order —
+    // a ref that is both was moved after packing, and the loose file is the
+    // truth.
+    if let Ok(id) = std::fs::read_to_string(common.join(refname)) {
+        return Some(id.trim().to_owned()).filter(|id| !id.is_empty());
+    }
+    let packed = std::fs::read_to_string(common.join("packed-refs")).ok()?;
+    packed
+        .lines()
+        // `#` opens the header line, `^` a peeled-tag line; neither is a ref.
+        .filter(|line| !line.starts_with(['#', '^']))
+        .find_map(|line| {
+            let (id, name) = line.split_once(' ')?;
+            (name.trim() == refname).then(|| id.to_owned())
+        })
 }
 
 /// Where the project sits inside its repository, as a `/`-terminated prefix
@@ -2294,6 +2398,72 @@ mod tests {
         let id = engine.open_project(dir.path());
         assert!(engine.git_status(id).is_empty());
         assert_eq!(engine.git_status_version(id), 0);
+        assert_eq!(engine.git_branch(id), None);
+        assert_eq!(engine.git_head(id), None);
+    }
+
+    /// [`read_head`] answers from the repository's files, so it has to agree
+    /// with git in every shape a HEAD comes in — loose, packed, detached — and
+    /// say "unknown" rather than something wrong for a branch with no commits.
+    #[test]
+    fn head_is_read_from_the_repository_files_and_agrees_with_git() {
+        if !has_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        assert!(
+            host_git(repo, &["init", "--quiet", "-b", "main"])
+                .status
+                .success()
+        );
+        // Unborn: `HEAD` names a ref that exists nowhere yet.
+        assert_eq!(read_head(repo), None);
+
+        std::fs::write(repo.join("README"), "one\n").unwrap();
+        assert!(host_git(repo, &["add", "README"]).status.success());
+        assert!(
+            host_git(repo, &["commit", "--quiet", "-m", "first"])
+                .status
+                .success()
+        );
+        let rev_parse = |repo: &Path| {
+            let out = host_git(repo, &["rev-parse", "HEAD"]);
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        // Loose: the ref is a file under `.git/refs/heads`.
+        assert_eq!(read_head(repo).as_deref(), Some(rev_parse(repo).as_str()));
+
+        // Packed: `git pack-refs` moves it into `.git/packed-refs`.
+        assert!(
+            host_git(repo, &["pack-refs", "--all", "--prune"])
+                .status
+                .success()
+        );
+        assert!(!repo.join(".git/refs/heads/main").exists());
+        assert_eq!(read_head(repo).as_deref(), Some(rev_parse(repo).as_str()));
+
+        // Detached: `HEAD` holds the id itself.
+        let head = rev_parse(repo);
+        assert!(
+            host_git(repo, &["checkout", "--quiet", "--detach", &head])
+                .status
+                .success()
+        );
+        assert_eq!(read_head(repo).as_deref(), Some(head.as_str()));
+
+        // A linked worktree: `.git` is a file, and the ref lives in the main
+        // repository's git dir, reached through `commondir`.
+        let linked = dir.path().join("linked");
+        assert!(
+            host_git(
+                repo,
+                &["worktree", "add", "--quiet", linked.to_str().unwrap(), "main"]
+            )
+            .status
+            .success()
+        );
+        assert_eq!(read_head(&linked).as_deref(), Some(rev_parse(&linked).as_str()));
     }
 
     #[test]
@@ -2788,6 +2958,27 @@ mod tests {
         panic!("git status never reported {path}");
     }
 
+    /// Wait for the cached branch record to satisfy `pred` — the cache refills
+    /// behind the same debounce [`await_change`] describes, and reading it is
+    /// what schedules the run.
+    #[cfg(unix)]
+    fn await_branch(
+        engine: &crate::Engine,
+        id: ProjectId,
+        pred: impl Fn(&BranchInfo) -> bool,
+    ) -> BranchInfo {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if let Some(branch) = engine.git_branch(id)
+                && pred(&branch)
+            {
+                return branch;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("git status never reported the expected branch");
+    }
+
     /// Is there a git to test against at all?
     fn has_git() -> bool {
         if Command::new("git").arg("--version").output().is_ok() {
@@ -3084,6 +3275,89 @@ mod tests {
         // in the panel forever.
         engine.git_discard(id, &["new.rs".to_owned()]).unwrap();
         assert_eq!(plain_status(&repo), "");
+    }
+
+    /// The cheap reads answer from the status run's cache: the branch record a
+    /// title bar polls every half second — name, drift and upstream, since the
+    /// ↑↓ arrows and the history panes' reload keys are built from it — and
+    /// the head a history pane keys its reloads on, both without a JSON
+    /// snapshot of every changed file, and both agreeing with what git itself
+    /// says about the same repository.
+    #[test]
+    #[cfg(unix)]
+    fn the_branch_and_head_are_cached_for_cheap_reads() {
+        if !has_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, repo) = live_repo(dir.path());
+        std::fs::write(repo.join("README"), "one\n").unwrap();
+        assert!(host_git(&repo, &["add", "README"]).status.success());
+        assert!(
+            host_git(&repo, &["commit", "--quiet", "-m", "first"])
+                .status
+                .success()
+        );
+        std::fs::write(repo.join("README"), "two\n").unwrap();
+
+        let id = engine.open_project(&repo);
+        await_change(&engine, id, "README");
+
+        let branch = engine.git_branch(id).expect("a run has completed");
+        assert_eq!(branch.name.as_deref(), Some("main"));
+        assert_eq!((branch.ahead, branch.behind), (0, 0));
+        assert_eq!(branch.upstream, None);
+        let head = engine.git_head(id).expect("a commit exists to name");
+        let out = host_git(&repo, &["rev-parse", "HEAD"]);
+        assert_eq!(head, String::from_utf8_lossy(&out.stdout).trim());
+        // The panel's snapshot carries the same key, so a caller already
+        // holding one pays nothing extra for it.
+        assert_eq!(engine.git_changes(id).head.as_deref(), Some(head.as_str()));
+
+        // Publish the branch and commit past it: the cheap read has to carry
+        // the drift and the upstream, because a fetch or push moves these
+        // without moving HEAD and the views keyed on this read must see it.
+        assert!(
+            host_git(dir.path(), &["init", "--quiet", "--bare", "remote.git"])
+                .status
+                .success()
+        );
+        let remote = dir.path().join("remote.git");
+        let remote = remote.to_str().unwrap();
+        assert!(
+            host_git(&repo, &["remote", "add", "origin", remote])
+                .status
+                .success()
+        );
+        assert!(
+            host_git(&repo, &["push", "--quiet", "-u", "origin", "main"])
+                .status
+                .success()
+        );
+        assert!(
+            host_git(&repo, &["commit", "--allow-empty", "-qm", "ahead"])
+                .status
+                .success()
+        );
+        // Host git moved refs behind the engine's back; the engine's own
+        // commands do this for themselves.
+        engine.git_state_changed(id);
+        let ahead = await_branch(&engine, id, |branch| branch.ahead == 1);
+        assert_eq!(ahead.name.as_deref(), Some("main"));
+        assert_eq!((ahead.ahead, ahead.behind), (1, 0));
+        assert_eq!(ahead.upstream.as_deref(), Some("origin/main"));
+
+        // A detached HEAD is a *present* record with no name: on no branch is
+        // not the same answer as no repository, and the title bar's "no
+        // branch" chip hangs on the difference.
+        assert!(
+            host_git(&repo, &["checkout", "--quiet", "--detach"])
+                .status
+                .success()
+        );
+        engine.git_state_changed(id);
+        let detached = await_branch(&engine, id, |branch| branch.name.is_none());
+        assert_eq!(detached.name, None);
     }
 
     #[test]

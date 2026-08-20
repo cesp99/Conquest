@@ -78,14 +78,16 @@ import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.core.GitChange
 import to.eyed.conquest.code.core.GitFileStatus
 import to.eyed.conquest.code.core.GitPanelState
 import to.eyed.conquest.code.core.GitSession
 import to.eyed.conquest.code.core.ProjectSession
+import to.eyed.conquest.code.core.ResumedEffect
+import to.eyed.conquest.code.core.pollVersion
 import to.eyed.conquest.code.terminal.Userland
 import to.eyed.conquest.code.ui.theme.BufferFontFamily
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
@@ -199,6 +201,13 @@ fun GitPanel(
     val session = remember(project) { GitSession(project) }
 
     var state by remember(project) { mutableStateOf(GitPanelState()) }
+    /**
+     * The commit HEAD names, from the engine's cached status run. It is the
+     * history tab's staleness key: `git log` needs re-running when *this*
+     * moves, not when the status snapshot is replaced — which happens on
+     * every save while the panel is open.
+     */
+    var head by remember(project) { mutableStateOf<String?>(null) }
     // Seeded from, and written back to, the draft the panel was closed with:
     // Escape and — on a phone — opening a file both take the panel out of the
     // composition, and a commit message is the one thing here nobody wants to
@@ -240,23 +249,32 @@ fun GitPanel(
 
     // One counter, polled; the parse happens only when it moves. Reading the
     // counter is itself a JNI call that schedules a `git status`, so it is off
-    // the main thread too — cheap, but it takes the engine's locks.
-    LaunchedEffect(session) {
-        var seen = -1L
-        while (true) {
-            val version = withContext(Dispatchers.Default) { session.version }
-            if (version != seen) {
-                seen = version
-                state = withContext(Dispatchers.Default) { session.state() }
-            }
-            delay(POLL_MS)
-        }
+    // the main thread too — cheap, but it takes the engine's locks. Gated on
+    // the lifecycle for the same reason: a backgrounded app must not keep
+    // scheduling `git status` runs under proot.
+    ResumedEffect(session) {
+        pollVersion(
+            intervalMs = POLL_MS,
+            version = { session.version },
+            read = { session.state() to CoreBridge.gitHead(project.id) },
+            apply = { (newState, newHead) ->
+                state = newState
+                head = newHead
+            },
+        )
     }
 
-    // Loaded when the History tab is opened, and again whenever the
-    // repository's own counter moves — a commit made in this panel has to
-    // appear at the top of it without asking the user to come back.
-    LaunchedEffect(session, tab, state) {
+    // Loaded when the History tab is opened, and again whenever the commit
+    // graph could have moved — a commit made in this panel changes HEAD, so
+    // it appears at the top without asking the user to come back, while a
+    // save only replaces the status snapshot and reloads nothing. The branch
+    // is keyed whole — name, ahead/behind, upstream — because a fetch or push
+    // moves upstream refs without touching HEAD, and the ref chips beside the
+    // subjects would otherwise go stale. A pure `git tag` moves neither and
+    // still does not reload, which is the one residual this key accepts. When
+    // the engine cannot name HEAD, the snapshot itself is the key, which is
+    // the old trigger: eager, but never stale.
+    LaunchedEffect(session, tab, state.branch, head ?: state) {
         if (tab != GitPanelTab.History) return@LaunchedEffect
         history = withContext(Dispatchers.IO) { session.log() }
     }

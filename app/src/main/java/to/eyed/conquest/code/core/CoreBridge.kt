@@ -28,6 +28,14 @@ object CoreBridge {
      * exists — a worktree scan panics without one. The engine points `HOME`
      * (and the trash) at this directory.
      *
+     * Cheap on the calling thread: paths, logging and the engine's own state
+     * are set up synchronously, and the expensive part — the gpui runtime —
+     * is only *kicked off*, onto a thread of its own. Nothing here or later
+     * waits for that boot: work reaching the runtime before it is up queues
+     * inside the engine, and the UI gates on the version counters it already
+     * polls ([projectVersion] and friends), which stay 0 until there is
+     * something to show.
+     *
      * [verboseLogging] raises the engine's log level from Info to Debug, which
      * is where its git and scan diagnostics live. Pass `BuildConfig.DEBUG`: the
      * Rust library cannot tell a debug APK from a release one on its own,
@@ -212,6 +220,28 @@ object CoreBridge {
      * it never waits on git.
      */
     external fun gitStatusVersion(projectId: Long): Long
+
+    /**
+     * The branch record the project is on, from the cached status run, as
+     * JSON — `{name, ahead, behind, unborn, upstream}`, the same object
+     * [gitChanges] nests — with no JSON of the changed files and no git run:
+     * the title bar's drift arrows and the history views' reload keys ride
+     * the same half-second poll the name does. Null when nothing is known:
+     * no repository, or no completed run yet. A detached HEAD is a present
+     * object whose `name` is null — on no branch, which is not the same
+     * answer as no repository. Versioned by [gitStatusVersion], like every
+     * other read of that cache.
+     */
+    external fun gitBranchInfo(projectId: Long): String?
+
+    /**
+     * The commit HEAD points at, from the same cache — the staleness key for
+     * the commit graph: history needs reloading when this moves, not on every
+     * status change. Null when it is not known, which a caller must read as
+     * "assume it moved", never as "nothing changed". Versioned by
+     * [gitStatusVersion].
+     */
+    external fun gitHead(projectId: Long): String?
 
     /**
      * The status map as a JSON object of project-relative path to status
@@ -822,6 +852,15 @@ object CoreBridge {
      */
     external fun acpSessionList(refresh: Boolean): String
 
+    /**
+     * Version counter for [acpSessionList] — the cached list's own `version`
+     * field, without serializing the list to learn it. Poll this single load
+     * and make the full read only when it moves; it covers `loading` flipping
+     * as well as the answer landing. 0 means no agent is running, and a
+     * replaced agent never repeats a value already seen.
+     */
+    external fun acpSessionListVersion(): Long
+
     /** Forgets one of the agent's past conversations — `session/delete`. */
     external fun acpDeleteSession(sessionId: String): Boolean
 
@@ -1026,8 +1065,18 @@ object CoreBridge {
     external fun acpClearNotice(sessionId: Long): Boolean
 
     /**
+     * Version counter for [acpPendingElicitations] — poll this single load
+     * and read the list only when it moves, the [acpSessionVersion] contract.
+     * It moves whenever any of the agent's questions changes, session-scoped
+     * ones included. 0 means no agent is running, and a replaced agent never
+     * repeats a value already seen.
+     */
+    external fun acpElicitationsVersion(): Long
+
+    /**
      * The agent's questions that belong to no session — ACP's *request*
      * scope, in the same shape as `elicitations` in [acpSessionState].
+     * Read it when [acpElicitationsVersion] moves.
      *
      * No session argument because there may be no session: an agent can ask
      * for a token while authenticating, before any conversation exists. One

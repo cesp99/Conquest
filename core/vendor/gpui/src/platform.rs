@@ -40,16 +40,26 @@ use crate::{
     FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap,
     LineLayout, Pixels, PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
-    Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
+    Size, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
 };
+// CONQUEST PATCH: decoding is behind the off-by-default `images` feature — see
+// Cargo.toml.
+#[cfg(feature = "images")]
+use crate::SvgRenderer;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
-use anyhow::{Context as _, Result};
+use anyhow::Result;
+#[cfg(feature = "images")]
+use anyhow::Context as _;
 use async_task::Runnable;
 use futures::channel::oneshot;
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
+// CONQUEST PATCH: behind the off-by-default `images` feature — the gif codec
+// is only compiled with it.
+#[cfg(feature = "images")]
 use image::codecs::gif::GifDecoder;
+#[cfg(feature = "images")]
 use image::{AnimationDecoder as _, DynamicImage, Frame};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use scheduler::Instant;
@@ -60,6 +70,8 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
+// CONQUEST PATCH: only the images-gated decode paths read from a Cursor.
+#[cfg(feature = "images")]
 use std::io::Cursor;
 use std::ops;
 use std::time::Duration;
@@ -2490,6 +2502,9 @@ pub struct Image {
     pub id: u64,
 }
 
+// CONQUEST PATCH: behind the off-by-default `images` feature — without codecs
+// a decoder can never be built.
+#[cfg(feature = "images")]
 pub(crate) fn decode_static_image(
     bytes: &[u8],
     format: image::ImageFormat,
@@ -2500,6 +2515,7 @@ pub(crate) fn decode_static_image(
     decode_static_image_from_decoder(decoder)
 }
 
+#[cfg(feature = "images")]
 pub(crate) fn decode_static_image_from_decoder(
     mut decoder: impl image::ImageDecoder,
 ) -> Result<SmallVec<[Frame; 1]>> {
@@ -2578,6 +2594,9 @@ impl Image {
     }
 
     /// Convert the clipboard image to an `ImageData` object.
+    // CONQUEST PATCH: behind the off-by-default `images` feature — decoding
+    // needs the codecs and the SVG renderer.
+    #[cfg(feature = "images")]
     pub fn to_image_data(&self, svg_renderer: SvgRenderer) -> Result<Arc<RenderImage>> {
         let frames = match self.format {
             ImageFormat::Gif => {

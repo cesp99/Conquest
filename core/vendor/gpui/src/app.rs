@@ -50,13 +50,16 @@ use crate::{
     MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
     PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton,
     PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation,
-    ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
+    ScreenCaptureSource, SharedString, SubscriberSet, Subscription,
     SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
     ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
     WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
+// CONQUEST PATCH: behind the off-by-default `images` feature — see Cargo.toml.
+#[cfg(feature = "images")]
+use crate::SvgRenderer;
 
 mod async_context;
 #[cfg(feature = "bench")]
@@ -201,7 +204,11 @@ impl Application {
         let mut context_lock = self.0.borrow_mut();
         let asset_source = Arc::new(asset_source);
         context_lock.asset_source = asset_source.clone();
-        context_lock.svg_renderer = SvgRenderer::new(asset_source);
+        // CONQUEST PATCH: behind the off-by-default `images` feature.
+        #[cfg(feature = "images")]
+        {
+            context_lock.svg_renderer = SvgRenderer::new(asset_source);
+        }
         drop(context_lock);
         self
     }
@@ -738,6 +745,8 @@ pub struct App {
     // assets
     pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
     asset_source: Arc<dyn AssetSource>,
+    // CONQUEST PATCH: behind the off-by-default `images` feature.
+    #[cfg(feature = "images")]
     pub(crate) svg_renderer: SvgRenderer,
     http_client: Arc<dyn HttpClient>,
 
@@ -817,6 +826,7 @@ impl App {
                 platform_owned_drag: None,
                 background_executor,
                 foreground_executor,
+                #[cfg(feature = "images")]
                 svg_renderer: SvgRenderer::new(asset_source.clone()),
                 loading_assets: Default::default(),
                 asset_source,
@@ -1586,6 +1596,8 @@ impl App {
     }
 
     /// Returns the SVG renderer used by the application.
+    // CONQUEST PATCH: behind the off-by-default `images` feature.
+    #[cfg(feature = "images")]
     pub fn svg_renderer(&self) -> SvgRenderer {
         self.svg_renderer.clone()
     }

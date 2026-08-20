@@ -12,11 +12,31 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use rope::{Point, Rope};
 use streaming_iterator::StreamingIterator as _;
 use tree_sitter::{InputEdit, Parser, Query, QueryCursor, Tree};
+
+/// Pooled query cursors, the way the vendored `language` crate pools its own
+/// (`language.rs` `QUERY_CURSORS`): a `QueryCursor` carries real allocations,
+/// and [`HighlightState::highlights`] runs for every window the UI draws.
+static QUERY_CURSORS: Mutex<Vec<QueryCursor>> = Mutex::new(Vec::new());
+
+/// Run `f` with a cursor from the pool. The byte range is reset on the way
+/// back in — a cursor remembers `set_byte_range` across uses, and the next
+/// borrower may not set its own.
+pub(crate) fn with_query_cursor<T>(f: impl FnOnce(&mut QueryCursor) -> T) -> T {
+    let mut cursor = QUERY_CURSORS
+        .lock()
+        .unwrap()
+        .pop()
+        .unwrap_or_default();
+    let result = f(&mut cursor);
+    cursor.set_byte_range(0..usize::MAX);
+    QUERY_CURSORS.lock().unwrap().push(cursor);
+    result
+}
 
 /// Zed's syntax style keys (subset ordering is ours; indices are the
 /// engine<->UI contract). Longest-dotted-prefix matching maps capture
@@ -436,27 +456,29 @@ impl HighlightState {
             return Vec::new();
         };
         let mut items: Vec<(usize, usize, String)> = Vec::new();
-        let mut cursor = QueryCursor::new();
-        cursor.set_byte_range(offset.saturating_sub(1)..offset.saturating_add(1));
-        let mut matches = cursor.matches(&outline.query, tree.root_node(), RopeTextProvider(text));
-        while let Some(match_) = matches.next() {
-            let Some(item) = match_
-                .captures
-                .iter()
-                .find(|capture| capture.index == outline.item)
-            else {
-                continue;
-            };
-            let start = item.node.start_byte();
-            let end = item.node.end_byte();
-            if offset < start || offset > end {
-                continue;
+        with_query_cursor(|cursor| {
+            cursor.set_byte_range(offset.saturating_sub(1)..offset.saturating_add(1));
+            let mut matches =
+                cursor.matches(&outline.query, tree.root_node(), RopeTextProvider(text));
+            while let Some(match_) = matches.next() {
+                let Some(item) = match_
+                    .captures
+                    .iter()
+                    .find(|capture| capture.index == outline.item)
+                else {
+                    continue;
+                };
+                let start = item.node.start_byte();
+                let end = item.node.end_byte();
+                if offset < start || offset > end {
+                    continue;
+                }
+                let Some(label) = self.outline_label(text, match_) else {
+                    continue;
+                };
+                items.push((start, end, label));
             }
-            let Some(label) = self.outline_label(text, match_) else {
-                continue;
-            };
-            items.push((start, end, label));
-        }
+        });
         // Outermost first: containing ranges start earlier or end later.
         items.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
         // Zed keeps only strictly nesting items (buffer.rs:4475-4482): a
@@ -597,42 +619,43 @@ impl HighlightState {
         let last_row = text.offset_to_point(range.end).row;
         let mut columns = ColumnConverter::new(text, first_row, last_row);
 
-        let mut cursor = QueryCursor::new();
-        cursor.set_byte_range(range.clone());
         let mut spans = Vec::new();
-        let mut captures = cursor.captures(query, tree.root_node(), RopeTextProvider(text));
-        while let Some((match_, capture_index)) = captures.next() {
-            let capture = match_.captures[*capture_index];
-            let Some(style) = styles[capture.index as usize] else {
-                continue;
-            };
-            let node_range = capture.node.range();
-            let start = node_range.start_point;
-            let end = node_range.end_point;
-            let span_first = (start.row as u32).max(first_row);
-            let span_last = (end.row as u32).min(last_row);
-            for row in span_first..=span_last {
-                let start_col = if row == start.row as u32 {
-                    start.column
-                } else {
-                    0
-                };
-                let end_col = if row == end.row as u32 {
-                    end.column
-                } else {
-                    text.line_len(row) as usize
-                };
-                if end_col <= start_col {
+        with_query_cursor(|cursor| {
+            cursor.set_byte_range(range.clone());
+            let mut captures = cursor.captures(query, tree.root_node(), RopeTextProvider(text));
+            while let Some((match_, capture_index)) = captures.next() {
+                let capture = match_.captures[*capture_index];
+                let Some(style) = styles[capture.index as usize] else {
                     continue;
+                };
+                let node_range = capture.node.range();
+                let start = node_range.start_point;
+                let end = node_range.end_point;
+                let span_first = (start.row as u32).max(first_row);
+                let span_last = (end.row as u32).min(last_row);
+                for row in span_first..=span_last {
+                    let start_col = if row == start.row as u32 {
+                        start.column
+                    } else {
+                        0
+                    };
+                    let end_col = if row == end.row as u32 {
+                        end.column
+                    } else {
+                        text.line_len(row) as usize
+                    };
+                    if end_col <= start_col {
+                        continue;
+                    }
+                    spans.push(HighlightSpan {
+                        row,
+                        start_col_utf16: columns.utf16_col(row, start_col),
+                        end_col_utf16: columns.utf16_col(row, end_col),
+                        style,
+                    });
                 }
-                spans.push(HighlightSpan {
-                    row,
-                    start_col_utf16: columns.utf16_col(row, start_col),
-                    end_col_utf16: columns.utf16_col(row, end_col),
-                    style,
-                });
             }
-        }
+        });
         spans
     }
 }

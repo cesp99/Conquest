@@ -31,10 +31,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -91,10 +93,13 @@ import androidx.compose.ui.unit.sp
 import kotlin.math.max
 import kotlin.math.min
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import to.eyed.conquest.code.ui.theme.LocalAppSettings
 import to.eyed.conquest.code.ui.theme.BufferFontFamily
 import to.eyed.conquest.code.core.GitHunk
 import to.eyed.conquest.code.core.GitHunkKind
+import to.eyed.conquest.code.core.ResumedEffect
+import to.eyed.conquest.code.core.pollVersion
 import to.eyed.conquest.code.ui.git.blameText
 import to.eyed.conquest.code.ui.git.rememberGitAnnotations
 import to.eyed.conquest.code.ui.workspace.GitStatusColours
@@ -305,30 +310,22 @@ fun EditorPane(
 
     // Syntax lags the text slightly by design (the reparse is off the
     // keystroke path), so watch for it landing and repaint when it does.
-    LaunchedEffect(state) {
-        while (true) {
-            state.refreshHighlightVersion()
-            delay(HIGHLIGHT_POLL_MILLIS)
-        }
+    ResumedEffect(state) {
+        pollVersion(
+            intervalMs = HIGHLIGHT_POLL_MILLIS,
+            version = { state.engineHighlightVersion },
+            read = {},
+            apply = { state.refreshHighlightVersion() },
+        )
     }
 
     // What the language server has said about this buffer. Its own loop
     // rather than a branch of the one above: the counter it watches moves on
     // a *publish*, which is rare and unrelated to a reparse, and the payload
     // it then reads is a JSON document rather than an integer.
-    LaunchedEffect(state) { pollBufferDiagnostics(state) }
+    ResumedEffect(state) { pollBufferDiagnostics(state) }
 
-    var cursorVisible by remember { mutableStateOf(true) }
-    // `state.revision`, not the session's version: the engine's counter is a
-    // plain field and composition cannot see it change, so keying on it never
-    // restarted the blink after an edit that left the caret where it was.
-    LaunchedEffect(state.cursorRow, state.cursorCol, state.revision) {
-        cursorVisible = true
-        while (true) {
-            delay(CURSOR_BLINK_MILLIS)
-            cursorVisible = !cursorVisible
-        }
-    }
+    val cursorVisible = rememberCursorBlink(state)
 
     val verticalScroll = rememberScrollableState { delta -> state.applyScrollDeltaY(delta) }
     val horizontalScroll = rememberScrollableState { delta -> state.applyScrollDeltaX(delta) }
@@ -1074,8 +1071,10 @@ fun EditorPane(
 
                 // Carets. The extra ones don't blink: a blinking column is hard
                 // to read as one thing, and their whole job is to show where the
-                // next keystroke lands.
-                if (cursorVisible) paintCaret(state.cursorRow, state.cursorCol)
+                // next keystroke lands. Read here, in the draw pass, on purpose:
+                // a draw-scope read invalidates the draw alone, so the blink
+                // never recomposes the pane.
+                if (cursorVisible.value) paintCaret(state.cursorRow, state.cursorCol)
                 for (caret in extras) paintCaret(caret.headRow, caret.headCol)
 
                 // Selection drag handles, for the primary selection only —
@@ -1334,6 +1333,38 @@ fun EditorPane(
             onActed = { focusRequester.requestFocus() },
         )
     }
+}
+
+/**
+ * The caret's blink, restarted whenever the caret moves or the buffer
+ * changes.
+ *
+ * The caret is watched through [snapshotFlow] rather than passed as effect
+ * keys: keys are read during composition, and a helper that returns a value
+ * composes in its *caller's* scope — so keying on [EditorState.cursorRow]
+ * recomposed the whole pane, ten pointer handlers and the canvas, on every
+ * keystroke and arrow key. Here nothing reads snapshot state during
+ * composition at all; the one read of the returned state sits in the canvas's
+ * draw lambda, where a toggle invalidates the draw alone.
+ *
+ * `state.revision`, not the session's version: the engine's counter is a
+ * plain field and the snapshot system cannot see it change, so watching it
+ * never restarted the blink after an edit that left the caret where it was.
+ */
+@Composable
+private fun rememberCursorBlink(state: EditorState): State<Boolean> {
+    val visible = remember(state) { mutableStateOf(true) }
+    LaunchedEffect(state) {
+        snapshotFlow { Triple(state.cursorRow, state.cursorCol, state.revision) }
+            .collectLatest {
+                visible.value = true
+                while (true) {
+                    delay(CURSOR_BLINK_MILLIS)
+                    visible.value = !visible.value
+                }
+            }
+    }
+    return visible
 }
 
 /**

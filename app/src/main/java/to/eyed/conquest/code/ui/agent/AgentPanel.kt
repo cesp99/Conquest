@@ -84,6 +84,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -179,6 +180,14 @@ private const val MaxDiffLines = 200
  * the end is where the error is — and says how much it left out.
  */
 private const val MaxTerminalLines = 40
+
+/**
+ * How long a keystroke in the composer waits before the `@` popup's files are
+ * matched. [findMentionFiles] is a blocking call under the engine's project
+ * mutex, so firing on every keystroke queues stale searches that contend with
+ * the fresh one — the file finder's debounce, for the same reason.
+ */
+private const val MentionDebounceMillis = 120L
 
 /**
  * Whether this build can show an agent panel at all.
@@ -2917,11 +2926,13 @@ private fun Composer(
         ?.takeIf { enabled && "@$it" != dismissedToken }
     var fileChoices by remember { mutableStateOf(emptyList<String>()) }
     LaunchedEffect(mentionQuery) {
-        fileChoices = if (mentionQuery == null) {
-            emptyList()
-        } else {
-            withContext(Dispatchers.IO) { findMentionFiles(project.id, mentionQuery) }
+        if (mentionQuery == null) {
+            // Dismissing the token closes the popup now, not a debounce later.
+            fileChoices = emptyList()
+            return@LaunchedEffect
         }
+        delay(MentionDebounceMillis)
+        fileChoices = withContext(Dispatchers.IO) { findMentionFiles(project.id, mentionQuery) }
     }
 
     fun completeCommand(command: AgentCommand) {

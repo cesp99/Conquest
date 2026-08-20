@@ -29,7 +29,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -48,6 +47,8 @@ import to.eyed.conquest.code.core.GitSession
 import to.eyed.conquest.code.core.PatchLine
 import to.eyed.conquest.code.core.PatchResult
 import to.eyed.conquest.code.core.ProjectSession
+import to.eyed.conquest.code.core.ResumedEffect
+import to.eyed.conquest.code.core.pollVersion
 import to.eyed.conquest.code.ui.theme.BufferFontFamily
 import to.eyed.conquest.code.ui.theme.LocalAppSettings
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
@@ -90,16 +91,14 @@ fun DiffPane(
     // fifteen milliseconds — which is wasteful at best, and the second of the
     // pair is what the pane ended up showing.
     var patch by remember(session, target) { mutableStateOf<PatchResult?>(null) }
-    LaunchedEffect(session, target) {
-        var seen = -1L
-        while (true) {
-            val version = withContext(Dispatchers.Default) { session.version }
-            if (version != seen) {
-                seen = version
-                patch = withContext(Dispatchers.IO) { session.patch(target.path, target.staged) }
-            }
-            kotlinx.coroutines.delay(400)
-        }
+    ResumedEffect(session, target) {
+        pollVersion(
+            intervalMs = 400,
+            version = { session.version },
+            // IO, not the loop's own Default: the patch is git under proot.
+            read = { withContext(Dispatchers.IO) { session.patch(target.path, target.staged) } },
+            apply = { patch = it },
+        )
     }
 
     val result = patch

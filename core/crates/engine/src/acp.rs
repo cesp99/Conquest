@@ -69,7 +69,7 @@ use crate::acp_elicit::Elicitations;
 use crate::acp_terminal::{Terminals, snapshot_json};
 use crate::acp_thread::{PermissionDecision, Phase, PromptInput, SessionThread};
 use crate::guest::{self, GuestCommand};
-use crate::{BufferId, BufferState, ProjectId};
+use crate::{Buffers, ProjectId};
 
 /// How long the whole startup — spawn, initialize — gets before the watcher
 /// takes the process down. The same figure, for the same reasons, as
@@ -135,7 +135,6 @@ impl AgentSpec {
 
 type Sessions = Arc<Mutex<HashMap<u64, Arc<SessionHandle>>>>;
 type Index = Arc<Mutex<HashMap<acp::SessionId, u64>>>;
-type Buffers = Arc<Mutex<HashMap<BufferId, BufferState>>>;
 
 /// Lock order, wherever two are wanted at once: **the agent slot, then the
 /// sessions map, then one session's thread, then permissions / written /
@@ -984,13 +983,10 @@ impl AgentShared {
         // `handle_read_text_file` reads the buffer for the same reason
         // (agent_servers/src/acp.rs:4787-4812).
         let canonical = std::fs::canonicalize(&request.path).unwrap_or(request.path.clone());
-        let buffer_text = self
-            .buffers
-            .lock()
-            .unwrap()
-            .values()
-            .find(|state| state.file_path() == Some(&canonical))
-            .map(|state| state.buffer.text());
+        let buffer_text = self.buffers.read().unwrap().values().find_map(|state| {
+            let state = state.lock().unwrap();
+            (state.file_path() == Some(&canonical)).then(|| state.buffer.text())
+        });
         let text = match buffer_text {
             Some(text) => Ok(text),
             None => std::fs::read_to_string(&request.path),
@@ -2059,6 +2055,23 @@ impl crate::Engine {
         state.to_string()
     }
 
+    /// Version counter for [`Self::acp_pending_elicitations`] — poll this one
+    /// integer and read the list only when it moves, the same
+    /// counter-then-payload contract as `acp_session_version`.
+    ///
+    /// It moves whenever any of the agent's questions changes, session-scoped
+    /// ones included: those are rarer than the poll by orders of magnitude,
+    /// and one spare list read per question beats a second counter per scope.
+    /// The connection's id rides in the high bits so replacing the agent —
+    /// whose fresh counter restarts at zero — can never repeat a value a
+    /// poller has already seen. 0 means no agent is running.
+    pub fn acp_elicitations_version(&self) -> u64 {
+        let shared = self.acp.agent.lock().unwrap().clone();
+        shared
+            .map(|shared| (shared.id << 32) + shared.elicitations.version())
+            .unwrap_or(0)
+    }
+
     /// The agent's questions that belong to no session — the protocol's
     /// *request* scope, as a JSON array in the same shape `elicitations`
     /// takes in the session state.
@@ -2548,6 +2561,22 @@ impl crate::Engine {
             shared.refresh_session_list();
         }
         shared.session_list.lock().unwrap().json().to_string()
+    }
+
+    /// Version counter for [`Self::acp_session_list`] — the `version` field
+    /// of the cached list, without serializing the list to read it. Poll
+    /// this, and make the full read only when it moves: it already covers
+    /// `loading` flipping and the answer landing, because
+    /// `refresh_session_list` bumps it at both ends.
+    ///
+    /// The connection's id rides in the high bits, exactly as in
+    /// [`Self::acp_elicitations_version`] and for the same reason. 0 means no
+    /// agent is running.
+    pub fn acp_session_list_version(&self) -> u64 {
+        let shared = self.acp.agent.lock().unwrap().clone();
+        shared
+            .map(|shared| (shared.id << 32) + shared.session_list.lock().unwrap().version)
+            .unwrap_or(0)
     }
 
     /// Forget one of the agent's past conversations — `session/delete`, when
@@ -4026,12 +4055,20 @@ mod tests {
         // One field of every kind the schema has, so a type flattened on the
         // way out or coerced on the way back shows up here rather than on a
         // device. The agent prints Python's own type name for each value.
+        // The panel finds these through the change counter, so the counter
+        // must move exactly when the questions do — on the ask and on the
+        // answer, and not on the reads in between.
+        let elicit_version = shared.elicitations.version();
         handle.update(|thread| thread.push_user_message("/ask"));
         start_prompt(&shared, &cx, 1, PromptInput::text_only("/ask"), false);
         let question = {
             wait_for("the form question", || {
                 !shared.elicitations.for_session(1).is_empty()
             });
+            assert!(
+                shared.elicitations.version() > elicit_version,
+                "a question opening moves the counter"
+            );
             let asked = shared.elicitations.for_session(1);
             assert_eq!(asked.len(), 1);
             asked[0].clone()
@@ -4050,11 +4087,16 @@ mod tests {
         assert_eq!(fields["tags"]["options"].as_array().unwrap().len(), 3);
 
         let id = question["id"].as_str().unwrap();
+        let answered_from = shared.elicitations.version();
         assert!(shared.elicitations.respond(
             id,
             r#"{"action":"accept","content":{
                  "note":"hello","branch":"dev","depth":7,"dry":false,"tags":["a","c"]}}"#,
         ));
+        assert!(
+            shared.elicitations.version() > answered_from,
+            "the answer moves the counter too — that is how the card goes away"
+        );
         wait_for("the form turn to end", || {
             let thread = handle.thread.lock().unwrap();
             thread.phase == Phase::Ready && thread.stop_reason.as_deref() == Some("end_turn")
@@ -4135,11 +4177,19 @@ mod tests {
         // These four methods are the difference between threads that live as
         // long as the agent process and threads the agent itself remembers.
         assert!(shared.caps().list && shared.caps().load_session && shared.caps().delete);
+        // The list is found the same way: its version is what the panel
+        // polls, and a refresh must move it at both ends — once for
+        // `loading`, once for the answer.
+        let list_version = shared.session_list.lock().unwrap().version;
         shared.refresh_session_list();
         wait_for("the session list", || {
             let list = shared.session_list.lock().unwrap();
             !list.loading && list.sessions.as_array().is_some_and(|s| !s.is_empty())
         });
+        assert!(
+            shared.session_list.lock().unwrap().version >= list_version + 2,
+            "the refresh moved the list version for loading and for the answer"
+        );
         let listed = {
             let list = shared.session_list.lock().unwrap();
             assert_eq!(list.error, None);

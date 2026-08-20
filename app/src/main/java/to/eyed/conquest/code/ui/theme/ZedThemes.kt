@@ -2,6 +2,7 @@ package to.eyed.conquest.code.ui.theme
 
 import android.content.Context
 import android.util.Log
+import android.util.LruCache
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -16,9 +17,9 @@ import java.util.concurrent.ConcurrentHashMap
  * enum to extend.
  *
  * The index is names only: listing eleven themes in the picker must not cost
- * eleven palette parses. Palettes are parsed on first use and kept, because the
- * selector's live preview walks the list and a second visit to a theme has to
- * be free.
+ * eleven palette parses. Palettes are parsed on first use and kept in a
+ * bounded cache ([parsed]) sized so the selector's live preview — which walks
+ * the whole list — never evicts what it is about to revisit.
  */
 object ZedThemes {
     /** Zed's own defaults (`settings_content/src/theme.rs:353-354`). */
@@ -31,7 +32,15 @@ object ZedThemes {
     @Volatile
     private var index: List<ZedTheme.Meta>? = null
 
-    private val parsed = ConcurrentHashMap<String, ZedTheme>()
+    /**
+     * Parsed palettes, bounded. Sixteen because [warm] only works if every
+     * installed theme fits at once — the selector's walk previews each one,
+     * and evicting mid-walk would put the parse back on the frame that paints
+     * it. Eleven ship today; the headroom is for a vendored family or two,
+     * and past it the least recently previewed palettes go rather than the
+     * process keeping every theme it has ever painted.
+     */
+    private val parsed = LruCache<String, ZedTheme>(16)
 
     /** Which family file each theme name came from, so [get] reads one file. */
     private val sources = ConcurrentHashMap<String, String>()
@@ -104,7 +113,7 @@ object ZedThemes {
             .onFailure { Log.w(TAG, "theme \"$name\" failed to parse", it) }
             .getOrNull()
             ?: return null
-        parsed[name] = theme
+        parsed.put(name, theme)
         return theme
     }
 

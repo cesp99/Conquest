@@ -37,3 +37,4 @@ core/**/target
 /app/build
 /app/full
 /app/play
+.spettro/

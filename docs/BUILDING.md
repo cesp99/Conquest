@@ -131,6 +131,32 @@ symbol name encodes the Java class and method it binds to, so
 Adding a class that Android instantiates reflectively — an Activity,
 a Service, a Parcelable — may need a keep rule of its own.
 
+## Baseline profile
+
+Release builds compile a [baseline
+profile](https://developer.android.com/topic/performance/baselineprofiles/overview)
+ahead of time — a recorded list of the methods a cold start actually runs —
+so first launch executes compiled code instead of waiting on the JIT. The
+profile lives at `app/src/main/generated/baselineProfiles/baseline-prof.txt`
+and is committed, so ordinary release builds need no emulator and nothing
+extra: both editions pick it up automatically.
+
+Re-record it when the startup path changes in a big way (a new splash
+sequence, a different first screen — not routine edits):
+
+```sh
+./gradlew :app:generateBaselineProfile
+```
+
+That one command builds a non-minified release of each edition, boots a
+Gradle-managed headless emulator (API 36 `google_apis` `x86_64`, the same
+system image `tools/fold-emulator.sh` uses), cold-starts the app a few times
+while recording, and writes the merged profile back into `src/main`. It
+needs that system image installed and KVM available, and takes a few
+minutes. The journey it records is deliberately just "cold start into the
+workspace" — see `baselineprofile/src/main/java/…/BaselineProfileGenerator.kt`
+for why it stays shallow.
+
 ## Rust-only iteration
 
 ```sh
