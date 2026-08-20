@@ -16,16 +16,13 @@
 //! One thread, not a pool: reparses for a buffer must not overlap, and a
 //! single worker keeps its parser warm across jobs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
-use std::sync::{Arc, Mutex};
 use std::thread;
 
 use tree_sitter::Parser;
 
-use crate::{BufferId, BufferState};
-
-pub(crate) type Buffers = Arc<Mutex<HashMap<BufferId, BufferState>>>;
+use crate::{BufferId, Buffers};
 
 /// Queue a buffer for reparsing; sending the same id twice before the worker
 /// gets to it is harmless.
@@ -75,17 +72,21 @@ fn run(buffers: Buffers, incoming: Receiver<BufferId>) {
     }
 }
 
-/// Parse one buffer, holding the lock only to take a snapshot and to install
-/// the result.
+/// Parse one buffer, holding its lock only to take a snapshot and to install
+/// the result — and the map's read lock only long enough to find it, so a
+/// parse in flight here never blocks the UI reading any buffer.
 fn reparse(buffers: &Buffers, parser: &mut Parser, id: BufferId) {
     // Bounded so a buffer being typed into quickly can't spin here forever;
     // whatever is left over is picked up by the next request, which the next
     // edit will send anyway.
     for _ in 0..4 {
+        // Re-fetched each round so a buffer closed mid-parse is noticed.
+        let Some(buffer) = buffers.read().unwrap().get(&id).cloned() else {
+            return;
+        };
         let Some((language, old_tree, rope, version)) = ({
-            let buffers = buffers.lock().unwrap();
-            buffers.get(&id).and_then(|state| {
-                let highlight = state.highlight.as_ref()?;
+            let state = buffer.lock().unwrap();
+            state.highlight.as_ref().and_then(|highlight| {
                 if !highlight.is_dirty() {
                     return None;
                 }
@@ -107,10 +108,7 @@ fn reparse(buffers: &Buffers, parser: &mut Parser, id: BufferId) {
             return;
         };
 
-        let mut buffers = buffers.lock().unwrap();
-        let Some(state) = buffers.get_mut(&id) else {
-            return;
-        };
+        let mut state = buffer.lock().unwrap();
         if state.version != version {
             // The buffer moved while we parsed. The tree we just built is for
             // older text, so throw it away and go round again rather than

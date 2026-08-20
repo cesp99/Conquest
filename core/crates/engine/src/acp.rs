@@ -69,7 +69,7 @@ use crate::acp_elicit::Elicitations;
 use crate::acp_terminal::{Terminals, snapshot_json};
 use crate::acp_thread::{PermissionDecision, Phase, PromptInput, SessionThread};
 use crate::guest::{self, GuestCommand};
-use crate::{BufferId, BufferState, ProjectId};
+use crate::{Buffers, ProjectId};
 
 /// How long the whole startup — spawn, initialize — gets before the watcher
 /// takes the process down. The same figure, for the same reasons, as
@@ -135,7 +135,6 @@ impl AgentSpec {
 
 type Sessions = Arc<Mutex<HashMap<u64, Arc<SessionHandle>>>>;
 type Index = Arc<Mutex<HashMap<acp::SessionId, u64>>>;
-type Buffers = Arc<Mutex<HashMap<BufferId, BufferState>>>;
 
 /// Lock order, wherever two are wanted at once: **the agent slot, then the
 /// sessions map, then one session's thread, then permissions / written /
@@ -984,13 +983,10 @@ impl AgentShared {
         // `handle_read_text_file` reads the buffer for the same reason
         // (agent_servers/src/acp.rs:4787-4812).
         let canonical = std::fs::canonicalize(&request.path).unwrap_or(request.path.clone());
-        let buffer_text = self
-            .buffers
-            .lock()
-            .unwrap()
-            .values()
-            .find(|state| state.file_path() == Some(&canonical))
-            .map(|state| state.buffer.text());
+        let buffer_text = self.buffers.read().unwrap().values().find_map(|state| {
+            let state = state.lock().unwrap();
+            (state.file_path() == Some(&canonical)).then(|| state.buffer.text())
+        });
         let text = match buffer_text {
             Some(text) => Ok(text),
             None => std::fs::read_to_string(&request.path),

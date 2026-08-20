@@ -111,11 +111,9 @@ impl crate::Engine {
 
         let mut file = FileState::new(path);
         file.mark_synced(0);
-        let mut buffers = self.buffers.lock().unwrap();
-        if let Some(state) = buffers.get_mut(&id) {
-            state.file = Some(file);
+        if let Ok(state) = self.buffer(id) {
+            state.lock().unwrap().file = Some(file);
         }
-        drop(buffers);
         // The buffer now has both a path and a language, which is everything a
         // language server needs to be started for it — lazily, off this thread,
         // and silently when there is nothing to start (see lsp.rs).
@@ -126,10 +124,17 @@ impl crate::Engine {
     /// The buffer already holding `path`, if any.
     pub fn buffer_for_path(&self, path: &Path) -> Option<BufferId> {
         self.buffers
-            .lock()
+            .read()
             .unwrap()
             .iter()
-            .find(|(_, state)| state.file.as_ref().is_some_and(|file| file.path == path))
+            .find(|(_, state)| {
+                state
+                    .lock()
+                    .unwrap()
+                    .file
+                    .as_ref()
+                    .is_some_and(|file| file.path == path)
+            })
             .map(|(id, _)| *id)
     }
 
@@ -175,22 +180,22 @@ impl crate::Engine {
         // Take the text and path under the lock, then write without holding
         // it: a save of a large file must not stall every other buffer query.
         let (path, text, version) = {
-            let buffers = self.buffers.lock().unwrap();
-            let state = buffers.get(&id).ok_or(EngineError::UnknownBuffer(id))?;
+            let state = self.buffer(id)?;
+            let state = state.lock().unwrap();
             let file = state.file.as_ref().ok_or(EngineError::NoFile(id))?;
             (file.path.clone(), state.buffer.text(), state.version)
         };
 
         write_atomically(&path, &text)?;
 
-        let mut buffers = self.buffers.lock().unwrap();
-        let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
+        let state = self.buffer(id)?;
+        let mut state = state.lock().unwrap();
         if let Some(file) = &mut state.file {
             // Record the version we actually wrote, not the current one: an
             // edit that landed during the write must leave the buffer dirty.
             file.mark_synced(version);
         }
-        drop(buffers);
+        drop(state);
         // rust-analyzer runs `cargo check` on save and nowhere else, so most of
         // its diagnostics arrive because of this line.
         self.lsp_did_save(id);
@@ -206,8 +211,8 @@ impl crate::Engine {
         let path = self.buffer_path(id).ok_or(EngineError::NoFile(id))?;
         let text = std::fs::read_to_string(&path).map_err(|err| io_error(&path, err))?;
 
-        let mut buffers = self.buffers.lock().unwrap();
-        let state = buffers.get_mut(&id).ok_or(EngineError::UnknownBuffer(id))?;
+        let state = self.buffer(id)?;
+        let mut state = state.lock().unwrap();
         let len = state.buffer.len();
         let old_end = self
             .lsp_is_live()
@@ -225,8 +230,8 @@ impl crate::Engine {
         if let Some(file) = &mut state.file {
             file.mark_synced(version);
         }
-        let lsp_change = self.history_change(state, old_end);
-        drop(buffers);
+        let lsp_change = self.history_change(&state, old_end);
+        drop(state);
         if needs_highlight {
             self.request_highlight(id);
         }
@@ -247,15 +252,13 @@ impl crate::Engine {
 /// calls from the runtime thread, where there is no `&Engine` to be had.
 /// Costs one `stat` per *matching* buffer and nothing at all for the paths we
 /// don't have open, which is almost all of them.
-pub(crate) fn note_disk_changes(
-    buffers: &std::sync::Mutex<std::collections::HashMap<BufferId, crate::BufferState>>,
-    paths: &[PathBuf],
-) {
+pub(crate) fn note_disk_changes(buffers: &crate::Buffers, paths: &[PathBuf]) {
     if paths.is_empty() {
         return;
     }
-    let mut buffers = buffers.lock().unwrap();
-    for state in buffers.values_mut() {
+    let buffers = buffers.read().unwrap();
+    for state in buffers.values() {
+        let mut state = state.lock().unwrap();
         let Some(file) = &mut state.file else {
             continue;
         };

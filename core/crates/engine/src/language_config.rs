@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 use rope::Rope;
 use serde::Serialize;
 use streaming_iterator::StreamingIterator as _;
-use tree_sitter::{Query, QueryCursor, Tree};
+use tree_sitter::{Query, Tree};
 
 use crate::highlight::{RopeTextProvider, ts_language};
 
@@ -207,35 +207,37 @@ fn scope_at<'a>(
     text: &Rope,
     offset: usize,
 ) -> Option<&'a str> {
-    let mut cursor = QueryCursor::new();
-    cursor.set_byte_range(offset.saturating_sub(1)..offset.saturating_add(1));
     let mut smallest: Option<(&str, Range<usize>)> = None;
-    let mut matches = cursor.matches(&overrides.query, tree.root_node(), RopeTextProvider(text));
-    while let Some(match_) = matches.next() {
-        for capture in match_.captures {
-            let Some(entry) = overrides
-                .captures
-                .get(capture.index as usize)
-                .and_then(Option::as_ref)
-            else {
-                continue;
-            };
-            let range = capture.node.byte_range();
-            if entry.range_is_inclusive {
-                if offset < range.start || offset > range.end {
+    crate::highlight::with_query_cursor(|cursor| {
+        cursor.set_byte_range(offset.saturating_sub(1)..offset.saturating_add(1));
+        let mut matches =
+            cursor.matches(&overrides.query, tree.root_node(), RopeTextProvider(text));
+        while let Some(match_) = matches.next() {
+            for capture in match_.captures {
+                let Some(entry) = overrides
+                    .captures
+                    .get(capture.index as usize)
+                    .and_then(Option::as_ref)
+                else {
+                    continue;
+                };
+                let range = capture.node.byte_range();
+                if entry.range_is_inclusive {
+                    if offset < range.start || offset > range.end {
+                        continue;
+                    }
+                } else if offset <= range.start || offset >= range.end {
                     continue;
                 }
-            } else if offset <= range.start || offset >= range.end {
-                continue;
-            }
-            if smallest
-                .as_ref()
-                .is_none_or(|(_, smallest)| range.len() < smallest.len())
-            {
-                smallest = Some((entry.name.as_str(), range));
+                if smallest
+                    .as_ref()
+                    .is_none_or(|(_, smallest)| range.len() < smallest.len())
+                {
+                    smallest = Some((entry.name.as_str(), range));
+                }
             }
         }
-    }
+    });
     smallest.map(|(name, _)| name)
 }
 
