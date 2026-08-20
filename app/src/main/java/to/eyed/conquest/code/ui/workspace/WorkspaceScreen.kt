@@ -27,6 +27,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.focusable
@@ -46,6 +47,7 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import to.eyed.conquest.code.core.AppSettings
@@ -181,6 +183,42 @@ private fun DockDivider(vertical: Boolean = false) {
 }
 
 /**
+ * Which of the workspace's overlays are on screen — every dialog, picker and
+ * palette drawn over the work area, one flag each.
+ *
+ * A remembered holder rather than ten delegated locals of [WorkspaceScreen]:
+ * the flags are written from callbacks handed all over the workspace — menus,
+ * chords, the status bar — and read only where each overlay is rendered.
+ * Kept on one stable object, a callback that opens an overlay captures
+ * `overlays` alone, and flipping a flag invalidates the scopes that read it,
+ * never the children that merely hold the callbacks writing it.
+ */
+private class WorkspaceOverlays {
+    // Removing the Linux userland throws away ~100 MB and everything
+    // installed into it, so it confirms first — same rule as deleting a
+    // project.
+    var removeUserlandOpen by mutableStateOf(false)
+    // `projects` is re-listed whenever the picker opens or a transfer
+    // finishes, rather than watched — projects change only when the user
+    // changes them.
+    var pickerOpen by mutableStateOf(false)
+    /** The tab bar's `+`, Ctrl+N, and the palette's `workspace: new file`. */
+    var newFileOpen by mutableStateOf(false)
+    /**
+     * Whether the language-server prompt is on screen. The install itself
+     * lives in [LanguageServerInstaller], so closing this does not stop apt.
+     */
+    var serverPromptOpen by mutableStateOf(false)
+    var finderOpen by mutableStateOf(false)
+    var paletteOpen by mutableStateOf(false)
+    var settingsOpen by mutableStateOf(false)
+    var themeSelectorOpen by mutableStateOf(false)
+    /** Ctrl+G. A surface rather than a command: it answers for itself. */
+    var goToLineOpen by mutableStateOf(false)
+    var outlineOpen by mutableStateOf(false)
+}
+
+/**
  * Root of the IDE UI, in the spirit of Zed's workspace: a project panel, a tab
  * strip, an editor area and a status bar. Wide screens (tablets, unfolded
  * foldables) get a fixed sidebar; compact screens (phones, folded) get a
@@ -215,35 +253,17 @@ fun WorkspaceScreen(
     val terminals = remember(context) { TerminalSessions.of(context) }
     var terminalFocused by remember { mutableStateOf(false) }
     var dockHeight by remember { mutableStateOf(TerminalDockHeight) }
-    // Removing the Linux userland throws away ~100 MB and everything installed
-    // into it, so it confirms first — same rule as deleting a project.
-    var removeUserlandOpen by remember { mutableStateOf(false) }
-
-    // Project picker state. `projects` is re-listed whenever the dialog opens
-    // or a transfer finishes, rather than watched — projects change only when
-    // the user changes them.
-    var pickerOpen by remember { mutableStateOf(false) }
-    /** The tab bar's `+`, Ctrl+N, and the palette's `workspace: new file`. */
-    var newFileOpen by remember { mutableStateOf(false) }
+    val overlays = remember { WorkspaceOverlays() }
     /** Whether the project panel holds the keyboard — see [WorkspaceCommand.NewFile]. */
     var projectPanelFocused by remember { mutableStateOf(false) }
-    /**
-     * Whether the language-server prompt is on screen, and for which grammar
-     * (null = show the list). The install itself lives in
-     * [LanguageServerInstaller], so closing this does not stop apt.
-     */
-    var serverPromptOpen by remember { mutableStateOf(false) }
+    /** Which grammar the language-server prompt is about (null = show the list). */
     var serverPromptGrammar by remember { mutableStateOf<String?>(null) }
     /** Why the last new-file create failed, if it did. */
     var newFileError by remember { mutableStateOf<String?>(null) }
     /** The picker opens straight into the clone form for Ctrl+Shift+G. */
     var pickerStartsInClone by remember { mutableStateOf(false) }
-    var finderOpen by remember { mutableStateOf(false) }
-    var paletteOpen by remember { mutableStateOf(false) }
     /** Ctrl+Shift+E asked the panel to show the active file and take the keyboard. */
     var revealInPanel by remember { mutableStateOf(false) }
-    var settingsOpen by remember { mutableStateOf(false) }
-    var themeSelectorOpen by remember { mutableStateOf(false) }
     var searchBarOpen by remember { mutableStateOf(false) }
     /**
      * What the right-hand dock is showing, if anything.
@@ -257,9 +277,6 @@ fun WorkspaceScreen(
      * README beside a Rust file.
      */
     val docks = remember { DockLayout() }
-    /** Ctrl+G. A surface rather than a command: it answers for itself. */
-    var goToLineOpen by remember { mutableStateOf(false) }
-    var outlineOpen by remember { mutableStateOf(false) }
     /** Ctrl+Shift+F. The token is bumped to pull focus back to its query. */
     var projectSearchFocus by remember { mutableIntStateOf(0) }
     /** Ctrl+Shift+G, the same way: press it again to put focus back on the list. */
@@ -430,8 +447,8 @@ fun WorkspaceScreen(
     // closes underneath it there is nothing left for it to move.
     LaunchedEffect(files.active) {
         if (files.active?.editor == null) {
-            goToLineOpen = false
-            outlineOpen = false
+            overlays.goToLineOpen = false
+            overlays.outlineOpen = false
         }
     }
 
@@ -468,7 +485,7 @@ fun WorkspaceScreen(
                 is SafTransfer.Result.Imported -> {
                     refreshProjects()
                     openProject(result.project.absolutePath)
-                    pickerOpen = false
+                    overlays.pickerOpen = false
                 }
                 is SafTransfer.Result.Failed -> transferError = result.message
                 else -> Unit
@@ -720,7 +737,7 @@ fun WorkspaceScreen(
                 // 965). Refusing here does the same: the preview pass falls
                 // through and the panel's own handler sees the chord.
                 if (projectPanelFocused) return false
-                newFileOpen = true
+                overlays.newFileOpen = true
             }
             WorkspaceCommand.ToggleProjectPanel -> togglePanel(WorkspacePanel.Project)
             WorkspaceCommand.ToggleLeftDock -> if (!toggleDock(DockSide.Left)) return false
@@ -729,27 +746,27 @@ fun WorkspaceScreen(
                 refreshProjects()
                 transferError = null
                 pickerStartsInClone = false
-                pickerOpen = true
+                overlays.pickerOpen = true
             }
             WorkspaceCommand.InstallLanguageServer -> {
                 if (!LanguageServerInstaller.isSupported) return false
                 // The open file names the language; with nothing open the
                 // prompt shows the list rather than guessing one.
                 serverPromptGrammar = files.active?.language
-                serverPromptOpen = true
+                overlays.serverPromptOpen = true
             }
             WorkspaceCommand.CloneRepository -> {
                 if (!GitClone.isSupported) return false
                 refreshProjects()
                 transferError = null
                 pickerStartsInClone = true
-                pickerOpen = true
+                overlays.pickerOpen = true
             }
             WorkspaceCommand.FindFile -> {
                 if (project == null) return false
-                finderOpen = true
+                overlays.finderOpen = true
             }
-            WorkspaceCommand.SelectTheme -> themeSelectorOpen = true
+            WorkspaceCommand.SelectTheme -> overlays.themeSelectorOpen = true
             WorkspaceCommand.TogglePreview -> {
                 if (!canPreviewActiveFile()) return false
                 togglePanel(WorkspacePanel.Preview)
@@ -795,7 +812,7 @@ fun WorkspaceScreen(
             WorkspaceCommand.OpenSettings -> {
                 scope.launch {
                     settingsValid = withContext(Dispatchers.IO) { CoreBridge.settingsAreValid() }
-                    settingsOpen = true
+                    overlays.settingsOpen = true
                 }
             }
             WorkspaceCommand.OpenSettingsFile -> {
@@ -949,7 +966,7 @@ fun WorkspaceScreen(
                 // dispatched by the same `runCommand` it opens, and a command
                 // that opens the list of commands is a knot for no gain.
                 if (isCommandPalette(event, focus)) {
-                    paletteOpen = true
+                    overlays.paletteOpen = true
                     return@onPreviewKeyEvent true
                 }
                 if (isProjectSearch(event)) return@onPreviewKeyEvent openProjectSearch()
@@ -958,12 +975,12 @@ fun WorkspaceScreen(
                 }
                 if (isGoToLine(event, focus)) {
                     if (files.active?.editor == null) return@onPreviewKeyEvent false
-                    goToLineOpen = true
+                    overlays.goToLineOpen = true
                     return@onPreviewKeyEvent true
                 }
                 if (isOutline(event, focus)) {
                     if (files.active?.editor == null) return@onPreviewKeyEvent false
-                    outlineOpen = true
+                    overlays.outlineOpen = true
                     return@onPreviewKeyEvent true
                 }
                 tabIndexFor(event, files.tabs.size, focus)?.let { index ->
@@ -982,7 +999,7 @@ fun WorkspaceScreen(
         val menuGroups = listOf(
             listOf(
                 MenuAction("New project…", null) {
-                    refreshProjects(); transferError = null; pickerOpen = true
+                    refreshProjects(); transferError = null; overlays.pickerOpen = true
                 },
                 MenuAction("Open project…", shortcutLabel(WorkspaceCommand.OpenProjects)) {
                     runCommand(WorkspaceCommand.OpenProjects)
@@ -1013,10 +1030,10 @@ fun WorkspaceScreen(
                     runCommand(WorkspaceCommand.ToggleGitPanel)
                 },
                 MenuAction("Go to line…", GoToLineChord.label, enabled = active?.editor != null) {
-                    goToLineOpen = true
+                    overlays.goToLineOpen = true
                 },
                 MenuAction("Outline…", OutlineChord.label, enabled = active?.editor != null) {
-                    outlineOpen = true
+                    overlays.outlineOpen = true
                 },
                 MenuAction(
                     "Toggle preview",
@@ -1040,7 +1057,7 @@ fun WorkspaceScreen(
                 // which on a phone is everyone, and it is the only way to
                 // reach the commands this table cannot give a chord to.
                 MenuAction("Command palette…", CommandPaletteChord.label) {
-                    paletteOpen = true
+                    overlays.paletteOpen = true
                 },
                 MenuAction("Reveal in project panel", shortcutLabel(WorkspaceCommand.RevealInProjectPanel), enabled = active != null) {
                     runCommand(WorkspaceCommand.RevealInProjectPanel)
@@ -1073,7 +1090,7 @@ fun WorkspaceScreen(
                 MenuAction("Edit settings.json", null, enabled = project != null) {
                     runCommand(WorkspaceCommand.OpenSettingsFile)
                 },
-            ) + userlandActions(context) { removeUserlandOpen = true },
+            ) + userlandActions(context) { overlays.removeUserlandOpen = true },
         )
 
         Column(modifier = Modifier.fillMaxSize()) {
@@ -1186,7 +1203,7 @@ fun WorkspaceScreen(
                                         rootFocus.requestFocus()
                                     },
                                     onToggleSearch = { searchBarOpen = !searchBarOpen },
-                                    onOpenOutline = { outlineOpen = true },
+                                    onOpenOutline = { overlays.outlineOpen = true },
                                     isPreviewOpen = docks.isOpen(WorkspacePanel.Preview, settings),
                                     onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
                                     diffProject = project,
@@ -1276,13 +1293,13 @@ fun WorkspaceScreen(
                 // while the editor is the thing on screen: it moves the caret
                 // as you type, which is pointless behind a full-screen panel.
                 val goToLineEditor = active?.editor
-                if (goToLineOpen && goToLineEditor != null &&
+                if (overlays.goToLineOpen && goToLineEditor != null &&
                     plan.fullScreen == null && !terminalIsFullScreen
                 ) {
                     GoToLine(
                         editor = goToLineEditor,
                         onDismiss = {
-                            goToLineOpen = false
+                            overlays.goToLineOpen = false
                             rootFocus.requestFocus()
                         },
                         modifier = Modifier.align(Alignment.TopCenter),
@@ -1291,13 +1308,13 @@ fun WorkspaceScreen(
                 // Gated like go-to-line: previewing moves the caret, which is
                 // pointless — and invisible — behind a full-screen panel.
                 val outlineEditor = active?.editor
-                if (outlineOpen && outlineEditor != null &&
+                if (overlays.outlineOpen && outlineEditor != null &&
                     plan.fullScreen == null && !terminalIsFullScreen
                 ) {
                     OutlinePicker(
                         editor = outlineEditor,
                         onDismiss = {
-                            outlineOpen = false
+                            overlays.outlineOpen = false
                             rootFocus.requestFocus()
                         },
                     )
@@ -1392,13 +1409,13 @@ fun WorkspaceScreen(
                     // file should offer C++.
                     serverPromptGrammar =
                         server.languages.firstOrNull() ?: grammarForServer(server.name)
-                    serverPromptOpen = true
+                    overlays.serverPromptOpen = true
                 }.takeIf { LanguageServerInstaller.isSupported },
             )
         }
     }
 
-    if (settingsOpen) {
+    if (overlays.settingsOpen) {
         SettingsScreen(
             settings = settings,
             settingsPath = settingsPath,
@@ -1425,12 +1442,12 @@ fun WorkspaceScreen(
                 }
             },
             onDismiss = {
-                settingsOpen = false
+                overlays.settingsOpen = false
                 settingsRefusal = null
             },
             onEditFile = if (project != null && settingsPath != null) {
                 {
-                    settingsOpen = false
+                    overlays.settingsOpen = false
                     settingsRefusal = null
                     runCommand(WorkspaceCommand.OpenSettingsFile)
                 }
@@ -1482,18 +1499,18 @@ fun WorkspaceScreen(
     }
 
     val openedProject = project
-    if (finderOpen && openedProject != null) {
+    if (overlays.finderOpen && openedProject != null) {
         FileFinder(
             project = openedProject,
             onOpen = { match ->
-                finderOpen = false
+                overlays.finderOpen = false
                 openFile(openedProject, match.path)
             },
-            onDismiss = { finderOpen = false },
+            onDismiss = { overlays.finderOpen = false },
         )
     }
 
-    if (themeSelectorOpen) {
+    if (overlays.themeSelectorOpen) {
         ThemeSelector(
             mode = settings.theme,
             onSetMode = { mode ->
@@ -1503,13 +1520,13 @@ fun WorkspaceScreen(
                 }
             },
             onDismiss = {
-                themeSelectorOpen = false
+                overlays.themeSelectorOpen = false
                 rootFocus.requestFocus()
             },
         )
     }
 
-    if (paletteOpen) {
+    if (overlays.paletteOpen) {
         CommandPalette(
             workspace = CommandContext(
                 hasProject = project != null,
@@ -1530,7 +1547,7 @@ fun WorkspaceScreen(
             ),
             onRun = { runCommand(it) },
             onDismiss = {
-                paletteOpen = false
+                overlays.paletteOpen = false
                 // Compose hands focus nowhere when an overlay leaves, and the
                 // whole keymap goes with it — the same failure the terminal's
                 // Stop-all once caused.
@@ -1540,10 +1557,10 @@ fun WorkspaceScreen(
         )
     }
 
-    if (removeUserlandOpen) {
+    if (overlays.removeUserlandOpen) {
         val name = Userland.backend.displayName
         AlertDialog(
-            onDismissRequest = { removeUserlandOpen = false },
+            onDismissRequest = { overlays.removeUserlandOpen = false },
             title = { Text("Remove the $name userland?") },
             text = {
                 Text(
@@ -1554,7 +1571,7 @@ fun WorkspaceScreen(
             },
             confirmButton = {
                 TextButton(onClick = {
-                    removeUserlandOpen = false
+                    overlays.removeUserlandOpen = false
                     scope.launch {
                         // Sessions are running inside it; they have to go first.
                         terminals.closeAll()
@@ -1576,16 +1593,16 @@ fun WorkspaceScreen(
                 }) { Text("Remove") }
             },
             dismissButton = {
-                TextButton(onClick = { removeUserlandOpen = false }) { Text("Cancel") }
+                TextButton(onClick = { overlays.removeUserlandOpen = false }) { Text("Cancel") }
             },
         )
     }
 
-    if (pickerOpen) {
+    if (overlays.pickerOpen) {
         ProjectPicker(
             startInClone = pickerStartsInClone,
             onCloned = { path ->
-                pickerOpen = false
+                overlays.pickerOpen = false
                 pickerStartsInClone = false
                 refreshProjects()
                 openProject(path)
@@ -1595,7 +1612,7 @@ fun WorkspaceScreen(
             busyMessage = transferMessage,
             errorMessage = transferError,
             onOpen = { summary ->
-                pickerOpen = false
+                overlays.pickerOpen = false
                 openProject(summary.path)
             },
             onCreate = { name ->
@@ -1604,7 +1621,7 @@ fun WorkspaceScreen(
                     if (created == null) {
                         transferError = "Could not create that project"
                     } else {
-                        pickerOpen = false
+                        overlays.pickerOpen = false
                         openProject(created.absolutePath)
                     }
                 }
@@ -1625,16 +1642,16 @@ fun WorkspaceScreen(
                     }
                 }
             },
-            onDismiss = { pickerOpen = false },
+            onDismiss = { overlays.pickerOpen = false },
             nameError = { name -> ProjectsRoot.nameError(context, name) },
         )
     }
 
-    if (serverPromptOpen) {
+    if (overlays.serverPromptOpen) {
         LanguageServerPrompt(
             grammar = serverPromptGrammar,
             onDismiss = {
-                serverPromptOpen = false
+                overlays.serverPromptOpen = false
                 // Compose hands focus nowhere when an overlay leaves, and the
                 // whole keymap goes with it.
                 rootFocus.requestFocus()
@@ -1643,7 +1660,7 @@ fun WorkspaceScreen(
     }
 
     val newFileProject = project
-    if (newFileOpen && newFileProject != null) {
+    if (overlays.newFileOpen && newFileProject != null) {
         EntryNameDialog(
             title = "NEW FILE",
             confirmLabel = "Create",
@@ -1661,7 +1678,7 @@ fun WorkspaceScreen(
                 }
             },
             onConfirm = { name ->
-                newFileOpen = false
+                overlays.newFileOpen = false
                 scope.launch {
                     val result = withContext(Dispatchers.IO) {
                         ProjectFiles.create(File(newFileProject.rootPath), "", name, isDir = false)
@@ -1677,7 +1694,7 @@ fun WorkspaceScreen(
                 }
             },
             onDismiss = {
-                newFileOpen = false
+                overlays.newFileOpen = false
                 rootFocus.requestFocus()
             },
         )
@@ -1743,28 +1760,9 @@ private fun EditorArea(
         val activeEditor = active?.editor
         if (active != null && activeEditor != null) {
             val previewKind = PreviewKind.of(active.path)
-            var symbolPath by remember(active.path) {
-                mutableStateOf<List<String>>(emptyList())
-            }
-            // Re-asked when the caret settles or a reparse lands — all
-            // observable state, and the JNI read runs off the main thread.
-            LaunchedEffect(
-                activeEditor,
-                activeEditor.cursorRow,
-                activeEditor.cursorCol,
-                activeEditor.highlightVersion,
-            ) {
-                delay(BREADCRUMB_SETTLE_MS)
-                val id = activeEditor.session.id
-                val row = activeEditor.cursorRow.toLong()
-                val col = activeEditor.cursorCol.toLong()
-                symbolPath = withContext(Dispatchers.Default) {
-                    parseOutlinePath(CoreBridge.bufferOutlinePath(id, row, col))
-                }
-            }
-            EditorToolbar(
+            BreadcrumbToolbar(
+                editor = activeEditor,
                 fileName = active.name,
-                symbolPath = symbolPath,
                 onToggleSearch = onToggleSearch,
                 onOpenOutline = onOpenOutline,
                 kind = previewKind,
@@ -1843,6 +1841,54 @@ private fun EditorArea(
             )
         }
     }
+}
+
+/**
+ * The toolbar and the symbol-path lookup behind its breadcrumbs, in a scope
+ * of their own.
+ *
+ * The caret is watched through [snapshotFlow] rather than passed as effect
+ * keys: keys are read during composition, and a read of snapshot state there
+ * subscribes the *enclosing* scope — keyed from [EditorArea], every arrow key
+ * recomposed the tab strip, toolbar, search bar and pane around it. Here the
+ * reads happen inside the effect, and a caret move invalidates nothing until
+ * the settled path itself changes — and then only this toolbar.
+ */
+@Composable
+private fun BreadcrumbToolbar(
+    editor: EditorState,
+    fileName: String,
+    onToggleSearch: () -> Unit,
+    onOpenOutline: () -> Unit,
+    kind: PreviewKind?,
+    isPreviewOpen: Boolean,
+    onTogglePreview: (() -> Unit)?,
+) {
+    var symbolPath by remember(editor) { mutableStateOf<List<String>>(emptyList()) }
+    // Re-asked when the caret settles or a reparse lands — all observable
+    // state, and the JNI read runs off the main thread. `collectLatest`, so a
+    // caret still moving restarts the settle delay instead of queueing a
+    // query per step.
+    LaunchedEffect(editor) {
+        snapshotFlow {
+            Triple(editor.cursorRow, editor.cursorCol, editor.highlightVersion)
+        }.collectLatest { (row, col, _) ->
+            delay(BREADCRUMB_SETTLE_MS)
+            val id = editor.session.id
+            symbolPath = withContext(Dispatchers.Default) {
+                parseOutlinePath(CoreBridge.bufferOutlinePath(id, row.toLong(), col.toLong()))
+            }
+        }
+    }
+    EditorToolbar(
+        fileName = fileName,
+        symbolPath = symbolPath,
+        onToggleSearch = onToggleSearch,
+        onOpenOutline = onOpenOutline,
+        kind = kind,
+        isPreviewOpen = isPreviewOpen,
+        onTogglePreview = onTogglePreview,
+    )
 }
 
 /**
