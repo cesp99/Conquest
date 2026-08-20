@@ -3,6 +3,7 @@ import java.util.Properties
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.androidx.baselineprofile)
 }
 
 // The Rust engine (core/) is compiled to libconquestcore.so by cargo-ndk and
@@ -96,6 +97,20 @@ android {
     }
 }
 
+// Baseline profile consumer side: `:baselineprofile` records which methods a
+// cold start runs (on a Gradle-managed emulator), and release builds compile
+// that list ahead of time so first launch skips the interpreter. Regenerate
+// with `./gradlew :app:generateBaselineProfile`; the result is committed.
+baselineProfile {
+    // Both flavors start up through the same code, so keep one merged profile
+    // in src/main/generated/baselineProfiles rather than one copy per flavor.
+    mergeIntoMain = true
+    // Committed profile, applied on every release build — no emulator needed
+    // at build time.
+    saveInSrc = true
+    automaticGenerationDuringBuild = false
+}
+
 // Pinned in gradle.properties so the app and the vendored terminal modules
 // (which build libtermux.so with ndk-build) cannot drift apart.
 val ndkVersion = providers.gradleProperty("conquest.ndkVersion").get()
@@ -145,6 +160,10 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.runtime.compose)
+    // Installs the baseline profile when the store (or adb) doesn't compile
+    // it at install time.
+    implementation(libs.androidx.profileinstaller)
+    baselineProfile(project(":baselineprofile"))
     testImplementation(libs.junit)
     // The real org.json, for host tests only. Android ships it, but the
     // android.jar the unit tests compile against holds stubs that throw at

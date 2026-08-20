@@ -25,6 +25,11 @@ dependencyResolutionManagement {
 rootProject.name = "Conquest Code by Eyed"
 include(":app")
 
+// Baseline profile generator: a com.android.test module that cold-starts the
+// app on a Gradle-managed emulator and records which methods run. The output
+// is committed under app/src/main/generated/baselineProfiles.
+include(":baselineprofile")
+
 // Termux's terminal emulator and view, vendored verbatim under vendor/.
 // See vendor/VENDOR.md for the upstream commit and the list of local patches.
 include(":terminal-emulator")
