@@ -5,7 +5,9 @@
 # `./gradlew assemble`, fails the other way: packaging needs rustup's
 # Android targets and cargo-ndk to cross-compile the engine, which a
 # hosted runner does not have. `:app:compileFullDebugKotlin` is the line
-# between the two: every Kotlin file compiles, nothing native runs.
+# between the two: every Kotlin file compiles, nothing native runs —
+# though `preBuild` depends on `cargoNdkBuild`, so that task is excluded
+# by hand; the Kotlin compiler never reads the .so it would produce.
 #
 # The Gradle and Kotlin daemons would compile outside the tracer's reach,
 # so both are kept in-process.
@@ -67,7 +69,7 @@ jobs:
         run: |
           ./gradlew --no-daemon \
             -Dkotlin.compiler.execution.strategy=in-process \
-            :app:compileFullDebugKotlin
+            :app:compileFullDebugKotlin -x :app:cargoNdkBuild
 
       - uses: github/codeql-action/analyze@v3
         with:
