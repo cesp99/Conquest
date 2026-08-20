@@ -14,7 +14,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import kotlinx.coroutines.delay
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -33,6 +32,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import to.eyed.conquest.code.core.ResumedEffect
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import java.io.File
 import java.util.Locale
@@ -88,13 +88,16 @@ private fun ImageView(absolutePath: String) {
     // A picture has no buffer, so nothing else in the app is watching this
     // file: without this poll, overwriting or deleting it from the terminal
     // left the tab showing a bitmap that no longer exists on disk, with no
-    // sign that anything had happened. Two longs, twice a second.
+    // sign that anything had happened. Two longs, twice a second — and none
+    // at all from the background.
     var stamp by remember(absolutePath) { mutableStateOf(0L to 0L) }
-    LaunchedEffect(absolutePath) {
-        while (true) {
-            val next = withContext(Dispatchers.IO) { file.lastModified() to file.length() }
-            if (next != stamp) stamp = next
-            delay(FILE_POLL_MS)
+    ResumedEffect(absolutePath) {
+        withContext(Dispatchers.IO) {
+            while (true) {
+                val next = file.lastModified() to file.length()
+                if (next != stamp) withContext(Dispatchers.Main) { stamp = next }
+                delay(FILE_POLL_MS)
+            }
         }
     }
 

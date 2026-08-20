@@ -222,6 +222,23 @@ object CoreBridge {
     external fun gitStatusVersion(projectId: Long): Long
 
     /**
+     * The branch the project is on, from the cached status run — no JSON of
+     * the changed files, no git. Null when it is not known: no repository, no
+     * completed run yet, or a detached HEAD, which is on no branch. Versioned
+     * by [gitStatusVersion], like every other read of that cache.
+     */
+    external fun gitBranch(projectId: Long): String?
+
+    /**
+     * The commit HEAD points at, from the same cache — the staleness key for
+     * the commit graph: history needs reloading when this moves, not on every
+     * status change. Null when it is not known, which a caller must read as
+     * "assume it moved", never as "nothing changed". Versioned by
+     * [gitStatusVersion].
+     */
+    external fun gitHead(projectId: Long): String?
+
+    /**
      * The status map as a JSON object of project-relative path to status
      * (`modified`, `added`, `deleted`, `renamed`, `conflicted`, `untracked`,
      * `ignored`). Ancestor directories of a changed file are included with a
@@ -830,6 +847,15 @@ object CoreBridge {
      */
     external fun acpSessionList(refresh: Boolean): String
 
+    /**
+     * Version counter for [acpSessionList] — the cached list's own `version`
+     * field, without serializing the list to learn it. Poll this single load
+     * and make the full read only when it moves; it covers `loading` flipping
+     * as well as the answer landing. 0 means no agent is running, and a
+     * replaced agent never repeats a value already seen.
+     */
+    external fun acpSessionListVersion(): Long
+
     /** Forgets one of the agent's past conversations — `session/delete`. */
     external fun acpDeleteSession(sessionId: String): Boolean
 
@@ -1034,8 +1060,18 @@ object CoreBridge {
     external fun acpClearNotice(sessionId: Long): Boolean
 
     /**
+     * Version counter for [acpPendingElicitations] — poll this single load
+     * and read the list only when it moves, the [acpSessionVersion] contract.
+     * It moves whenever any of the agent's questions changes, session-scoped
+     * ones included. 0 means no agent is running, and a replaced agent never
+     * repeats a value already seen.
+     */
+    external fun acpElicitationsVersion(): Long
+
+    /**
      * The agent's questions that belong to no session — ACP's *request*
      * scope, in the same shape as `elicitations` in [acpSessionState].
+     * Read it when [acpElicitationsVersion] moves.
      *
      * No session argument because there may be no session: an agent can ask
      * for a token while authenticating, before any conversation exists. One

@@ -98,6 +98,8 @@ import to.eyed.conquest.code.ui.theme.LocalAppSettings
 import to.eyed.conquest.code.ui.theme.BufferFontFamily
 import to.eyed.conquest.code.core.GitHunk
 import to.eyed.conquest.code.core.GitHunkKind
+import to.eyed.conquest.code.core.ResumedEffect
+import to.eyed.conquest.code.core.pollVersion
 import to.eyed.conquest.code.ui.git.blameText
 import to.eyed.conquest.code.ui.git.rememberGitAnnotations
 import to.eyed.conquest.code.ui.workspace.GitStatusColours
@@ -308,18 +310,20 @@ fun EditorPane(
 
     // Syntax lags the text slightly by design (the reparse is off the
     // keystroke path), so watch for it landing and repaint when it does.
-    LaunchedEffect(state) {
-        while (true) {
-            state.refreshHighlightVersion()
-            delay(HIGHLIGHT_POLL_MILLIS)
-        }
+    ResumedEffect(state) {
+        pollVersion(
+            intervalMs = HIGHLIGHT_POLL_MILLIS,
+            version = { state.engineHighlightVersion },
+            read = {},
+            apply = { state.refreshHighlightVersion() },
+        )
     }
 
     // What the language server has said about this buffer. Its own loop
     // rather than a branch of the one above: the counter it watches moves on
     // a *publish*, which is rare and unrelated to a reparse, and the payload
     // it then reads is a JSON document rather than an integer.
-    LaunchedEffect(state) { pollBufferDiagnostics(state) }
+    ResumedEffect(state) { pollBufferDiagnostics(state) }
 
     val cursorVisible = rememberCursorBlink(state)
 

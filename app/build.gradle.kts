@@ -144,6 +144,7 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
     testImplementation(libs.junit)
     // The real org.json, for host tests only. Android ships it, but the
     // android.jar the unit tests compile against holds stubs that throw at

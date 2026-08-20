@@ -287,9 +287,11 @@ internal suspend fun requestLsp(
     if (id <= 0L) return null
     var settled = false
     try {
-        while (true) {
-            val answer = withContext(Dispatchers.Default) {
-                when (CoreBridge.lspRequestVersion(id)) {
+        // One hop for the whole wait, not one per tick: the loop stays on
+        // Default and the caller gets the answer when it lands.
+        return withContext(Dispatchers.Default) {
+            while (true) {
+                val answer = when (CoreBridge.lspRequestVersion(id)) {
                     // Forgotten: superseded, cancelled, or its buffer closed.
                     // Nothing more is coming, exactly like a search whose
                     // version reads 0.
@@ -297,12 +299,15 @@ internal suspend fun requestLsp(
                     2L -> LspAnswer.parse(CoreBridge.lspRequestResult(id)) ?: LspAnswer.forgotten(id)
                     else -> null
                 }
+                if (answer != null) {
+                    settled = true
+                    return@withContext answer
+                }
+                delay(REQUEST_POLL_MILLIS)
             }
-            if (answer != null) {
-                settled = true
-                return answer
-            }
-            delay(REQUEST_POLL_MILLIS)
+            // The loop only ends through the return above.
+            @Suppress("UNREACHABLE_CODE")
+            LspAnswer.forgotten(id)
         }
     } finally {
         if (!settled) {

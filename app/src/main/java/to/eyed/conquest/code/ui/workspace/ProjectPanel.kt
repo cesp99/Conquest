@@ -87,6 +87,7 @@ import to.eyed.conquest.code.core.GitFileStatus as EngineStatus
 import to.eyed.conquest.code.core.GitignoredFiles
 import to.eyed.conquest.code.core.ProjectEntry
 import to.eyed.conquest.code.core.ProjectSession
+import to.eyed.conquest.code.core.ResumedEffect
 import to.eyed.conquest.code.ui.theme.LocalUiFontSize
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import to.eyed.conquest.code.ui.theme.glyphHeight
@@ -827,31 +828,29 @@ fun ProjectPanel(
         // Keyed on `tree`, not `project`: changing a setting that affects the
         // tree (showing gitignored files) builds a fresh, empty
         // ProjectTreeState, and an effect still holding the old one would
-        // leave the panel permanently blank.
-        LaunchedEffect(tree) {
-            while (true) {
-                val version = project.version
-                val shape = tree.shape
-                if (version != tree.version) {
-                    tree.publish(
-                        version,
-                        withContext(Dispatchers.Default) { tree.rebuild() },
-                        shape,
-                    )
-                } else if (statusSource.version != tree.statusVersion) {
-                    // Statuses normally land after the tree has been drawn.
-                    // Re-colouring keeps the same rows and the same keys, so
-                    // the list doesn't blink, scroll, or re-measure.
-                    val current = tree.rows
-                    tree.publish(
-                        version,
-                        withContext(Dispatchers.Default) { tree.restatus(current) },
-                        shape,
-                    )
+        // leave the panel permanently blank. The loop lives on Default — the
+        // counters it compares are JNI reads — and comes back to the main
+        // thread only to publish.
+        ResumedEffect(tree) {
+            withContext(Dispatchers.Default) {
+                while (true) {
+                    val version = project.version
+                    val shape = tree.shape
+                    if (version != tree.version) {
+                        val rows = tree.rebuild()
+                        withContext(Dispatchers.Main) { tree.publish(version, rows, shape) }
+                    } else if (statusSource.version != tree.statusVersion) {
+                        // Statuses normally land after the tree has been
+                        // drawn. Re-colouring keeps the same rows and the
+                        // same keys, so the list doesn't blink, scroll, or
+                        // re-measure.
+                        val rows = tree.restatus(tree.rows)
+                        withContext(Dispatchers.Main) { tree.publish(version, rows, shape) }
+                    }
+                    val eager = !project.scanComplete ||
+                        SystemClock.uptimeMillis() < expectChangeUntil
+                    delay(if (eager) SCANNING_POLL_MS else IDLE_POLL_MS)
                 }
-                val eager = !project.scanComplete ||
-                    SystemClock.uptimeMillis() < expectChangeUntil
-                delay(if (eager) SCANNING_POLL_MS else IDLE_POLL_MS)
             }
         }
 

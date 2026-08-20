@@ -39,11 +39,14 @@ import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import to.eyed.conquest.code.core.Commit
 import to.eyed.conquest.code.core.CommitDetails
+import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.core.GitSession
 import to.eyed.conquest.code.core.ProjectSession
+import to.eyed.conquest.code.core.ResumedEffect
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import to.eyed.conquest.code.ui.theme.ZedTheme
 import java.text.SimpleDateFormat
@@ -148,20 +151,45 @@ fun GitGraphPane(
     LaunchedEffect(session) { loadMore() }
 
     // A commit made while this tab is open belongs at the top of it. Watched
-    // through the same counter everything else uses; a move resets the list
-    // rather than appending, since history can be rewritten as well as added
-    // to.
-    LaunchedEffect(session) {
-        var seen = withContext(Dispatchers.Default) { session.version }
-        while (true) {
-            kotlinx.coroutines.delay(500)
-            val now = withContext(Dispatchers.Default) { session.version }
-            if (now != seen) {
-                seen = now
-                commits = emptyList()
-                exhausted = false
-                error = null
-                loadMore()
+    // through the same counter everything else uses — but the counter also
+    // bumps on every save, and each reload here is `git log` under proot, so
+    // a move only reloads when what history depends on has moved: HEAD, or
+    // the branch, both read from the same cached run the counter versions. A
+    // reload resets the list rather than appending, since history can be
+    // rewritten as well as added to. When the engine cannot name HEAD, every
+    // move reloads — the old trigger: eager, but never stale.
+    //
+    // The baseline survives the lifecycle block's restarts on purpose: a
+    // commit made while the app was in the background (an agent, a shell)
+    // must reload on the way back, and re-capturing the key on resume would
+    // hide it. Null still means "not captured yet", which is what makes the
+    // very first pass a capture rather than a reload of what the effect
+    // above just loaded.
+    var seenGraph by remember(session) { mutableStateOf<Pair<String?, String?>?>(null) }
+    ResumedEffect(session) {
+        fun graphKey(): Pair<String?, String?> =
+            CoreBridge.gitHead(project.id) to CoreBridge.gitBranch(project.id)
+        withContext(Dispatchers.Default) {
+            var seen = Long.MIN_VALUE
+            while (true) {
+                val now = session.version
+                if (now != seen) {
+                    seen = now
+                    val graph = graphKey()
+                    val prior = seenGraph
+                    if (prior != graph || graph.first == null) {
+                        withContext(Dispatchers.Main) {
+                            seenGraph = graph
+                            if (prior != null) {
+                                commits = emptyList()
+                                exhausted = false
+                                error = null
+                                loadMore()
+                            }
+                        }
+                    }
+                }
+                delay(500)
             }
         }
     }

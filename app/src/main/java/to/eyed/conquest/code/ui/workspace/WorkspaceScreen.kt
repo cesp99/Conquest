@@ -61,6 +61,7 @@ import to.eyed.conquest.code.core.ProjectEntry
 import to.eyed.conquest.code.core.ProjectSession
 import to.eyed.conquest.code.core.ProjectSummary
 import to.eyed.conquest.code.core.ProjectsRoot
+import to.eyed.conquest.code.core.ResumedEffect
 import to.eyed.conquest.code.core.SafTransfer
 import java.io.File
 import android.content.Context
@@ -521,7 +522,9 @@ fun WorkspaceScreen(
     // One loop for every tab's status. A buffer whose file changed underneath
     // it while *clean* is reloaded without asking: there are no local edits to
     // lose, and silently showing stale text would be the worse behaviour.
-    LaunchedEffect(files) {
+    // Restarting on every return to the foreground is exactly right here:
+    // the background is where files change underneath tabs.
+    ResumedEffect(files) {
         while (true) {
             files.refreshStatuses()
             for (tab in files.tabs) {

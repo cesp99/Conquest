@@ -1,7 +1,6 @@
 package to.eyed.conquest.code.core
 
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -1374,38 +1373,38 @@ private const val POLL_MS = 120L
 @Composable
 fun rememberAgentSession(sessionId: Long?): AgentSessionSnapshot {
     var snapshot by remember(sessionId) { mutableStateOf(AgentSessionSnapshot()) }
-    LaunchedEffect(sessionId) {
-        if (sessionId == null || sessionId < 0) return@LaunchedEffect
-        var seen = -1L
-        var conversation = AgentConversation()
-        while (true) {
-            val fresh = withContext(Dispatchers.Default) {
+    ResumedEffect(sessionId) {
+        if (sessionId == null || sessionId < 0) return@ResumedEffect
+        withContext(Dispatchers.Default) {
+            var seen = -1L
+            // Seeded from the snapshot, not fresh: coming back to the
+            // foreground restarts this block, and starting the merge from
+            // what is already on screen re-reads only the rows that moved
+            // while the app was away instead of the whole transcript.
+            var conversation = snapshot.conversation
+            while (true) {
                 val version = CoreBridge.acpSessionVersion(sessionId)
-                if (version == seen) {
-                    null
-                } else {
+                if (version != seen) {
                     val state = AgentSessionState.parse(CoreBridge.acpSessionState(sessionId))
                     val merged = conversation.apply(
                         CoreBridge.acpEntriesSince(sessionId, conversation.revision)
                     )
-                    version to AgentSessionSnapshot(state, merged)
+                    val next = AgentSessionSnapshot(state, merged)
+                    conversation = merged
+                    withContext(Dispatchers.Main) { snapshot = next }
+                    // A truncation puts us back to nothing and asks to be
+                    // re-read from zero. Recording the version we just saw
+                    // would mean waiting for the *next* change to do it,
+                    // leaving the panel blank in between — so leave `seen`
+                    // behind instead.
+                    seen = if (merged.revision == 0L && state.entryCount > 0) {
+                        -1L
+                    } else {
+                        version
+                    }
                 }
+                delay(POLL_MS)
             }
-            if (fresh != null) {
-                val (version, next) = fresh
-                conversation = next.conversation
-                snapshot = next
-                // A truncation puts us back to nothing and asks to be re-read
-                // from zero. Recording the version we just saw would mean
-                // waiting for the *next* change to do it, leaving the panel
-                // blank in between — so leave `seen` behind instead.
-                seen = if (next.conversation.revision == 0L && next.state.entryCount > 0) {
-                    -1L
-                } else {
-                    version
-                }
-            }
-            delay(POLL_MS)
         }
     }
     return snapshot
@@ -1423,20 +1422,25 @@ fun rememberAgentSession(sessionId: Long?): AgentSessionSnapshot {
 @Composable
 fun rememberPendingElicitations(enabled: Boolean): List<AgentElicitation> {
     var questions by remember { mutableStateOf(emptyList<AgentElicitation>()) }
-    LaunchedEffect(enabled) {
+    ResumedEffect(enabled) {
         if (!enabled) {
             questions = emptyList()
-            return@LaunchedEffect
+            return@ResumedEffect
         }
-        while (true) {
-            val fresh = withContext(Dispatchers.Default) {
+        // The counter covers session-scoped questions too, so a move can find
+        // this list unchanged — one spare read per question raised anywhere,
+        // instead of a serialize-and-parse per tick to find out nothing
+        // happened.
+        pollVersion(
+            intervalMs = POLL_MS,
+            version = { CoreBridge.acpElicitationsVersion() },
+            read = {
                 parseElicitations(
                     runCatching { JSONArray(CoreBridge.acpPendingElicitations()) }.getOrNull(),
                 )
-            }
-            if (fresh != questions) questions = fresh
-            delay(POLL_MS)
-        }
+            },
+            apply = { questions = it },
+        )
     }
     return questions
 }
@@ -1452,23 +1456,33 @@ fun rememberPendingElicitations(enabled: Boolean): List<AgentElicitation> {
 @Composable
 fun rememberAgentSessionList(enabled: Boolean, refreshToken: Int): AgentSessionList {
     var list by remember { mutableStateOf(AgentSessionList.NONE) }
-    LaunchedEffect(enabled, refreshToken) {
+    // Outside the lifecycle block: the round trip is owed to the *ask*, not
+    // to the block — coming back to the foreground must re-read the cache,
+    // never re-ask the agent.
+    var refreshOwed by remember(enabled, refreshToken) { mutableStateOf(true) }
+    ResumedEffect(enabled, refreshToken) {
         if (!enabled) {
             list = AgentSessionList.NONE
-            return@LaunchedEffect
+            return@ResumedEffect
         }
-        var refresh = true
-        var seen = -1L
-        while (true) {
-            val fresh = withContext(Dispatchers.Default) {
-                AgentSessionList.parse(CoreBridge.acpSessionList(refresh))
+        withContext(Dispatchers.Default) {
+            var seen = -1L
+            while (true) {
+                // The counter first, and the full serialize-and-parse only
+                // when it moved: the refresh bumps it at both ends (loading,
+                // then the answer), so both of those still arrive.
+                val version = CoreBridge.acpSessionListVersion()
+                val refresh = refreshOwed
+                if (refresh || version != seen) {
+                    val fresh = AgentSessionList.parse(CoreBridge.acpSessionList(refresh))
+                    seen = version
+                    withContext(Dispatchers.Main) {
+                        refreshOwed = false
+                        list = fresh
+                    }
+                }
+                delay(POLL_MS)
             }
-            refresh = false
-            if (fresh.version != seen) {
-                seen = fresh.version
-                list = fresh
-            }
-            delay(POLL_MS)
         }
     }
     return list
@@ -1490,23 +1504,37 @@ fun rememberAgentSessionList(enabled: Boolean, refreshToken: Int): AgentSessionL
 @Composable
 fun rememberAgentTerminal(terminalId: String, enabled: Boolean = true): AgentTerminalState {
     var state by remember(terminalId) { mutableStateOf(AgentTerminalState.Gone) }
-    LaunchedEffect(terminalId, enabled) {
+    // Outside the lifecycle block, because finality must survive its
+    // restarts: coming back to the foreground re-runs the block, and asking
+    // the engine about a terminal it has since evicted would overwrite the
+    // kept record with Gone.
+    var over by remember(terminalId) { mutableStateOf(false) }
+    ResumedEffect(terminalId, enabled, over) {
         // A terminal whose output is already sealed onto the entry needs no
         // poll at all: the record is on the card, and the engine may well
         // have evicted the live one.
-        if (!enabled) return@LaunchedEffect
-        var seen = 0L
-        while (true) {
-            val previous = state
-            val fresh = withContext(Dispatchers.Default) {
-                AgentTerminalState.parse(CoreBridge.acpTerminalOutput(terminalId, seen), previous)
+        if (!enabled || over) return@ResumedEffect
+        withContext(Dispatchers.Default) {
+            var seen = 0L
+            while (true) {
+                val previous = state
+                val fresh =
+                    AgentTerminalState.parse(CoreBridge.acpTerminalOutput(terminalId, seen), previous)
+                seen = fresh.revision
+                // Gone (released, or its session closed) and finished are both
+                // final; the card keeps what it last read.
+                val finished = fresh.revision == 0L || !fresh.running
+                // `parse` answers with `previous` itself when nothing moved,
+                // so identity is the no-change test.
+                if (fresh !== previous || finished) {
+                    withContext(Dispatchers.Main) {
+                        state = fresh
+                        if (finished) over = true
+                    }
+                }
+                if (finished) return@withContext
+                delay(POLL_MS)
             }
-            state = fresh
-            seen = fresh.revision
-            // Gone (released, or its session closed) and finished are both
-            // final; the card keeps what it last read.
-            if (fresh.revision == 0L || !fresh.running) return@LaunchedEffect
-            delay(POLL_MS)
         }
     }
     return state
