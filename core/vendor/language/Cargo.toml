@@ -75,7 +75,11 @@ tree-sitter-md = { workspace = true, optional = true }
 tree-sitter-python = { workspace = true, optional = true }
 tree-sitter-rust = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }
-tree-sitter = { workspace = true, features = ["wasm"] }
+# CONQUEST PATCH: the "wasm" feature is dropped — it pulls the whole
+# Cranelift/Wasmtime stack into the .so for a .wasm-grammar path this app
+# never takes (all grammars are statically linked via `grammars`). The
+# wasm-loading code in language.rs/language_registry.rs is patched out to match.
+tree-sitter.workspace = true
 unicase = "2.6"
 util.workspace = true
 watch.workspace = true

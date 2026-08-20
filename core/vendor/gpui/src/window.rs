@@ -2,6 +2,10 @@
 use crate::Inspector;
 #[cfg(feature = "profiler")]
 use crate::profiler;
+// CONQUEST PATCH: behind the off-by-default `images` feature — only paint_svg
+// uses these.
+#[cfg(feature = "images")]
+use crate::{RenderSvgParams, SMOOTH_SVG_SCALE_FACTOR};
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
@@ -13,8 +17,7 @@ use crate::{
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+    RenderImageParams, Replay, ResizeEdge, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
@@ -4316,6 +4319,9 @@ impl Window {
     /// Paint a monochrome SVG into the scene for the next frame at the current stacking context.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
+    // CONQUEST PATCH: behind the off-by-default `images` feature — rasterizing
+    // needs the SVG renderer.
+    #[cfg(feature = "images")]
     pub fn paint_svg(
         &mut self,
         bounds: Bounds<Pixels>,

@@ -611,9 +611,20 @@ notify-types = { git = "https://github.com/zed-industries/notify", rev = "0890bb
 trash = { path = "crates/trash-android" }
 
 [profile.release]
-lto = "thin"
+# Fat LTO over one codegen unit trades compile time for the smallest, fastest
+# .so. panic = "abort" drops the unwinding machinery; a panic on any engine
+# thread now kills the whole process — the jni-bridge panic hook still logs it
+# to logcat first.
+codegen-units = 1
+lto = "fat"
 opt-level = 3
+panic = "abort"
 strip = "symbols"
+
+[profile.release.package.grammars]
+# The statically linked tree-sitter parse tables gain nothing from O3 and are
+# a large share of the binary; optimize them for size.
+opt-level = "s"
 
 [profile.dev]
 # Keep dev builds fast but usable on device.

@@ -1,22 +1,26 @@
-use crate::{
-    AssetSource, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
-    swap_rgba_pa_to_bgra,
-};
+// CONQUEST PATCH: everything but the atlas key types (RenderSvgParams,
+// SvgSize, SMOOTH_SVG_SCALE_FACTOR) is behind the off-by-default `images`
+// feature — see Cargo.toml.
+use crate::{DevicePixels, SharedString, Size};
+#[cfg(feature = "images")]
+use crate::{AssetSource, IsZero, RenderImage, Result, swap_rgba_pa_to_bgra};
+#[cfg(feature = "images")]
 use image::Frame;
+#[cfg(feature = "images")]
 use resvg::tiny_skia::Pixmap;
+#[cfg(feature = "images")]
 use smallvec::SmallVec;
-use std::{
-    hash::Hash,
-    sync::{Arc, LazyLock, OnceLock},
-};
+use std::hash::Hash;
+#[cfg(feature = "images")]
+use std::sync::{Arc, LazyLock, OnceLock};
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "images", target_os = "macos"))]
 const EMOJI_FONT_FAMILIES: &[&str] = &["Apple Color Emoji", ".AppleColorEmojiUI"];
 
-#[cfg(target_os = "windows")]
+#[cfg(all(feature = "images", target_os = "windows"))]
 const EMOJI_FONT_FAMILIES: &[&str] = &["Segoe UI Emoji", "Segoe UI Symbol"];
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(all(feature = "images", any(target_os = "linux", target_os = "freebsd")))]
 const EMOJI_FONT_FAMILIES: &[&str] = &[
     "Noto Color Emoji",
     "Emoji One",
@@ -24,14 +28,18 @@ const EMOJI_FONT_FAMILIES: &[&str] = &[
     "JoyPixels",
 ];
 
-#[cfg(not(any(
-    target_os = "macos",
-    target_os = "windows",
-    target_os = "linux",
-    target_os = "freebsd",
-)))]
+#[cfg(all(
+    feature = "images",
+    not(any(
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "freebsd",
+    ))
+))]
 const EMOJI_FONT_FAMILIES: &[&str] = &[];
 
+#[cfg(feature = "images")]
 fn is_emoji_presentation(c: char) -> bool {
     static EMOJI_PRESENTATION_REGEX: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new("\\p{Emoji_Presentation}").unwrap());
@@ -39,6 +47,7 @@ fn is_emoji_presentation(c: char) -> bool {
     EMOJI_PRESENTATION_REGEX.is_match(c.encode_utf8(&mut buf))
 }
 
+#[cfg(feature = "images")]
 fn font_has_char(db: &usvg::fontdb::Database, id: usvg::fontdb::ID, ch: char) -> bool {
     db.with_face_data(id, |font_data, face_index| {
         ttf_parser::Face::parse(font_data, face_index)
@@ -49,6 +58,7 @@ fn font_has_char(db: &usvg::fontdb::Database, id: usvg::fontdb::ID, ch: char) ->
     .unwrap_or(false)
 }
 
+#[cfg(feature = "images")]
 fn select_emoji_font(
     ch: char,
     fonts: &[usvg::fontdb::ID],
@@ -87,6 +97,7 @@ pub struct RenderSvgParams {
     pub size: Size<DevicePixels>,
 }
 
+#[cfg(feature = "images")]
 #[derive(Clone)]
 /// A struct holding everything necessary to render SVGs.
 pub struct SvgRenderer {
@@ -100,6 +111,7 @@ pub struct SvgRenderer {
 /// [`SvgRenderer::render_parsed`]. Parsing resolves fonts and converts text
 /// to paths, so callers that need to rasterize the same SVG at multiple
 /// scales should retain this value to avoid re-paying the parse cost.
+#[cfg(feature = "images")]
 pub struct ParsedSvg(usvg::Tree);
 
 /// The size in which to render the SVG.
@@ -110,6 +122,7 @@ pub enum SvgSize {
     ScaleFactor(f32),
 }
 
+#[cfg(feature = "images")]
 impl SvgRenderer {
     /// Creates a new SVG renderer with the provided asset source.
     pub fn new(asset_source: Arc<dyn AssetSource>) -> Self {
@@ -258,6 +271,7 @@ impl SvgRenderer {
     }
 }
 
+#[cfg(feature = "images")]
 fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Error> {
     // Cap the size of the rendered pixmap to avoid texture allocation panics
     // Related issue: #56466
@@ -294,6 +308,7 @@ fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Erro
     Ok(pixmap)
 }
 
+#[cfg(feature = "images")]
 fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Database) {
     let font_paths = [
         "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
@@ -311,6 +326,7 @@ fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Dat
 // fontdb defaults generic families to Microsoft fonts ("Arial", "Times New Roman")
 // which aren't installed on most Linux systems. fontconfig normally overrides these,
 // but when it fails the defaults remain and all generic family queries return None.
+#[cfg(feature = "images")]
 fn fix_generic_font_families(db: &mut usvg::fontdb::Database) {
     use usvg::fontdb::{Family, Query};
 
@@ -341,7 +357,7 @@ fn fix_generic_font_families(db: &mut usvg::fontdb::Database) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "images"))]
 mod tests {
     use super::*;
     use usvg::fontdb::{Database, Family, Query};

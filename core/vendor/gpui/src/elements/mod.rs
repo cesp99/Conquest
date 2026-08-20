@@ -8,6 +8,9 @@ mod image_cache;
 mod img;
 mod list;
 mod surface;
+// CONQUEST PATCH: behind the off-by-default `images` feature — painting an
+// Svg element needs the SVG renderer.
+#[cfg(feature = "images")]
 mod svg;
 mod text;
 mod uniform_list;
@@ -22,6 +25,7 @@ pub use image_cache::*;
 pub use img::*;
 pub use list::*;
 pub use surface::*;
+#[cfg(feature = "images")]
 pub use svg::*;
 pub use text::*;
 pub use uniform_list::*;

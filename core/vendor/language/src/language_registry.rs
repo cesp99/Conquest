@@ -3,9 +3,9 @@ use crate::{
     CachedLspAdapter, File, Language, LanguageConfig, LanguageId, LanguageMatcher,
     LanguageServerName, LspAdapter, ManifestName, PLAIN_TEXT, ToolchainLister,
     available_languages::AvailableLanguages, language_settings::all_language_settings,
-    task_context::ContextProvider, with_parser,
+    task_context::ContextProvider,
 };
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Result, anyhow};
 use collections::{FxHashMap, HashMap, HashSet, hash_map};
 pub use language_core::{
     BinaryStatus, LanguageName, LanguageQueries, LanguageServerStatusUpdate,
@@ -24,14 +24,13 @@ use parking_lot::{Mutex, RwLock};
 use postage::watch;
 
 use std::{
-    ffi::OsStr,
     path::{Path, PathBuf},
     sync::Arc,
 };
 use text::Rope;
 use theme::Theme;
 
-use util::{maybe, post_inc};
+use util::post_inc;
 
 pub struct LanguageRegistry {
     state: RwLock<LanguageRegistryState>,
@@ -68,13 +67,13 @@ pub struct FakeLanguageServerEntry {
     pub _server: Option<lsp::FakeLanguageServer>,
 }
 
+// CONQUEST PATCH: upstream also has `Loaded`/`Loading` variants for grammars
+// compiled to .wasm and loaded from disk at runtime. That path needs
+// tree-sitter's "wasm" feature (the whole Cranelift/Wasmtime stack), which this
+// build turns off — every grammar is statically linked, so an `Unloaded` .wasm
+// grammar can only ever fail to load (see `get_or_load_grammar`).
 enum AvailableGrammar {
     Native(tree_sitter::Language),
-    Loaded(#[allow(unused)] PathBuf, tree_sitter::Language),
-    Loading(
-        #[allow(unused)] PathBuf,
-        Vec<oneshot::Sender<Result<tree_sitter::Language, Arc<anyhow::Error>>>>,
-    ),
     Unloaded(PathBuf),
     LoadFailed(Arc<anyhow::Error>),
 }
@@ -724,48 +723,20 @@ impl LanguageRegistry {
                 AvailableGrammar::LoadFailed(error) => {
                     tx.send(Err(error.clone())).ok();
                 }
-                AvailableGrammar::Native(grammar) | AvailableGrammar::Loaded(_, grammar) => {
+                AvailableGrammar::Native(grammar) => {
                     tx.send(Ok(grammar.clone())).ok();
                 }
-                AvailableGrammar::Loading(_, txs) => {
-                    txs.push(tx);
-                }
+                // CONQUEST PATCH: upstream reads the .wasm file and loads it
+                // through the parser's WasmStore here. This build has no
+                // Wasmtime, so registering a .wasm grammar is the mistake — the
+                // error names it rather than pretending the file is bad.
                 AvailableGrammar::Unloaded(wasm_path) => {
-                    log::trace!("start loading grammar {name:?}");
-                    let this = self.clone();
-                    let wasm_path = wasm_path.clone();
-                    *grammar = AvailableGrammar::Loading(wasm_path.clone(), vec![tx]);
-                    self.executor
-                        .spawn(async move {
-                            let grammar_result = maybe!({
-                                let wasm_bytes = std::fs::read(&wasm_path)?;
-                                let grammar_name = wasm_path
-                                    .file_stem()
-                                    .and_then(OsStr::to_str)
-                                    .context("invalid grammar filename")?;
-                                anyhow::Ok(with_parser(|parser| {
-                                    let mut store = parser.take_wasm_store().unwrap();
-                                    let grammar = store.load_language(grammar_name, &wasm_bytes);
-                                    parser.set_wasm_store(store).unwrap();
-                                    grammar
-                                })?)
-                            })
-                            .map_err(Arc::new);
-
-                            let value = match &grammar_result {
-                                Ok(grammar) => AvailableGrammar::Loaded(wasm_path, grammar.clone()),
-                                Err(error) => AvailableGrammar::LoadFailed(error.clone()),
-                            };
-
-                            log::trace!("finish loading grammar {name:?}");
-                            let old_value = this.state.write().grammars.insert(name, value);
-                            if let Some(AvailableGrammar::Loading(_, txs)) = old_value {
-                                for tx in txs {
-                                    tx.send(grammar_result.clone()).ok();
-                                }
-                            }
-                        })
-                        .detach();
+                    let error = Arc::new(anyhow!(
+                        "grammar {name:?} is a .wasm grammar ({wasm_path:?}); this build only \
+                         supports statically linked grammars"
+                    ));
+                    tx.send(Err(error.clone())).ok();
+                    *grammar = AvailableGrammar::LoadFailed(error);
                 }
             }
         } else {

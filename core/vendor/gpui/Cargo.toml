@@ -28,6 +28,33 @@ test-support = [
     "proptest",
 ]
 bench = ["test-support", "profiler", "dep:criterion"]
+# CONQUEST PATCH: image decoding and SVG rasterization live behind this
+# off-by-default feature. The engine drives gpui as a headless runtime — no
+# build of this app ever decodes an image or rasterizes an SVG — and the image
+# codecs plus resvg/usvg/ttf-parser are pure dead weight in the shipped .so.
+# `image` itself stays a required dependency: RenderImage and the paint API use
+# its codec-free core types (Frame/Delay/RgbaImage). The list mirrors the
+# workspace `image` pin (default features minus "avif").
+images = [
+    "dep:resvg",
+    "dep:usvg",
+    "dep:ttf-parser",
+    "image/bmp",
+    "image/dds",
+    "image/exr",
+    "image/ff",
+    "image/gif",
+    "image/hdr",
+    "image/ico",
+    "image/jpeg",
+    "image/png",
+    "image/pnm",
+    "image/qoi",
+    "image/rayon",
+    "image/tga",
+    "image/tiff",
+    "image/webp",
+]
 inspector = ["gpui_macros/inspector"]
 leak-detection = ["backtrace"]
 wayland = []
@@ -63,7 +90,9 @@ futures-concurrency.workspace = true
 gpui_macros.workspace = true
 gpui_shared_string.workspace = true
 http_client.workspace = true
-image.workspace = true
+# CONQUEST PATCH: codec-free — the workspace pin's codec features move into
+# the off-by-default "images" feature above.
+image = { version = "0.25.1", default-features = false }
 inventory.workspace = true
 itertools.workspace = true
 log.workspace = true
@@ -79,9 +108,10 @@ raw-window-handle.workspace = true
 regex.workspace = true
 refineable.workspace = true
 scheduler.workspace = true
-resvg.workspace = true
-usvg.workspace = true
-ttf-parser = "0.25"
+# CONQUEST PATCH: optional, behind the off-by-default "images" feature.
+resvg = { workspace = true, optional = true }
+usvg = { workspace = true, optional = true }
+ttf-parser = { version = "0.25", optional = true }
 util_macros.workspace = true
 schemars.workspace = true
 seahash = "4.1"
