@@ -1,0 +1,55 @@
+# CodeQL, without a build.
+#
+# Autobuild would run `./gradlew assemble`, which needs rustup's Android
+# targets and cargo-ndk to cross-compile the engine — none of which a
+# hosted runner has, and none of which the Java/Kotlin extractor needs.
+# `build-mode: none` reads the sources directly instead.
+#
+# The vendored Termux libraries under vendor/ are analyzed upstream and
+# only carry `CONQUEST PATCH` edits here, so they are excluded rather
+# than reported as ours.
+#
+# NOTE: GitHub rejects results from this workflow while the repository's
+# *default setup* is still enabled — turn it off first under
+# Settings → Code security → Code scanning.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "41 6 * * 1"
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: java-kotlin
+            build-mode: none
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config: |
+            paths-ignore:
+              - vendor
+              - core/vendor
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
