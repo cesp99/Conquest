@@ -3,6 +3,7 @@ package to.eyed.conquest.code.ui.workspace
 import androidx.annotation.DrawableRes
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.platform.LocalContext
+import java.util.concurrent.ConcurrentHashMap
 import to.eyed.conquest.code.R
 
 /**
@@ -59,10 +60,19 @@ object FileIcons {
         val context = LocalContext.current
         // Resources by name rather than a generated `when`: the table is
         // generated from Zed's and a name it carries that we have no drawable
-        // for should degrade to the file sheet, not fail to compile.
-        val id = context.resources.getIdentifier(name, "drawable", context.packageName)
-        return if (id != 0) id else R.drawable.ic_file_file
+        // for should degrade to the file sheet, not fail to compile. The name
+        // lookup is a linear scan through the resource tables, and this runs
+        // for every file-tree row and editor tab on every recomposition — so
+        // each name is resolved once and remembered, misses included (a name
+        // with no drawable stays missing; asking again won't change that).
+        // Resource ids are stable for the life of the process.
+        return ids.getOrPut(name) {
+            val id = context.resources.getIdentifier(name, "drawable", context.packageName)
+            if (id != 0) id else R.drawable.ic_file_file
+        }
     }
+
+    private val ids = ConcurrentHashMap<String, Int>()
 
     private const val DEFAULT = "ic_file_file"
 }
