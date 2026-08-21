@@ -1066,6 +1066,24 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitLog(
     to_jstring(&env, json)
 }
 
+/// The branch's changes since it left `base` — the merge-base diff behind the
+/// panel's "View Branch Diff", in `gitPatch`'s JSON shape: `{"files":[…]}` or
+/// `{"error":…}`. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitBranchPatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    base: JString,
+) -> jstring {
+    let base = get_string(&mut env, &base);
+    let json = match engine().git_branch_patch(project_id as u64, &base) {
+        Ok(files) => serde_json::json!({ "files": files }).to_string(),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    };
+    to_jstring(&env, json)
+}
+
 /// What one commit changed against its first parent, in `gitPatch`'s JSON
 /// shape — `{"files":[…]}` or `{"error":…}`. An empty `path` is the whole
 /// commit; a path narrows it to one file. **Blocking**.

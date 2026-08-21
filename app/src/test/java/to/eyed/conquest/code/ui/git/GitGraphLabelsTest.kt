@@ -73,4 +73,12 @@ class GitGraphLabelsTest {
         // A short sha is used whole, as Zed's `get(0..7)` fallback does.
         assertEquals("abc — s", commitTabTitle("abc", "s"))
     }
+
+    /** The branch diff tab is Zed's "Changes since {branch}" (branch_diff.rs:43). */
+    @Test
+    fun theBranchDiffTabIsChangesSinceItsBase() {
+        assertEquals("Changes since main", DiffTarget(path = null, mergeBase = "main").title)
+        // The plain project diff keeps its own name.
+        assertEquals("All changes", DiffTarget(path = null).title)
+    }
 }

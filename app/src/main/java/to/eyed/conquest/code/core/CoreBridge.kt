@@ -431,6 +431,13 @@ object CoreBridge {
     external fun gitPatch(projectId: Long, path: String, staged: Boolean): String
 
     /**
+     * The branch's changes since it left [base] — the merge-base diff behind
+     * "View Branch Diff", in [gitPatch]'s JSON shape. **Blocking** — it runs
+     * git.
+     */
+    external fun gitBranchPatch(projectId: Long, base: String): String
+
+    /**
      * A page of commit history, newest first, as JSON — `{"commits":[…]}` or
      * `{"error":…}`. [allRefs] walks every branch, remote and tag in
      * `--date-order` — the graph's view; false is the plain HEAD walk the

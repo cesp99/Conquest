@@ -230,4 +230,57 @@ class RemoteOutputTest {
         assertEquals("pull", RemoteAction.Pull("origin").name)
         assertEquals("push", RemoteAction.Push("main", "origin").name)
     }
+
+    // --- failures ------------------------------------------------------
+
+    @Test
+    fun aFailureCarriesGitsOwnWordsNotTheExitStatus() {
+        // Real transcript of a fetch with no network: the fatal line is the
+        // whole story, and "git exited with 2" was none of it.
+        val failed = RemoteOpResult(
+            stderr = "fatal: unable to access 'https://github.com/x/y/': " +
+                "Could not resolve host: github.com\n",
+            error = "git exited with 2",
+        )
+        assertEquals(
+            "git fetch failed: fatal: unable to access 'https://github.com/x/y/': " +
+                "Could not resolve host: github.com",
+            remoteFailureMessage(RemoteAction.Fetch("origin"), failed),
+        )
+    }
+
+    @Test
+    fun theFatalLineOutranksTheProgressAboveIt() {
+        // A push's stderr opens with counting/compressing progress; the strip
+        // ellipsizes at three lines, so the reason must come first, alone.
+        val failed = RemoteOpResult(
+            stderr = "Enumerating objects: 5, done.\n" +
+                "Counting objects: 100% (5/5), done.\n" +
+                "error: failed to push some refs to 'github.com:x/y.git'\n",
+            error = "git exited with 1",
+        )
+        assertEquals(
+            "git push failed: error: failed to push some refs to 'github.com:x/y.git'",
+            remoteFailureMessage(RemoteAction.Push("main", "origin"), failed),
+        )
+    }
+
+    @Test
+    fun aFailureWithNoTellingLineKeepsItsLastWordAndAnEmptyOneTheError() {
+        // No fatal:/error: prefix — the last non-blank line is the best guess.
+        val odd = RemoteOpResult(
+            stderr = "Permission denied (publickey).\n",
+            error = "git exited with 128",
+        )
+        assertEquals(
+            "git pull failed: Permission denied (publickey).",
+            remoteFailureMessage(RemoteAction.Pull("origin"), odd),
+        )
+        // Silent streams are an engine-level refusal: its error is everything.
+        val silent = RemoteOpResult(error = "Could not run git in the Linux userland")
+        assertEquals(
+            "git fetch failed: Could not run git in the Linux userland",
+            remoteFailureMessage(RemoteAction.Fetch(null), silent),
+        )
+    }
 }

@@ -76,6 +76,7 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
@@ -209,6 +210,17 @@ fun GitPanel(
     onOpenFile: (String) -> Unit,
     /** Open a diff view — one file's, or the whole project's for null. */
     onOpenDiff: (String?) -> Unit,
+    /**
+     * Open the branch diff against the given base branch — the clean tree's
+     * "View Branch Diff", Zed's `DeployBranchDiff` (branch_diff.rs:80-137).
+     */
+    onOpenBranchDiff: (String) -> Unit,
+    /**
+     * Open one commit as a diff tab — Zed's `CommitView::open`, which is what
+     * the footer's subject line dispatches (git_panel.rs:6183-6197). Takes
+     * the sha and the subject the tab is titled by.
+     */
+    onOpenCommit: (String, String) -> Unit,
     /** Open the commit graph, which is a view of the whole repository. */
     onOpenGraph: () -> Unit,
     /** Open the branch picker — what the header's branch button dispatches. */
@@ -247,6 +259,12 @@ fun GitPanel(
      * moves, which is exactly when the answer changes.
      */
     var lastCommit by remember(project) { mutableStateOf<Commit?>(null) }
+    // Drafts live in project-keyed objects backed by SharedPreferences (see
+    // GitDrafts.kt); the binding installs this project's id → path key and
+    // seeds the maps from disk, and it must run before anything below reads a
+    // draft — which the order of these remembers is.
+    val draftContext = LocalContext.current
+    remember(project) { GitDraftStore.bind(draftContext, project.id, project.rootPath) }
     // Seeded from, and written back to, the draft the panel was closed with:
     // Escape and — on a phone — opening a file both take the panel out of the
     // composition, and a commit message is the one thing here nobody wants to
@@ -286,6 +304,13 @@ fun GitPanel(
     var history by remember(project) { mutableStateOf<CommitPage?>(null) }
     /** The commit whose detail is expanded, by sha. */
     var openCommit by remember(project) { mutableStateOf<CommitDetails?>(null) }
+    /**
+     * The sha the user last asked the History tab to expand. Loads race —
+     * two quick clicks run two `git show`s, and the *larger* commit answers
+     * last — so an arriving detail is applied only while it is still the one
+     * asked for, the guard [setAmendPending] and GitGraphPane already keep.
+     */
+    var requestedCommit by remember(project) { mutableStateOf<String?>(null) }
     var identityWanted by remember(project) { mutableStateOf(false) }
     var identityName by remember(project) { mutableStateOf(TextFieldValue()) }
     var identityEmail by remember(project) { mutableStateOf(TextFieldValue()) }
@@ -451,6 +476,7 @@ fun GitPanel(
         if (next == tab) return
         tab = next
         openCommit = null
+        requestedCommit = null
     }
 
     /**
@@ -615,8 +641,16 @@ fun GitPanel(
                 // command never claims the spinner.
                 ops.pendingRemote = true
                 val result = command()
-                if (result.ok) toast = formatRemoteOutput(action, result)
-                result.error
+                if (result.ok) {
+                    toast = formatRemoteOutput(action, result)
+                    null
+                } else {
+                    // git's own words, not the bare exit status: "git exited
+                    // with 2" names the strip, [remoteFailureMessage] the
+                    // reason — Zed shows the command's output the same way
+                    // (notifications.rs:36-73).
+                    remoteFailureMessage(action, result)
+                }
             },
             onFailure = { ops.pendingRemote = false },
             onSuccess = {
@@ -883,14 +917,29 @@ fun GitPanel(
     }
 
     /**
-     * What Zed's footer opens is the commit view (`CommitView::open`,
-     * git_panel.rs:6183-6197); this panel's view of one commit is the History
-     * tab's expanded row, so the subject line goes there, opened on its sha.
+     * The clean tree's way out — Zed's `DeployBranchDiff` (branch_diff.rs:
+     * 80-137): resolve the repository's default branch as the base and open
+     * the branch-vs-base diff; a repository with no default branch falls back
+     * to the plain project diff, exactly as Zed falls back to `ProjectDiff`.
+     * The button only shows on a clean tree, where the project diff is always
+     * empty — which is why this must not open it when a base exists.
      */
-    fun showCommit(sha: String) {
-        tab = GitPanelTab.History
+    fun viewBranchDiff() {
         scope.launch {
-            openCommit = withContext(Dispatchers.IO) { session.commitDetails(sha) }
+            val base = withContext(Dispatchers.IO) { session.defaultBranch() }
+            if (base == null) onOpenDiff(null) else onOpenBranchDiff(base)
+        }
+    }
+
+    /**
+     * Expand one History row, applying the answer only while it is still the
+     * one asked for — last *clicked* wins, not last to finish.
+     */
+    fun expandCommit(sha: String) {
+        requestedCommit = sha
+        scope.launch {
+            val details = withContext(Dispatchers.IO) { session.commitDetails(sha) }
+            if (requestedCommit == sha) openCommit = details
         }
     }
 
@@ -1010,10 +1059,15 @@ fun GitPanel(
                     // Zed's ctrl-g leader, panel-scoped as its whole chord
                     // block is ("GitPanel" context, default-linux.json:
                     // 1060-1069) — never global, because in the editor plain
-                    // ctrl-g is go-to-line (:622). No Alt: AltGr arrives as
-                    // Ctrl+Alt on European layouts, and typing a character
-                    // must not arm a chord.
-                    if (event.key == Key.G && !event.isShiftPressed && !event.isAltPressed) {
+                    // ctrl-g is go-to-line (:622). Never armed from inside
+                    // the commit box either — see [armsGitChord].
+                    if (armsGitChord(
+                            gitChordKeyOf(event.key),
+                            event.isShiftPressed,
+                            event.isAltPressed,
+                            messageFocused,
+                        )
+                    ) {
                         chordArmedAt = SystemClock.uptimeMillis()
                         return@onPreviewKeyEvent true
                     }
@@ -1143,12 +1197,9 @@ fun GitPanel(
                     onOpen = { commit ->
                         if (openCommit?.commit?.sha == commit.sha) {
                             openCommit = null
+                            requestedCommit = null
                         } else {
-                            scope.launch {
-                                openCommit = withContext(Dispatchers.IO) {
-                                    session.commitDetails(commit.sha)
-                                }
-                            }
+                            expandCommit(commit.sha)
                         }
                     },
                     onOpenFile = onOpenFile,
@@ -1160,7 +1211,7 @@ fun GitPanel(
                     EmptyMessage(
                         state = state,
                         busy = ops.busy,
-                        onViewBranchDiff = { onOpenDiff(null) },
+                        onViewBranchDiff = ::viewBranchDiff,
                         onInitRepository = ::initRepository,
                     )
                 }
@@ -1251,14 +1302,31 @@ fun GitPanel(
 
             ops.error?.let { text ->
                 HorizontalDivider(color = theme.color("border.variant"))
-                Text(
-                    text = text,
-                    style = MaterialTheme.typography.labelMedium,
-                    color = theme.color("error"),
-                    maxLines = 3,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                )
+                // Dismissible, because unlike a toast it never times out: a
+                // failed fetch's refusal otherwise sat over the commit box
+                // until the next command happened to replace it.
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 10.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        text = text,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = theme.color("error"),
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    FooterIconButton(
+                        icon = R.drawable.ic_ui_close,
+                        label = "Dismiss",
+                        enabled = true,
+                        onClick = { ops.error = null },
+                    )
+                }
             }
 
             // What a remote command said when it *worked* — the strip the
@@ -1299,7 +1367,13 @@ fun GitPanel(
                     message = it
                     CommitDrafts.put(project.id, it.text)
                 },
-                onFocusChanged = { messageFocused = it },
+                onFocusChanged = { focused ->
+                    messageFocused = focused
+                    // A pending chord dies when the caret enters the box:
+                    // the next keystroke there is *typing*, and a leader
+                    // armed a moment earlier must not intercept it.
+                    if (focused) chordArmedAt = null
+                },
                 stagedCount = state.staged.size,
                 busy = ops.busy,
                 commitLabel = commitButtonLabel(
@@ -1359,7 +1433,12 @@ fun GitPanel(
                         commit = footerCommit,
                         hasUnstaged = state.unstaged.isNotEmpty(),
                         enabled = !ops.busy,
-                        onOpenCommit = { showCommit(footerCommit.sha) },
+                        // What Zed's footer opens is the commit view
+                        // (`CommitView::open`, git_panel.rs:6183-6197), and a
+                        // commit diff tab is exactly that — the same tab the
+                        // graph's rows open, so one commit looks the same
+                        // from every door.
+                        onOpenCommit = { onOpenCommit(footerCommit.sha, footerCommit.subject) },
                         onUncommit = ::uncommit,
                         onOpenGraph = onOpenGraph,
                     )
@@ -1532,15 +1611,20 @@ private fun RepoHeader(
     }
 }
 
-/** The branch's name, or what stands in for one (git_panel.rs:8640-8654). */
-private fun branchLabel(state: GitPanelState, head: String?): String {
+/**
+ * The branch's name, or what stands in for one (git_panel.rs:8640-8654).
+ * An unborn branch is still a *named* branch — Zed synthesizes it from
+ * `symbolic-ref HEAD` and shows the bare name (repository.rs:2076-2094) —
+ * so `git init` reads "main" here, no suffix: the empty state's body already
+ * says nothing has been committed.
+ */
+internal fun branchLabel(state: GitPanelState, head: String?): String {
     if (!state.hasRepo) return "No repository"
     val branch = state.branch ?: return "git"
     val name = branch.name
     return when {
         // The drift arrows are the split button's counts now, as in Zed —
         // the name is only the name.
-        name != null && branch.unborn -> "$name · no commits yet"
         name != null -> name
         // A detached HEAD wears the first 8 characters of its sha —
         // `MAX_SHORT_SHA_LEN` — and a repository with no commit at all Zed's
@@ -1718,20 +1802,20 @@ private fun EmptyMessage(
             // `gap_1` between the label and its button (git_panel.rs:6937, 7009).
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            when {
+            when (gitPanelEmptyState(state)) {
                 // Asked before told: an empty list is not yet a clean tree,
                 // and not yet a missing repository either — the init button
                 // must not flash while the first scan is still out.
-                !state.scanned -> EmptyLabel("Asking git…")
+                GitPanelEmptyState.Scanning -> EmptyLabel("Asking git…")
                 // An empty list is what "clean" looks like *and* what "git
                 // never ran" looks like. Claiming the first when it is the
                 // second told a user with no git in their Debian that their
                 // tree was clean.
-                !state.ran -> EmptyLabel(
+                GitPanelEmptyState.NoGit -> EmptyLabel(
                     "Could not run git here — ${Userland.backend.displayName} needs git " +
                         "installed before the panel can show anything"
                 )
-                !state.hasRepo -> {
+                GitPanelEmptyState.NoRepo -> {
                     // Zed's uninitialized state, label and button both
                     // (git_panel.rs:7008-7027); the button is `git init`, and
                     // the poll redraws the panel as a clean repository after.
@@ -1742,7 +1826,7 @@ private fun EmptyMessage(
                         onClick = onInitRepository,
                     )
                 }
-                else -> {
+                GitPanelEmptyState.Clean -> {
                     // Zed's words for a clean tree (git_panel.rs:6940), and
                     // its branch-diff way out on every branch that is not the
                     // main one (git_panel.rs:6935-6951).
@@ -2601,6 +2685,28 @@ internal fun uncommitPinRefusal(expected: String, fresh: String?): String? =
             "Check the last commit and try again."
     }
 
+/** Which empty state the change-list region is in — see [gitPanelEmptyState]. */
+internal enum class GitPanelEmptyState { Scanning, NoGit, NoRepo, Clean }
+
+/**
+ * The empty state's dispatch, Zed's `render_empty_state` order
+ * (git_panel.rs:6920-6931) with the two states of our own in front.
+ *
+ * The order is load-bearing: a project outside any repository never runs git
+ * at all — the engine's `status_for` answers "no repository" from the host
+ * filesystem without a proot spawn, so `ran` is false there *by design* — and
+ * reading that as "git is not installed" hid the Initialize Repository state
+ * behind a complaint about a git that was fine. No-repo is answered first,
+ * from the walk that actually ran; "git never ran" is only meaningful where
+ * there was a repository to run it in.
+ */
+internal fun gitPanelEmptyState(state: GitPanelState): GitPanelEmptyState = when {
+    !state.scanned -> GitPanelEmptyState.Scanning
+    !state.hasRepo -> GitPanelEmptyState.NoRepo
+    !state.ran -> GitPanelEmptyState.NoGit
+    else -> GitPanelEmptyState.Clean
+}
+
 /**
  * Whether the clean tree's way out is offered — Zed shows "View Branch Diff"
  * on every branch that is not the main one: `!is_on_main_branch`, where main
@@ -2634,69 +2740,6 @@ internal fun discardLabel(change: GitChange): String = when {
     change.inHead -> "Discard changes…"
     change.isDirectory -> "Move the folder to the trash…"
     else -> "Move to the trash…"
-}
-
-/**
- * Commit messages typed but not yet committed, one per project.
- *
- * The panel is a composable that gets *removed*: Escape closes it, and on a
- * compact screen opening a file takes the work area away from it. So its own
- * composition cannot be where a half-written commit message lives — that is the
- * one thing here nobody will retype. Kept beside the panel rather than hoisted
- * into the workspace because nothing else reads it, and touched only from the
- * main thread, like the composition that owns it.
- */
-internal object CommitDrafts {
-    private val drafts = mutableMapOf<Long, String>()
-
-    fun of(project: Long): String = drafts[project] ?: ""
-
-    fun put(project: Long, message: String) {
-        if (message.isEmpty()) drafts.remove(project) else drafts[project] = message
-    }
-
-    /** After a commit that landed: that message has done its job. */
-    fun clear(project: Long) {
-        drafts.remove(project)
-    }
-}
-
-/**
- * A pending amend, one per project, outliving the composition as
- * [CommitDrafts] does — Zed keeps `amend_pending` and the pre-amend
- * `original_message` per work directory and restores both on load
- * (`SerializedCommitMessage`, git_panel.rs:496-504, 1541-1558). Presence in
- * the map *is* the pending flag; the value is the draft the amend displaced,
- * put back when the amend is cancelled or lands. Main thread only, like the
- * composition that reads it.
- */
-internal object AmendDrafts {
-    private val originals = mutableMapOf<Long, String>()
-
-    fun pending(project: Long): Boolean = project in originals
-
-    fun original(project: Long): String = originals[project] ?: ""
-
-    fun enter(project: Long, original: String) {
-        originals[project] = original
-    }
-
-    fun clear(project: Long) {
-        originals.remove(project)
-    }
-}
-
-/**
- * The split button's other two toggles. Signoff keeps its setting the way a
- * draft keeps its words — Zed serializes `signoff_enabled` and never resets it
- * after a commit (git_panel.rs:489-494, 1466-1495). Skip Hooks is deliberately
- * weaker: never persisted, and *spent* — reset to false — by every commit that
- * lands (git_panel.rs:3131, 8059-8064), because `--no-verify` is a decision
- * about one commit, not a policy.
- */
-internal object CommitToggles {
-    var signoff: Boolean = false
-    var skipHooks: Boolean = false
 }
 
 /**

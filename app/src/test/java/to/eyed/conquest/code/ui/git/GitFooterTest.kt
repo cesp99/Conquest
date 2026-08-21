@@ -47,6 +47,58 @@ class GitFooterTest {
     }
 
     @Test
+    fun theEmptyStateTellsNoRepoApartFromNoGit() {
+        // A project outside any repository never runs git at all — the engine
+        // answers "no repository" from the host filesystem — so `ran` is
+        // false there by design, and it must read as Zed's Initialize
+        // Repository state, not as a missing git binary.
+        val noRepo = to.eyed.conquest.code.core.GitPanelState(
+            scanned = true, ran = false, hasRepo = false,
+        )
+        assertEquals(GitPanelEmptyState.NoRepo, gitPanelEmptyState(noRepo))
+        // A repository git could not be run *in* is the genuine no-git case.
+        val noGit = to.eyed.conquest.code.core.GitPanelState(
+            scanned = true, ran = false, hasRepo = true,
+        )
+        assertEquals(GitPanelEmptyState.NoGit, gitPanelEmptyState(noGit))
+        // The first scan still out claims nothing yet.
+        assertEquals(
+            GitPanelEmptyState.Scanning,
+            gitPanelEmptyState(to.eyed.conquest.code.core.GitPanelState()),
+        )
+        val clean = to.eyed.conquest.code.core.GitPanelState(
+            scanned = true, ran = true, hasRepo = true,
+        )
+        assertEquals(GitPanelEmptyState.Clean, gitPanelEmptyState(clean))
+    }
+
+    @Test
+    fun anUnbornBranchWearsItsBareName() {
+        // Zed shows just "main" after `git init` (git_panel.rs:8640-8654 with
+        // repository.rs:2076-2094 — an unborn branch is still a named one);
+        // the empty state's body already says nothing has been committed.
+        val unborn = to.eyed.conquest.code.core.GitPanelState(
+            scanned = true, ran = true, hasRepo = true,
+            branch = to.eyed.conquest.code.core.GitBranch(name = "main", unborn = true),
+        )
+        assertEquals("main", branchLabel(unborn, head = null))
+    }
+
+    @Test
+    fun theBranchLabelFallsBackAsZedDoes() {
+        val detached = to.eyed.conquest.code.core.GitPanelState(
+            scanned = true, ran = true, hasRepo = true,
+            branch = to.eyed.conquest.code.core.GitBranch(name = null),
+        )
+        // A detached HEAD wears the first 8 characters of its sha.
+        assertEquals("abc1234d", branchLabel(detached, head = "abc1234def"))
+        // No branch and no commit at all is Zed's "(no branch)".
+        assertEquals("(no branch)", branchLabel(detached, head = null))
+        val noRepo = to.eyed.conquest.code.core.GitPanelState(scanned = true)
+        assertEquals("No repository", branchLabel(noRepo, head = null))
+    }
+
+    @Test
     fun pushedDetailNamesEveryRemote() {
         assertEquals(
             "This commit was already pushed to origin/main.",

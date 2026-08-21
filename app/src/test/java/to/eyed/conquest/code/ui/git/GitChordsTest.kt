@@ -49,6 +49,38 @@ class GitChordsTest {
     }
 
     @Test
+    fun theLeaderNeverArmsFromInsideTheCommitBox() {
+        // With the caret in the message box the next keystroke is typing;
+        // an armed leader there turned a typed 'g' into a network fetch.
+        assertEquals(
+            false,
+            armsGitChord(GitChordKey.G, shift = false, alt = false, messageFocused = true),
+        )
+        assertEquals(
+            true,
+            armsGitChord(GitChordKey.G, shift = false, alt = false, messageFocused = false),
+        )
+    }
+
+    @Test
+    fun onlyBareCtrlGArmsTheLeader() {
+        // Shift is a different keystroke, and AltGr arrives as Ctrl+Alt on
+        // European layouts — typing a character must not arm a chord.
+        assertEquals(
+            false,
+            armsGitChord(GitChordKey.G, shift = true, alt = false, messageFocused = false),
+        )
+        assertEquals(
+            false,
+            armsGitChord(GitChordKey.G, shift = false, alt = true, messageFocused = false),
+        )
+        assertEquals(
+            false,
+            armsGitChord(GitChordKey.D, shift = false, alt = false, messageFocused = false),
+        )
+    }
+
+    @Test
     fun bareModifiersKeepTheChordPending() {
         // Shift going down on its way to `ctrl-g shift-up` is not the second
         // key — with or without the Shift bit, which the left Shift's own

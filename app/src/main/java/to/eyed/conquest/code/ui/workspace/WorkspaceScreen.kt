@@ -996,6 +996,29 @@ fun WorkspaceScreen(
     }
 
     /**
+     * Show the branch against its merge base with [base] — Zed's Branch Diff
+     * tab ("Changes since {base}", branch_diff.rs:43), the git panel's "View
+     * Branch Diff". Keyed by the base so a later deploy against the same base
+     * reuses the tab.
+     */
+    fun openBranchDiff(base: String) {
+        if (project == null) return
+        val target = DiffTarget(path = null, mergeBase = base)
+        val key = "git-branch-diff:$base"
+        val existing = files.indexOfPath(key)
+        if (existing >= 0) {
+            files.select(existing)
+        } else {
+            files.open(OpenFile(path = key, editor = null, diff = target))
+        }
+        dockTookWorkArea?.let { side ->
+            docks.closeDock(side)
+            terminalFocused = false
+            rootFocus.requestFocus()
+        }
+    }
+
+    /**
      * Show what one commit changed — Zed's CommitView, in [DiffPane]'s
      * clothes. [path] narrows it to one file (the graph sidebar's per-file
      * "View Changes"); the two are different tabs, as Zed's filtered view is.
@@ -1266,6 +1289,8 @@ fun WorkspaceScreen(
                         onOpenPath = ::openFromDock,
                         onOpenSettings = { runCommand(WorkspaceCommand.OpenSettings) },
                         onOpenDiff = ::openDiff,
+                        onOpenBranchDiff = ::openBranchDiff,
+                        onOpenCommit = { sha, subject -> openCommitDiff(sha, subject) },
                         onOpenGraph = ::openGraph,
                         onSwitchBranch = { runCommand(WorkspaceCommand.SwitchBranch) },
                         onEntryRemoved = ::closeTabsUnder,
@@ -1386,6 +1411,10 @@ fun WorkspaceScreen(
                                             runCommand(WorkspaceCommand.OpenSettings)
                                         },
                                         onOpenDiff = ::openDiff,
+                                        onOpenBranchDiff = ::openBranchDiff,
+                                        onOpenCommit = { sha, subject ->
+                                            openCommitDiff(sha, subject)
+                                        },
                                         onOpenGraph = ::openGraph,
                                         onSwitchBranch = {
                                             runCommand(WorkspaceCommand.SwitchBranch)
@@ -2094,6 +2123,10 @@ private fun DockPanel(
     onOpenMatch: (String, ProjectSearchMatch) -> Unit,
     onOpenPath: (String) -> Unit,
     onOpenDiff: (String?) -> Unit,
+    /** The git panel's "View Branch Diff" opening the branch-vs-base tab. */
+    onOpenBranchDiff: (String) -> Unit,
+    /** The git panel's footer opening one commit as a diff tab. */
+    onOpenCommit: (String, String) -> Unit,
     onOpenGraph: () -> Unit,
     /** The git panel's branch button opening the branch picker. */
     onSwitchBranch: () -> Unit,
@@ -2134,6 +2167,8 @@ private fun DockPanel(
             focusToken = gitFocus,
             onOpenFile = onOpenPath,
             onOpenDiff = onOpenDiff,
+            onOpenBranchDiff = onOpenBranchDiff,
+            onOpenCommit = onOpenCommit,
             onOpenGraph = onOpenGraph,
             onSwitchBranch = onSwitchBranch,
             onDismiss = onDismiss,

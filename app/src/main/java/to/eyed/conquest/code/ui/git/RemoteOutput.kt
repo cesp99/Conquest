@@ -129,6 +129,36 @@ private fun formatPull(remote: String, output: RemoteOpResult): RemoteToast {
 }
 
 /**
+ * The strip's sentence for a remote command that *failed* — Zed's "git
+ * {fetch|pull|push} failed" headline (notifications.rs:36-73), with git's own
+ * words carried along, because the bare exit status ("git exited with 2")
+ * explains nothing about a network that was down or a ref that was rejected.
+ */
+fun remoteFailureMessage(action: RemoteAction, output: RemoteOpResult): String {
+    val detail = remoteFailureDetail(output) ?: output.error
+    return when (detail) {
+        null -> "git ${action.name} failed"
+        else -> "git ${action.name} failed: $detail"
+    }
+}
+
+/**
+ * What git itself said about the failure, distilled: its `fatal:`/`error:`
+ * lines when it wrote any — those carry the reason, while the rest of stderr
+ * is fetch progress that would push them past the strip's ellipsis — else the
+ * last non-blank line, which is where a one-line refusal lands. Null when the
+ * streams are empty, which is an engine-level refusal whose [RemoteOpResult
+ * .error] already says everything there is.
+ */
+internal fun remoteFailureDetail(output: RemoteOpResult): String? {
+    val said = output.stderr.ifBlank { output.stdout }
+    val lines = said.lines().map(String::trim).filter { it.isNotEmpty() }
+    if (lines.isEmpty()) return null
+    val telling = lines.filter { it.startsWith("fatal:") || it.startsWith("error:") }
+    return (telling.ifEmpty { lines.takeLast(1) }).joinToString("\n")
+}
+
+/**
  * The label and URL of a push's pull-request hint, or null. Only `remote:`
  * lines count — an SSH warning with a URL in it must not become a button —
  * and the URL must follow a line (or share one) with a known hint, which is

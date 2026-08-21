@@ -70,6 +70,23 @@ internal fun panelRequestStep(
 const val GIT_CHORD_TIMEOUT_MS = 4_000L
 
 /**
+ * Whether a ctrl keystroke arms the leader: bare `ctrl-g` — no Shift, and no
+ * Alt, because AltGr arrives as Ctrl+Alt on European layouts and typing a
+ * character must not arm a chord — and never while the commit editor holds
+ * the caret. An armed leader owns the next keystroke whole, so arming it over
+ * the message box turned the next typed 'g' into a network fetch and ate
+ * every other letter; Zed gets away with arming there because its resolver
+ * *replays* unmatched keystrokes into the editor as text
+ * (key_dispatch.rs:537-561), which Compose has no equivalent of.
+ */
+internal fun armsGitChord(
+    key: GitChordKey,
+    shift: Boolean,
+    alt: Boolean,
+    messageFocused: Boolean,
+): Boolean = key == GitChordKey.G && !shift && !alt && !messageFocused
+
+/**
  * The second keystroke, reduced to the vocabulary the chord table cares
  * about. [Modifier] is every modifier going down on its own — Shift on its
  * way to `ctrl-g shift-up` must not resolve the chord, or the shifted half of

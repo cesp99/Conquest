@@ -69,10 +69,18 @@ data class DiffTarget(
     val commit: String? = null,
     /** The commit's subject line, which is most of its tab title. */
     val subject: String = "",
+    /**
+     * A branch name: the tab is then the whole branch against its merge base
+     * with that branch — Zed's Branch Diff ("Changes since {branch}",
+     * branch_diff.rs:43), the clean tree's "View Branch Diff". Worktree
+     * contents included, so it polls like the plain diff.
+     */
+    val mergeBase: String? = null,
 ) {
     /** What the tab strip calls it. */
     val title: String = when {
         commit != null -> commitTabTitle(commit, subject)
+        mergeBase != null -> "Changes since $mergeBase"
         path == null -> "All changes"
         else -> "Diff: ${path.substringAfterLast('/')}"
     }
@@ -128,7 +136,16 @@ fun DiffPane(
                 intervalMs = 400,
                 version = { session.version },
                 // IO, not the loop's own Default: the patch is git under proot.
-                read = { withContext(Dispatchers.IO) { session.patch(target.path, target.staged) } },
+                read = {
+                    withContext(Dispatchers.IO) {
+                        val base = target.mergeBase
+                        if (base != null) {
+                            session.branchPatch(base)
+                        } else {
+                            session.patch(target.path, target.staged)
+                        }
+                    }
+                },
                 apply = { patch = it },
             )
         }
@@ -148,6 +165,9 @@ fun DiffPane(
                     // An empty commit — `--allow-empty` exists — or a merge
                     // whose first-parent diff is nothing.
                     target.commit != null -> "This commit changed no files"
+                    // Nothing since the merge base: the branch has not
+                    // actually diverged from the base branch.
+                    target.mergeBase != null -> "This branch matches ${target.mergeBase}"
                     target.path == null -> "Nothing has changed since the last commit"
                     else -> "${target.path} matches the last commit"
                 }

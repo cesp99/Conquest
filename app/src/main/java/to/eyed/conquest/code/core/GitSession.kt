@@ -122,6 +122,21 @@ class GitSession(private val project: ProjectSession) {
     }
 
     /**
+     * The branch's changes since it left [base] — Zed's Branch Diff, a
+     * `git diff <base>...` merge-base diff with worktree contents included,
+     * which is what the clean tree's "View Branch Diff" opens. **Blocking** —
+     * call it from [kotlinx.coroutines.Dispatchers.IO].
+     */
+    fun branchPatch(base: String): PatchResult {
+        val root = JSONObject(CoreBridge.gitBranchPatch(project.id, base))
+        if (!root.isNull("error")) return PatchResult(error = root.getString("error"))
+        val files = root.optJSONArray("files") ?: JSONArray()
+        return PatchResult(
+            files = List(files.length()) { index -> FileDiff.parse(files.getJSONObject(index)) },
+        )
+    }
+
+    /**
      * What one commit changed against its first parent, as the patch the diff
      * view draws. A [path] narrows it to one file — the sidebar's per-file
      * "View Changes". **Blocking** — call it from
