@@ -68,6 +68,7 @@ import org.json.JSONObject
 import to.eyed.conquest.code.R
 import to.eyed.conquest.code.core.Commit
 import to.eyed.conquest.code.core.CommitDetails
+import to.eyed.conquest.code.core.CommitPage
 import to.eyed.conquest.code.core.CoreBridge
 import to.eyed.conquest.code.core.GitBranch
 import to.eyed.conquest.code.core.GitSession
@@ -153,17 +154,101 @@ internal fun sidebarDate(epochSeconds: Long, zone: TimeZone = TimeZone.getDefaul
  * Whether a `%D` decoration is the HEAD chip — the one that leads with a
  * check icon. Zed matches the current branch's name or `"HEAD -> " + branch`
  * (`is_head_ref`, git_graph.rs:1698-1701); a detached HEAD decorates as the
- * bare word, which is nobody's branch name.
+ * bare word, which is nobody's branch name, so its chip dresses like any
+ * other — the plain 0.08/0.25 wash, no check (git_graph.rs:1717-1740).
  */
 internal fun isHeadDecoration(decoration: String, branch: String?): Boolean =
-    decoration == "HEAD" ||
-        (branch != null && (decoration == branch || decoration == "HEAD -> $branch"))
+    branch != null && (decoration == branch || decoration == "HEAD -> $branch")
 
 /** The initials disc's text: `Carlo Esposito` → `CE`, and `?` for nobody. */
 internal fun authorInitials(name: String): String {
     val words = name.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
     val initials = words.take(2).mapNotNull { it.firstOrNull()?.uppercaseChar() }
     return if (initials.isEmpty()) "?" else initials.joinToString("")
+}
+
+/**
+ * The pager's book-keeping, out of the composition so a JVM test can drive
+ * its interleavings. Snapshot state throughout, so the pane recomposes off it
+ * exactly as it did off the local vars this replaces.
+ *
+ * The invariant it holds: **a page lands only on the list it was asked for.**
+ * A page fetch is `git log` under proot — slow — and three callers share it:
+ * the first load, the scroll-driven pager, and the version poll's reload.
+ * Without a guard, a reload that emptied the list while a page for row 100
+ * was in flight got that page appended *first*, then page zero after it —
+ * history with its newest commits below older ones, lanes drawn from the
+ * scrambled order, and the stale call's error path could set [exhausted] and
+ * kill paging for the fresh list. So [reset] bumps a generation, and a load
+ * that comes back under an old generation drops everything on the floor.
+ */
+internal class GraphPaging {
+    var commits by mutableStateOf<List<Commit>>(emptyList())
+        private set
+
+    /** What the pane says while a read is due — true from birth, so the
+     * empty pane opens on "Reading history…" rather than "nothing". */
+    var loading by mutableStateOf(true)
+        private set
+    var exhausted by mutableStateOf(false)
+        private set
+    var error by mutableStateOf<String?>(null)
+        private set
+
+    /** Which list an in-flight page belongs to. */
+    private var generation = 0
+
+    /** A fetch is in flight — the guard, distinct from [loading], which is
+     * also true before the first fetch has even been asked for. */
+    private var inFlight = false
+
+    /** Forget the list — history may have been rewritten, not just added to —
+     * and strand every in-flight page on the old generation. */
+    fun reset() {
+        generation += 1
+        inFlight = false
+        commits = emptyList()
+        loading = true
+        exhausted = false
+        error = null
+    }
+
+    /**
+     * Read the next page through [fetch] (skip → page) and append it. One at
+     * a time: a call while another is in flight returns immediately, and a
+     * call that suspended across a [reset] discards its page.
+     */
+    suspend fun loadMore(fetch: suspend (skip: Int) -> CommitPage) {
+        if (exhausted || inFlight) return
+        val epoch = generation
+        inFlight = true
+        loading = true
+        val page = fetch(commits.size)
+        // A reset emptied the list while this page was on its way: it is a
+        // page of a list that no longer exists, and everything below — the
+        // append, the flags, the error — belongs to the new one.
+        if (epoch != generation) return
+        inFlight = false
+        loading = false
+        if (page.error != null) {
+            error = page.error
+            exhausted = true
+            return
+        }
+        if (page.commits.isEmpty()) {
+            exhausted = true
+            return
+        }
+        // A page that is entirely commits already seen — history rewritten
+        // under us — would leave the list unchanged and the paging waiting for
+        // a change that never comes.
+        val before = commits.size
+        // Deduplicate: a commit made while this is open shifts the window, and
+        // the same sha arriving twice would draw two rows and two lanes.
+        val seen = commits.mapTo(mutableSetOf()) { it.sha }
+        commits = commits + page.commits.filter { seen.add(it.sha) }
+        if (commits.size == before) exhausted = true
+    }
 }
 
 /**
@@ -188,10 +273,12 @@ fun GitGraphPane(
     val theme = LocalZedTheme.current
     val context = LocalContext.current
     val session = remember(project) { GitSession(project) }
-    var commits by remember(session) { mutableStateOf<List<Commit>>(emptyList()) }
-    var error by remember(session) { mutableStateOf<String?>(null) }
-    var loading by remember(session) { mutableStateOf(true) }
-    var exhausted by remember(session) { mutableStateOf(false) }
+    val paging = remember(session) { GraphPaging() }
+    // The one fetch every pager call shares — a slow `git log` under proot,
+    // which is exactly why [GraphPaging] guards its interleavings.
+    val fetchPage: suspend (Int) -> CommitPage = { skip ->
+        withContext(Dispatchers.IO) { session.log(PAGE, skip, allRefs = true) }
+    }
     /** The row whose sidebar is open, or null when none is. */
     var selected by remember(session) { mutableStateOf<Commit?>(null) }
     /** What the selection's sidebar has read so far. */
@@ -245,38 +332,11 @@ fun GitGraphPane(
     // grows, so doing it in composition made every page cost more than the
     // last on the frame's own thread.
     var rows by remember(session) { mutableStateOf<List<GraphRow>>(emptyList()) }
-    LaunchedEffect(commits) {
-        rows = withContext(Dispatchers.Default) { layoutGraph(commits) }
+    LaunchedEffect(paging.commits) {
+        rows = withContext(Dispatchers.Default) { layoutGraph(paging.commits) }
     }
 
-    suspend fun loadMore() {
-        if (exhausted) return
-        loading = true
-        val page = withContext(Dispatchers.IO) {
-            session.log(PAGE, commits.size, allRefs = true)
-        }
-        loading = false
-        if (page.error != null) {
-            error = page.error
-            exhausted = true
-            return
-        }
-        if (page.commits.isEmpty()) {
-            exhausted = true
-            return
-        }
-        // A page that is entirely commits already seen — history rewritten
-        // under us — would leave the list unchanged and the paging waiting for
-        // a change that never comes.
-        val before = commits.size
-        // Deduplicate: a commit made while this is open shifts the window, and
-        // the same sha arriving twice would draw two rows and two lanes.
-        val seen = commits.mapTo(mutableSetOf()) { it.sha }
-        commits = commits + page.commits.filter { seen.add(it.sha) }
-        if (commits.size == before) exhausted = true
-    }
-
-    LaunchedEffect(session) { loadMore() }
+    LaunchedEffect(session) { paging.loadMore(fetchPage) }
 
     // A commit made while this tab is open belongs at the top of it. Watched
     // through the same counter everything else uses — but the counter also
@@ -323,10 +383,10 @@ fun GitGraphPane(
                             seenGraph = graph
                             branchName = name
                             if (prior != null) {
-                                commits = emptyList()
-                                exhausted = false
-                                error = null
-                                loadMore()
+                                // Strands any in-flight page on the old
+                                // generation before the fresh page-zero read.
+                                paging.reset()
+                                paging.loadMore(fetchPage)
                             }
                         }
                     }
@@ -350,7 +410,7 @@ fun GitGraphPane(
     }
     LaunchedEffect(session) {
         snapshotFlow { nearTheEnd }.collect { near ->
-            if (near && !loading && !exhausted) loadMore()
+            if (near && !paging.loading && !paging.exhausted) paging.loadMore(fetchPage)
         }
     }
 
@@ -364,9 +424,10 @@ fun GitGraphPane(
         val palette = lanePalette(theme)
         Row(modifier = Modifier.fillMaxSize()) {
             Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                val error = paging.error
                 when {
-                    error != null && rows.isEmpty() -> Message(error!!, isError = true)
-                    rows.isEmpty() && loading -> Message("Reading history…")
+                    error != null && rows.isEmpty() -> Message(error, isError = true)
+                    rows.isEmpty() && paging.loading -> Message("Reading history…")
                     rows.isEmpty() -> Message("Nothing has been committed yet")
                     else -> Column(modifier = Modifier.fillMaxSize()) {
                         if (columns) {
@@ -389,9 +450,9 @@ fun GitGraphPane(
                             }
                             if (error != null) {
                                 item(key = "error") {
-                                    Message(error!!, isError = true, inline = true)
+                                    Message(error, isError = true, inline = true)
                                 }
-                            } else if (!exhausted) {
+                            } else if (!paging.exhausted) {
                                 item(key = "loading") {
                                     Message("Reading more…", inline = true)
                                 }

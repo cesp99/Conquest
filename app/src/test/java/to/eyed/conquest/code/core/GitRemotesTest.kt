@@ -34,6 +34,48 @@ class GitRemotesTest {
         assertFalse(list.remotes[1].isGithub)
     }
 
+    /**
+     * `isGithub` is host equality over the parsed URL, as Zed's provider
+     * does (github.rs:192-198) — a substring test called every lookalike
+     * GitHub, and disagreed with `githubRepoSlug`'s strict check, so the
+     * picker's glyph and the sidebar's "View on GitHub" contradicted each
+     * other for the same remote.
+     */
+    @Test
+    fun lookalikeHostsAreNotGithub() {
+        assertFalse(GitRemote("r", "https://notgithub.com/a/b").isGithub)
+        assertFalse(GitRemote("r", "https://mirror.example/github.com/x").isGithub)
+        assertFalse(GitRemote("r", "https://evil.example/x@github.com/a/b").isGithub)
+        assertFalse(GitRemote("r", "git@evil.example:github.com/a").isGithub)
+        assertFalse(GitRemote("r", "/home/carlo/repos/github.com/local").isGithub)
+        assertTrue(GitRemote("r", "https://github.com/a/b.git").isGithub)
+        assertTrue(GitRemote("r", "git@github.com:a/b.git").isGithub)
+        assertTrue(GitRemote("r", "ssh://git@github.com:22/a/b.git").isGithub)
+    }
+
+    /** The shared parse both gates read ([GitRemoteUrl]): host and path out
+     * of every spelling git writes, null for anything host-less. */
+    @Test
+    fun remoteUrlsSplitIntoHostAndPath() {
+        assertEquals(
+            GitRemoteUrl("github.com", "a/b.git"),
+            GitRemoteUrl.parse("https://user@github.com:443/a/b.git"),
+        )
+        assertEquals(
+            GitRemoteUrl("gitlab.example.com", "group/repo.git"),
+            // The scp spelling, with a dotted user as Zed's regex allows
+            // (remote.rs:16-17, `first.last@…` in its own tests).
+            GitRemoteUrl.parse("first.last@gitlab.example.com:group/repo.git"),
+        )
+        assertEquals(
+            GitRemoteUrl("github.com", "a/b"),
+            GitRemoteUrl.parse("github.com/a/b"),
+        )
+        assertNull(GitRemoteUrl.parse("/home/carlo/repos/local"))
+        assertNull(GitRemoteUrl.parse("not_a_url"))
+        assertNull(GitRemoteUrl.parse(""))
+    }
+
     @Test
     fun aFailedListingIsAnErrorAndNoRemotes() {
         val list = GitRemoteList.parse("""{"error":"Not a git repository"}""")

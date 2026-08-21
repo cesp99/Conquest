@@ -225,7 +225,7 @@ internal fun DiffBody(files: List<FileDiff>, onOpenFile: (String) -> Unit) {
             }
             if (file.hunks.isEmpty()) {
                 item(key = "empty:$fileIndex") {
-                    Notice("Only the file's mode changed.")
+                    Notice(hunklessCaption(file))
                 }
                 continue
             }
@@ -257,6 +257,20 @@ internal fun DiffBody(files: List<FileDiff>, onOpenFile: (String) -> Unit) {
             }
         }
     }
+}
+
+/**
+ * What a text file's section with no hunks means. git prints a bare header
+ * for four different reasons, and only one of them is about modes: calling an
+ * empty new file "Only the file's mode changed." was wrong on its face — a
+ * new file has no old mode.
+ */
+internal fun hunklessCaption(file: FileDiff): String = when {
+    file.created -> "Empty file added."
+    file.deleted -> "Empty file deleted."
+    // A pure rename: `rename from`/`rename to` and not a line of content.
+    file.original != null -> "Renamed — the contents are unchanged."
+    else -> "Only the file's mode changed."
 }
 
 /**

@@ -41,6 +41,19 @@ class GitHostingTest {
         assertNull(githubRepoSlug("https://github.example.com/a/b"))
     }
 
+    /**
+     * An '@' buried in the *path* must not move the host: RFC 3986 userinfo
+     * cannot contain '/', and Zed's `Url::parse` reads `git.evil.example`
+     * here (remote.rs:19-31) — while a real user, even with a port beside
+     * it, still parses.
+     */
+    @Test
+    fun anAtSignInThePathDoesNotMoveTheHost() {
+        assertNull(githubRepoSlug("https://git.evil.example/mirror/x@github.com/fakeowner/fakerepo"))
+        assertNull(githubRepoSlug("git@evil.example:github.com/a"))
+        assertEquals("a/b", githubRepoSlug("ssh://git@github.com:22/a/b.git"))
+    }
+
     /** Owner and repo are exactly two segments — no more, no fewer. */
     @Test
     fun theSlugIsExactlyTwoSegments()  {

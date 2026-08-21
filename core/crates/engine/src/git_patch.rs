@@ -19,6 +19,13 @@ pub struct FileDiff {
     pub original: Option<String>,
     /// True when git said the content is binary; [`hunks`] is then empty.
     pub is_binary: bool,
+    /// `new file mode` stood in the header: the diff creates this file. What
+    /// tells an *empty* new file — no hunks — from a mode-only change, which
+    /// is otherwise the same hunkless shape.
+    pub created: bool,
+    /// `deleted file mode`: the diff removes the file — again the only sign,
+    /// when the file was empty.
+    pub deleted: bool,
     pub hunks: Vec<PatchHunk>,
 }
 
@@ -249,6 +256,8 @@ fn new_file_patch(project_root: &std::path::Path, path: &str) -> Vec<FileDiff> {
             path: path.to_owned(),
             original: None,
             is_binary: true,
+            created: true,
+            deleted: false,
             hunks: Vec::new(),
         }];
     }
@@ -261,10 +270,15 @@ fn new_file_patch(project_root: &std::path::Path, path: &str) -> Vec<FileDiff> {
         lines
     };
     if lines.is_empty() {
+        // An untracked *empty* file: no lines, but still a new file — the
+        // `created` flag is all that keeps the view from misreading the
+        // hunkless shape as a mode change.
         return vec![FileDiff {
             path: path.to_owned(),
             original: None,
             is_binary: false,
+            created: true,
+            deleted: false,
             hunks: Vec::new(),
         }];
     }
@@ -287,6 +301,8 @@ fn new_file_patch(project_root: &std::path::Path, path: &str) -> Vec<FileDiff> {
         path: path.to_owned(),
         original: None,
         is_binary: false,
+        created: true,
+        deleted: false,
         hunks: vec![hunk],
     }]
 }
@@ -327,6 +343,8 @@ pub(crate) fn parse_patch(output: &str) -> Vec<FileDiff> {
                 path: String::new(),
                 original: None,
                 is_binary: false,
+                created: false,
+                deleted: false,
                 hunks: Vec::new(),
             });
             continue;
@@ -350,6 +368,14 @@ pub(crate) fn parse_patch(output: &str) -> Vec<FileDiff> {
             if let Some(path) = strip_prefix_path(rest, "b/") {
                 file.path = path;
             }
+            continue;
+        }
+        if line.starts_with("new file mode ") {
+            file.created = true;
+            continue;
+        }
+        if line.starts_with("deleted file mode ") {
+            file.deleted = true;
             continue;
         }
         if let Some(from) = line.strip_prefix("rename from ") {
@@ -631,6 +657,8 @@ Binary files a/logo.png and b/logo.png differ\n",
         );
         assert_eq!(created[0].path, "new.txt");
         assert!(created[0].original.is_none(), "a new file was not renamed");
+        assert!(created[0].created, "`new file mode` marks a creation");
+        assert!(!created[0].deleted);
         assert_eq!(created[0].hunks[0].lines[0].new_line, 1);
 
         let deleted = parse_patch(
@@ -646,6 +674,57 @@ Binary files a/logo.png and b/logo.png differ\n",
         );
         assert_eq!(deleted[0].path, "gone.txt");
         assert!(deleted[0].original.is_none());
+        assert!(deleted[0].deleted, "`deleted file mode` marks a deletion");
+        assert!(!deleted[0].created);
+    }
+
+    /// An **empty** file added or deleted prints a bare header: no `---`/`+++`
+    /// pair, no hunks — the exact shape of a mode-only change, which is why
+    /// the flags exist. The device test caught the diff view captioning a
+    /// commit's empty new `.gitignore` with "Only the file's mode changed."
+    #[test]
+    fn empty_files_are_creations_and_deletions_not_mode_changes() {
+        let created = parse_patch(
+            &[
+                "diff --git a/empty b/empty",
+                "new file mode 100644",
+                "index 0000000..e69de29",
+                "",
+            ]
+            .join("\n"),
+        );
+        assert_eq!(created[0].path, "empty", "the header names the file");
+        assert!(created[0].created);
+        assert!(!created[0].deleted);
+        assert!(created[0].hunks.is_empty());
+
+        let deleted = parse_patch(
+            &[
+                "diff --git a/gone b/gone",
+                "deleted file mode 100644",
+                "index e69de29..0000000",
+                "",
+            ]
+            .join("\n"),
+        );
+        assert_eq!(deleted[0].path, "gone");
+        assert!(deleted[0].deleted);
+        assert!(!deleted[0].created);
+
+        // And a real mode-only change stays exactly what it was: neither.
+        let mode = parse_patch(
+            &[
+                "diff --git a/tool.sh b/tool.sh",
+                "old mode 100644",
+                "new mode 100755",
+                "",
+            ]
+            .join("\n"),
+        );
+        assert_eq!(mode[0].path, "tool.sh");
+        assert!(!mode[0].created);
+        assert!(!mode[0].deleted);
+        assert!(mode[0].hunks.is_empty());
     }
 
     /// A carriage return belongs to the line's content; dropping it makes the

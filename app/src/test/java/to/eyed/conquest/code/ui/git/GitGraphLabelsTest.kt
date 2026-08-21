@@ -35,16 +35,21 @@ class GitGraphLabelsTest {
         assertEquals("Mar 5, 2026", sidebarDate(1772719620L, utc))
     }
 
-    /** Zed's `is_head_ref` (git_graph.rs:1698-1701), plus the detached spelling. */
+    /** Zed's `is_head_ref` (git_graph.rs:1698-1701). */
     @Test
     fun theHeadChipIsTheCurrentBranchsDecoration() {
         assertTrue(isHeadDecoration("HEAD -> main", "main"))
         assertTrue(isHeadDecoration("main", "main"))
-        assertTrue(isHeadDecoration("HEAD", null))
         assertFalse(isHeadDecoration("origin/main", "main"))
         assertFalse(isHeadDecoration("HEAD -> feature", "main"))
         assertFalse(isHeadDecoration("main", null))
         assertFalse(isHeadDecoration("tag: v1.0", "main"))
+        // A detached HEAD decorates as the bare word, which is nobody's
+        // branch name: Zed's `is_head_ref` needs a current branch and gives
+        // that chip the plain wash, no check icon (git_graph.rs:1698-1701,
+        // 1717-1740).
+        assertFalse(isHeadDecoration("HEAD", null))
+        assertFalse(isHeadDecoration("HEAD", "main"))
     }
 
     @Test

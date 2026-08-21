@@ -354,9 +354,17 @@ data class GitBranch(
  * and the fetch URL — which is what tells a github.com remote from any other.
  */
 data class GitRemote(val name: String, val url: String) {
-    /** The remote is on github.com — what gates the open-on-web actions. */
+    /**
+     * The remote is on github.com — what gates the open-on-web actions.
+     *
+     * Host equality over the parsed URL, as Zed's provider does
+     * (github.rs:192-198): a bare substring test called
+     * `https://notgithub.com/…` and a `github.com` buried in somebody
+     * else's path GitHub, and disagreed with `githubRepoSlug`, which gates
+     * the graph sidebar off the same remote.
+     */
     val isGithub: Boolean
-        get() = url.contains("github.com/") || url.contains("github.com:")
+        get() = GitRemoteUrl.parse(url)?.host == "github.com"
 }
 
 /** Every remote, or why the listing failed. */
@@ -612,6 +620,11 @@ data class FileDiff(
     val original: String?,
     /** git said the content is binary; there are no hunks to show. */
     val isBinary: Boolean,
+    /** The diff creates this file — what tells an empty new file from a
+     * mode-only change, which is otherwise the same hunkless shape. */
+    val created: Boolean = false,
+    /** The diff removes this file — the same tell, for an empty deletion. */
+    val deleted: Boolean = false,
     val hunks: List<PatchHunk>,
 ) {
     /** How many lines the patch adds and removes, for a summary line. */
@@ -625,6 +638,8 @@ data class FileDiff(
                 path = json.optString("path"),
                 original = if (json.isNull("original")) null else json.getString("original"),
                 isBinary = json.optBoolean("is_binary"),
+                created = json.optBoolean("created"),
+                deleted = json.optBoolean("deleted"),
                 hunks = List(hunks.length()) { index ->
                     val hunk = hunks.getJSONObject(index)
                     val lines = hunk.optJSONArray("lines") ?: JSONArray()

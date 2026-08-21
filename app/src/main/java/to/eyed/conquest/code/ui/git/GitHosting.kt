@@ -2,6 +2,7 @@ package to.eyed.conquest.code.ui.git
 
 import java.net.URLEncoder
 import java.security.MessageDigest
+import to.eyed.conquest.code.core.GitRemoteUrl
 
 /**
  * The github.com half of Zed's hosting-provider registry, on foot.
@@ -23,29 +24,18 @@ import java.security.MessageDigest
  *  - `https://github.com/owner/repo.git` (with an optional `user@`)
  *  - `git@github.com:owner/repo.git`
  *  - `ssh://git@github.com/owner/repo.git`
+ *
+ * The split is [GitRemoteUrl]'s — the same parse `GitRemote.isGithub` reads,
+ * so the picker's glyph and this sidebar gate cannot disagree — and the host
+ * must be github.com *exactly*: `notgithub.com`, `github.com.evil.example`
+ * and an `@github.com` buried in another host's path are all somebody else.
  */
 internal fun githubRepoSlug(remoteUrl: String): String? {
-    val url = remoteUrl.trim()
-    val path = when {
-        // The scp spelling: everything after the colon is the path.
-        url.startsWith("git@github.com:") -> url.substringAfter(':')
-        else -> {
-            // A URL proper: strip the scheme, an optional user, then require
-            // the host to be github.com exactly — `notgithub.com` and
-            // `github.com.evil.example` are both somebody else.
-            val withoutScheme = url
-                .removePrefix("https://")
-                .removePrefix("http://")
-                .removePrefix("ssh://")
-            if (withoutScheme == url && !url.startsWith("github.com/")) return null
-            val withoutUser = withoutScheme.substringAfter('@')
-            if (withoutUser.substringBefore('/') != "github.com") return null
-            withoutUser.substringAfter('/', "")
-        }
-    }
+    val url = GitRemoteUrl.parse(remoteUrl) ?: return null
+    if (url.host != "github.com") return null
     // Owner and repo are the first two segments and there must be exactly
     // two, `.git` and a trailing slash shrugged off (github.rs:203-211).
-    val segments = path.removeSuffix("/").removeSuffix(".git").split('/')
+    val segments = url.path.removeSuffix("/").removeSuffix(".git").split('/')
     if (segments.size != 2 || segments.any { it.isBlank() }) return null
     return "${segments[0]}/${segments[1]}"
 }

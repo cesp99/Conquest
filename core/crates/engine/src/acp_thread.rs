@@ -1298,6 +1298,8 @@ pub(crate) fn tool_diff(root: &Path, diff: &acp::Diff) -> FileDiff {
             path,
             original: None,
             is_binary: true,
+            created: false,
+            deleted: false,
             hunks: Vec::new(),
         };
     }
@@ -1305,6 +1307,8 @@ pub(crate) fn tool_diff(root: &Path, diff: &acp::Diff) -> FileDiff {
         path,
         original: None,
         is_binary: false,
+        created: false,
+        deleted: false,
         hunks: unified_hunks(old, new),
     }
 }
