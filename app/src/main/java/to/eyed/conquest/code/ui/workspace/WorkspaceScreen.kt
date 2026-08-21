@@ -36,6 +36,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
@@ -89,7 +91,9 @@ import to.eyed.conquest.code.ui.git.DiffPane
 import to.eyed.conquest.code.ui.git.DiffTarget
 import to.eyed.conquest.code.ui.git.GitGraphPane
 import to.eyed.conquest.code.ui.git.GitPanel
+import to.eyed.conquest.code.ui.git.GitPanelCommand
 import to.eyed.conquest.code.ui.git.GitPanelDockWidth
+import to.eyed.conquest.code.ui.git.GitPanelRequest
 import to.eyed.conquest.code.ui.git.rememberGitBranch
 import to.eyed.conquest.code.ui.media.MediaPane
 import to.eyed.conquest.code.ui.preview.MarkdownPreview
@@ -286,6 +290,15 @@ fun WorkspaceScreen(
     /** Ctrl+Shift+G, the same way: press it again to put focus back on the list. */
     var gitPanelFocus by remember { mutableIntStateOf(0) }
     var agentPanelFocus by remember { mutableIntStateOf(0) }
+    /**
+     * Whether the git panel holds the keyboard. It is what lets Ctrl+G be
+     * the panel's chord leader there and go-to-line everywhere else — the
+     * root key pass below stands aside on it, the way Zed scopes its git
+     * chords to the `GitPanel` context (default-linux.json:1060).
+     */
+    var gitPanelFocused by remember { mutableStateOf(false) }
+    /** A palette-run git command on its way to the panel — see [GitPanelRequest]. */
+    var gitPanelRequest by remember { mutableStateOf<GitPanelRequest?>(null) }
     /**
      * Whether the dock is drawn over the whole work area rather than beside
      * the editor. Decided during layout, where the width is known, and read by
@@ -692,6 +705,24 @@ fun WorkspaceScreen(
         return true
     }
 
+    /**
+     * A git command run from the palette reaches the panel as a request: the
+     * panel owns the session, the single-flight busy flag and the strip that
+     * says what git answered, so the command must run *there* — Zed routes
+     * its workspace-registered git actions to the panel the same way
+     * (git_ui.rs:193-241). Opening the dock first is what makes the spinner,
+     * and whatever git says back, visible.
+     */
+    fun requestGitPanelCommand(command: GitPanelCommand): Boolean {
+        if (project == null) return false
+        docks.open(WorkspacePanel.Git, settings)
+        // On a compact screen the panel takes the work area from a focused
+        // terminal, and nothing else would tell the key table it is gone.
+        terminalFocused = false
+        gitPanelRequest = GitPanelRequest(command, (gitPanelRequest?.token ?: 0) + 1)
+        return true
+    }
+
     fun runCommand(command: WorkspaceCommand): Boolean {
         val active = files.active
         when (command) {
@@ -815,6 +846,23 @@ fun WorkspaceScreen(
                 if (project == null) return false
                 if (togglePanel(WorkspacePanel.Git)) gitPanelFocus++
             }
+            // The git family runs in the panel — see requestGitPanelCommand.
+            WorkspaceCommand.GitFetch ->
+                if (!requestGitPanelCommand(GitPanelCommand.Fetch)) return false
+            WorkspaceCommand.GitPull ->
+                if (!requestGitPanelCommand(GitPanelCommand.Pull)) return false
+            WorkspaceCommand.GitPullRebase ->
+                if (!requestGitPanelCommand(GitPanelCommand.PullRebase)) return false
+            WorkspaceCommand.GitPush ->
+                if (!requestGitPanelCommand(GitPanelCommand.Push)) return false
+            WorkspaceCommand.GitForcePush ->
+                if (!requestGitPanelCommand(GitPanelCommand.ForcePush)) return false
+            WorkspaceCommand.GitStageAll ->
+                if (!requestGitPanelCommand(GitPanelCommand.StageAll)) return false
+            WorkspaceCommand.GitUnstageAll ->
+                if (!requestGitPanelCommand(GitPanelCommand.UnstageAll)) return false
+            WorkspaceCommand.GitDiff ->
+                if (!requestGitPanelCommand(GitPanelCommand.Diff)) return false
             WorkspaceCommand.FindInFile -> {
                 if (files.active?.editor == null) return false
                 searchBarOpen = true
@@ -1006,6 +1054,12 @@ fun WorkspaceScreen(
                     return@onPreviewKeyEvent runCommand(WorkspaceCommand.TogglePreview)
                 }
                 if (isGoToLine(event, focus)) {
+                    // Ctrl+G is the git panel's chord leader while the panel
+                    // has the keyboard — Zed scopes its git chords to the
+                    // `GitPanel` context for exactly this collision
+                    // (default-linux.json:1060 vs :622) — so go-to-line
+                    // stands aside and the panel's own handler takes the key.
+                    if (gitPanelFocused) return@onPreviewKeyEvent false
                     if (files.active?.editor == null) return@onPreviewKeyEvent false
                     overlays.goToLineOpen = true
                     return@onPreviewKeyEvent true
@@ -1015,9 +1069,17 @@ fun WorkspaceScreen(
                     overlays.outlineOpen = true
                     return@onPreviewKeyEvent true
                 }
-                tabIndexFor(event, files.tabs.size, focus)?.let { index ->
-                    files.select(index)
-                    return@onPreviewKeyEvent true
+                // Ctrl+1 and Ctrl+2 switch the *panel's* tabs while the git
+                // panel has the keyboard (Zed's git_panel::ActivateChangesTab
+                // / ActivateHistoryTab, default-linux.json:1010-1011); the
+                // other digits still pick editor tabs from there.
+                val gitPanelTabChord = gitPanelFocused &&
+                    (event.key == Key.One || event.key == Key.Two)
+                if (!gitPanelTabChord) {
+                    tabIndexFor(event, files.tabs.size, focus)?.let { index ->
+                        files.select(index)
+                        return@onPreviewKeyEvent true
+                    }
                 }
                 workspaceCommandFor(event, focus)?.let { return@onPreviewKeyEvent runCommand(it) }
                 false
@@ -1185,6 +1247,9 @@ fun WorkspaceScreen(
                         settings = settings,
                         searchFocus = projectSearchFocus,
                         gitFocus = gitPanelFocus,
+                        gitRequest = gitPanelRequest,
+                        onGitRequestHandled = { gitPanelRequest = null },
+                        onGitFocusChanged = { gitPanelFocused = it },
                         agentFocus = agentPanelFocus,
                         revealRequest = revealInPanel,
                         onRevealHandled = { revealInPanel = false },
@@ -1300,6 +1365,9 @@ fun WorkspaceScreen(
                                         settings = settings,
                                         searchFocus = projectSearchFocus,
                                         gitFocus = gitPanelFocus,
+                                        gitRequest = gitPanelRequest,
+                                        onGitRequestHandled = { gitPanelRequest = null },
+                                        onGitFocusChanged = { gitPanelFocused = it },
                                         agentFocus = agentPanelFocus,
                                         revealRequest = revealInPanel,
                                         onRevealHandled = { revealInPanel = false },
@@ -2005,6 +2073,11 @@ private fun DockPanel(
     settings: AppSettings,
     searchFocus: Int,
     gitFocus: Int,
+    /** A palette-run git command for the git panel, and its receipt. */
+    gitRequest: GitPanelRequest?,
+    onGitRequestHandled: () -> Unit,
+    /** The git panel reporting whether it holds the keyboard. */
+    onGitFocusChanged: (Boolean) -> Unit,
     agentFocus: Int,
     revealRequest: Boolean,
     openedPath: String?,
@@ -2056,6 +2129,9 @@ private fun DockPanel(
             onOpenGraph = onOpenGraph,
             onSwitchBranch = onSwitchBranch,
             onDismiss = onDismiss,
+            request = gitRequest,
+            onRequestHandled = onGitRequestHandled,
+            onFocusChanged = onGitFocusChanged,
         )
         WorkspacePanel.Agent -> AgentPanel(
             project = project ?: return,

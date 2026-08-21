@@ -43,6 +43,7 @@ import to.eyed.conquest.code.core.Commit
 import to.eyed.conquest.code.core.CommitDetails
 import to.eyed.conquest.code.core.CommitPage
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -65,6 +66,7 @@ import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isAltPressed
 import androidx.compose.ui.input.key.isCtrlPressed
 import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
@@ -82,7 +84,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.os.SystemClock
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import to.eyed.conquest.code.R
@@ -209,6 +213,19 @@ fun GitPanel(
     /** Open the branch picker — what the header's branch button dispatches. */
     onSwitchBranch: () -> Unit,
     onDismiss: () -> Unit,
+    /**
+     * A command the palette ran on the panel's behalf — see [GitPanelRequest].
+     * Handled once the first `git status` has landed, and answered with
+     * [onRequestHandled] so the same ask cannot run twice.
+     */
+    request: GitPanelRequest? = null,
+    onRequestHandled: () -> Unit = {},
+    /**
+     * The panel reporting whether it — or anything in it — holds the
+     * keyboard. The workspace's root key pass gates go-to-line and the
+     * editor-tab digits on it, so ctrl-g can be this panel's leader.
+     */
+    onFocusChanged: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val theme = LocalZedTheme.current
@@ -291,6 +308,13 @@ fun GitPanel(
     var pendingRemote by remember(project) { mutableStateOf(false) }
     /** A "which remote?" question waiting on the user — see [RemotePickerRequest]. */
     var remotePicker by remember(project) { mutableStateOf<RemotePickerRequest?>(null) }
+    /**
+     * When ctrl-g armed a pending chord, or null — the leader state the key
+     * handler resolves against and the hint chip is drawn from. Deliberately
+     * not keyed on the project: a half-typed chord has no business surviving
+     * anything, and it does not.
+     */
+    var chordArmedAt by remember { mutableStateOf<Long?>(null) }
 
     val listState = rememberLazyListState()
     // History's own scroll survives a round trip through the Changes tab.
@@ -403,6 +427,37 @@ fun GitPanel(
         } else {
             perform({ session.stage(listOf(change.path)) })
         }
+    }
+
+    /**
+     * Zed's `git::StageAll` / `git::UnstageAll` (git_panel.rs:2602-2608),
+     * whose menu asides name the commands they stand for: `git add --all` and
+     * `git reset` (git_panel.rs:5741-5743). Ours go by path through the same
+     * engine calls a row's checkbox uses, so the status cache and the poll
+     * behave exactly as they do for a single file.
+     */
+    fun stageAll() {
+        val paths = stageAllPaths(state.entries)
+        if (paths.isEmpty()) return
+        perform({ session.stage(paths) })
+    }
+
+    fun unstageAll() {
+        val paths = unstageAllPaths(state.entries)
+        if (paths.isEmpty()) return
+        perform({ session.unstage(paths) })
+    }
+
+    /**
+     * Zed's `git_panel::ActivateChangesTab` / `ActivateHistoryTab`
+     * (default-linux.json:1010-1011), and the tab strip's own click.
+     * Re-selecting the open tab is a no-op: it must not throw away the
+     * expanded commit the user is reading.
+     */
+    fun selectTab(next: GitPanelTab) {
+        if (next == tab) return
+        tab = next
+        openCommit = null
     }
 
     /**
@@ -718,6 +773,26 @@ fun GitPanel(
         }
     }
 
+    /**
+     * One dispatcher for every keyboard into the panel: the second key of a
+     * ctrl-g chord, and a palette run arriving as [request]. Zed's fetch,
+     * push and pull actions share one workspace registration the same way
+     * (git_ui.rs:193-241), which is what keeps the buttons, the chords and
+     * the palette from drifting apart.
+     */
+    fun runPanelCommand(command: GitPanelCommand) {
+        when (command) {
+            GitPanelCommand.Fetch -> fetch(fetchAll = true)
+            GitPanelCommand.Push -> push()
+            GitPanelCommand.Pull -> pull(rebase = false)
+            GitPanelCommand.ForcePush -> push(force = true)
+            GitPanelCommand.PullRebase -> pull(rebase = true)
+            GitPanelCommand.Diff -> onOpenDiff(null)
+            GitPanelCommand.StageAll -> stageAll()
+            GitPanelCommand.UnstageAll -> unstageAll()
+        }
+    }
+
     /** Save the identity, then commit — which is what the user asked for. */
     fun saveIdentity() {
         perform({ session.setIdentity(identityName.text, identityEmail.text) }) {
@@ -823,9 +898,40 @@ fun GitPanel(
         scope.launch { listState.animateScrollToItem(stops[next]) }
     }
 
+    // A palette command arriving from outside the panel. It waits for the
+    // first status scan: "git: push" run with the panel closed composes this
+    // panel *and* asks it to push in the same breath, and a push before the
+    // branch is known would silently do nothing.
+    LaunchedEffect(request, state.scanned) {
+        val asked = request ?: return@LaunchedEffect
+        if (!state.scanned) return@LaunchedEffect
+        onRequestHandled()
+        runPanelCommand(asked.command)
+    }
+
+    // The pending leader's clock — see GIT_CHORD_TIMEOUT_MS for why Zed's
+    // wait-forever is not copied here.
+    LaunchedEffect(chordArmedAt) {
+        if (chordArmedAt != null) {
+            delay(GIT_CHORD_TIMEOUT_MS)
+            chordArmedAt = null
+        }
+    }
+
+    // The focus flag must not survive the panel: on a compact screen opening
+    // a file removes the whole dock, and Compose does not promise a parting
+    // onFocusChanged(false) on the way out.
+    DisposableEffect(Unit) {
+        onDispose { onFocusChanged(false) }
+    }
+
     Row(
         modifier = modifier
             .fillMaxSize()
+            // How the workspace's root key pass knows this panel has the
+            // keyboard — `hasFocus`, not `isFocused`, because the commit box
+            // holding the caret still means the git panel is what is focused.
+            .onFocusChanged { onFocusChanged(it.hasFocus) }
             // The panel itself is the focus target the arrows talk to. The
             // commit box takes focus away from it while it is being typed in,
             // which is exactly what `messageFocused` below is watching for.
@@ -837,7 +943,38 @@ fun GitPanel(
             // entirely in a text field.
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                // An armed ctrl-g owns the next keystroke whole: a matched
+                // second key runs its command, anything else — Escape
+                // included — aborts, and both are consumed, exactly as Zed's
+                // resolver treats a sequence (see GitChords.kt). Bare
+                // modifiers pass, or `ctrl-g shift-up` could never be typed.
+                if (chordArmedAt != null) {
+                    return@onPreviewKeyEvent when (
+                        val step = gitChordStep(gitChordKeyOf(event.key), event.isShiftPressed)
+                    ) {
+                        is GitChordStep.Match -> {
+                            chordArmedAt = null
+                            runPanelCommand(step.command)
+                            true
+                        }
+                        GitChordStep.StillPending -> false
+                        GitChordStep.Abort -> {
+                            chordArmedAt = null
+                            true
+                        }
+                    }
+                }
                 if (event.isCtrlPressed) {
+                    // Zed's ctrl-g leader, panel-scoped as its whole chord
+                    // block is ("GitPanel" context, default-linux.json:
+                    // 1060-1069) — never global, because in the editor plain
+                    // ctrl-g is go-to-line (:622). No Alt: AltGr arrives as
+                    // Ctrl+Alt on European layouts, and typing a character
+                    // must not arm a chord.
+                    if (event.key == Key.G && !event.isShiftPressed && !event.isAltPressed) {
+                        chordArmedAt = SystemClock.uptimeMillis()
+                        return@onPreviewKeyEvent true
+                    }
                     // Zed's `ctrl-enter` for commit and `ctrl-shift-enter` for
                     // amend (default-linux.json:1054-1055), and both work from
                     // the message box as well — that is where they are wanted.
@@ -845,6 +982,26 @@ fun GitPanel(
                     if (isEnter) {
                         if (event.isShiftPressed) amend() else commit()
                         return@onPreviewKeyEvent true
+                    }
+                    // Zed's `ctrl-space` Stage All and `ctrl-shift-space`
+                    // Unstage All (default-linux.json:1070-1071).
+                    if (event.key == Key.Spacebar && !event.isAltPressed) {
+                        if (event.isShiftPressed) unstageAll() else stageAll()
+                        return@onPreviewKeyEvent true
+                    }
+                    // Zed's `ctrl-1` / `ctrl-2` tab switching
+                    // (default-linux.json:1010-1011). The root pass leaves
+                    // these two digits alone while this panel has the
+                    // keyboard; the rest still pick editor tabs from it.
+                    if (!event.isShiftPressed && !event.isAltPressed) {
+                        if (event.key == Key.One) {
+                            selectTab(GitPanelTab.Changes)
+                            return@onPreviewKeyEvent true
+                        }
+                        if (event.key == Key.Two) {
+                            selectTab(GitPanelTab.History)
+                            return@onPreviewKeyEvent true
+                        }
                     }
                     return@onPreviewKeyEvent false
                 }
@@ -910,14 +1067,8 @@ fun GitPanel(
             TabBar(
                 tab = tab,
                 changeCount = state.entries.size,
-                onTab = {
-                    // Re-selecting the open tab is a no-op: it must not throw
-                    // away the expanded commit the user is reading.
-                    if (it != tab) {
-                        tab = it
-                        openCommit = null
-                    }
-                },
+                // The same switch Ctrl+1 and Ctrl+2 run, no-op included.
+                onTab = ::selectTab,
             )
 
             if (tab == GitPanelTab.Changes) {
@@ -1015,6 +1166,44 @@ fun GitPanel(
                             )
                         }
                     }
+                }
+            }
+
+            // The armed leader, made visible: Zed echoes pending keystrokes
+            // in its status bar, which Android has no equivalent of, so the
+            // panel itself wears a chip in the strip the notices use, saying
+            // a chord is waiting on its second key.
+            if (chordArmedAt != null) {
+                HorizontalDivider(color = theme.color("border.variant"))
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(theme.color("elevated_surface.background"))
+                            .border(
+                                1.dp,
+                                theme.color("border.variant"),
+                                RoundedCornerShape(4.dp),
+                            )
+                            .padding(horizontal = 4.dp, vertical = 1.dp),
+                    ) {
+                        // Spelled as the remote menu's shortcut column spells
+                        // the same chords.
+                        Text(
+                            text = "Ctrl G",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = theme.color("text.muted"),
+                        )
+                    }
+                    Text(
+                        text = "…",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = theme.color("text.muted"),
+                    )
                 }
             }
 
@@ -2487,6 +2676,21 @@ internal fun isCreatedChange(change: GitChange): Boolean {
  */
 internal fun trackedCommitPaths(entries: List<GitChange>): List<String> =
     entries.filterNot(::isCreatedChange).map { it.path }
+
+/**
+ * What `git::StageAll` sends — every path with anything left to stage: the
+ * unstaged half of every row, and the conflicts, whose staging *is* the
+ * resolution (the Conflicts section's own header already stages them). A row
+ * wholly staged has nothing to add and is left out. Zed's version is
+ * `git add --all` on the repository (git_panel.rs:2602-2604, 5741); by path
+ * it comes to the same set.
+ */
+internal fun stageAllPaths(entries: List<GitChange>): List<String> =
+    entries.filter { it.conflicted || it.unstaged != null }.map { it.path }
+
+/** What `git::UnstageAll` sends — every path with a staged half (git_panel.rs:2606-2608). */
+internal fun unstageAllPaths(entries: List<GitChange>): List<String> =
+    entries.filter { it.staged != null }.map { it.path }
 
 /**
  * Zed's `has_tracked_changes()` = `tracked_count > 0` (git_panel.rs:5162-5164),

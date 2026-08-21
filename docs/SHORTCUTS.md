@@ -215,7 +215,37 @@ out of a focused terminal.
 | `Enter` | Open it |
 | `Delete` / `Backspace` | Discard its changes, after a prompt that names it |
 | `Ctrl` `Enter` | Commit what is staged, from anywhere in the panel |
+| `Ctrl` `Shift` `Enter` | Amend — the first press enters amend mode, the second commits |
+| `Ctrl` `Space` | Stage everything |
+| `Ctrl` `Shift` `Space` | Unstage everything |
+| `Ctrl` `1` / `Ctrl` `2` | The Changes / History tab |
 | `Esc`, or `✕` | Close the panel |
+
+### The `Ctrl` `G` chords
+
+While the panel has the keyboard, `Ctrl` `G` is a **leader**, exactly as in
+Zed's `GitPanel` keymap context: press it, and the next keystroke completes a
+two-step chord. A small `Ctrl G …` chip above the commit box says the chord
+is waiting. A key that matches nothing cancels it — and does nothing else,
+as in Zed — and so do `Esc` and saying nothing for a few seconds, which Zed
+(with a status bar that echoes pending keys) does not need. In the editor,
+`Ctrl` `G` is still go-to-line, and in a terminal it is still BEL.
+
+| Chord | Action |
+|---|---|
+| `Ctrl` `G`, `Ctrl` `G` | Fetch |
+| `Ctrl` `G`, `↑` | Push |
+| `Ctrl` `G`, `↓` | Pull |
+| `Ctrl` `G`, `Shift` `↑` | Force push (`--force-with-lease`) |
+| `Ctrl` `G`, `Shift` `↓` | Pull with rebase |
+| `Ctrl` `G`, `D` | Open the whole project's diff |
+
+Every one of these is also a command in the palette — `git: fetch`,
+`git: push`, `git: pull`, `git: force push`, `git: pull rebase`,
+`git: stage all`, `git: unstage all`, `git: diff` — which is the route with
+no keyboard at all, and the route from a focused terminal. Run from there,
+the command opens the git panel and runs in it, so the spinner and whatever
+git says back have somewhere to be seen.
 
 The first commit in a fresh userland fails: git guesses an identity from the
 hostname (`root@localhost.(none)`), refuses to use it, and says so. The panel
@@ -400,7 +430,8 @@ Cancelling really does put everything back: the selection you had, every extra
 cursor, and the exact scroll position — not just the line number.
 
 `Ctrl` `G` is deliberately not offered while a terminal has the keyboard, where
-it is BEL and readline's abort.
+it is BEL and readline's abort — and while the git panel has it, `Ctrl` `G` is
+that panel's chord leader instead, exactly as in Zed (see **Git panel**).
 
 ## Outline
 

@@ -1,0 +1,106 @@
+package to.eyed.conquest.code.ui.git
+
+import androidx.compose.ui.input.key.Key
+
+/**
+ * The ctrl-g leader chords — Zed's two-step git bindings, scoped to the
+ * `"GitPanel"` context (assets/keymaps/default-linux.json:1060-1069) and to
+ * this panel here, for the same reason: in the editor plain `ctrl-g` is
+ * go-to-line (:622), and in a terminal it is BEL, so the leader can only ever
+ * live where the git panel has the keyboard.
+ *
+ * The mechanics mirror Zed's resolver: `ctrl-g` arms a pending chord, the next
+ * non-modifier keystroke completes it or aborts it, and it is consumed either
+ * way — an unmatched second key does nothing rather than falling through to
+ * whatever it means on its own. The one deliberate difference is the timeout:
+ * Zed holds a pending key forever, but Zed also echoes it in its status bar,
+ * and an indefinite mode behind one small chip is a trap for a grazed ctrl-g
+ * on a touch screen — see [GIT_CHORD_TIMEOUT_MS].
+ *
+ * The state itself — when the leader was pressed — lives in the panel as
+ * composition state, because the pending chip is drawn from it; what lives
+ * here is everything decidable without a clock or a screen.
+ */
+
+/**
+ * A command the panel can be asked to run from a keyboard or from the
+ * palette — the second keys of the ctrl-g chords, plus the two bulk stages,
+ * which are single chords (`ctrl-space` / `ctrl-shift-space`,
+ * default-linux.json:1070-1071). One vocabulary for both routes, so the
+ * chords and the palette cannot drift apart.
+ */
+enum class GitPanelCommand { Fetch, Push, Pull, ForcePush, PullRebase, Diff, StageAll, UnstageAll }
+
+/**
+ * A palette-run command on its way to the panel. The workspace cannot run
+ * `git::Push` itself — the panel owns the session, the single-flight busy
+ * flag and the strip that says what git answered — so the ask travels as a
+ * value, the way [to.eyed.conquest.code.ui.git.GitPanel]'s `focusToken` does.
+ * [token] makes the same command asked twice two distinct values.
+ */
+data class GitPanelRequest(val command: GitPanelCommand, val token: Int)
+
+/**
+ * How long an armed ctrl-g waits for its second key. Zed has no timeout at
+ * all; a few seconds is long enough to think and short enough that arrow keys
+ * grazed into chord mode come back before they are missed.
+ */
+const val GIT_CHORD_TIMEOUT_MS = 4_000L
+
+/**
+ * The second keystroke, reduced to the vocabulary the chord table cares
+ * about. [Modifier] is every modifier going down on its own — Shift on its
+ * way to `ctrl-g shift-up` must not resolve the chord, or the shifted half of
+ * the table could never be typed.
+ */
+internal enum class GitChordKey { G, D, Up, Down, Escape, Modifier, Other }
+
+/** What one keystroke does to a pending ctrl-g leader. */
+internal sealed interface GitChordStep {
+    /** The chord completed: run [command]. The keystroke is consumed. */
+    data class Match(val command: GitPanelCommand) : GitChordStep
+
+    /** A bare modifier: the chord stays pending and the keystroke passes. */
+    data object StillPending : GitChordStep
+
+    /**
+     * Anything unbound — Escape included: the chord is dropped and the
+     * keystroke is consumed, which is how Zed treats a second key that
+     * matches no sequence.
+     */
+    data object Abort : GitChordStep
+}
+
+/**
+ * Zed's table, second keys only (default-linux.json:1062-1067). Ctrl on the
+ * second keystroke is deliberately not consulted: the leader is typed with
+ * Ctrl held and fingers do not lift in time, and Zed itself spells the fetch
+ * chord `ctrl-g ctrl-g`. Shift is consulted, because it is what separates
+ * Push from Force Push and Pull from Pull Rebase — and on the letters a
+ * shifted key matches nothing rather than its unshifted meaning.
+ */
+internal fun gitChordStep(key: GitChordKey, shift: Boolean): GitChordStep = when {
+    key == GitChordKey.Modifier -> GitChordStep.StillPending
+    key == GitChordKey.G && !shift -> GitChordStep.Match(GitPanelCommand.Fetch)
+    key == GitChordKey.Up && !shift -> GitChordStep.Match(GitPanelCommand.Push)
+    key == GitChordKey.Up -> GitChordStep.Match(GitPanelCommand.ForcePush)
+    key == GitChordKey.Down && !shift -> GitChordStep.Match(GitPanelCommand.Pull)
+    key == GitChordKey.Down -> GitChordStep.Match(GitPanelCommand.PullRebase)
+    key == GitChordKey.D && !shift -> GitChordStep.Match(GitPanelCommand.Diff)
+    else -> GitChordStep.Abort
+}
+
+/** A Compose key event's key, in the chord table's vocabulary. */
+internal fun gitChordKeyOf(key: Key): GitChordKey = when (key) {
+    Key.G -> GitChordKey.G
+    Key.D -> GitChordKey.D
+    Key.DirectionUp -> GitChordKey.Up
+    Key.DirectionDown -> GitChordKey.Down
+    Key.Escape -> GitChordKey.Escape
+    Key.ShiftLeft, Key.ShiftRight,
+    Key.CtrlLeft, Key.CtrlRight,
+    Key.AltLeft, Key.AltRight,
+    Key.MetaLeft, Key.MetaRight,
+    -> GitChordKey.Modifier
+    else -> GitChordKey.Other
+}
