@@ -1303,7 +1303,19 @@ const STDERR_MARKER: &str = "conquest-stderr:";
 /// after its marker; both markers are printed with no added newline so each
 /// stream comes back byte-for-byte, trailing newlines included — the toast
 /// rules end on `\n` and have to keep matching.
-const SPLIT_WRAPPER: &str = r#"t="${TMPDIR:-/tmp}/conquest-stderr.$$"; "$@" 2>"$t"; s=$?; printf 'conquest-stderr:'; cat "$t" 2>/dev/null; rm -f "$t"; printf 'conquest-exit:%d' "$s""#;
+///
+/// The park is `/tmp` **literally**, never `$TMPDIR`. This wrapper only ever
+/// runs inside our own Debian rootfs, where `/tmp` always exists — while
+/// TMPDIR is whatever the environment happened to hand the shell, and on
+/// Android the app process carries one naming the *host* cache directory, a
+/// path that does not exist inside the fake root. `sh` then fails the
+/// redirection before git ever runs and moves on: exit 2, both streams
+/// empty, and the sentence explaining it all on sh's own stderr, which the
+/// capture does not return. A fetch that failed for a real reason came back
+/// as "git exited with 2" with nothing to show — the guest environment now
+/// pins TMPDIR too ([`crate::guest`]), and this wrapper additionally refuses
+/// to trust it.
+const SPLIT_WRAPPER: &str = r#"t="/tmp/conquest-stderr.$$"; "$@" 2>"$t"; s=$?; printf 'conquest-stderr:'; cat "$t" 2>/dev/null; rm -f "$t"; printf 'conquest-exit:%d' "$s""#;
 
 /// What one split-stream command did.
 pub(crate) struct GitSplitRun {
@@ -2638,6 +2650,27 @@ mod tests {
         assert_eq!(run.status, 3);
         assert_eq!(run.stdout, "out\n");
         assert_eq!(run.stderr, "err\n");
+
+        // And with a TMPDIR naming a directory that does not exist — the
+        // environment every Android app process hands its children, where
+        // TMPDIR is the app's *host* cache directory, unreachable inside the
+        // fake root. A wrapper that trusted it failed its own redirection
+        // before the command ever ran: exit 2, both streams empty, and a
+        // remote failure reduced to "git exited with 2" with nothing to show.
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(SPLIT_WRAPPER)
+            .arg("conquest-git")
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("printf 'out\\n'; printf 'fatal: no\\n' >&2; exit 128")
+            .env("TMPDIR", "/definitely/not/there")
+            .output()
+            .expect("failed to run sh");
+        let run = parse_split_run(&out.stdout).unwrap();
+        assert_eq!(run.status, 128, "the real exit status was lost");
+        assert_eq!(run.stdout, "out\n");
+        assert_eq!(run.stderr, "fatal: no\n", "stderr was lost");
     }
 
     #[test]
@@ -3468,6 +3501,90 @@ mod tests {
         engine.git_commit(id, "second", false, false, false).unwrap();
         let log = host_git(&repo, &["log", "--format=%s"]);
         assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "second\nfirst");
+    }
+
+    /// A failing remote command through the whole split-stream chain —
+    /// [`run_git_split`], the fake guest, a real `/bin/sh`, a real git — in
+    /// the environment an Android app process actually spawns from: TMPDIR
+    /// names a directory that only exists on the host. What must come back
+    /// is git's own "fatal:" sentence and git's own exit status.
+    ///
+    /// This is the device defect pinned down: the split wrapper parked
+    /// stderr under `${TMPDIR}`, the app's inherited TMPDIR pointed at the
+    /// host cache directory (set by the runtime after fork, invisible in the
+    /// initial `/proc/<pid>/environ`), `sh` failed the redirection before
+    /// git ever ran, and every failed fetch surfaced as "git exited with 2"
+    /// with both streams empty — while the same command in the app's own
+    /// terminal printed two `fatal:` lines and exited 128.
+    #[test]
+    #[cfg(unix)]
+    fn a_hostile_tmpdir_cannot_swallow_what_a_failing_fetch_said() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: no git on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let repo = projects.join("thing");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(
+            host_git(&repo, &["init", "--quiet", "-b", "main"])
+                .status
+                .success()
+        );
+        assert!(
+            host_git(&repo, &["remote", "add", "origin", "/nonexistent-repo"])
+                .status
+                .success()
+        );
+
+        // The fake guest, with the one addition that matters here: it hands
+        // the wrapper the hostile TMPDIR, overriding the sane one the fixed
+        // guest environment now pins — because the wrapper itself must not
+        // trust whatever the environment says by the time it runs.
+        let proot = dir.path().join("fake-proot");
+        std::fs::write(
+            &proot,
+            format!(
+                "#!/bin/sh\n\
+                 while [ \"$1\" != \"-w\" ]; do shift; done\n\
+                 shift 2\n\
+                 TMPDIR={gone}\n\
+                 GIT_CONFIG_GLOBAL=/dev/null\n\
+                 GIT_CONFIG_SYSTEM=/dev/null\n\
+                 export TMPDIR GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM\n\
+                 exec \"$@\"\n",
+                gone = dir.path().join("not-there").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&proot, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let engine = crate::Engine::new();
+        engine.set_userland(&proot, dir.path(), dir.path(), &projects);
+        let userland = engine.userland().unwrap();
+
+        let run = run_git_split(
+            &userland,
+            &repo,
+            "git fetch",
+            git_argv(&repo, &["fetch", "--all"]),
+        )
+        .expect("the guest ran");
+        assert!(
+            run.stderr.contains("fatal:"),
+            "git's own words were lost: status {} stdout {:?} stderr {:?}",
+            run.status,
+            run.stdout,
+            run.stderr
+        );
+        assert_ne!(run.status, 0, "a failing fetch reported success");
+        assert_ne!(
+            run.status, 2,
+            "the wrapper's own redirection failure leaked through as git's exit"
+        );
     }
 
     /// A command past its deadline gets the deadline's own sentence — by then

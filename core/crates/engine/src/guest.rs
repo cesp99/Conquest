@@ -344,6 +344,15 @@ pub(crate) fn invocation(userland: &Userland, command: &GuestCommand) -> Invocat
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
         ),
         ("HOME".into(), "/root".into()),
+        // The guest's own /tmp, for the same reason the guest gets a guest
+        // PATH: the inherited value is a *host* path. Android's runtime sets
+        // TMPDIR to the app's cache directory after fork — invisible in
+        // `/proc/<pid>/environ`, which only shows the initial environment —
+        // and that directory does not exist inside the fake root. A shell
+        // told to park a stream under it fails the redirection and reports
+        // exit 2 with nothing said, which is how a failing `git fetch` came
+        // back with empty output instead of git's own "fatal:" line.
+        ("TMPDIR".into(), "/tmp".into()),
         ("LANG".into(), "C.UTF-8".into()),
         // Machine-readable output is not localised, but *errors* are, and we
         // log them.
@@ -493,6 +502,17 @@ pub(crate) fn capture_outcome(
             String::from_utf8_lossy(&err).trim()
         );
         return Captured::Failed;
+    }
+    // A successful exit can still have complaints on stderr — a shell whose
+    // redirection failed says why *here*, then carries on and exits zero.
+    // Dropping them silently is how a wrapper failure once read as "git
+    // exited with 2" with nothing else to show, so at least the log keeps
+    // the sentence.
+    if !err.is_empty() {
+        log::debug!(
+            "{label} stderr (exit 0): {}",
+            String::from_utf8_lossy(&err).trim()
+        );
     }
     Captured::Output(out)
 }
@@ -992,6 +1012,10 @@ mod tests {
                     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
                 ),
                 ("HOME".to_owned(), "/root".to_owned()),
+                // The guest's /tmp, never the host's: Android sets TMPDIR to
+                // the app cache directory at runtime, which does not exist
+                // inside the fake root — see `invocation`.
+                ("TMPDIR".to_owned(), "/tmp".to_owned()),
                 ("LANG".to_owned(), "C.UTF-8".to_owned()),
                 ("LC_ALL".to_owned(), "C".to_owned()),
             ])
