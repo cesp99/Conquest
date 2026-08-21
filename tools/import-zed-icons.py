@@ -280,9 +280,11 @@ UI_ICONS = (
     "eye_off.svg",
     "file_tree.svg",
     "git_branch.svg",
+    "git_graph.svg",
     "load_circle.svg",
     "magnifying_glass.svg",
     "terminal.svg",
+    "undo.svg",
 )
 
 

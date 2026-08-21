@@ -76,6 +76,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.DpOffset
@@ -220,6 +221,12 @@ fun GitPanel(
      * every save while the panel is open.
      */
     var head by remember(project) { mutableStateOf<String?>(null) }
+    /**
+     * The commit HEAD names, whole — the footer's one line of history, Zed's
+     * `most_recent_commit` (repository.rs:512-518). Reloaded when [head]
+     * moves, which is exactly when the answer changes.
+     */
+    var lastCommit by remember(project) { mutableStateOf<Commit?>(null) }
     // Seeded from, and written back to, the draft the panel was closed with:
     // Escape and — on a phone — opening a file both take the panel out of the
     // composition, and a commit message is the one thing here nobody wants to
@@ -234,6 +241,12 @@ fun GitPanel(
     var busy by remember(project) { mutableStateOf(false) }
     var error by remember(project) { mutableStateOf<String?>(null) }
     var confirming by remember(project) { mutableStateOf<GitChange?>(null) }
+    /**
+     * An uncommit stopped at the door because some remote already holds the
+     * commit — Zed's "Are you sure?" prompt (git_panel.rs:3209-3230). Carries
+     * what the dialog needs to finish the job; see [PendingUncommit].
+     */
+    var pendingUncommit by remember(project) { mutableStateOf<PendingUncommit?>(null) }
     /**
      * The identity form, shown when git refuses to commit without one. Not a
      * setting and not a dialog: it is the answer to the error immediately
@@ -317,6 +330,18 @@ fun GitPanel(
     LaunchedEffect(session, tab, state.branch, head ?: state) {
         if (tab != GitPanelTab.History) return@LaunchedEffect
         history = withContext(Dispatchers.IO) { session.log() }
+    }
+
+    // The footer's subject line, from the same log API at limit 1. Keyed by
+    // HEAD because that is the only thing that changes the answer; no HEAD —
+    // an unborn branch, no userland — is no commit, and no footer row.
+    LaunchedEffect(session, head) {
+        val sha = head
+        lastCommit = if (sha == null) {
+            null
+        } else {
+            withContext(Dispatchers.IO) { session.log(limit = 1).commits.firstOrNull() }
+        }
     }
 
     val rows = remember(state) { gitPanelRows(state) }
@@ -700,6 +725,73 @@ fun GitPanel(
     }
 
     /**
+     * The reset itself, past every question — `git reset --soft HEAD^` — and
+     * then the commit box refilled with the message the commit held, which is
+     * Zed's own order: [prior] was read *before* the reset, while HEAD still
+     * named the commit (git_panel.rs:3157-3183).
+     */
+    fun runUncommit(prior: String?) {
+        perform({ session.uncommit() }) {
+            val text = prior?.trimEnd('\n').orEmpty()
+            if (text.isNotEmpty()) {
+                message = TextFieldValue(text, TextRange(text.length))
+                CommitDrafts.put(project.id, text)
+            }
+        }
+    }
+
+    /**
+     * Zed's `GitPanel::uncommit` (git_panel.rs:3150-3192): the old message and
+     * the pushed evidence are read first, and only a commit some
+     * `remote/branch` already holds gets a confirmation — nothing pushed
+     * proceeds silently, exactly as there (git_panel.rs:3205-3230).
+     */
+    fun uncommit() {
+        // [perform] would refuse too, but only after the reads below; saying
+        // it now keeps the button honest about why nothing happened.
+        if (busy) {
+            error = "Still running the last git command…"
+            return
+        }
+        // Zed asks for "HEAD" by name; the engine's revision check is hex-only
+        // (git_history.rs:166-173), so HEAD goes by the sha the status cache
+        // already holds. Null — lost between polls — just skips the prefill.
+        val sha = head
+        scope.launch {
+            val (prior, pushed) = withContext(Dispatchers.IO) {
+                sha?.let { session.commitDetails(it) }?.message to session.headPushedRemotes()
+            }
+            if (pushed.isEmpty()) {
+                runUncommit(prior)
+            } else {
+                pendingUncommit = PendingUncommit(pushed, prior)
+            }
+        }
+    }
+
+    /**
+     * The empty state's "Initialize Repository" — `git init`, with Zed's
+     * branch-name rule inside ([GitSession.initRepository]). No follow-up
+     * needed here: the engine invalidates its cache, and the poll redraws
+     * this as an ordinary clean repository.
+     */
+    fun initRepository() {
+        perform({ session.initRepository() })
+    }
+
+    /**
+     * What Zed's footer opens is the commit view (`CommitView::open`,
+     * git_panel.rs:6183-6197); this panel's view of one commit is the History
+     * tab's expanded row, so the subject line goes there, opened on its sha.
+     */
+    fun showCommit(sha: String) {
+        tab = GitPanelTab.History
+        scope.launch {
+            openCommit = withContext(Dispatchers.IO) { session.commitDetails(sha) }
+        }
+    }
+
+    /**
      * Discard, from every route to it — the menu, the row, and Delete.
      *
      * A conflict never reaches the dialog. `git restore --source=HEAD` on an
@@ -869,7 +961,12 @@ fun GitPanel(
             } else
             Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
                 if (rows.isEmpty()) {
-                    EmptyMessage(state)
+                    EmptyMessage(
+                        state = state,
+                        busy = busy,
+                        onViewBranchDiff = { onOpenDiff(null) },
+                        onInitRepository = ::initRepository,
+                    )
                 }
                 LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                     itemsIndexed(rows, key = { _, row -> row.key }) { index, row ->
@@ -987,9 +1084,11 @@ fun GitPanel(
                 onToggleSignoff = ::toggleSignoff,
                 onToggleSkipHooks = ::toggleSkipHooks,
             )
-            // While an amend is pending a banner says what the button will now
-            // do, with the way out beside it (git_panel.rs:6125-6150) — Zed
-            // hangs it under the commit footer too (git_panel.rs:8356-8361).
+            // The panel's very last row is Zed's own bottom slot
+            // (git_panel.rs:8356-8361): while an amend is pending, a banner
+            // saying what the button will now do with the way out beside it
+            // (git_panel.rs:6125-6150); otherwise the previous-commit row —
+            // the last subject, Uncommit and the graph (git_panel.rs:6152-6255).
             if (amendPending) {
                 HorizontalDivider(color = theme.color("border.variant"))
                 Row(
@@ -1015,6 +1114,20 @@ fun GitPanel(
                         label = "Cancel",
                         enabled = !busy,
                         onClick = { setAmendPending(false) },
+                    )
+                }
+            } else {
+                val footerCommit = lastCommit
+                // The row exists only when there is a repository, a branch and
+                // a commit to describe (git_panel.rs:6157-6159).
+                if (state.hasRepo && state.branch != null && footerCommit != null) {
+                    RepoFooter(
+                        commit = footerCommit,
+                        hasUnstaged = state.unstaged.isNotEmpty(),
+                        enabled = !busy,
+                        onOpenCommit = { showCommit(footerCommit.sha) },
+                        onUncommit = ::uncommit,
+                        onOpenGraph = onOpenGraph,
                     )
                 }
             }
@@ -1047,6 +1160,25 @@ fun GitPanel(
             onDismissRequest = { warning = null },
             text = { Text(text) },
             confirmButton = { TextButton(onClick = { warning = null }) { Text("OK") } },
+        )
+    }
+
+    // A commit that was already pushed does not uncommit silently — Zed's
+    // prompt, title, detail and both options (git_panel.rs:3209-3230).
+    pendingUncommit?.let { request ->
+        AlertDialog(
+            onDismissRequest = { pendingUncommit = null },
+            title = { Text("Are you sure?") },
+            text = { Text(uncommitPushedDetail(request.remotes)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingUncommit = null
+                    runUncommit(request.priorMessage)
+                }) { Text("Uncommit") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingUncommit = null }) { Text("Cancel") }
+            },
         )
     }
 }
@@ -1146,30 +1278,287 @@ private fun branchLabel(state: GitPanelState, head: String?): String {
     }
 }
 
+/**
+ * The panel's very last row — Zed's `render_previous_commit`
+ * (git_panel.rs:6152-6255): the last commit's subject on the left, one
+ * truncated `LabelSize::Small` line that opens the commit, and on the right
+ * the Uncommit and Git Graph icon buttons in a `gap_0p5` cluster. The row is
+ * `p_1p5` with a `gap_1p5` under a 1px top border in `border` at 0.8
+ * (git_panel.rs:6164-6169). Uncommit exists only when the commit has a
+ * parent — a root commit has nothing to reset back to (git_panel.rs:6215).
+ */
 @Composable
-private fun EmptyMessage(state: GitPanelState) {
+private fun RepoFooter(
+    commit: Commit,
+    /** What words the Uncommit button's meta — see [uncommitMeta]. */
+    hasUnstaged: Boolean,
+    enabled: Boolean,
+    onOpenCommit: () -> Unit,
+    onUncommit: () -> Unit,
+    onOpenGraph: () -> Unit,
+) {
     val theme = LocalZedTheme.current
-    val text = when {
-        !state.hasRepo -> "This project is not in a git repository"
-        !state.scanned -> "Asking git…"
-        // An empty list is what "clean" looks like *and* what "git never ran"
-        // looks like. Claiming the first when it is the second told a user
-        // with no git in their Debian that their tree was clean.
-        !state.ran -> "Could not run git here — ${Userland.backend.displayName} needs git " +
-            "installed before the panel can show anything"
-        // Zed's words for a clean tree (git_panel.rs:6940). The other cases
-        // are ours: Zed never has to explain a missing userland.
-        else -> "No changes to commit"
+    HorizontalDivider(color = theme.color("border").copy(alpha = 0.8f))
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        val interaction = remember { MutableInteractionSource() }
+        val hovered by interaction.collectIsHoveredAsState()
+        // `justify_between`: the subject keeps the left and gives way, the
+        // buttons keep the right whole.
+        Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+            Text(
+                text = commit.subject.ifBlank { "(no message)" },
+                style = MaterialTheme.typography.labelMedium,
+                color = theme.color("text"),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    // `px_1 rounded_sm`, `element_hover` under the pointer,
+                    // and the pointer a hand (git_panel.rs:6171-6177).
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(
+                        if (hovered) theme.color("element.hover") else Color.Transparent
+                    )
+                    .pointerHoverIcon(PointerIcon.Hand)
+                    .clickable(
+                        interactionSource = interaction,
+                        indication = null,
+                        onClickLabel = "Show this commit",
+                        onClick = onOpenCommit,
+                    )
+                    .padding(horizontal = 4.dp),
+            )
+        }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            // `gap_0p5` (git_panel.rs:6213).
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            if (commit.parents.isNotEmpty()) {
+                FooterIconButton(
+                    icon = R.drawable.ic_ui_undo,
+                    // Zed's tooltip title and its meta line, worn as the
+                    // accessibility label (git_panel.rs:6222-6231).
+                    label = "Uncommit — ${uncommitMeta(hasUnstaged)}",
+                    enabled = enabled,
+                    onClick = onUncommit,
+                )
+            }
+            FooterIconButton(
+                icon = R.drawable.ic_ui_git_graph,
+                // Zed's tooltip (git_panel.rs:6242-6248).
+                label = "Open Git Graph",
+                enabled = true,
+                onClick = onOpenGraph,
+            )
+        }
     }
-    // Zed centres a muted default-size label in the empty panel
-    // (git_panel.rs:6926-6940).
+}
+
+/**
+ * Zed's `IconButton` in its Subtle clothes — a 22px `rounded_sm` square,
+ * transparent at rest, `ghost_element.hover`/`.active` under the pointer
+ * (button_like.rs:245-330), the glyph at `IconSize::Small` = 14px in the
+ * label's muted colour. The tap target is the taller invisible wrapper, as
+ * every small control here (density decision, DECISIONS.md).
+ */
+@Composable
+private fun FooterIconButton(
+    icon: Int,
+    label: String,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val pressed by interaction.collectIsPressedAsState()
+    Box(
+        modifier = Modifier
+            .size(30.dp)
+            .then(
+                if (enabled) {
+                    Modifier
+                        .pointerHoverIcon(PointerIcon.Hand)
+                        .clickable(
+                            interactionSource = interaction,
+                            indication = null,
+                            onClickLabel = label,
+                            onClick = onClick,
+                        )
+                } else {
+                    Modifier
+                }
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(22.dp)
+                .clip(RoundedCornerShape(4.dp))
+                .background(
+                    when {
+                        !enabled -> Color.Transparent
+                        pressed -> theme.color("ghost_element.active", Color.Transparent)
+                        hovered -> theme.color("ghost_element.hover", Color.Transparent)
+                        else -> Color.Transparent
+                    }
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Image(
+                painter = painterResource(icon),
+                contentDescription = label,
+                colorFilter = ColorFilter.tint(
+                    theme.color(if (enabled) "text.muted" else "text.disabled")
+                ),
+                modifier = Modifier.size(14.dp),
+            )
+        }
+    }
+}
+
+/**
+ * What the empty change-list region says — Zed's `render_empty_state`
+ * dispatch (git_panel.rs:6920-6931): a centred column, the label a muted
+ * default-size line, its way out an Outlined button a `gap_1` under it. Two
+ * of the states are ours alone — a scan still out, a userland with no git —
+ * because Zed never has to explain either; the other two are Zed's, words,
+ * buttons and all.
+ */
+@Composable
+private fun EmptyMessage(
+    state: GitPanelState,
+    busy: Boolean,
+    onViewBranchDiff: () -> Unit,
+    onInitRepository: () -> Unit,
+) {
+    val theme = LocalZedTheme.current
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Text(
-            text = text,
-            style = MaterialTheme.typography.bodyMedium,
-            color = theme.color("text.muted"),
+        Column(
             modifier = Modifier.padding(24.dp),
-        )
+            horizontalAlignment = Alignment.CenterHorizontally,
+            // `gap_1` between the label and its button (git_panel.rs:6937, 7009).
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            when {
+                // Asked before told: an empty list is not yet a clean tree,
+                // and not yet a missing repository either — the init button
+                // must not flash while the first scan is still out.
+                !state.scanned -> EmptyLabel("Asking git…")
+                // An empty list is what "clean" looks like *and* what "git
+                // never ran" looks like. Claiming the first when it is the
+                // second told a user with no git in their Debian that their
+                // tree was clean.
+                !state.ran -> EmptyLabel(
+                    "Could not run git here — ${Userland.backend.displayName} needs git " +
+                        "installed before the panel can show anything"
+                )
+                !state.hasRepo -> {
+                    // Zed's uninitialized state, label and button both
+                    // (git_panel.rs:7008-7027); the button is `git init`, and
+                    // the poll redraws the panel as a clean repository after.
+                    EmptyLabel("No Git Repositories")
+                    OutlinedButton(
+                        label = "Initialize Repository",
+                        enabled = !busy,
+                        onClick = onInitRepository,
+                    )
+                }
+                else -> {
+                    // Zed's words for a clean tree (git_panel.rs:6940), and
+                    // its branch-diff way out on every branch that is not the
+                    // main one (git_panel.rs:6935-6951).
+                    EmptyLabel("No changes to commit")
+                    if (showsViewBranchDiff(state.branch?.name)) {
+                        OutlinedButton(
+                            label = "View Branch Diff",
+                            enabled = !busy,
+                            onClick = onViewBranchDiff,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** The empty state's sentence: muted, default size (git_panel.rs:6940, 7012). */
+@Composable
+private fun EmptyLabel(text: String) {
+    val theme = LocalZedTheme.current
+    Text(
+        text = text,
+        style = MaterialTheme.typography.bodyMedium,
+        color = theme.color("text.muted"),
+        textAlign = TextAlign.Center,
+    )
+}
+
+/**
+ * Zed's `ButtonStyle::Outlined` at `ButtonSize::Default`: a 22px `rounded_sm`
+ * pill ringed 1px in `border.variant`, filled `element.background` at rest;
+ * under the pointer the fill goes `ghost_element.hover` and the ring sharpens
+ * to `border`; pressed is `element.active` (button_like.rs:224-229, 280-285,
+ * 336-341, 469). The label is `LabelSize::Small` in plain `text` — and the
+ * tap target is the taller invisible wrapper, as every small control here
+ * (density decision, DECISIONS.md).
+ */
+@Composable
+private fun OutlinedButton(label: String, enabled: Boolean, onClick: () -> Unit) {
+    val theme = LocalZedTheme.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val pressed by interaction.collectIsPressedAsState()
+    Box(
+        modifier = Modifier
+            .heightIn(min = 30.dp)
+            .then(
+                if (enabled) {
+                    Modifier
+                        .pointerHoverIcon(PointerIcon.Hand)
+                        .clickable(
+                            interactionSource = interaction,
+                            indication = null,
+                            onClickLabel = label,
+                            onClick = onClick,
+                        )
+                } else {
+                    Modifier
+                }
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            modifier = Modifier
+                .height(22.dp)
+                .clip(RoundedCornerShape(4.dp))
+                .background(
+                    when {
+                        pressed && enabled -> theme.color("element.active")
+                        hovered && enabled -> theme.color("ghost_element.hover", Color.Transparent)
+                        else -> theme.color("element.background", Color.Transparent)
+                    }
+                )
+                .border(
+                    1.dp,
+                    if (hovered && enabled) theme.color("border") else theme.color("border.variant"),
+                    RoundedCornerShape(4.dp),
+                )
+                .padding(horizontal = 4.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = theme.color(if (enabled) "text" else "text.disabled"),
+            )
+        }
     }
 }
 
@@ -1910,6 +2299,40 @@ internal fun discardRefusal(change: GitChange): String? = when {
             "result — discarding it would keep one side of the merge and say nothing."
     else -> null
 }
+
+/**
+ * An uncommit stopped at the door because some remote already holds HEAD:
+ * the evidence the dialog names, and the old message — read before the
+ * reset, while HEAD still named the commit — that will refill the commit
+ * box when the reset lands.
+ */
+internal data class PendingUncommit(val remotes: List<String>, val priorMessage: String?)
+
+/**
+ * Whether the clean tree's way out is offered — Zed shows "View Branch Diff"
+ * on every branch that is not the main one: `!is_on_main_branch`, where main
+ * means the name is exactly `main` or `master` (git_panel.rs:6935,
+ * 7049-7059). No branch at all — a detached HEAD — is not the main branch
+ * either, there as here.
+ */
+internal fun showsViewBranchDiff(branchName: String?): Boolean =
+    branchName != "main" && branchName != "master"
+
+/**
+ * The Uncommit button's meta line — the command it stands for. Zed words it
+ * `--soft` only when something is unstaged (git_panel.rs:6218-6231), though
+ * the reset it runs is always soft (repository.rs:1492-1516); the wording is
+ * kept as-is because parity is the point.
+ */
+internal fun uncommitMeta(hasUnstaged: Boolean): String =
+    if (hasUnstaged) "git reset HEAD^ --soft" else "git reset HEAD^"
+
+/**
+ * The pushed-commit confirmation's sentence — Zed's own, the remotes
+ * comma-joined (git_panel.rs:3216-3228).
+ */
+internal fun uncommitPushedDetail(remotes: List<String>): String =
+    "This commit was already pushed to ${remotes.joinToString(", ")}."
 
 /** What the discard item says it will do to *this* row. */
 internal fun discardLabel(change: GitChange): String = when {
