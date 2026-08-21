@@ -1142,24 +1142,6 @@ fun GitPanel(
                 .fillMaxSize()
                 .background(theme.color("panel.background"))
         ) {
-            // The branch on the left, the remote split button on the right —
-            // Zed's `PanelRepoFooter` row (git_panel.rs:8711-8746), worn as
-            // this panel's header: the button at the top right, opposite the
-            // branch, which is where the phone keeps it on every tab.
-            RepoHeader(
-                state = state,
-                head = head,
-                busy = ops.busy,
-                pendingRemote = ops.pendingRemote,
-                onSwitchBranch = onSwitchBranch,
-                onFetch = { fetch(fetchAll = true) },
-                onFetchFrom = { fetch(fetchAll = false) },
-                onPull = { pull(rebase = false) },
-                onPullRebase = { pull(rebase = true) },
-                onPush = { push() },
-                onPushTo = { push(selectRemote = true) },
-                onForcePush = { push(force = true) },
-            )
             TabBar(
                 tab = tab,
                 changeCount = state.entries.size,
@@ -1185,8 +1167,8 @@ fun GitPanel(
                         .padding(start = 4.dp, end = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    // Ctrl+Enter commits from this tab too; the repo header
-                    // above carries the busy mark for every tab now.
+                    // Ctrl+Enter commits from this tab too; the repo row
+                    // below carries the busy mark for every tab now.
                     Spacer(modifier = Modifier.weight(1f))
                     GhostButton(label = "Graph", enabled = true, onClick = onOpenGraph)
                 }
@@ -1361,6 +1343,27 @@ fun GitPanel(
                 )
             }
 
+            // The branch on the left, the remote split button on the right —
+            // Zed's `PanelRepoFooter` row (git_panel.rs:8711-8746), hung where
+            // Zed hangs it: at the bottom, directly above the commit editor,
+            // and still standing on the History tab so every tab carries the
+            // branch and the busy mark.
+            HorizontalDivider(color = theme.color("border.variant"))
+            RepoHeader(
+                state = state,
+                head = head,
+                busy = ops.busy,
+                pendingRemote = ops.pendingRemote,
+                onSwitchBranch = onSwitchBranch,
+                onFetch = { fetch(fetchAll = true) },
+                onFetchFrom = { fetch(fetchAll = false) },
+                onPull = { pull(rebase = false) },
+                onPullRebase = { pull(rebase = true) },
+                onPush = { push() },
+                onPushTo = { push(selectRemote = true) },
+                onForcePush = { push(force = true) },
+            )
+
             if (tab == GitPanelTab.Changes) {
             // The commit editor's own `border_t_1` in `border`
             // (git_panel.rs:5991-5996).
@@ -1503,9 +1506,9 @@ fun GitPanel(
 /**
  * Zed's `PanelRepoFooter` — the git-branch icon and the branch on the left,
  * the remote split button on the right, an `px_2` / `py_1p5` row,
- * `justify_between` with a `gap_1` (git_panel.rs:8711-8746). Zed hangs it
- * above the commit editor; this panel wears it as its header. The branch name
- * is a `LabelSize::Small` button label there (git_panel.rs:8687-8692).
+ * `justify_between` with a `gap_1` (git_panel.rs:8711-8746). It hangs where
+ * Zed hangs it, directly above the commit editor. The branch name is a
+ * `LabelSize::Small` button label there (git_panel.rs:8687-8692).
  *
  * No branch to speak for — detached HEAD, nothing committed — and there is no
  * remote button at all (git_panel.rs:5851 via [remoteButtonSpec]).
