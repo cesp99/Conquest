@@ -64,6 +64,7 @@ editor.
 | `Ctrl` `Shift` `T` | Reopen the tab you closed last |
 | `Ctrl` `Shift` `E` | Reveal the open file in the project panel |
 | `Ctrl` `Shift` `G` | Show/hide the git panel |
+| `Ctrl` `Alt` `Shift` `B` | Switch git branch (the branch picker) |
 | `Ctrl` `Alt` `A` | Show/hide the agent panel |
 | `Ctrl` `,` | Open settings |
 | — | Edit settings.json as a tab (`zed: open settings file` in the palette, or the ☰ menu) |
@@ -136,6 +137,18 @@ type in the editor beside it and the diff catches up.
 accurate one. There is no credential helper inside the userland, so an HTTPS
 remote will fail with git's own words about authentication — SSH with a key in
 the userland's `~/.ssh` is the way that works today.
+
+## The branch picker
+
+The branch name — in the git panel's header, or in the title bar — opens the
+**branch picker**, Zed's own: every local and remote branch with its last
+commit, filtered as you type, `Enter` checks out. A remote branch checks out
+by growing a local tracking branch named after it, exactly as Zed does. A name
+no branch has becomes a **Create Branch** entry — `Enter` branches off HEAD,
+`Ctrl` `Enter` off the repository's default branch. `Ctrl` `Shift`
+`Backspace` deletes the selected branch (`Alt` on top force-deletes; a branch
+that is not fully merged asks first), `Ctrl` `Shift` `I` cycles the
+all/local/remote filter and `Ctrl` `K` opens it as a menu.
 
 ## The commit graph
 

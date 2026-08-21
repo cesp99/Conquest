@@ -201,6 +201,13 @@ enum class WorkspaceCommand(
     OpenGitGraph("git::OpenGraph", isAvailable = { it.hasProject }),
 
     /**
+     * The branch picker — Zed's `git::Switch`, which the git panel's branch
+     * button and the title bar's branch chip both dispatch, on the chord Zed
+     * gives its `branches::OpenRecent` alias (default-linux.json:644).
+     */
+    SwitchBranch("git::Switch", isAvailable = { it.hasProject }),
+
+    /**
      * Show or hide the git panel — Zed's `git_panel::ToggleFocus`, on the
      * chord Zed gives it (default-linux.json:700).
      */
@@ -453,6 +460,15 @@ private val BINDINGS: List<Binding> = listOf(
         WorkspaceCommand.ToggleGitPanel,
         Chord(AndroidKeyEvent.KEYCODE_G, "G", shift = true),
         Everywhere,
+    ),
+    // Zed's `alt-ctrl-shift-b` for the branch picker (default-linux.json:644,
+    // via the `branches::OpenRecent` alias of `git::Branch`). All three
+    // modifiers, so it cannot collide with `ctrl-b`'s dock family above.
+    // `InWorkspace`, like every other Alt chord.
+    Binding(
+        WorkspaceCommand.SwitchBranch,
+        Chord(AndroidKeyEvent.KEYCODE_B, "B", shift = true, alt = true),
+        InWorkspace,
     ),
     // `ctrl-alt-a`, which is what Zed binds `agent::ToggleFocus` to besides
     // `ctrl-?` — the question mark needs a shift on every layout a phone

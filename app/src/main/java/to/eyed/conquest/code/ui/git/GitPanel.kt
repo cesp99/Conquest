@@ -206,6 +206,8 @@ fun GitPanel(
     onOpenDiff: (String?) -> Unit,
     /** Open the commit graph, which is a view of the whole repository. */
     onOpenGraph: () -> Unit,
+    /** Open the branch picker — what the header's branch button dispatches. */
+    onSwitchBranch: () -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -896,6 +898,7 @@ fun GitPanel(
                 head = head,
                 busy = busy,
                 pendingRemote = pendingRemote,
+                onSwitchBranch = onSwitchBranch,
                 onFetch = { fetch(fetchAll = true) },
                 onFetchFrom = { fetch(fetchAll = false) },
                 onPull = { pull(rebase = false) },
@@ -1199,6 +1202,7 @@ private fun RepoHeader(
     head: String?,
     busy: Boolean,
     pendingRemote: Boolean,
+    onSwitchBranch: () -> Unit,
     onFetch: () -> Unit,
     onFetchFrom: () -> Unit,
     onPull: () -> Unit,
@@ -1224,14 +1228,51 @@ private fun RepoHeader(
             colorFilter = ColorFilter.tint(theme.color("text.disabled")),
             modifier = Modifier.size(14.dp),
         )
-        Text(
-            text = branchLabel(state, head),
-            style = MaterialTheme.typography.labelMedium,
-            color = theme.color("text"),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
+        // The name is Zed's "branch-selector" button — `ButtonSize::None`,
+        // `LabelSize::Small`, truncating — whose click dispatches
+        // `git::Switch`, the branch picker (git_panel.rs:8687-8709). A ghost
+        // hug around the text, not the whole row: the gap keeps belonging to
+        // the header. Without a repository there is nothing to switch, so the
+        // label stays a label.
+        Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+            val branchInteraction = remember { MutableInteractionSource() }
+            val branchHovered by branchInteraction.collectIsHoveredAsState()
+            val branchPressed by branchInteraction.collectIsPressedAsState()
+            Text(
+                text = branchLabel(state, head),
+                style = MaterialTheme.typography.labelMedium,
+                color = theme.color("text"),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(
+                        when {
+                            !state.hasRepo -> Color.Transparent
+                            branchPressed -> theme.color("ghost_element.active")
+                            branchHovered -> theme.color("ghost_element.hover")
+                            else -> Color.Transparent
+                        }
+                    )
+                    .then(
+                        if (state.hasRepo) {
+                            Modifier
+                                .pointerHoverIcon(PointerIcon.Hand)
+                                .clickable(
+                                    interactionSource = branchInteraction,
+                                    indication = null,
+                                    // Zed's tooltip title for the trigger
+                                    // (git_panel.rs:8705-8707).
+                                    onClickLabel = "Switch Branch",
+                                    onClick = onSwitchBranch,
+                                )
+                        } else {
+                            Modifier
+                        }
+                    )
+                    .padding(horizontal = 4.dp),
+            )
+        }
         // The non-remote commands — stages, commits — have no spinner of
         // their own, so their busy mark stays; a running remote command is
         // the split button's own disabled-and-turning state (git_ui.rs:1110-1123).

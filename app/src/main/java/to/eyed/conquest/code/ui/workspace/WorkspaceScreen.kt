@@ -84,6 +84,7 @@ import to.eyed.conquest.code.ui.editor.SoftWrapMode
 import to.eyed.conquest.code.ui.editor.LspServer
 import to.eyed.conquest.code.ui.editor.rememberLspState
 import to.eyed.conquest.code.ui.media.MediaKind
+import to.eyed.conquest.code.ui.git.BranchPicker
 import to.eyed.conquest.code.ui.git.DiffPane
 import to.eyed.conquest.code.ui.git.DiffTarget
 import to.eyed.conquest.code.ui.git.GitGraphPane
@@ -217,6 +218,8 @@ private class WorkspaceOverlays {
     /** Ctrl+G. A surface rather than a command: it answers for itself. */
     var goToLineOpen by mutableStateOf(false)
     var outlineOpen by mutableStateOf(false)
+    /** The branch picker — Zed's `git::Switch`, from the panel's branch button. */
+    var branchPickerOpen by mutableStateOf(false)
 }
 
 /**
@@ -799,6 +802,10 @@ fun WorkspaceScreen(
                 if (project == null) return false
                 openGraph()
             }
+            WorkspaceCommand.SwitchBranch -> {
+                if (project == null) return false
+                overlays.branchPickerOpen = true
+            }
             WorkspaceCommand.ToggleAgentPanel -> {
                 if (!isAgentPanelSupported) return false
                 if (togglePanel(WorkspacePanel.Agent)) agentPanelFocus++
@@ -1106,8 +1113,10 @@ fun WorkspaceScreen(
                 isDirty = active?.isDirty == true,
                 menuGroups = menuGroups,
                 branch = rememberGitBranch(project),
+                // Zed's title-bar branch button opens the branch picker, not
+                // the panel (title_bar.rs:1050-1058).
                 onBranch = if (project != null) {
-                    { runCommand(WorkspaceCommand.ToggleGitPanel) }
+                    { runCommand(WorkspaceCommand.SwitchBranch) }
                 } else {
                     null
                 },
@@ -1163,6 +1172,7 @@ fun WorkspaceScreen(
                         onOpenSettings = { runCommand(WorkspaceCommand.OpenSettings) },
                         onOpenDiff = ::openDiff,
                         onOpenGraph = ::openGraph,
+                        onSwitchBranch = { runCommand(WorkspaceCommand.SwitchBranch) },
                         onEntryRemoved = ::closeTabsUnder,
                         onEntryMoved = ::retitleTabs,
                         onPanelFocusChanged = { projectPanelFocused = it },
@@ -1278,6 +1288,9 @@ fun WorkspaceScreen(
                                         },
                                         onOpenDiff = ::openDiff,
                                         onOpenGraph = ::openGraph,
+                                        onSwitchBranch = {
+                                            runCommand(WorkspaceCommand.SwitchBranch)
+                                        },
                                         onEntryRemoved = ::closeTabsUnder,
                                         onEntryMoved = ::retitleTabs,
                         onPanelFocusChanged = { projectPanelFocused = it },
@@ -1510,6 +1523,16 @@ fun WorkspaceScreen(
                 openFile(openedProject, match.path)
             },
             onDismiss = { overlays.finderOpen = false },
+        )
+    }
+
+    if (overlays.branchPickerOpen && openedProject != null) {
+        BranchPicker(
+            project = openedProject,
+            onDismiss = {
+                overlays.branchPickerOpen = false
+                rootFocus.requestFocus()
+            },
         )
     }
 
@@ -1966,6 +1989,8 @@ private fun DockPanel(
     onOpenPath: (String) -> Unit,
     onOpenDiff: (String?) -> Unit,
     onOpenGraph: () -> Unit,
+    /** The git panel's branch button opening the branch picker. */
+    onSwitchBranch: () -> Unit,
     onEntryRemoved: (String) -> Unit,
     onEntryMoved: (String, String) -> Unit,
     /** The project panel reporting whether it holds the keyboard. */
@@ -2004,6 +2029,7 @@ private fun DockPanel(
             onOpenFile = onOpenPath,
             onOpenDiff = onOpenDiff,
             onOpenGraph = onOpenGraph,
+            onSwitchBranch = onSwitchBranch,
             onDismiss = onDismiss,
         )
         WorkspacePanel.Agent -> AgentPanel(
