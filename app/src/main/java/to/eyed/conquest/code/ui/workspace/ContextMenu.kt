@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -81,6 +82,13 @@ internal data class ContextMenuItem(
      * phone there is no beside, so it is a second line under the label.
      */
     val aside: String? = null,
+    /**
+     * Zed's `.separator()` — a 1px rule above this entry, dividing the menu
+     * into its groups (the remote menu draws one between Pull (Rebase) and
+     * Push, git_ui.rs:1050). On the entry rather than in the list so [items]
+     * stays a plain list of rows.
+     */
+    val separatorAbove: Boolean = false,
     val onClick: () -> Unit,
 )
 
@@ -121,6 +129,14 @@ internal fun ContextMenu(
                 .padding(horizontal = rem(MenuMetrics.INSET)),
         ) {
             for (item in items) {
+                if (item.separatorAbove) {
+                    // Zed's separator: a 1px `border.variant` rule with 4px of
+                    // surface above and below (context_menu.rs's Divider row).
+                    HorizontalDivider(
+                        color = theme.color("border.variant"),
+                        modifier = Modifier.padding(vertical = rem(MenuMetrics.INSET)),
+                    )
+                }
                 ContextMenuRow(item, onChosen = onDismiss)
             }
         }

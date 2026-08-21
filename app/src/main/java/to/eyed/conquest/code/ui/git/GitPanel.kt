@@ -91,6 +91,7 @@ import to.eyed.conquest.code.core.GitFileStatus
 import to.eyed.conquest.code.core.GitPanelState
 import to.eyed.conquest.code.core.GitSession
 import to.eyed.conquest.code.core.ProjectSession
+import to.eyed.conquest.code.core.RemoteOpResult
 import to.eyed.conquest.code.core.ResumedEffect
 import to.eyed.conquest.code.core.pollVersion
 import to.eyed.conquest.code.terminal.Userland
@@ -141,6 +142,12 @@ private val FieldRadius = 6.dp
 
 /** The engine debounces git by 400 ms; polling faster only costs JNI calls. */
 private const val POLL_MS = 250L
+
+/**
+ * The Fetch From picker's extra row when there is more than one remote —
+ * `FetchOptions::All.name()` (repository.rs:664-669; git_panel.rs:3653-3655).
+ */
+private const val FetchAllRemotes = "Fetch all remotes"
 
 /** How far PageUp and PageDown move the selection. */
 private const val PAGE_ROWS = 10
@@ -254,6 +261,21 @@ fun GitPanel(
      * 3109-3112) — not toasts, so ours are a dialog and not the error strip.
      */
     var warning by remember(project) { mutableStateOf<String?>(null) }
+    /**
+     * What the last remote command said when it *worked* — Zed's success
+     * `StatusToast` (git_panel.rs:5278-5334), worded by [formatRemoteOutput].
+     * Shown in the strip the errors use, and cleared the moment any next
+     * command starts, as a toast would have timed out.
+     */
+    var remoteNotice by remember(project) { mutableStateOf<String?>(null) }
+    /**
+     * The remote command in flight — Zed's `pending_remote_operation`
+     * (git_panel.rs:442-447). What turns the split button's spinner; [busy]
+     * alone cannot, because it is also every stage and commit.
+     */
+    var pendingRemote by remember(project) { mutableStateOf(false) }
+    /** A "which remote?" question waiting on the user — see [RemotePickerRequest]. */
+    var remotePicker by remember(project) { mutableStateOf<RemotePickerRequest?>(null) }
 
     val listState = rememberLazyListState()
     // History's own scroll survives a round trip through the Changes tab.
@@ -324,6 +346,7 @@ fun GitPanel(
         }
         busy = true
         error = null
+        remoteNotice = null
         scope.launch {
             val failure = withContext(Dispatchers.IO) { action() }
             error = failure
@@ -498,36 +521,174 @@ fun GitPanel(
     }
 
     /**
-     * Push, or publish a branch that has no upstream yet.
-     *
-     * Zed's own button says "Publish" for the second case and shows the push
-     * for the first; the difference is `-u`, and it is the difference between
-     * "send these commits" and "make this branch exist on the remote".
+     * A remote command through [perform]: one at a time, the split button's
+     * spinner while it runs, and the outcome *said* — Zed's toast sentence on
+     * success ([formatRemoteOutput]), git's own refusal in the error strip on
+     * failure, where Zed shows a "git {fetch|pull|push} failed" toast with a
+     * log view (notifications.rs:36-73).
      *
      * There is no credential helper inside the guest, so an HTTPS remote will
      * ask for a password nobody can type and git will fail — with its own
      * words, which is what the strip below shows. SSH with a key in the
      * userland's `~/.ssh` works.
      */
-    fun push() {
+    fun runRemote(action: RemoteAction, command: () -> RemoteOpResult) {
+        var toast: RemoteToast? = null
+        perform(
+            action = {
+                // Set here, past [perform]'s busy guard, so a refused second
+                // command never claims the spinner.
+                pendingRemote = true
+                val result = command()
+                if (result.ok) toast = formatRemoteOutput(action, result)
+                result.error
+            },
+            onFailure = { pendingRemote = false },
+            onSuccess = {
+                pendingRemote = false
+                remoteNotice = toast?.message
+            },
+        )
+    }
+
+    /**
+     * Zed's `get_remote` (git_panel.rs:4130-4175): the branch's configured
+     * remote for that direction first — skipped when [alwaysSelect], which is
+     * what makes Push To always ask — then the whole `git remote -v` list,
+     * where none at all is [onNone]'s problem, exactly one picks itself with
+     * no modal, and several go to the picker (picker_prompt.rs:27-31).
+     */
+    fun resolveRemote(
+        branch: String,
+        forPush: Boolean,
+        alwaysSelect: Boolean,
+        onNone: () -> Unit,
+        onRemote: (String) -> Unit,
+    ) {
+        scope.launch {
+            val configured = if (alwaysSelect) {
+                null
+            } else {
+                withContext(Dispatchers.IO) { session.branchRemote(branch, forPush) }
+            }
+            if (configured != null) {
+                onRemote(configured)
+                return@launch
+            }
+            val listing = withContext(Dispatchers.IO) { session.remotes() }
+            if (listing.error != null) {
+                error = listing.error
+                return@launch
+            }
+            val names = listing.remotes.map { it.name }
+            when {
+                names.isEmpty() -> onNone()
+                names.size == 1 -> onRemote(names.first())
+                else -> remotePicker = RemotePickerRequest(
+                    // Zed's prompt — pulls included: the same helper serves
+                    // both directions (git_panel.rs:4160-4166).
+                    prompt = "Pick which remote to push to",
+                    options = names,
+                    onPick = onRemote,
+                )
+            }
+        }
+    }
+
+    /**
+     * Zed's `git::Fetch` and `git::FetchFrom` (git_panel.rs:3637-3732):
+     * [fetchAll] is the plain Fetch — `git fetch --all` — while Fetch From
+     * lists the remotes, appends a "Fetch all remotes" row when there are
+     * several (git_panel.rs:3653-3655), and fetches the one picked. No
+     * remotes at all is silently nothing, as in Zed (git_panel.rs:3705-3707).
+     */
+    fun fetch(fetchAll: Boolean) {
+        if (fetchAll) {
+            runRemote(RemoteAction.Fetch(null)) { session.fetch(null) }
+            return
+        }
+        scope.launch {
+            val listing = withContext(Dispatchers.IO) { session.remotes() }
+            if (listing.error != null) {
+                error = listing.error
+                return@launch
+            }
+            val names = listing.remotes.map { it.name }
+            when {
+                names.isEmpty() -> {}
+                names.size == 1 -> runRemote(RemoteAction.Fetch(names.first())) {
+                    session.fetch(names.first())
+                }
+                else -> remotePicker = RemotePickerRequest(
+                    // Zed's prompt (git_panel.rs:3660); the extra row's label
+                    // is `FetchOptions::All.name()` (repository.rs:664-669).
+                    prompt = "Pick which remote to fetch",
+                    options = names + FetchAllRemotes,
+                    onPick = { choice ->
+                        val remote = choice.takeUnless { it == FetchAllRemotes }
+                        runRemote(RemoteAction.Fetch(remote)) { session.fetch(remote) }
+                    },
+                )
+            }
+        }
+    }
+
+    /**
+     * Zed's `git::Pull` / `git::PullRebase` (git_panel.rs:3830-3892). The
+     * branch name joins the argv only when the branch has no upstream, and
+     * the engine is what knows that.
+     */
+    fun pull(rebase: Boolean) {
+        // No branch, no pull — the handler's own early-return (git_panel.rs:3837).
+        val branch = state.branch?.name ?: return
+        resolveRemote(
+            branch = branch,
+            forPush = false,
+            alwaysSelect = false,
+            // Pull with no remotes is silently nothing (git_panel.rs:3850-3854).
+            onNone = {},
+        ) { remote ->
+            runRemote(RemoteAction.Pull(remote)) { session.pull(branch, remote, rebase) }
+        }
+    }
+
+    /**
+     * Push, or publish a branch that has no upstream yet — and Force Push and
+     * Push To, which are the same command with a flag or a question in front
+     * (git_panel.rs:3894-3986).
+     *
+     * Zed's own button says "Publish" for the no-upstream case and shows the
+     * push for the first; the difference is `-u`, and it is the difference
+     * between "send these commits" and "make this branch exist on the remote".
+     * [force] is `--force-with-lease`, never plain `--force`, and the lease is
+     * the only safety Zed puts in front of it.
+     */
+    fun push(force: Boolean = false, selectRemote: Boolean = false) {
         val branch = state.branch ?: return
-        perform({
-            // Zed's get_remote: the branch's configured push remote first,
-            // then the remote list — where a single remote picks itself
-            // (picker_prompt.rs:27-31; the several-remotes picker is the
-            // split button's, not this plain button's).
-            val remote = session.branchRemote(branch.name.orEmpty(), forPush = true)
-                ?: session.remotes().remotes.firstOrNull()?.name
+        // The handler's early-return on a detached HEAD (git_panel.rs:3908).
+        val name = branch.name ?: return
+        resolveRemote(
+            branch = name,
+            forPush = true,
+            alwaysSelect = selectRemote,
+            onNone = {
                 // Zed git_panel.rs:3941
-                ?: return@perform "No remote available to push to. Add a remote to be able to publish changes."
-            session.push(
-                branch.name.orEmpty(),
-                remote,
-                // Publish and Republish both: no upstream, or an upstream
-                // whose remote branch is gone (git_panel.rs:3920-3929).
-                setUpstream = !branch.hasUpstream || branch.upstreamGone,
-            ).error
-        })
+                error = "No remote available to push to. Add a remote to be able to publish changes."
+            },
+        ) { remote ->
+            runRemote(RemoteAction.Push(name, remote)) {
+                session.push(
+                    name,
+                    remote,
+                    // Publish and Republish both: no upstream, or an upstream
+                    // whose remote branch is gone (git_panel.rs:3920-3929).
+                    // Force wins over it in the argv, exactly as in Zed's
+                    // options (repository.rs:2717-2727).
+                    setUpstream = !branch.hasUpstream || branch.upstreamGone,
+                    force = force,
+                )
+            }
+        }
     }
 
     /** Save the identity, then commit — which is what the user asked for. */
@@ -634,9 +795,23 @@ fun GitPanel(
                 .fillMaxSize()
                 .background(theme.color("panel.background"))
         ) {
-            // Zed's panel opens straight onto its tab strip: no header bar, no
-            // title, no close button — the branch lives at the bottom, in the
-            // repo footer above the commit editor (git_panel.rs:8245-8365).
+            // The branch on the left, the remote split button on the right —
+            // Zed's `PanelRepoFooter` row (git_panel.rs:8711-8746), worn as
+            // this panel's header: the button at the top right, opposite the
+            // branch, which is where the phone keeps it on every tab.
+            RepoHeader(
+                state = state,
+                head = head,
+                busy = busy,
+                pendingRemote = pendingRemote,
+                onFetch = { fetch(fetchAll = true) },
+                onFetchFrom = { fetch(fetchAll = false) },
+                onPull = { pull(rebase = false) },
+                onPullRebase = { pull(rebase = true) },
+                onPush = { push() },
+                onPushTo = { push(selectRemote = true) },
+                onForcePush = { push(force = true) },
+            )
             TabBar(
                 tab = tab,
                 changeCount = state.entries.size,
@@ -668,17 +843,8 @@ fun GitPanel(
                         .padding(start = 4.dp, end = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    // Ctrl+Enter commits from this tab too, and the repo
-                    // footer with its busy mark lives on the Changes tab —
-                    // a running git command must not be invisible here.
-                    if (busy) {
-                        Text(
-                            text = "…",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = theme.color("text.muted"),
-                            modifier = Modifier.padding(start = 6.dp),
-                        )
-                    }
+                    // Ctrl+Enter commits from this tab too; the repo header
+                    // above carries the busy mark for every tab now.
                     Spacer(modifier = Modifier.weight(1f))
                     GhostButton(label = "Graph", enabled = true, onClick = onOpenGraph)
                 }
@@ -764,6 +930,21 @@ fun GitPanel(
                 )
             }
 
+            // What a remote command said when it *worked* — the strip the
+            // errors use, in quieter clothes: the panel's stand-in for Zed's
+            // success StatusToast (git_panel.rs:5278-5334).
+            remoteNotice?.let { text ->
+                HorizontalDivider(color = theme.color("border.variant"))
+                Text(
+                    text = text,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = theme.color("text.muted"),
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                )
+            }
+
             if (identityWanted) {
                 HorizontalDivider(color = theme.color("border.variant"))
                 IdentityForm(
@@ -778,7 +959,6 @@ fun GitPanel(
             }
 
             if (tab == GitPanelTab.Changes) {
-            RepoFooter(state = state, busy = busy, onPush = ::push)
             // The commit editor's own `border_t_1` in `border`
             // (git_panel.rs:5991-5996).
             HorizontalDivider(color = theme.color("border"))
@@ -842,6 +1022,12 @@ fun GitPanel(
         }
     }
 
+    // Fetch From, Push To, and any pull or push whose branch names no remote
+    // of its own: the "which remote?" modal (picker_prompt.rs:27-42).
+    remotePicker?.let { request ->
+        RemotePickerDialog(request = request, onDismiss = { remotePicker = null })
+    }
+
     val pending = confirming
     if (pending != null) {
         DiscardDialog(
@@ -866,20 +1052,30 @@ fun GitPanel(
 }
 
 /**
- * Zed's `PanelRepoFooter` — the branch on the left, the remote button on the
- * right, in an `px_2` / `py_1p5` row above the commit editor
- * (git_panel.rs:8709-8747). The branch name is a `LabelSize::Small` button
- * label there (git_panel.rs:8689-8692); ours is the same size, plus the drift
- * arrows its remote button would otherwise carry.
+ * Zed's `PanelRepoFooter` — the git-branch icon and the branch on the left,
+ * the remote split button on the right, an `px_2` / `py_1p5` row,
+ * `justify_between` with a `gap_1` (git_panel.rs:8711-8746). Zed hangs it
+ * above the commit editor; this panel wears it as its header. The branch name
+ * is a `LabelSize::Small` button label there (git_panel.rs:8687-8692).
+ *
+ * No branch to speak for — detached HEAD, nothing committed — and there is no
+ * remote button at all (git_panel.rs:5851 via [remoteButtonSpec]).
  */
 @Composable
-private fun RepoFooter(state: GitPanelState, busy: Boolean, onPush: () -> Unit) {
+private fun RepoHeader(
+    state: GitPanelState,
+    head: String?,
+    busy: Boolean,
+    pendingRemote: Boolean,
+    onFetch: () -> Unit,
+    onFetchFrom: () -> Unit,
+    onPull: () -> Unit,
+    onPullRebase: () -> Unit,
+    onPush: () -> Unit,
+    onPushTo: () -> Unit,
+    onForcePush: () -> Unit,
+) {
     val theme = LocalZedTheme.current
-    val branch = state.branch
-    // An unborn branch — `git init`, nothing committed — has no commit to
-    // push, and git answers a publish with "src refspec does not match any".
-    val canPush = branch?.name != null && !busy && !branch.unborn &&
-        (branch.ahead > 0 || !branch.hasUpstream)
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -887,48 +1083,66 @@ private fun RepoFooter(state: GitPanelState, busy: Boolean, onPush: () -> Unit) 
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
+        // The `GitBranch` icon leading the row — `IconSize::Small` = 14px,
+        // Disabled with a single repository, which is all this app opens
+        // (git_panel.rs:8721-8727).
+        Image(
+            painter = painterResource(R.drawable.ic_ui_git_branch),
+            contentDescription = null,
+            colorFilter = ColorFilter.tint(theme.color("text.disabled")),
+            modifier = Modifier.size(14.dp),
+        )
         Text(
-            text = branchLabel(state),
+            text = branchLabel(state, head),
             style = MaterialTheme.typography.labelMedium,
             color = theme.color("text"),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
-        if (busy) {
+        // The non-remote commands — stages, commits — have no spinner of
+        // their own, so their busy mark stays; a running remote command is
+        // the split button's own disabled-and-turning state (git_ui.rs:1110-1123).
+        if (busy && !pendingRemote) {
             Text(
                 text = "…",
                 style = MaterialTheme.typography.labelMedium,
                 color = theme.color("text.muted"),
             )
         }
-        if (branch?.name != null) {
-            FilledButton(
-                // Zed's wording: "Publish" makes the branch exist on the
-                // remote, "Push" sends the commits it is ahead by
-                // (git_ui.rs:785-838).
-                label = when {
-                    !branch.hasUpstream -> "Publish"
-                    branch.ahead > 0 -> "↑${branch.ahead} Push"
-                    else -> "Pushed"
-                },
-                enabled = canPush,
-                onClick = onPush,
+        val spec = remoteButtonSpec(state.branch)
+        if (spec != null) {
+            RemoteSplitButton(
+                spec = spec,
+                enabled = !busy,
+                remotePending = pendingRemote,
+                onFetch = onFetch,
+                onFetchFrom = onFetchFrom,
+                onPull = onPull,
+                onPullRebase = onPullRebase,
+                onPush = onPush,
+                onPushTo = onPushTo,
+                onForcePush = onForcePush,
             )
         }
     }
 }
 
-/** "main ↑2 ↓1", or what there is of it. */
-private fun branchLabel(state: GitPanelState): String {
+/** The branch's name, or what stands in for one (git_panel.rs:8640-8654). */
+private fun branchLabel(state: GitPanelState, head: String?): String {
     if (!state.hasRepo) return "No repository"
     val branch = state.branch ?: return "git"
-    val name = branch.name ?: "detached HEAD"
-    return buildString {
-        append(name)
-        if (branch.unborn) append(" · no commits yet")
-        if (branch.ahead > 0) append(" ↑${branch.ahead}")
-        if (branch.behind > 0) append(" ↓${branch.behind}")
+    val name = branch.name
+    return when {
+        // The drift arrows are the split button's counts now, as in Zed —
+        // the name is only the name.
+        name != null && branch.unborn -> "$name · no commits yet"
+        name != null -> name
+        // A detached HEAD wears the first 8 characters of its sha —
+        // `MAX_SHORT_SHA_LEN` — and a repository with no commit at all Zed's
+        // "(no branch)" (git_panel.rs:8640-8654).
+        head != null -> head.take(8)
+        else -> "(no branch)"
     }
 }
 
