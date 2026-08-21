@@ -939,6 +939,28 @@ fun WorkspaceScreen(
         }
     }
 
+    /**
+     * Show what one commit changed — Zed's CommitView, in [DiffPane]'s
+     * clothes. [path] narrows it to one file (the graph sidebar's per-file
+     * "View Changes"); the two are different tabs, as Zed's filtered view is.
+     */
+    fun openCommitDiff(sha: String, subject: String, path: String? = null) {
+        if (project == null) return
+        val target = DiffTarget(path = path, commit = sha, subject = subject)
+        val key = "git-commit:$sha:${path ?: ""}"
+        val existing = files.indexOfPath(key)
+        if (existing >= 0) {
+            files.select(existing)
+        } else {
+            files.open(OpenFile(path = key, editor = null, diff = target))
+        }
+        dockTookWorkArea?.let { side ->
+            docks.closeDock(side)
+            terminalFocused = false
+            rootFocus.requestFocus()
+        }
+    }
+
     fun openProjectSearch(): Boolean {
         if (project == null) return false
         docks.open(WorkspacePanel.Search, settings)
@@ -1221,6 +1243,7 @@ fun WorkspaceScreen(
                                     onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
                                     diffProject = project,
                                     onOpenPath = { path -> project?.let { openFile(it, path) } },
+                                    onOpenCommit = ::openCommitDiff,
                                     softWrap = settings.softWrap,
                                     showInlineBlame = settings.inlineBlame,
                                     onOpenDefinition = { target ->
@@ -1755,6 +1778,8 @@ private fun EditorArea(
     /** For a diff tab, which needs the project rather than a buffer. */
     diffProject: ProjectSession?,
     onOpenPath: (String) -> Unit,
+    /** The graph asking for a commit's diff tab, whole or one file of it. */
+    onOpenCommit: (sha: String, subject: String, path: String?) -> Unit,
     softWrap: SoftWrapMode,
     showInlineBlame: Boolean,
     /**
@@ -1849,7 +1874,7 @@ private fun EditorArea(
         } else if (active.graph && diffProject != null) {
             GitGraphPane(
                 project = diffProject,
-                onOpenFile = onOpenPath,
+                onOpenCommit = onOpenCommit,
                 modifier = Modifier.weight(1f),
             )
         } else if (active.diff != null && diffProject != null) {
