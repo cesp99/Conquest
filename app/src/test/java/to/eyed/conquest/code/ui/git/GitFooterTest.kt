@@ -2,6 +2,8 @@ package to.eyed.conquest.code.ui.git
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -30,6 +32,18 @@ class GitFooterTest {
     fun uncommitMetaWordsTheSoftFlagOnlyWithUnstagedChanges() {
         assertEquals("git reset HEAD^ --soft", uncommitMeta(hasUnstaged = true))
         assertEquals("git reset HEAD^", uncommitMeta(hasUnstaged = false))
+    }
+
+    @Test
+    fun uncommitRunsOnlyAgainstTheCommitItRead() {
+        // The engine's reset is a blind `HEAD^`; the pin is what keeps a
+        // commit landing mid-flow — or while the pushed dialog sat open —
+        // from being the one that gets reset.
+        assertNull(uncommitPinRefusal(expected = "abc123", fresh = "abc123"))
+        assertNotNull(uncommitPinRefusal(expected = "abc123", fresh = "def456"))
+        // HEAD lost altogether — an unborn branch after an outside reset —
+        // is no commit to uncommit, not a reset of whatever comes next.
+        assertNotNull(uncommitPinRefusal(expected = "abc123", fresh = null))
     }
 
     @Test

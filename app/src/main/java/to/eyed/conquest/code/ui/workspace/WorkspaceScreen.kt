@@ -439,6 +439,10 @@ fun WorkspaceScreen(
             terminals.closeAll()
             files.clearClosedHistory()
             dismissedConflicts.value = emptySet()
+            // A git command still waiting on the old project's first scan is
+            // about that project; it must not survive into this one. The
+            // panel's own stamp check is the second lock on the same door.
+            gitPanelRequest = null
             project?.close()
             val opened = ProjectSession(path)
             project = opened
@@ -714,12 +718,16 @@ fun WorkspaceScreen(
      * and whatever git says back, visible.
      */
     fun requestGitPanelCommand(command: GitPanelCommand): Boolean {
-        if (project == null) return false
+        val open = project ?: return false
         docks.open(WorkspacePanel.Git, settings)
         // On a compact screen the panel takes the work area from a focused
         // terminal, and nothing else would tell the key table it is gone.
         terminalFocused = false
-        gitPanelRequest = GitPanelRequest(command, (gitPanelRequest?.token ?: 0) + 1)
+        // Stamped with the project it was asked for: the panel drops a
+        // request whose stamp no longer matches, so a push asked on one
+        // project can never land on another the workspace switched to while
+        // the first scan was still out.
+        gitPanelRequest = GitPanelRequest(command, open.id, (gitPanelRequest?.token ?: 0) + 1)
         return true
     }
 

@@ -36,9 +36,31 @@ enum class GitPanelCommand { Fetch, Push, Pull, ForcePush, PullRebase, Diff, Sta
  * `git::Push` itself — the panel owns the session, the single-flight busy
  * flag and the strip that says what git answered — so the ask travels as a
  * value, the way [to.eyed.conquest.code.ui.git.GitPanel]'s `focusToken` does.
- * [token] makes the same command asked twice two distinct values.
+ * [project] is the project it was asked *for*: the request waits out the
+ * panel's first scan, and the workspace can switch projects under it in that
+ * window. [token] makes the same command asked twice two distinct values.
  */
-data class GitPanelRequest(val command: GitPanelCommand, val token: Int)
+data class GitPanelRequest(val command: GitPanelCommand, val project: Long, val token: Int)
+
+/** What the panel's request effect does with a pending [GitPanelRequest]. */
+internal enum class PanelRequestStep { Run, Drop, Wait }
+
+/**
+ * The request effect's decision, out where it can be tested. A request
+ * stamped for another project is [PanelRequestStep.Drop] — answered so it
+ * cannot linger, but never run against a repository it was not asked about.
+ * One for this project waits for the first `git status` ([scanned]), because
+ * a push before the branch is known would silently do nothing; then it runs.
+ */
+internal fun panelRequestStep(
+    request: GitPanelRequest,
+    project: Long,
+    scanned: Boolean,
+): PanelRequestStep = when {
+    request.project != project -> PanelRequestStep.Drop
+    !scanned -> PanelRequestStep.Wait
+    else -> PanelRequestStep.Run
+}
 
 /**
  * How long an armed ctrl-g waits for its second key. Zed has no timeout at

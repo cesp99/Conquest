@@ -116,8 +116,13 @@ fun BranchPicker(project: ProjectSession, onDismiss: () -> Unit) {
     var filter by remember { mutableStateOf(BranchFilterState.filter) }
     var filterMenuOpen by remember { mutableStateOf(false) }
     var selected by remember { mutableIntStateOf(0) }
-    /** One git command at a time, the panel's own rule. */
-    var busy by remember { mutableStateOf(false) }
+    /**
+     * One git command at a time — the *same* one command the panel counts,
+     * through [GitOps]: a checkout must not run through the middle of a pull
+     * the panel started, and the picker opens over the panel whatever the
+     * panel is doing.
+     */
+    val ops = remember(project) { GitOps.of(project.id) }
     /** Alt swaps delete for force delete, on the trash icon and its colour. */
     var altHeld by remember { mutableStateOf(false) }
     var failure by remember { mutableStateOf<BranchOpFailure?>(null) }
@@ -175,13 +180,15 @@ fun BranchPicker(project: ProjectSession, onDismiss: () -> Unit) {
         BranchFilterState.filter = next
     }
 
-    /** A branch command off the main thread, its refusal worded by [title]. */
+    /**
+     * A branch command off the main thread, its refusal worded by [title] —
+     * through the shared single-flight, so it queues behind nothing and
+     * nothing runs over it. Refused silently while anything is in flight:
+     * every button here is disabled on the same flag, so a refusal only
+     * meets a keyboard's Enter.
+     */
     fun run(title: String, action: () -> String?, onRefused: ((String) -> Unit)? = null) {
-        if (busy) return
-        busy = true
-        scope.launch {
-            val refusal = withContext(Dispatchers.IO) { action() }
-            busy = false
+        GitOps.run(project.id, { action() }) { refusal ->
             when {
                 refusal == null -> onDismiss()
                 onRefused != null -> onRefused(refusal)
@@ -222,13 +229,10 @@ fun BranchPicker(project: ProjectSession, onDismiss: () -> Unit) {
     fun delete(entry: GitBranchEntry, force: Boolean) {
         // HEAD is never deletable, from any of the routes here
         // (branch_picker.rs:1118-1120).
-        if (busy || entry.isHead) return
-        busy = true
-        scope.launch {
-            val refusal = withContext(Dispatchers.IO) {
-                session.deleteBranch(entry.name, entry.isRemote, force)
-            }
-            busy = false
+        if (entry.isHead) return
+        GitOps.run(project.id, {
+            session.deleteBranch(entry.name, entry.isRemote, force)
+        }) { refusal ->
             when {
                 // Zed removes the row and keeps the picker up; re-listing is
                 // the same thing said fresher.
@@ -383,7 +387,7 @@ fun BranchPicker(project: ProjectSession, onDismiss: () -> Unit) {
                             FooterButton(
                                 label = "Delete",
                                 hint = "Ctrl Shift Backspace",
-                                enabled = !busy,
+                                enabled = !ops.busy,
                                 // The plain delete: Zed's footer button
                                 // dispatches DeleteBranch, and Alt only arms
                                 // the row's trash icon (branch_picker.rs:2027-2042).
@@ -393,7 +397,7 @@ fun BranchPicker(project: ProjectSession, onDismiss: () -> Unit) {
                         FooterButton(
                             label = "Switch",
                             hint = "Enter",
-                            enabled = !busy,
+                            enabled = !ops.busy,
                             isPrimary = true,
                             onClick = { confirmRow(footerRow, secondary = false) },
                         )
@@ -403,14 +407,14 @@ fun BranchPicker(project: ProjectSession, onDismiss: () -> Unit) {
                             FooterButton(
                                 label = "Create New From: $base",
                                 hint = "Ctrl Enter",
-                                enabled = !busy,
+                                enabled = !ops.busy,
                                 onClick = { confirmRow(footerRow, secondary = true) },
                             )
                         }
                         FooterButton(
                             label = "Create",
                             hint = "Enter",
-                            enabled = !busy,
+                            enabled = !ops.busy,
                             isPrimary = true,
                             onClick = { confirmRow(footerRow, secondary = false) },
                         )

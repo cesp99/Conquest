@@ -50,6 +50,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -257,8 +258,17 @@ fun GitPanel(
         mutableStateOf(TextFieldValue(draft, TextRange(draft.length)))
     }
     var selected by remember(project) { mutableIntStateOf(-1) }
-    var busy by remember(project) { mutableStateOf(false) }
-    var error by remember(project) { mutableStateOf<String?>(null) }
+    /**
+     * The mutation single-flight — busy, the error strip, the success notice,
+     * the remote spinner — lives in [GitOps], not the composition: the panel
+     * is removed by Escape, by a compact screen opening a file, by a fold
+     * crossing the width threshold, while the git command under a running
+     * pull finishes regardless. Re-attaching here is what lets a reopened
+     * panel show the spinner for — and the outcome of — an operation it did
+     * not start, and what keeps the branch picker from running a checkout
+     * through the middle of it.
+     */
+    val ops = remember(project) { GitOps.of(project.id) }
     var confirming by remember(project) { mutableStateOf<GitChange?>(null) }
     /**
      * An uncommit stopped at the door because some remote already holds the
@@ -293,19 +303,6 @@ fun GitPanel(
      * 3109-3112) — not toasts, so ours are a dialog and not the error strip.
      */
     var warning by remember(project) { mutableStateOf<String?>(null) }
-    /**
-     * What the last remote command said when it *worked* — Zed's success
-     * `StatusToast` (git_panel.rs:5278-5334), worded by [formatRemoteOutput].
-     * Shown in the strip the errors use, and cleared the moment any next
-     * command starts, as a toast would have timed out.
-     */
-    var remoteNotice by remember(project) { mutableStateOf<String?>(null) }
-    /**
-     * The remote command in flight — Zed's `pending_remote_operation`
-     * (git_panel.rs:442-447). What turns the split button's spinner; [busy]
-     * alone cannot, because it is also every stage and commit.
-     */
-    var pendingRemote by remember(project) { mutableStateOf(false) }
     /** A "which remote?" question waiting on the user — see [RemotePickerRequest]. */
     var remotePicker by remember(project) { mutableStateOf<RemotePickerRequest?>(null) }
     /**
@@ -377,36 +374,23 @@ fun GitPanel(
     val selectedChange = (rows.getOrNull(selection) as? GitPanelRow.FileRow)?.change
 
     /**
-     * Every command: off the main thread, one at a time, and whatever git said
-     * about it shown rather than logged.
+     * Every command: off the main thread, one at a time — across every
+     * surface, which is [GitOps]'s job — and whatever git said about it shown
+     * rather than logged.
      *
      * [onSuccess] runs back on the main thread, so a command that clears a
-     * field does it here and not from an IO dispatcher.
+     * field does it here and not from an IO dispatcher. Both callbacks run in
+     * [GitOps]'s own scope, not the composition's: a pull outlives a panel
+     * dismissed mid-flight, and its outcome must still land in the strip a
+     * reopened panel reads.
      */
     fun perform(
         action: suspend () -> String?,
         onFailure: (String) -> Unit = {},
         onSuccess: () -> Unit = {},
     ) {
-        // One at a time, and *said* rather than swallowed: a `git add` inside
-        // proot is easily a second, and a Ctrl+Enter that vanished into it
-        // looks exactly like a keybinding that does not work.
-        if (busy) {
-            error = "Still running the last git command…"
-            return
-        }
-        busy = true
-        error = null
-        remoteNotice = null
-        scope.launch {
-            val failure = withContext(Dispatchers.IO) { action() }
-            error = failure
-            // Cleared *before* the callbacks: one of them runs the next
-            // command — saving an identity commits straight afterwards — and
-            // with the flag still set that command refused itself with "still
-            // running the last git command", which is this function's own
-            // guard talking about a command that had finished.
-            busy = false
+        val started = GitOps.run(project.id, action) { failure ->
+            ops.error = failure
             if (failure == null) onSuccess() else onFailure(failure)
             // The list still shows what git said *before* the command: the
             // engine invalidates its cache and re-runs `git status` behind a
@@ -415,6 +399,15 @@ fun GitPanel(
             // that run rather than waiting for the next poll to.
             state = withContext(Dispatchers.Default) { session.state() }
         }
+        // One at a time, and *said* rather than swallowed: a `git add` inside
+        // proot is easily a second, and a Ctrl+Enter that vanished into it
+        // looks exactly like a keybinding that does not work.
+        if (!started) {
+            ops.error = "Still running the last git command…"
+            return
+        }
+        ops.error = null
+        ops.notice = null
     }
 
     fun toggleStaged(change: GitChange) {
@@ -512,7 +505,7 @@ fun GitPanel(
         // Refused here as well as in the engine, so the button can say why
         // before it is pressed rather than after.
         if (text.isBlank()) {
-            error = "Write a commit message first"
+            ops.error = "Write a commit message first"
             return
         }
         val amend = amendPending
@@ -620,15 +613,15 @@ fun GitPanel(
             action = {
                 // Set here, past [perform]'s busy guard, so a refused second
                 // command never claims the spinner.
-                pendingRemote = true
+                ops.pendingRemote = true
                 val result = command()
                 if (result.ok) toast = formatRemoteOutput(action, result)
                 result.error
             },
-            onFailure = { pendingRemote = false },
+            onFailure = { ops.pendingRemote = false },
             onSuccess = {
-                pendingRemote = false
-                remoteNotice = toast?.message
+                ops.pendingRemote = false
+                ops.notice = toast?.message
             },
         )
     }
@@ -659,7 +652,7 @@ fun GitPanel(
             }
             val listing = withContext(Dispatchers.IO) { session.remotes() }
             if (listing.error != null) {
-                error = listing.error
+                ops.error = listing.error
                 return@launch
             }
             val names = listing.remotes.map { it.name }
@@ -692,7 +685,7 @@ fun GitPanel(
         scope.launch {
             val listing = withContext(Dispatchers.IO) { session.remotes() }
             if (listing.error != null) {
-                error = listing.error
+                ops.error = listing.error
                 return@launch
             }
             val names = listing.remotes.map { it.name }
@@ -755,7 +748,7 @@ fun GitPanel(
             alwaysSelect = selectRemote,
             onNone = {
                 // Zed git_panel.rs:3941
-                error = "No remote available to push to. Add a remote to be able to publish changes."
+                ops.error = "No remote available to push to. Add a remote to be able to publish changes."
             },
         ) { remote ->
             runRemote(RemoteAction.Push(name, remote)) {
@@ -802,18 +795,38 @@ fun GitPanel(
     }
 
     /**
-     * The reset itself, past every question — `git reset --soft HEAD^` — and
-     * then the commit box refilled with the message the commit held, which is
+     * The reset, pinned to [sha]: the engine's is a blind `git reset --soft
+     * HEAD^`, so HEAD is re-read from git itself first and the reset refused
+     * when it no longer names the commit the reads described — a commit landed
+     * from a terminal, or while the pushed-commit dialog sat open. Blocking;
+     * call it from [perform]'s action.
+     */
+    fun pinnedUncommit(sha: String): String? {
+        val fresh = session.log(limit = 1).commits.firstOrNull()?.sha
+        return uncommitPinRefusal(expected = sha, fresh = fresh) ?: session.uncommit()
+    }
+
+    /**
+     * The commit box refilled with the message the commit held, which is
      * Zed's own order: [prior] was read *before* the reset, while HEAD still
      * named the commit (git_panel.rs:3157-3183).
      */
-    fun runUncommit(prior: String?) {
-        perform({ session.uncommit() }) {
-            val text = prior?.trimEnd('\n').orEmpty()
-            if (text.isNotEmpty()) {
-                message = TextFieldValue(text, TextRange(text.length))
-                CommitDrafts.put(project.id, text)
-            }
+    fun refillCommitMessage(prior: String?) {
+        val text = prior?.trimEnd('\n').orEmpty()
+        if (text.isNotEmpty()) {
+            message = TextFieldValue(text, TextRange(text.length))
+            CommitDrafts.put(project.id, text)
+        }
+    }
+
+    /**
+     * The reset itself, past every question. Pinned to the sha the
+     * confirmation was about — the dialog can sit open while a commit lands,
+     * and `HEAD^` would then name the wrong parent.
+     */
+    fun runUncommit(request: PendingUncommit) {
+        perform({ pinnedUncommit(request.sha) }) {
+            refillCommitMessage(request.priorMessage)
         }
     }
 
@@ -822,28 +835,41 @@ fun GitPanel(
      * the pushed evidence are read first, and only a commit some
      * `remote/branch` already holds gets a confirmation — nothing pushed
      * proceeds silently, exactly as there (git_panel.rs:3205-3230).
+     *
+     * The whole task — reads and reset — is one [perform] window, as Zed
+     * holds `pending_commit` across it (git_panel.rs:3147, 3191). With the
+     * reads outside it, a second tap during them queued a second soft reset,
+     * and a commit landing mid-read was reset in place of the one the
+     * evidence described.
      */
     fun uncommit() {
-        // [perform] would refuse too, but only after the reads below; saying
-        // it now keeps the button honest about why nothing happened.
-        if (busy) {
-            error = "Still running the last git command…"
-            return
-        }
-        // Zed asks for "HEAD" by name; the engine's revision check is hex-only
-        // (git_history.rs:166-173), so HEAD goes by the sha the status cache
-        // already holds. Null — lost between polls — just skips the prefill.
-        val sha = head
-        scope.launch {
-            val (prior, pushed) = withContext(Dispatchers.IO) {
-                sha?.let { session.commitDetails(it) }?.message to session.headPushedRemotes()
-            }
-            if (pushed.isEmpty()) {
-                runUncommit(prior)
-            } else {
-                pendingUncommit = PendingUncommit(pushed, prior)
-            }
-        }
+        var ask: PendingUncommit? = null
+        var prior: String? = null
+        perform(
+            action = {
+                // HEAD from git itself, not the status cache: the sha the
+                // reset is pinned to must be the commit git holds *now*, and
+                // the poll's copy can be a commit behind. Zed asks for "HEAD"
+                // by name; the engine's revision check is hex-only
+                // (git_history.rs:166-173), so it goes by sha here. None — an
+                // unborn branch — leaves nothing to uncommit.
+                val sha = session.log(limit = 1).commits.firstOrNull()?.sha
+                    ?: return@perform null
+                prior = session.commitDetails(sha)?.message
+                val pushed = session.headPushedRemotes()
+                if (pushed.isEmpty()) {
+                    pinnedUncommit(sha)
+                } else {
+                    ask = PendingUncommit(pushed, prior, sha)
+                    null
+                }
+            },
+            onSuccess = {
+                // Either the question, or the prefill the reset earned —
+                // which is a no-op when nothing was reset.
+                ask?.let { pendingUncommit = it } ?: refillCommitMessage(prior)
+            },
+        )
     }
 
     /**
@@ -879,7 +905,7 @@ fun GitPanel(
     fun requestDiscard(change: GitChange) {
         val refusal = discardRefusal(change)
         if (refusal != null) {
-            error = refusal
+            ops.error = refusal
             return
         }
         confirming = change
@@ -901,12 +927,19 @@ fun GitPanel(
     // A palette command arriving from outside the panel. It waits for the
     // first status scan: "git: push" run with the panel closed composes this
     // panel *and* asks it to push in the same breath, and a push before the
-    // branch is known would silently do nothing.
+    // branch is known would silently do nothing. A request stamped for
+    // another project — asked on one, landing after a switch — is answered
+    // without running, never pushed against the wrong repository.
     LaunchedEffect(request, state.scanned) {
         val asked = request ?: return@LaunchedEffect
-        if (!state.scanned) return@LaunchedEffect
-        onRequestHandled()
-        runPanelCommand(asked.command)
+        when (panelRequestStep(asked, project.id, state.scanned)) {
+            PanelRequestStep.Wait -> {}
+            PanelRequestStep.Drop -> onRequestHandled()
+            PanelRequestStep.Run -> {
+                onRequestHandled()
+                runPanelCommand(asked.command)
+            }
+        }
     }
 
     // The pending leader's clock — see GIT_CHORD_TIMEOUT_MS for why Zed's
@@ -918,11 +951,20 @@ fun GitPanel(
         }
     }
 
-    // The focus flag must not survive the panel: on a compact screen opening
+    // The focus flag must not survive the panel — on a compact screen opening
     // a file removes the whole dock, and Compose does not promise a parting
-    // onFocusChanged(false) on the way out.
+    // onFocusChanged(false) on the way out — and neither must a request still
+    // waiting on its first scan: dismissed there, the forgotten push would
+    // otherwise run, unasked, whenever the panel is next opened. Both read
+    // through rememberUpdatedState, because DisposableEffect(Unit) would
+    // otherwise dispose with the values it was born with.
+    val pendingRequest by rememberUpdatedState(request)
+    val dropRequest by rememberUpdatedState(onRequestHandled)
     DisposableEffect(Unit) {
-        onDispose { onFocusChanged(false) }
+        onDispose {
+            onFocusChanged(false)
+            if (pendingRequest != null) dropRequest()
+        }
     }
 
     Row(
@@ -1053,8 +1095,8 @@ fun GitPanel(
             RepoHeader(
                 state = state,
                 head = head,
-                busy = busy,
-                pendingRemote = pendingRemote,
+                busy = ops.busy,
+                pendingRemote = ops.pendingRemote,
                 onSwitchBranch = onSwitchBranch,
                 onFetch = { fetch(fetchAll = true) },
                 onFetchFrom = { fetch(fetchAll = false) },
@@ -1117,7 +1159,7 @@ fun GitPanel(
                 if (rows.isEmpty()) {
                     EmptyMessage(
                         state = state,
-                        busy = busy,
+                        busy = ops.busy,
                         onViewBranchDiff = { onOpenDiff(null) },
                         onInitRepository = ::initRepository,
                     )
@@ -1127,7 +1169,7 @@ fun GitPanel(
                         when (row) {
                             is GitPanelRow.SectionRow -> SectionHeader(
                                 row = row,
-                                enabled = !busy,
+                                enabled = !ops.busy,
                                 onStageAll = {
                                     val paths = row.paths
                                     if (paths.isNotEmpty()) {
@@ -1146,7 +1188,7 @@ fun GitPanel(
                                 section = row.section,
                                 colours = colours,
                                 isSelected = index == selection,
-                                enabled = !busy,
+                                enabled = !ops.busy,
                                 onSelect = { selected = index },
                                 // Zed opens the *diff* when a change is
                                 // clicked, not the file: the question a
@@ -1207,7 +1249,7 @@ fun GitPanel(
                 }
             }
 
-            error?.let { text ->
+            ops.error?.let { text ->
                 HorizontalDivider(color = theme.color("border.variant"))
                 Text(
                     text = text,
@@ -1222,7 +1264,7 @@ fun GitPanel(
             // What a remote command said when it *worked* — the strip the
             // errors use, in quieter clothes: the panel's stand-in for Zed's
             // success StatusToast (git_panel.rs:5278-5334).
-            remoteNotice?.let { text ->
+            ops.notice?.let { text ->
                 HorizontalDivider(color = theme.color("border.variant"))
                 Text(
                     text = text,
@@ -1241,7 +1283,7 @@ fun GitPanel(
                     email = identityEmail,
                     onName = { identityName = it },
                     onEmail = { identityEmail = it },
-                    busy = busy,
+                    busy = ops.busy,
                     onSave = ::saveIdentity,
                     onDismiss = { identityWanted = false },
                 )
@@ -1259,7 +1301,7 @@ fun GitPanel(
                 },
                 onFocusChanged = { messageFocused = it },
                 stagedCount = state.staged.size,
-                busy = busy,
+                busy = ops.busy,
                 commitLabel = commitButtonLabel(
                     amendPending = amendPending,
                     hasStaged = state.staged.isNotEmpty(),
@@ -1304,7 +1346,7 @@ fun GitPanel(
                     GhostButton(
                         // Its "Cancel" (git_panel.rs:6143-6148).
                         label = "Cancel",
-                        enabled = !busy,
+                        enabled = !ops.busy,
                         onClick = { setAmendPending(false) },
                     )
                 }
@@ -1316,7 +1358,7 @@ fun GitPanel(
                     RepoFooter(
                         commit = footerCommit,
                         hasUnstaged = state.unstaged.isNotEmpty(),
-                        enabled = !busy,
+                        enabled = !ops.busy,
                         onOpenCommit = { showCommit(footerCommit.sha) },
                         onUncommit = ::uncommit,
                         onOpenGraph = onOpenGraph,
@@ -1365,7 +1407,7 @@ fun GitPanel(
             confirmButton = {
                 TextButton(onClick = {
                     pendingUncommit = null
-                    runUncommit(request.priorMessage)
+                    runUncommit(request)
                 }) { Text("Uncommit") }
             },
             dismissButton = {
@@ -2532,11 +2574,32 @@ internal fun discardRefusal(change: GitChange): String? = when {
 
 /**
  * An uncommit stopped at the door because some remote already holds HEAD:
- * the evidence the dialog names, and the old message — read before the
- * reset, while HEAD still named the commit — that will refill the commit
- * box when the reset lands.
+ * the evidence the dialog names, the old message — read before the reset,
+ * while HEAD still named the commit — that will refill the commit box when
+ * the reset lands, and [sha], the commit all of it was read against, which
+ * pins the eventual reset to that commit and no other.
  */
-internal data class PendingUncommit(val remotes: List<String>, val priorMessage: String?)
+internal data class PendingUncommit(
+    val remotes: List<String>,
+    val priorMessage: String?,
+    val sha: String,
+)
+
+/**
+ * Whether the reset may run — null — or why it must not: the engine's
+ * uncommit is a blind `git reset --soft HEAD^`, so [fresh] (HEAD as git
+ * names it *now*) has to still be [expected] (the commit whose message and
+ * pushed evidence were read). Anything else — a commit landed from a
+ * terminal while the confirmation sat open, a HEAD lost altogether — would
+ * soft-reset a commit nobody was asked about.
+ */
+internal fun uncommitPinRefusal(expected: String, fresh: String?): String? =
+    if (fresh == expected) {
+        null
+    } else {
+        "The commit at HEAD changed while Uncommit was waiting, so nothing was reset. " +
+            "Check the last commit and try again."
+    }
 
 /**
  * Whether the clean tree's way out is offered — Zed shows "View Branch Diff"
