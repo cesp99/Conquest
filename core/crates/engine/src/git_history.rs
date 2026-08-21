@@ -72,10 +72,21 @@ const RECORD: char = '\x1e';
 impl crate::Engine {
     /// A page of history, newest first. `skip` pages backwards through it.
     ///
+    /// `all_refs` is the graph's walk: every branch, remote and tag rather
+    /// than just what HEAD can reach, in `--date-order` — exactly Zed's
+    /// `LogSource::All` plus its default `LogOrder` (repository.rs:683,
+    /// 711-728). The panel's History tab keeps the plain HEAD walk.
+    ///
     /// **Blocking**: it runs git inside the guest.
-    pub fn git_log(&self, id: ProjectId, limit: u32, skip: u32) -> Result<Vec<Commit>, String> {
+    pub fn git_log(
+        &self,
+        id: ProjectId,
+        limit: u32,
+        skip: u32,
+        all_refs: bool,
+    ) -> Result<Vec<Commit>, String> {
         let repo = self.repo_for(id)?;
-        let args: Vec<OsString> = vec![
+        let mut args: Vec<OsString> = vec![
             OsString::from("log"),
             OsString::from(format!("--max-count={}", limit.clamp(1, 1000))),
             OsString::from(format!("--skip={skip}")),
@@ -83,6 +94,17 @@ impl crate::Engine {
             // and the UI wants "3 days ago" anyway.
             OsString::from(format!("--format={FIELDS}{RECORD}")),
         ];
+        if all_refs {
+            // Zed's graph argv, in its order: `--date-order` first, then the
+            // source args, with `--ignore-missing` "needed in case of unborn
+            // HEAD" (repository.rs:690-698, 711-728).
+            args.push(OsString::from("--date-order"));
+            args.push(OsString::from("--ignore-missing"));
+            args.push(OsString::from("--branches"));
+            args.push(OsString::from("--remotes"));
+            args.push(OsString::from("--tags"));
+            args.push(OsString::from("HEAD"));
+        }
         let run = run_git(
             &repo.userland,
             &repo.repo_root,
@@ -163,7 +185,7 @@ impl crate::Engine {
 /// hash it was given, but "it came from us a moment ago" is not something this
 /// function can check, and `--` would not save an argument that git reads as a
 /// path or an option.
-fn checked_sha(sha: &str) -> Result<String, String> {
+pub(crate) fn checked_sha(sha: &str) -> Result<String, String> {
     let trimmed = sha.trim();
     if trimmed.len() < 4 || trimmed.len() > 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!("{sha:?} is not a commit hash"));

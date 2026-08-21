@@ -158,7 +158,7 @@ fun TitleBar(
     modifier: Modifier = Modifier,
     /** The branch the project is on, as Zed shows it beside the name. */
     branch: GitBranch? = null,
-    /** Opens the git panel, which is what Zed's branch control leads to. */
+    /** Opens the branch picker, which is what Zed's branch control leads to. */
     onBranch: (() -> Unit)? = null,
 ) {
     val theme = LocalZedTheme.current
@@ -331,7 +331,11 @@ fun TitleBar(
                                 .clickable(
                                     interactionSource = branchInteraction,
                                     indication = null,
-                                    onClickLabel = "Open the git panel",
+                                    // Zed's branch button opens the branch
+                                    // picker (title_bar.rs:1050-1058); its
+                                    // tooltip is "Branch & Stash", but ours
+                                    // has no stash tab to promise.
+                                    onClickLabel = "Switch Branch",
                                     onClick = onBranch,
                                 )
                         } else {

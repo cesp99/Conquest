@@ -201,6 +201,83 @@ enum class WorkspaceCommand(
     OpenGitGraph("git::OpenGraph", isAvailable = { it.hasProject }),
 
     /**
+     * The branch picker — Zed's `git::Switch`, which the git panel's branch
+     * button and the title bar's branch chip both dispatch, on the chord Zed
+     * gives its `branches::OpenRecent` alias (default-linux.json:644).
+     */
+    SwitchBranch("git::Switch", isAvailable = { it.hasProject }),
+
+    /**
+     * The remote family — Zed's `git::Fetch`, `git::Pull`, `git::PullRebase`,
+     * `git::Push` and `git::ForcePush`, registered on the workspace there
+     * (git_ui.rs:193-241) and handed to the git panel here, which owns the
+     * session, the single-flight busy flag and the strip that says what git
+     * answered. Their chords are the panel's ctrl-g leader sequences, scoped
+     * to the panel exactly as Zed scopes them (default-linux.json:1060-1066)
+     * — two keystrokes, which this table cannot express, so no chord prints
+     * beside them and the panel's split button menu carries the labels
+     * instead.
+     *
+     * Offered only where there is a userland to run git in, like cloning;
+     * greyed while the git panel is switched off, like its toggle — the
+     * commands run *in* the panel, so a hidden panel means them too.
+     */
+    GitFetch(
+        "git::Fetch",
+        isOffered = { it.canClone },
+        isAvailable = { it.hasProject && "git_panel" !in it.hiddenPanels },
+    ),
+    GitPull(
+        "git::Pull",
+        isOffered = { it.canClone },
+        isAvailable = { it.hasProject && "git_panel" !in it.hiddenPanels },
+    ),
+    GitPullRebase(
+        "git::PullRebase",
+        isOffered = { it.canClone },
+        isAvailable = { it.hasProject && "git_panel" !in it.hiddenPanels },
+    ),
+    GitPush(
+        "git::Push",
+        isOffered = { it.canClone },
+        isAvailable = { it.hasProject && "git_panel" !in it.hiddenPanels },
+    ),
+    GitForcePush(
+        "git::ForcePush",
+        isOffered = { it.canClone },
+        isAvailable = { it.hasProject && "git_panel" !in it.hiddenPanels },
+    ),
+
+    /**
+     * The bulk stages — Zed's `git::StageAll` / `git::UnstageAll`, whose
+     * chords (`ctrl-space` / `ctrl-shift-space`, default-linux.json:
+     * 1070-1071) live in the panel's own key handler because they are
+     * panel-scoped there too: in the editor `ctrl-space` is completions.
+     */
+    GitStageAll(
+        "git::StageAll",
+        isOffered = { it.canClone },
+        isAvailable = { it.hasProject && "git_panel" !in it.hiddenPanels },
+    ),
+    GitUnstageAll(
+        "git::UnstageAll",
+        isOffered = { it.canClone },
+        isAvailable = { it.hasProject && "git_panel" !in it.hiddenPanels },
+    ),
+
+    /**
+     * The whole project's diff as a tab — Zed's `git::Diff`, the panel's own
+     * "View Diff" button and the `ctrl-g d` chord (default-linux.json:1067).
+     * Routed through the panel like the remote family, so the one dispatcher
+     * serves every way in.
+     */
+    GitDiff(
+        "git::Diff",
+        isOffered = { it.canClone },
+        isAvailable = { it.hasProject && "git_panel" !in it.hiddenPanels },
+    ),
+
+    /**
      * Show or hide the git panel — Zed's `git_panel::ToggleFocus`, on the
      * chord Zed gives it (default-linux.json:700).
      */
@@ -453,6 +530,15 @@ private val BINDINGS: List<Binding> = listOf(
         WorkspaceCommand.ToggleGitPanel,
         Chord(AndroidKeyEvent.KEYCODE_G, "G", shift = true),
         Everywhere,
+    ),
+    // Zed's `alt-ctrl-shift-b` for the branch picker (default-linux.json:644,
+    // via the `branches::OpenRecent` alias of `git::Branch`). All three
+    // modifiers, so it cannot collide with `ctrl-b`'s dock family above.
+    // `InWorkspace`, like every other Alt chord.
+    Binding(
+        WorkspaceCommand.SwitchBranch,
+        Chord(AndroidKeyEvent.KEYCODE_B, "B", shift = true, alt = true),
+        InWorkspace,
     ),
     // `ctrl-alt-a`, which is what Zed binds `agent::ToggleFocus` to besides
     // `ctrl-?` — the question mark needs a shift on every layout a phone

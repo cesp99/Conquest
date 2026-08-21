@@ -44,11 +44,51 @@ class GitSession(private val project: ProjectSession) {
         CoreBridge.gitStage(project.id, JSONArray(paths).toString())
 
     /**
-     * Send this branch's commits to `origin`; publish it when it has no
-     * upstream yet. Null when it worked. **Blocking** — it uses the network.
+     * Send this branch's commits to [remote] — Zed's push, its Publish and
+     * Republish when [setUpstream] (the branch has no upstream, or its
+     * upstream is gone), its Force Push when [force]: `--force-with-lease`,
+     * never plain `--force`, and the lease is the only safety Zed puts in
+     * front of it. The remote comes from the caller: resolve it with
+     * [branchRemote] and fall back to [remotes] and a picker, which is Zed's
+     * own order. **Blocking** — it uses the network.
      */
-    fun push(branch: String, setUpstream: Boolean): String? =
-        CoreBridge.gitPush(project.id, branch, setUpstream)
+    fun push(
+        branch: String,
+        remote: String,
+        setUpstream: Boolean,
+        force: Boolean = false,
+    ): RemoteOpResult =
+        RemoteOpResult.parse(CoreBridge.gitPush(project.id, branch, remote, setUpstream, force))
+
+    /**
+     * Fetch from one [remote], or — null — from every one of them, Zed's
+     * plain Fetch (`git fetch --all`). **Blocking** — network.
+     */
+    fun fetch(remote: String? = null): RemoteOpResult =
+        RemoteOpResult.parse(CoreBridge.gitFetch(project.id, remote.orEmpty()))
+
+    /**
+     * Pull [branch] from [remote], rebasing when [rebase] — Zed's Pull and
+     * Pull (Rebase). The branch name joins the argv only when the branch has
+     * no upstream, exactly as Zed passes it. **Blocking** — network.
+     */
+    fun pull(branch: String, remote: String, rebase: Boolean = false): RemoteOpResult =
+        RemoteOpResult.parse(CoreBridge.gitPull(project.id, branch, remote, rebase))
+
+    /**
+     * Every remote, with the fetch URL github.com detection reads — the
+     * Fetch From and Push To pickers' listing. **Blocking** — it runs git.
+     */
+    fun remotes(): GitRemoteList = GitRemoteList.parse(CoreBridge.gitRemotes(project.id))
+
+    /**
+     * The remote [branch] is configured to talk to in that direction, or null
+     * when none is — the cue to fall back to [remotes] and a picker (one
+     * remote picks itself; several ask), which is Zed's `get_remote` flow.
+     * **Blocking** — it runs git.
+     */
+    fun branchRemote(branch: String, forPush: Boolean): String? =
+        CoreBridge.gitBranchRemote(project.id, branch, forPush)
 
     /**
      * What changed, line by line — the whole patch, or one file's.
@@ -66,15 +106,48 @@ class GitSession(private val project: ProjectSession) {
 
     /**
      * A page of history, newest first. Empty for a repository with no commits.
+     * [allRefs] is the graph's walk — every branch, remote and tag in
+     * `--date-order`, Zed's `LogSource::All`; the default is the plain HEAD
+     * walk the panel's History tab shows.
      *
      * **Blocking** — call it from [kotlinx.coroutines.Dispatchers.IO].
      */
-    fun log(limit: Int = 100, skip: Int = 0): CommitPage {
-        val root = JSONObject(CoreBridge.gitLog(project.id, limit.toLong(), skip.toLong()))
+    fun log(limit: Int = 100, skip: Int = 0, allRefs: Boolean = false): CommitPage {
+        val root = JSONObject(CoreBridge.gitLog(project.id, limit.toLong(), skip.toLong(), allRefs))
         if (!root.isNull("error")) return CommitPage(error = root.getString("error"))
         val array = root.optJSONArray("commits") ?: JSONArray()
         return CommitPage(
             commits = List(array.length()) { index -> Commit.parse(array.getJSONObject(index)) },
+        )
+    }
+
+    /**
+     * The branch's changes since it left [base] — Zed's Branch Diff, a
+     * `git diff <base>...` merge-base diff with worktree contents included,
+     * which is what the clean tree's "View Branch Diff" opens. **Blocking** —
+     * call it from [kotlinx.coroutines.Dispatchers.IO].
+     */
+    fun branchPatch(base: String): PatchResult {
+        val root = JSONObject(CoreBridge.gitBranchPatch(project.id, base))
+        if (!root.isNull("error")) return PatchResult(error = root.getString("error"))
+        val files = root.optJSONArray("files") ?: JSONArray()
+        return PatchResult(
+            files = List(files.length()) { index -> FileDiff.parse(files.getJSONObject(index)) },
+        )
+    }
+
+    /**
+     * What one commit changed against its first parent, as the patch the diff
+     * view draws. A [path] narrows it to one file — the sidebar's per-file
+     * "View Changes". **Blocking** — call it from
+     * [kotlinx.coroutines.Dispatchers.IO].
+     */
+    fun commitPatch(sha: String, path: String? = null): PatchResult {
+        val root = JSONObject(CoreBridge.gitCommitPatch(project.id, sha, path.orEmpty()))
+        if (!root.isNull("error")) return PatchResult(error = root.getString("error"))
+        val files = root.optJSONArray("files") ?: JSONArray()
+        return PatchResult(
+            files = List(files.length()) { index -> FileDiff.parse(files.getJSONObject(index)) },
         )
     }
 
@@ -146,12 +219,95 @@ class GitSession(private val project: ProjectSession) {
      * empty commit, and nothing is staged implicitly: committing with an empty
      * index comes back with git's own "nothing added to commit".
      *
+     * The three flags are the commit split-button's menu: [amend] folds the
+     * commit into HEAD, [signoff] appends the trailer, [noVerify] is Skip
+     * Hooks — `git commit --no-verify`, the literal Zed's menu shows as that
+     * entry's aside.
+     *
      * The other refusal worth knowing is "unable to auto-detect email address",
      * which means the userland's git has no identity yet. It is fixed in the
      * terminal, once, with `git config --global user.email`; the panel shows
      * git's words rather than paraphrasing them. **Blocking**.
      */
-    fun commit(message: String): String? = CoreBridge.gitCommit(project.id, message)
+    fun commit(
+        message: String,
+        amend: Boolean = false,
+        signoff: Boolean = false,
+        noVerify: Boolean = false,
+    ): String? = CoreBridge.gitCommit(project.id, message, amend, signoff, noVerify)
+
+    /**
+     * Undo the last commit, keeping everything it held staged — exactly
+     * `git reset --soft HEAD^`, Zed's Uncommit. Nothing below here asks:
+     * check [headPushedRemotes] and read the old message back for the commit
+     * box *before* calling this, while HEAD still names the commit.
+     * Null when it worked. **Blocking**.
+     */
+    fun uncommit(): String? = CoreBridge.gitUncommit(project.id)
+
+    /**
+     * Every `remote/branch` that already holds HEAD — evidence for the
+     * uncommit confirmation that the commit was pushed. Empty both when
+     * nothing was pushed and when the check could not run; Zed proceeds
+     * silently in both cases, and so should a caller. **Blocking**.
+     */
+    fun headPushedRemotes(): List<String> =
+        parsePushedRemotes(CoreBridge.gitHeadPushedRemotes(project.id))
+
+    /**
+     * Make the project a repository — the panel's "Initialize Repository".
+     * The guest's own `init.defaultBranch` wins when it is set;
+     * [fallbackBranch] — Zed's setting defaults it to `main` — names the
+     * branch when it is not. Null when it worked. **Blocking**.
+     */
+    fun initRepository(fallbackBranch: String = "main"): String? =
+        CoreBridge.gitInit(project.id, fallbackBranch)
+
+    /**
+     * Every branch, local and remote-tracking, with the tip commit each
+     * picker row shows. **Blocking** — it runs git; read it when the picker
+     * opens, not on a poll loop.
+     */
+    fun branches(): GitBranchList = GitBranchList.parse(CoreBridge.gitBranches(project.id))
+
+    /**
+     * Check out a branch by the name [branches] listed. A remote name
+     * (`origin/feature`) grows a local tracking branch named after it first,
+     * as in Zed. Null when it worked; git's refusal — a dirty worktree above
+     * all — when it did not, and nothing is stashed or forced. **Blocking**.
+     */
+    fun checkoutBranch(name: String): String? = CoreBridge.gitChangeBranch(project.id, name)
+
+    /**
+     * Create a branch and switch to it. No [base] branches off HEAD — the
+     * picker's plain Create; "Create New From" passes the default branch.
+     * Null when it worked. **Blocking**.
+     */
+    fun createBranch(name: String, base: String? = null): String? =
+        CoreBridge.gitCreateBranch(project.id, name, base.orEmpty())
+
+    /**
+     * Delete a branch. A branch that is not fully merged is git's own
+     * refusal, which the picker answers by offering [force]; deleting a
+     * remote-tracking row passes [isRemote] so the `-r` rides along. Null
+     * when it worked. **Blocking**.
+     */
+    fun deleteBranch(name: String, isRemote: Boolean = false, force: Boolean = false): String? =
+        CoreBridge.gitDeleteBranch(project.id, name, isRemote, force)
+
+    /**
+     * The repository's default branch — what "Create New From:" names — or
+     * null when nothing in Zed's chain matches. **Blocking**.
+     */
+    fun defaultBranch(): String? = CoreBridge.gitDefaultBranch(project.id)
+
+    internal companion object {
+        /** The bridge's `{"remotes":[…]}`; an error object is an empty list. */
+        fun parsePushedRemotes(json: String): List<String> {
+            val remotes = JSONObject(json).optJSONArray("remotes") ?: JSONArray()
+            return List(remotes.length()) { remotes.getString(it) }
+        }
+    }
 }
 
 /** Which branch the repository is on, and how far it has drifted. */
@@ -168,6 +324,12 @@ data class GitBranch(
      * is the difference between a push and Zed's "Publish".
      */
     val upstream: String? = null,
+    /**
+     * The upstream is configured but its ref is gone — deleted on the remote.
+     * Zed's `UpstreamTracking::Gone`: the remote button reads "Republish",
+     * and pushing re-creates the branch with `--set-upstream`.
+     */
+    val upstreamGone: Boolean = false,
 ) {
     val hasUpstream: Boolean get() = upstream != null
 
@@ -182,7 +344,161 @@ data class GitBranch(
             behind = json.optInt("behind"),
             unborn = json.optBoolean("unborn"),
             upstream = if (json.isNull("upstream")) null else json.getString("upstream"),
+            upstreamGone = json.optBoolean("upstream_gone"),
         )
+    }
+}
+
+/**
+ * One remote, as `git remote -v` lists it: the name every remote argv takes,
+ * and the fetch URL — which is what tells a github.com remote from any other.
+ */
+data class GitRemote(val name: String, val url: String) {
+    /**
+     * The remote is on github.com — what gates the open-on-web actions.
+     *
+     * Host equality over the parsed URL, as Zed's provider does
+     * (github.rs:192-198): a bare substring test called
+     * `https://notgithub.com/…` and a `github.com` buried in somebody
+     * else's path GitHub, and disagreed with `githubRepoSlug`, which gates
+     * the graph sidebar off the same remote.
+     */
+    val isGithub: Boolean
+        get() = GitRemoteUrl.parse(url)?.host == "github.com"
+}
+
+/** Every remote, or why the listing failed. */
+data class GitRemoteList(
+    val remotes: List<GitRemote> = emptyList(),
+    val error: String? = null,
+) {
+    internal companion object {
+        fun parse(json: String): GitRemoteList {
+            val root = JSONObject(json)
+            val remotes = root.optJSONArray("remotes") ?: JSONArray()
+            return GitRemoteList(
+                remotes = List(remotes.length()) { index ->
+                    val remote = remotes.getJSONObject(index)
+                    GitRemote(name = remote.optString("name"), url = remote.optString("url"))
+                },
+                error = if (root.isNull("error")) null else root.getString("error"),
+            )
+        }
+    }
+}
+
+/**
+ * What a remote command (fetch, pull, push) said. The two streams are kept
+ * apart because Zed's toast rules read them separately — a pull's file count
+ * is parsed off stdout while the fetch progress lands on stderr, and a push's
+ * "Everything up-to-date" is a stderr sentence. [error] is null on success;
+ * on failure it is the one-line reason, with the streams still here for the
+ * log view.
+ */
+data class RemoteOpResult(
+    /** The remote the command ran against; null for fetch-all. */
+    val remote: String? = null,
+    val stdout: String = "",
+    val stderr: String = "",
+    val error: String? = null,
+) {
+    val ok: Boolean get() = error == null
+
+    internal companion object {
+        fun parse(json: String): RemoteOpResult {
+            val root = JSONObject(json)
+            return RemoteOpResult(
+                remote = if (root.isNull("remote")) null else root.getString("remote"),
+                stdout = root.optString("stdout"),
+                stderr = root.optString("stderr"),
+                error = if (root.isNull("error")) null else root.getString("error"),
+            )
+        }
+    }
+}
+
+/**
+ * One branch, as a picker row draws it: the name, and the tip commit's
+ * subject, author and date for the meta line. The engine's `BranchEntry`,
+ * which is Zed's `Branch` plus its `CommitSummary`, flattened.
+ */
+data class GitBranchEntry(
+    /**
+     * `main` — or `origin/main` for a remote-tracking branch: the refname
+     * with its namespace stripped, and the spelling
+     * [GitSession.checkoutBranch] takes back.
+     */
+    val name: String,
+    val isRemote: Boolean,
+    /** The branch HEAD is on: first in the sort, check icon, no delete. */
+    val isHead: Boolean,
+    /** The tip commit's hash — empty on an unborn branch, which has none. */
+    val sha: String,
+    val subject: String,
+    /** Seconds since the Unix epoch; 0 when there is no commit. */
+    val committerDate: Long,
+    val author: String,
+    /**
+     * The tip commit has a parent — false for a root commit, which is what
+     * hides the Uncommit button.
+     */
+    val hasParent: Boolean,
+    /**
+     * The upstream a local branch tracks, `origin/main`-style — the key the
+     * picker collapses remote rows by: a remote branch some local branch
+     * already tracks is not shown again.
+     */
+    val upstream: String? = null,
+    /** Drift against that upstream; both 0 when in sync or untracked. */
+    val ahead: Int = 0,
+    val behind: Int = 0,
+    /** The upstream is configured but its ref is gone — deleted remotely. */
+    val upstreamGone: Boolean = false,
+) {
+    /** The row has a commit to describe; false only on an unborn branch. */
+    val hasCommit: Boolean get() = sha.isNotEmpty()
+
+    /** `origin` of `origin/feature`; null for a local branch. */
+    val remote: String? get() = if (isRemote) name.substringBefore('/') else null
+
+    internal companion object {
+        fun parse(json: JSONObject): GitBranchEntry = GitBranchEntry(
+            name = json.optString("name"),
+            isRemote = json.optBoolean("is_remote"),
+            isHead = json.optBoolean("is_head"),
+            sha = json.optString("sha"),
+            subject = json.optString("subject"),
+            committerDate = json.optLong("committer_date"),
+            author = json.optString("author"),
+            hasParent = json.optBoolean("has_parent"),
+            upstream = if (json.isNull("upstream")) null else json.getString("upstream"),
+            ahead = json.optInt("ahead"),
+            behind = json.optInt("behind"),
+            upstreamGone = json.optBoolean("upstream_gone"),
+        )
+    }
+}
+
+/**
+ * Every branch, or as many as git could list: a partial listing keeps its
+ * rows and carries the complaint beside them, which the picker shows as a
+ * warning banner rather than an empty list — Zed's own rule.
+ */
+data class GitBranchList(
+    val branches: List<GitBranchEntry> = emptyList(),
+    val error: String? = null,
+) {
+    internal companion object {
+        fun parse(json: String): GitBranchList {
+            val root = JSONObject(json)
+            val branches = root.optJSONArray("branches") ?: JSONArray()
+            return GitBranchList(
+                branches = List(branches.length()) { index ->
+                    GitBranchEntry.parse(branches.getJSONObject(index))
+                },
+                error = if (root.isNull("error")) null else root.getString("error"),
+            )
+        }
     }
 }
 
@@ -304,6 +620,11 @@ data class FileDiff(
     val original: String?,
     /** git said the content is binary; there are no hunks to show. */
     val isBinary: Boolean,
+    /** The diff creates this file — what tells an empty new file from a
+     * mode-only change, which is otherwise the same hunkless shape. */
+    val created: Boolean = false,
+    /** The diff removes this file — the same tell, for an empty deletion. */
+    val deleted: Boolean = false,
     val hunks: List<PatchHunk>,
 ) {
     /** How many lines the patch adds and removes, for a summary line. */
@@ -317,6 +638,8 @@ data class FileDiff(
                 path = json.optString("path"),
                 original = if (json.isNull("original")) null else json.getString("original"),
                 isBinary = json.optBoolean("is_binary"),
+                created = json.optBoolean("created"),
+                deleted = json.optBoolean("deleted"),
                 hunks = List(hunks.length()) { index ->
                     val hunk = hunks.getJSONObject(index)
                     val lines = hunk.optJSONArray("lines") ?: JSONArray()

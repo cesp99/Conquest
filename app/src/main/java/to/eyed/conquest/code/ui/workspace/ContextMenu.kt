@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -57,6 +58,9 @@ internal object MenuMetrics {
 
     /** `ml_4` between a label and its keybinding (context_menu.rs:2089). */
     const val LABEL_TO_CHORD = 1f
+
+    /** The leading check slot a toggleable entry reserves, checked or not. */
+    const val CHECK_SLOT = 0.875f
 }
 
 /** One row of a context menu: what it does, and the chord that also does it. */
@@ -64,6 +68,27 @@ internal data class ContextMenuItem(
     val label: String,
     val shortcut: String? = null,
     val enabled: Boolean = true,
+    /**
+     * A toggleable entry — Zed's `toggleable(IconPosition::Start, checked)`
+     * (context_menu.rs): non-null grows a leading check slot, filled with the
+     * mark when true and left empty when false, so the labels of checked and
+     * unchecked entries stay aligned.
+     */
+    val checked: Boolean? = null,
+    /**
+     * Zed's documentation aside — the muted explainer an entry can carry (the
+     * commit menu's Skip Hooks shows the literal `git commit --no-verify`,
+     * git_panel.rs:5599-5608). Zed floats it in a panel beside the menu; on a
+     * phone there is no beside, so it is a second line under the label.
+     */
+    val aside: String? = null,
+    /**
+     * Zed's `.separator()` — a 1px rule above this entry, dividing the menu
+     * into its groups (the remote menu draws one between Pull (Rebase) and
+     * Push, git_ui.rs:1050). On the entry rather than in the list so [items]
+     * stays a plain list of rows.
+     */
+    val separatorAbove: Boolean = false,
     val onClick: () -> Unit,
 )
 
@@ -104,6 +129,14 @@ internal fun ContextMenu(
                 .padding(horizontal = rem(MenuMetrics.INSET)),
         ) {
             for (item in items) {
+                if (item.separatorAbove) {
+                    // Zed's separator: a 1px `border.variant` rule with 4px of
+                    // surface above and below (context_menu.rs's Divider row).
+                    HorizontalDivider(
+                        color = theme.color("border.variant"),
+                        modifier = Modifier.padding(vertical = rem(MenuMetrics.INSET)),
+                    )
+                }
                 ContextMenuRow(item, onChosen = onDismiss)
             }
         }
@@ -146,16 +179,35 @@ private fun ContextMenuRow(item: ContextMenuItem, onChosen: () -> Unit) {
                 vertical = rem(MenuMetrics.ROW_PAD_Y),
             ),
     ) {
-        Text(
-            text = item.label,
-            style = MaterialTheme.typography.bodyMedium,
-            color = if (item.enabled) {
-                MaterialTheme.colorScheme.onSurface
-            } else {
-                theme.color("text.disabled", MaterialTheme.colorScheme.onSurfaceVariant)
-            },
-            modifier = Modifier.weight(1f),
-        )
+        if (item.checked != null) {
+            // The check wears `Color::Accent`, as every selected mark in Zed
+            // (context_menu.rs renders toggleable entries with a Check icon in
+            // the accent colour); the slot stays open when unchecked.
+            Text(
+                text = if (item.checked) "✓" else "",
+                style = MaterialTheme.typography.labelMedium,
+                color = theme.color("text.accent", MaterialTheme.colorScheme.primary),
+                modifier = Modifier.widthIn(min = rem(MenuMetrics.CHECK_SLOT)),
+            )
+        }
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = item.label,
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (item.enabled) {
+                    MaterialTheme.colorScheme.onSurface
+                } else {
+                    theme.color("text.disabled", MaterialTheme.colorScheme.onSurfaceVariant)
+                },
+            )
+            if (item.aside != null) {
+                Text(
+                    text = item.aside,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
         if (item.shortcut != null) {
             Text(
                 text = item.shortcut,

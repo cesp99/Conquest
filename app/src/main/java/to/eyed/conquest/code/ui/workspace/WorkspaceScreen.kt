@@ -36,6 +36,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
@@ -84,11 +86,14 @@ import to.eyed.conquest.code.ui.editor.SoftWrapMode
 import to.eyed.conquest.code.ui.editor.LspServer
 import to.eyed.conquest.code.ui.editor.rememberLspState
 import to.eyed.conquest.code.ui.media.MediaKind
+import to.eyed.conquest.code.ui.git.BranchPicker
 import to.eyed.conquest.code.ui.git.DiffPane
 import to.eyed.conquest.code.ui.git.DiffTarget
 import to.eyed.conquest.code.ui.git.GitGraphPane
 import to.eyed.conquest.code.ui.git.GitPanel
+import to.eyed.conquest.code.ui.git.GitPanelCommand
 import to.eyed.conquest.code.ui.git.GitPanelDockWidth
+import to.eyed.conquest.code.ui.git.GitPanelRequest
 import to.eyed.conquest.code.ui.git.rememberGitBranch
 import to.eyed.conquest.code.ui.media.MediaPane
 import to.eyed.conquest.code.ui.preview.MarkdownPreview
@@ -217,6 +222,8 @@ private class WorkspaceOverlays {
     /** Ctrl+G. A surface rather than a command: it answers for itself. */
     var goToLineOpen by mutableStateOf(false)
     var outlineOpen by mutableStateOf(false)
+    /** The branch picker — Zed's `git::Switch`, from the panel's branch button. */
+    var branchPickerOpen by mutableStateOf(false)
 }
 
 /**
@@ -283,6 +290,15 @@ fun WorkspaceScreen(
     /** Ctrl+Shift+G, the same way: press it again to put focus back on the list. */
     var gitPanelFocus by remember { mutableIntStateOf(0) }
     var agentPanelFocus by remember { mutableIntStateOf(0) }
+    /**
+     * Whether the git panel holds the keyboard. It is what lets Ctrl+G be
+     * the panel's chord leader there and go-to-line everywhere else — the
+     * root key pass below stands aside on it, the way Zed scopes its git
+     * chords to the `GitPanel` context (default-linux.json:1060).
+     */
+    var gitPanelFocused by remember { mutableStateOf(false) }
+    /** A palette-run git command on its way to the panel — see [GitPanelRequest]. */
+    var gitPanelRequest by remember { mutableStateOf<GitPanelRequest?>(null) }
     /**
      * Whether the dock is drawn over the whole work area rather than beside
      * the editor. Decided during layout, where the width is known, and read by
@@ -423,6 +439,10 @@ fun WorkspaceScreen(
             terminals.closeAll()
             files.clearClosedHistory()
             dismissedConflicts.value = emptySet()
+            // A git command still waiting on the old project's first scan is
+            // about that project; it must not survive into this one. The
+            // panel's own stamp check is the second lock on the same door.
+            gitPanelRequest = null
             project?.close()
             val opened = ProjectSession(path)
             project = opened
@@ -689,6 +709,28 @@ fun WorkspaceScreen(
         return true
     }
 
+    /**
+     * A git command run from the palette reaches the panel as a request: the
+     * panel owns the session, the single-flight busy flag and the strip that
+     * says what git answered, so the command must run *there* — Zed routes
+     * its workspace-registered git actions to the panel the same way
+     * (git_ui.rs:193-241). Opening the dock first is what makes the spinner,
+     * and whatever git says back, visible.
+     */
+    fun requestGitPanelCommand(command: GitPanelCommand): Boolean {
+        val open = project ?: return false
+        docks.open(WorkspacePanel.Git, settings)
+        // On a compact screen the panel takes the work area from a focused
+        // terminal, and nothing else would tell the key table it is gone.
+        terminalFocused = false
+        // Stamped with the project it was asked for: the panel drops a
+        // request whose stamp no longer matches, so a push asked on one
+        // project can never land on another the workspace switched to while
+        // the first scan was still out.
+        gitPanelRequest = GitPanelRequest(command, open.id, (gitPanelRequest?.token ?: 0) + 1)
+        return true
+    }
+
     fun runCommand(command: WorkspaceCommand): Boolean {
         val active = files.active
         when (command) {
@@ -799,6 +841,10 @@ fun WorkspaceScreen(
                 if (project == null) return false
                 openGraph()
             }
+            WorkspaceCommand.SwitchBranch -> {
+                if (project == null) return false
+                overlays.branchPickerOpen = true
+            }
             WorkspaceCommand.ToggleAgentPanel -> {
                 if (!isAgentPanelSupported) return false
                 if (togglePanel(WorkspacePanel.Agent)) agentPanelFocus++
@@ -808,6 +854,23 @@ fun WorkspaceScreen(
                 if (project == null) return false
                 if (togglePanel(WorkspacePanel.Git)) gitPanelFocus++
             }
+            // The git family runs in the panel — see requestGitPanelCommand.
+            WorkspaceCommand.GitFetch ->
+                if (!requestGitPanelCommand(GitPanelCommand.Fetch)) return false
+            WorkspaceCommand.GitPull ->
+                if (!requestGitPanelCommand(GitPanelCommand.Pull)) return false
+            WorkspaceCommand.GitPullRebase ->
+                if (!requestGitPanelCommand(GitPanelCommand.PullRebase)) return false
+            WorkspaceCommand.GitPush ->
+                if (!requestGitPanelCommand(GitPanelCommand.Push)) return false
+            WorkspaceCommand.GitForcePush ->
+                if (!requestGitPanelCommand(GitPanelCommand.ForcePush)) return false
+            WorkspaceCommand.GitStageAll ->
+                if (!requestGitPanelCommand(GitPanelCommand.StageAll)) return false
+            WorkspaceCommand.GitUnstageAll ->
+                if (!requestGitPanelCommand(GitPanelCommand.UnstageAll)) return false
+            WorkspaceCommand.GitDiff ->
+                if (!requestGitPanelCommand(GitPanelCommand.Diff)) return false
             WorkspaceCommand.FindInFile -> {
                 if (files.active?.editor == null) return false
                 searchBarOpen = true
@@ -932,6 +995,51 @@ fun WorkspaceScreen(
         }
     }
 
+    /**
+     * Show the branch against its merge base with [base] — Zed's Branch Diff
+     * tab ("Changes since {base}", branch_diff.rs:43), the git panel's "View
+     * Branch Diff". Keyed by the base so a later deploy against the same base
+     * reuses the tab.
+     */
+    fun openBranchDiff(base: String) {
+        if (project == null) return
+        val target = DiffTarget(path = null, mergeBase = base)
+        val key = "git-branch-diff:$base"
+        val existing = files.indexOfPath(key)
+        if (existing >= 0) {
+            files.select(existing)
+        } else {
+            files.open(OpenFile(path = key, editor = null, diff = target))
+        }
+        dockTookWorkArea?.let { side ->
+            docks.closeDock(side)
+            terminalFocused = false
+            rootFocus.requestFocus()
+        }
+    }
+
+    /**
+     * Show what one commit changed — Zed's CommitView, in [DiffPane]'s
+     * clothes. [path] narrows it to one file (the graph sidebar's per-file
+     * "View Changes"); the two are different tabs, as Zed's filtered view is.
+     */
+    fun openCommitDiff(sha: String, subject: String, path: String? = null) {
+        if (project == null) return
+        val target = DiffTarget(path = path, commit = sha, subject = subject)
+        val key = "git-commit:$sha:${path ?: ""}"
+        val existing = files.indexOfPath(key)
+        if (existing >= 0) {
+            files.select(existing)
+        } else {
+            files.open(OpenFile(path = key, editor = null, diff = target))
+        }
+        dockTookWorkArea?.let { side ->
+            docks.closeDock(side)
+            terminalFocused = false
+            rootFocus.requestFocus()
+        }
+    }
+
     fun openProjectSearch(): Boolean {
         if (project == null) return false
         docks.open(WorkspacePanel.Search, settings)
@@ -977,6 +1085,12 @@ fun WorkspaceScreen(
                     return@onPreviewKeyEvent runCommand(WorkspaceCommand.TogglePreview)
                 }
                 if (isGoToLine(event, focus)) {
+                    // Ctrl+G is the git panel's chord leader while the panel
+                    // has the keyboard — Zed scopes its git chords to the
+                    // `GitPanel` context for exactly this collision
+                    // (default-linux.json:1060 vs :622) — so go-to-line
+                    // stands aside and the panel's own handler takes the key.
+                    if (gitPanelFocused) return@onPreviewKeyEvent false
                     if (files.active?.editor == null) return@onPreviewKeyEvent false
                     overlays.goToLineOpen = true
                     return@onPreviewKeyEvent true
@@ -986,9 +1100,17 @@ fun WorkspaceScreen(
                     overlays.outlineOpen = true
                     return@onPreviewKeyEvent true
                 }
-                tabIndexFor(event, files.tabs.size, focus)?.let { index ->
-                    files.select(index)
-                    return@onPreviewKeyEvent true
+                // Ctrl+1 and Ctrl+2 switch the *panel's* tabs while the git
+                // panel has the keyboard (Zed's git_panel::ActivateChangesTab
+                // / ActivateHistoryTab, default-linux.json:1010-1011); the
+                // other digits still pick editor tabs from there.
+                val gitPanelTabChord = gitPanelFocused &&
+                    (event.key == Key.One || event.key == Key.Two)
+                if (!gitPanelTabChord) {
+                    tabIndexFor(event, files.tabs.size, focus)?.let { index ->
+                        files.select(index)
+                        return@onPreviewKeyEvent true
+                    }
                 }
                 workspaceCommandFor(event, focus)?.let { return@onPreviewKeyEvent runCommand(it) }
                 false
@@ -1106,8 +1228,10 @@ fun WorkspaceScreen(
                 isDirty = active?.isDirty == true,
                 menuGroups = menuGroups,
                 branch = rememberGitBranch(project),
+                // Zed's title-bar branch button opens the branch picker, not
+                // the panel (title_bar.rs:1050-1058).
                 onBranch = if (project != null) {
-                    { runCommand(WorkspaceCommand.ToggleGitPanel) }
+                    { runCommand(WorkspaceCommand.SwitchBranch) }
                 } else {
                     null
                 },
@@ -1154,6 +1278,9 @@ fun WorkspaceScreen(
                         settings = settings,
                         searchFocus = projectSearchFocus,
                         gitFocus = gitPanelFocus,
+                        gitRequest = gitPanelRequest,
+                        onGitRequestHandled = { gitPanelRequest = null },
+                        onGitFocusChanged = { gitPanelFocused = it },
                         agentFocus = agentPanelFocus,
                         revealRequest = revealInPanel,
                         onRevealHandled = { revealInPanel = false },
@@ -1162,7 +1289,10 @@ fun WorkspaceScreen(
                         onOpenPath = ::openFromDock,
                         onOpenSettings = { runCommand(WorkspaceCommand.OpenSettings) },
                         onOpenDiff = ::openDiff,
+                        onOpenBranchDiff = ::openBranchDiff,
+                        onOpenCommit = { sha, subject -> openCommitDiff(sha, subject) },
                         onOpenGraph = ::openGraph,
+                        onSwitchBranch = { runCommand(WorkspaceCommand.SwitchBranch) },
                         onEntryRemoved = ::closeTabsUnder,
                         onEntryMoved = ::retitleTabs,
                         onPanelFocusChanged = { projectPanelFocused = it },
@@ -1211,6 +1341,7 @@ fun WorkspaceScreen(
                                     onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
                                     diffProject = project,
                                     onOpenPath = { path -> project?.let { openFile(it, path) } },
+                                    onOpenCommit = ::openCommitDiff,
                                     softWrap = settings.softWrap,
                                     showInlineBlame = settings.inlineBlame,
                                     onOpenDefinition = { target ->
@@ -1267,6 +1398,9 @@ fun WorkspaceScreen(
                                         settings = settings,
                                         searchFocus = projectSearchFocus,
                                         gitFocus = gitPanelFocus,
+                                        gitRequest = gitPanelRequest,
+                                        onGitRequestHandled = { gitPanelRequest = null },
+                                        onGitFocusChanged = { gitPanelFocused = it },
                                         agentFocus = agentPanelFocus,
                                         revealRequest = revealInPanel,
                                         onRevealHandled = { revealInPanel = false },
@@ -1277,7 +1411,14 @@ fun WorkspaceScreen(
                                             runCommand(WorkspaceCommand.OpenSettings)
                                         },
                                         onOpenDiff = ::openDiff,
+                                        onOpenBranchDiff = ::openBranchDiff,
+                                        onOpenCommit = { sha, subject ->
+                                            openCommitDiff(sha, subject)
+                                        },
                                         onOpenGraph = ::openGraph,
+                                        onSwitchBranch = {
+                                            runCommand(WorkspaceCommand.SwitchBranch)
+                                        },
                                         onEntryRemoved = ::closeTabsUnder,
                                         onEntryMoved = ::retitleTabs,
                         onPanelFocusChanged = { projectPanelFocused = it },
@@ -1513,6 +1654,16 @@ fun WorkspaceScreen(
         )
     }
 
+    if (overlays.branchPickerOpen && openedProject != null) {
+        BranchPicker(
+            project = openedProject,
+            onDismiss = {
+                overlays.branchPickerOpen = false
+                rootFocus.requestFocus()
+            },
+        )
+    }
+
     if (overlays.themeSelectorOpen) {
         ThemeSelector(
             mode = settings.theme,
@@ -1732,6 +1883,8 @@ private fun EditorArea(
     /** For a diff tab, which needs the project rather than a buffer. */
     diffProject: ProjectSession?,
     onOpenPath: (String) -> Unit,
+    /** The graph asking for a commit's diff tab, whole or one file of it. */
+    onOpenCommit: (sha: String, subject: String, path: String?) -> Unit,
     softWrap: SoftWrapMode,
     showInlineBlame: Boolean,
     /**
@@ -1826,7 +1979,7 @@ private fun EditorArea(
         } else if (active.graph && diffProject != null) {
             GitGraphPane(
                 project = diffProject,
-                onOpenFile = onOpenPath,
+                onOpenCommit = onOpenCommit,
                 modifier = Modifier.weight(1f),
             )
         } else if (active.diff != null && diffProject != null) {
@@ -1957,6 +2110,11 @@ private fun DockPanel(
     settings: AppSettings,
     searchFocus: Int,
     gitFocus: Int,
+    /** A palette-run git command for the git panel, and its receipt. */
+    gitRequest: GitPanelRequest?,
+    onGitRequestHandled: () -> Unit,
+    /** The git panel reporting whether it holds the keyboard. */
+    onGitFocusChanged: (Boolean) -> Unit,
     agentFocus: Int,
     revealRequest: Boolean,
     openedPath: String?,
@@ -1965,7 +2123,13 @@ private fun DockPanel(
     onOpenMatch: (String, ProjectSearchMatch) -> Unit,
     onOpenPath: (String) -> Unit,
     onOpenDiff: (String?) -> Unit,
+    /** The git panel's "View Branch Diff" opening the branch-vs-base tab. */
+    onOpenBranchDiff: (String) -> Unit,
+    /** The git panel's footer opening one commit as a diff tab. */
+    onOpenCommit: (String, String) -> Unit,
     onOpenGraph: () -> Unit,
+    /** The git panel's branch button opening the branch picker. */
+    onSwitchBranch: () -> Unit,
     onEntryRemoved: (String) -> Unit,
     onEntryMoved: (String, String) -> Unit,
     /** The project panel reporting whether it holds the keyboard. */
@@ -2003,8 +2167,14 @@ private fun DockPanel(
             focusToken = gitFocus,
             onOpenFile = onOpenPath,
             onOpenDiff = onOpenDiff,
+            onOpenBranchDiff = onOpenBranchDiff,
+            onOpenCommit = onOpenCommit,
             onOpenGraph = onOpenGraph,
+            onSwitchBranch = onSwitchBranch,
             onDismiss = onDismiss,
+            request = gitRequest,
+            onRequestHandled = onGitRequestHandled,
+            onFocusChanged = onGitFocusChanged,
         )
         WorkspacePanel.Agent -> AgentPanel(
             project = project ?: return,

@@ -223,7 +223,8 @@ object CoreBridge {
 
     /**
      * The branch record the project is on, from the cached status run, as
-     * JSON — `{name, ahead, behind, unborn, upstream}`, the same object
+     * JSON — `{name, ahead, behind, unborn, upstream, upstream_gone}`, the
+     * same object
      * [gitChanges] nests — with no JSON of the changed files and no git run:
      * the title bar's drift arrows and the history views' reload keys ride
      * the same half-second poll the name does. Null when nothing is known:
@@ -296,15 +297,132 @@ object CoreBridge {
      * Commits what is staged. An empty or whitespace-only message is refused
      * rather than becoming an empty commit, and nothing is staged implicitly —
      * a commit with an empty index comes back with git's own "nothing added to
-     * commit". **Blocking**.
+     * commit". The three flags are the split-button menu's Amend, Signoff and
+     * Skip Hooks, appended to the argv in Zed's own order. **Blocking**.
      */
-    external fun gitCommit(projectId: Long, message: String): String?
+    external fun gitCommit(
+        projectId: Long,
+        message: String,
+        amend: Boolean,
+        signoff: Boolean,
+        noVerify: Boolean,
+    ): String?
 
     /**
-     * Push [branch] to `origin`, setting its upstream when it has none. Null
-     * when it worked, the reason when it did not. **Blocking** — network.
+     * Undoes the last commit, keeping its changes staged — exactly `git reset
+     * --soft HEAD^`, Zed's Uncommit. Nothing below this call asks anything:
+     * read [gitHeadPushedRemotes] and the old message *before* resetting,
+     * while HEAD still names the commit. Null when it worked. **Blocking**.
      */
-    external fun gitPush(projectId: Long, branch: String, setUpstream: Boolean): String?
+    external fun gitUncommit(projectId: Long): String?
+
+    /**
+     * Every `remote/branch` that already holds HEAD, as JSON
+     * `{"remotes":[…]}` — the evidence the uncommit confirmation shows that
+     * the commit was pushed. Empty both for "nothing pushed" and for a check
+     * git could not run — Zed proceeds silently there, and a failed *check*
+     * must not block the reset. **Blocking**.
+     */
+    external fun gitHeadPushedRemotes(projectId: Long): String
+
+    /**
+     * Makes the project a repository — the panel's "Initialize Repository"
+     * empty state. Zed's two commands: the guest's `init.defaultBranch` names
+     * the branch when it is set, [fallbackBranch] when it is not, then
+     * `git init -b <branch>`. Null when it worked. **Blocking**.
+     */
+    external fun gitInit(projectId: Long, fallbackBranch: String): String?
+
+    /**
+     * Every local and remote-tracking branch with its tip commit, as JSON —
+     * see [GitBranchList] for the shape. A partial listing keeps what parsed
+     * and carries git's complaint beside it, which is the picker's warning
+     * banner. **Blocking** — it runs git; the picker reads it once on open,
+     * not on a poll loop.
+     */
+    external fun gitBranches(projectId: Long): String
+
+    /**
+     * Checks out a branch by the name [gitBranches] listed. A remote name
+     * (`origin/feature`) grows a local tracking branch named after it first —
+     * minus the remote prefix — exactly as Zed does. Null when it worked;
+     * git's refusal, a dirty worktree above all, when it did not. **Blocking**.
+     */
+    external fun gitChangeBranch(projectId: Long, name: String): String?
+
+    /**
+     * Creates a branch and switches to it — `git switch -c <name> [<base>]`.
+     * An empty [base] branches off HEAD, which is what the picker's plain
+     * Create does; "Create New From" passes the default branch. Null when it
+     * worked. **Blocking**.
+     */
+    external fun gitCreateBranch(projectId: Long, name: String, base: String): String?
+
+    /**
+     * Deletes a branch — `git branch -d|-D|-dr|-Dr <name>`, Zed's flag table.
+     * An unmerged branch is git's own "not fully merged", the picker's cue to
+     * offer force-delete. Null when it worked. **Blocking**.
+     */
+    external fun gitDeleteBranch(
+        projectId: Long,
+        name: String,
+        isRemote: Boolean,
+        force: Boolean,
+    ): String?
+
+    /**
+     * The repository's default branch, by Zed's chain: `upstream/HEAD`, then
+     * `origin/HEAD`, then `init.defaultBranch` if that local branch exists,
+     * then local `main`, then `master`. Null when nothing matches — the
+     * picker simply drops its "Create New From" entry. **Blocking**.
+     */
+    external fun gitDefaultBranch(projectId: Long): String?
+
+    /**
+     * Every remote with its fetch URL, as JSON — `{"remotes":[{name, url}]}`
+     * in `git remote -v`'s order, or `{"error":…}`. The Fetch From / Push To
+     * pickers' listing, and where github.com detection reads the URL.
+     * **Blocking** — it runs git.
+     */
+    external fun gitRemotes(projectId: Long): String
+
+    /**
+     * The remote [branch] is configured to push to ([isPush]) or pull from —
+     * Zed's `get_remote` asks `<branch>@{push}` or `branch.<branch>.remote`
+     * respectively — or null when none is configured (or git could not be
+     * asked): the cue to fall back to [gitRemotes] and a picker. **Blocking**.
+     */
+    external fun gitBranchRemote(projectId: Long, branch: String, isPush: Boolean): String?
+
+    /**
+     * Fetch from [remote], or from all remotes when it is empty — Zed's
+     * `git fetch --all`. Returns the remote-command JSON [RemoteOpResult]
+     * parses: git's stdout and stderr kept apart for the toast rules, plus
+     * `error` when it failed. Never null. **Blocking** — network.
+     */
+    external fun gitFetch(projectId: Long, remote: String): String
+
+    /**
+     * Pull [branch] from [remote], with `--rebase` when [rebase] — Zed's Pull
+     * and Pull (Rebase). The branch name joins the argv only when the branch
+     * has no upstream. Returns the remote-command JSON. **Blocking** —
+     * network.
+     */
+    external fun gitPull(projectId: Long, branch: String, remote: String, rebase: Boolean): String
+
+    /**
+     * Push [branch] to [remote] — with `--set-upstream` for Zed's Publish and
+     * Republish when [setUpstream], or `--force-with-lease` (never plain
+     * `--force`) when [force]; force wins when both are set, as in Zed.
+     * Returns the remote-command JSON. **Blocking** — network.
+     */
+    external fun gitPush(
+        projectId: Long,
+        branch: String,
+        remote: String,
+        setUpstream: Boolean,
+        force: Boolean,
+    ): String
 
     /**
      * The working tree's diff as a patch, as JSON. An empty [path] means every
@@ -313,10 +431,26 @@ object CoreBridge {
     external fun gitPatch(projectId: Long, path: String, staged: Boolean): String
 
     /**
-     * A page of commit history, newest first, as JSON — `{"commits":[…]}` or
-     * `{"error":…}`. **Blocking** — it runs git.
+     * The branch's changes since it left [base] — the merge-base diff behind
+     * "View Branch Diff", in [gitPatch]'s JSON shape. **Blocking** — it runs
+     * git.
      */
-    external fun gitLog(projectId: Long, limit: Long, skip: Long): String
+    external fun gitBranchPatch(projectId: Long, base: String): String
+
+    /**
+     * A page of commit history, newest first, as JSON — `{"commits":[…]}` or
+     * `{"error":…}`. [allRefs] walks every branch, remote and tag in
+     * `--date-order` — the graph's view; false is the plain HEAD walk the
+     * History tab shows. **Blocking** — it runs git.
+     */
+    external fun gitLog(projectId: Long, limit: Long, skip: Long, allRefs: Boolean): String
+
+    /**
+     * What one commit changed against its first parent, in [gitPatch]'s JSON
+     * shape. An empty [path] is the whole commit; a path narrows it to one
+     * file. **Blocking** — it runs git.
+     */
+    external fun gitCommitPatch(projectId: Long, sha: String, path: String): String
 
     /**
      * One commit in full: its fields, its whole message and the paths it

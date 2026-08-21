@@ -344,6 +344,15 @@ pub(crate) fn invocation(userland: &Userland, command: &GuestCommand) -> Invocat
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
         ),
         ("HOME".into(), "/root".into()),
+        // The guest's own /tmp, for the same reason the guest gets a guest
+        // PATH: the inherited value is a *host* path. Android's runtime sets
+        // TMPDIR to the app's cache directory after fork — invisible in
+        // `/proc/<pid>/environ`, which only shows the initial environment —
+        // and that directory does not exist inside the fake root. A shell
+        // told to park a stream under it fails the redirection and reports
+        // exit 2 with nothing said, which is how a failing `git fetch` came
+        // back with empty output instead of git's own "fatal:" line.
+        ("TMPDIR".into(), "/tmp".into()),
         ("LANG".into(), "C.UTF-8".into()),
         // Machine-readable output is not localised, but *errors* are, and we
         // log them.
@@ -368,16 +377,45 @@ fn proot_command(userland: &Userland, command: &GuestCommand) -> Command {
     proot
 }
 
+/// What one [`capture_outcome`] run came to, for the callers that must tell a
+/// deadline kill apart from everything else: by the time a deadline fires the
+/// program *was* running, and a mutating git command killed mid-flight may
+/// have partly applied — a message blaming the userland would be a lie about
+/// it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Captured {
+    /// Ran to a successful exit; its stdout.
+    Output(Vec<u8>),
+    /// Could not start, could not be waited on, or exited non-zero.
+    Failed,
+    /// Still running at the deadline and killed for it.
+    TimedOut,
+}
+
 /// Run a program in the guest to completion and return its stdout, or `None`
 /// if it could not be started, timed out, or exited non-zero.
 ///
 /// Nothing arrives until it exits: this is for queries whose answer is their
-/// output. A process the caller wants to talk to is [`spawn`]'s job.
+/// output. A process the caller wants to talk to is [`spawn`]'s job. A caller
+/// that has to distinguish the deadline from the other failures reads
+/// [`capture_outcome`] instead.
 pub(crate) fn capture(
     userland: &Userland,
     command: &GuestCommand,
     timeout: Duration,
 ) -> Option<Vec<u8>> {
+    match capture_outcome(userland, command, timeout) {
+        Captured::Output(output) => Some(output),
+        Captured::Failed | Captured::TimedOut => None,
+    }
+}
+
+/// [`capture`], with the failures kept apart — see [`Captured`].
+pub(crate) fn capture_outcome(
+    userland: &Userland,
+    command: &GuestCommand,
+    timeout: Duration,
+) -> Captured {
     let label = &command.label;
     let mut proot = proot_command(userland, command);
     proot
@@ -389,7 +427,7 @@ pub(crate) fn capture(
         Ok(child) => child,
         Err(err) => {
             log::debug!("{label} could not start: {err}");
-            return None;
+            return Captured::Failed;
         }
     };
 
@@ -407,8 +445,12 @@ pub(crate) fn capture(
     //
     // (`Command::output()` gets this right too — it polls both pipes — but it
     // consumes the child, leaving nothing to `kill()` when the timeout fires.)
-    let mut stdout = child.stdout.take()?;
-    let mut stderr = child.stderr.take()?;
+    let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        // Cannot happen — both were piped four lines up — but a child left
+        // running with nobody draining it would be worse than saying so.
+        terminate(&mut child);
+        return Captured::Failed;
+    };
     let out_reader = thread::spawn(move || {
         let mut buffer = Vec::new();
         let _ = stdout.read_to_end(&mut buffer);
@@ -421,6 +463,7 @@ pub(crate) fn capture(
     });
 
     let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -432,6 +475,7 @@ pub(crate) fn capture(
         }
         if Instant::now() >= deadline {
             log::debug!("{label} timed out after {timeout:?}; killing it");
+            timed_out = true;
             terminate(&mut child);
             break None;
         }
@@ -443,7 +487,13 @@ pub(crate) fn capture(
     let out = out_reader.join().unwrap_or_default();
     let err = err_reader.join().unwrap_or_default();
 
-    let status = status?;
+    let Some(status) = status else {
+        return if timed_out {
+            Captured::TimedOut
+        } else {
+            Captured::Failed
+        };
+    };
     if !status.success() {
         // For git, the overwhelmingly common cause is "git is not installed in
         // the guest", which is a perfectly ordinary state for a fresh Debian.
@@ -451,9 +501,20 @@ pub(crate) fn capture(
             "{label} exited with {status}: {}",
             String::from_utf8_lossy(&err).trim()
         );
-        return None;
+        return Captured::Failed;
     }
-    Some(out)
+    // A successful exit can still have complaints on stderr — a shell whose
+    // redirection failed says why *here*, then carries on and exits zero.
+    // Dropping them silently is how a wrapper failure once read as "git
+    // exited with 2" with nothing else to show, so at least the log keeps
+    // the sentence.
+    if !err.is_empty() {
+        log::debug!(
+            "{label} stderr (exit 0): {}",
+            String::from_utf8_lossy(&err).trim()
+        );
+    }
+    Captured::Output(out)
 }
 
 /// How long the login shell gets to print its environment. The real thing
@@ -951,6 +1012,10 @@ mod tests {
                     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
                 ),
                 ("HOME".to_owned(), "/root".to_owned()),
+                // The guest's /tmp, never the host's: Android sets TMPDIR to
+                // the app cache directory at runtime, which does not exist
+                // inside the fake root — see `invocation`.
+                ("TMPDIR".to_owned(), "/tmp".to_owned()),
                 ("LANG".to_owned(), "C.UTF-8".to_owned()),
                 ("LC_ALL".to_owned(), "C".to_owned()),
             ])
@@ -1144,6 +1209,11 @@ mod tests {
         let guest = fake_userland(dir.path());
         let command = GuestCommand::new("test", sh("printf half; exit 3"));
         assert_eq!(capture(&guest, &command, Duration::from_secs(10)), None);
+        // And a non-zero exit is a *failure*, never mistaken for the deadline.
+        assert_eq!(
+            capture_outcome(&guest, &command, Duration::from_secs(10)),
+            Captured::Failed
+        );
     }
 
     #[test]
@@ -1156,6 +1226,12 @@ mod tests {
         assert_eq!(capture(&guest, &command, Duration::from_millis(200)), None);
         // The deadline is what ended it, not the sleep.
         assert!(started.elapsed() < Duration::from_secs(20));
+        // And the outcome says so, which is what lets a killed mutation admit
+        // it may have partly applied rather than blame the userland.
+        assert_eq!(
+            capture_outcome(&guest, &command, Duration::from_millis(200)),
+            Captured::TimedOut
+        );
     }
 
     /// The real capture, through the fake proot: a genuine `bash --login`

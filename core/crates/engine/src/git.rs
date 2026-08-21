@@ -187,6 +187,11 @@ pub struct BranchInfo {
     /// that has never been pushed — the difference between "push" and Zed's
     /// "Publish".
     pub upstream: Option<String>,
+    /// The upstream is configured but its ref is gone — git's `[gone]`,
+    /// usually a branch deleted on the remote. Zed's `UpstreamTracking::Gone`:
+    /// the remote button reads "Republish", and a push re-creates the branch
+    /// with `--set-upstream` (git_ui.rs:822-829, git_panel.rs:3920-3929).
+    pub upstream_gone: bool,
 }
 
 /// Everything the git panel draws, as one snapshot.
@@ -242,14 +247,18 @@ pub(crate) struct ProjectGit {
     statuses: Arc<BTreeMap<String, GitStatus>>,
     /// The same run's output, unreduced, for the git panel.
     pub(crate) changes: Arc<Vec<FileChange>>,
-    branch: Option<BranchInfo>,
+    /// Read by the remote commands too: a push's refspec names the upstream's
+    /// branch, which this already knows.
+    pub(crate) branch: Option<BranchInfo>,
     /// The commit HEAD named when the run finished — see [`read_head`].
     head: Option<String>,
     /// Where the enclosing repository is, once a run has looked. `None` after
     /// a completed run means the project is not in a repository.
     repo_root: Option<PathBuf>,
-    /// Bumped when anything above actually changed, so a poll loop that sees a
-    /// steady number can skip the JNI read entirely.
+    /// Bumped when anything above actually changed — and when a run completed
+    /// that a reader could have seen pending (`scanned` was false, or `ran`
+    /// flipped), so a poll loop that sees a steady number can skip the JNI
+    /// read entirely and still never sits on a transient "asking git" state.
     version: u64,
     /// A run has completed at least once (successfully or not).
     scanned: bool,
@@ -484,18 +493,31 @@ fn run_until_settled(
             // Compared on the unreduced changes rather than the rolled-up map:
             // staging a file moves its letters without moving its colour, and
             // a panel watching this counter has to see that.
-            if *git.changes != outcome.changes
+            let content_changed = *git.changes != outcome.changes
                 || git.branch != outcome.branch
                 || git.head != outcome.head
-                || git.repo_root != outcome.repo_root
-            {
+                || git.repo_root != outcome.repo_root;
+            if content_changed {
                 git.statuses = Arc::new(outcome.statuses);
                 git.changes = Arc::new(outcome.changes);
                 git.branch = outcome.branch;
                 git.head = outcome.head;
                 git.repo_root = outcome.repo_root;
-                git.version += 1;
                 bump_generation();
+            }
+            // The version moves for a flag flip too, not only for content: a
+            // mutation calls [`Engine::git_state_changed`], which drops
+            // `scanned`, and whoever reads the state right then renders
+            // "Asking git…". When this run's snapshot turns out *identical* —
+            // a push that failed, a commit git refused — a version pegged to
+            // content would never tell the poll loop that the answer came
+            // back, and the panel sat on that transient forever. Same for
+            // `ran`: git becoming reachable (or not) changes what the panel
+            // says without changing a single path. The generation above stays
+            // content-only — the diff gutter's base text cannot go stale on a
+            // no-op.
+            if content_changed || !git.scanned || git.ran != outcome.ran {
+                git.version += 1;
             }
             git.scanned = true;
             git.ran = outcome.ran;
@@ -931,6 +953,14 @@ pub(crate) fn parse_branch(output: &[u8]) -> Option<BranchInfo> {
                 info.upstream = Some(upstream.to_owned());
             }
         }
+        // `main...origin/main [gone]` — the upstream is configured but its
+        // ref no longer exists. Only ever written whole, and only ever with
+        // an upstream to be gone.
+        if info.upstream.is_some()
+            && let Some((_, bracket)) = rest.split_once('[')
+        {
+            info.upstream_gone = bracket.trim_end_matches(']').trim() == "gone";
+        }
     }
     Some(info)
 }
@@ -1074,10 +1104,23 @@ fn summary(tier: u8, from: GitStatus) -> GitStatus {
 // when it refuses.
 // ---------------------------------------------------------------------------
 
-/// A command that takes longer than this has gone wrong. Shorter than the
-/// query's deadline because somebody is waiting on it with a finger on a
-/// button, and a spinner that never ends is worse than an error.
+/// A *read-only* command that takes longer than this has gone wrong. Shorter
+/// than the query's deadline because somebody is waiting on it with a finger
+/// on a button, and a spinner that never ends is worse than an error. Only
+/// reads may be killed this eagerly — a killed read costs a retry and nothing
+/// else; a killed write is [`MUTATION_TIMEOUT`]'s story.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The safety net for commands that *change* the repository — a checkout, a
+/// commit, and the remote trio that moves commits over a network that may be
+/// a phone's. Deliberately not a responsiveness promise: killing a mutation
+/// mid-flight leaves half-applied state behind — a fetch that already moved
+/// remote refs, a merge with `MERGE_HEAD` in place, a stale `index.lock`
+/// nothing in the app can clean up — which is strictly worse than a long
+/// wait. Zed's equivalents run with no deadline at all; ten minutes is the
+/// something-is-truly-wedged backstop, not a duration any healthy command
+/// reaches.
+pub(crate) const MUTATION_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// What the shell wrapper prints after the command it ran.
 const EXIT_MARKER: &str = "conquest-exit:";
@@ -1102,6 +1145,7 @@ const EXIT_MARKER: &str = "conquest-exit:";
 const WRAPPER: &str = r#""$@" 2>&1; printf 'conquest-exit:%d' "$?""#;
 
 /// What one command did.
+#[derive(Debug)]
 pub(crate) struct GitRun {
     /// git's own exit status.
     pub status: i32,
@@ -1119,44 +1163,76 @@ impl GitRun {
     /// sentence with `fatal:` or `error:` when there is one, and that when
     /// there is not — the commit case — it is the last thing said.
     pub fn message(&self) -> String {
-        let lines: Vec<&str> = self
-            .output
-            .lines()
-            .map(str::trim_end)
-            .filter(|line| !line.trim().is_empty())
-            .collect();
-        let marked = lines.iter().find_map(|line| {
-            line.strip_prefix("fatal: ")
-                .or_else(|| line.strip_prefix("error: "))
-        });
-        match marked.or_else(|| lines.last().copied()) {
-            Some(line) => line.trim().to_owned(),
-            None => format!("git exited with {}", self.status),
-        }
+        failure_line(&self.output, self.status)
     }
 }
 
-/// Run one git command inside the guest and read back everything it said.
+/// The shared body of [`GitRun::message`] — also what a split-stream command
+/// ([`run_git_split`]) summarizes its two streams through.
+pub(crate) fn failure_line(output: &str, status: i32) -> String {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let marked = lines.iter().find_map(|line| {
+        line.strip_prefix("fatal: ")
+            .or_else(|| line.strip_prefix("error: "))
+    });
+    match marked.or_else(|| lines.last().copied()) {
+        Some(line) => line.trim().to_owned(),
+        None => format!("git exited with {status}"),
+    }
+}
+
+/// Run one *read-only* git command inside the guest and read back everything
+/// it said.
 ///
-/// `Err` means the *guest* failed — no proot, no `sh`, a deadline — which is
-/// not something git said and not something the user can act on beyond
-/// installing the userland.
+/// `Err` means the *guest* failed — no proot, no `sh`, the deadline — which
+/// is not something git said. A command that changes the repository goes
+/// through [`run_git_mutating`] instead, whose deadline is a safety net
+/// rather than a promise of responsiveness.
 pub(crate) fn run_git(
     userland: &Userland,
     repo_root: &Path,
     label: &str,
     argv: Vec<OsString>,
 ) -> Result<GitRun, String> {
+    run_git_with(userland, repo_root, label, argv, COMMAND_TIMEOUT)
+}
+
+/// [`run_git`] for a command that *changes* the repository. Same guest, same
+/// wrapper, same retry — but the deadline is [`MUTATION_TIMEOUT`]: killing
+/// `git checkout` or `git commit` mid-flight leaves a half-switched worktree
+/// or a stale `index.lock` behind, which is strictly worse than a long wait,
+/// so only a truly wedged command is ever killed.
+pub(crate) fn run_git_mutating(
+    userland: &Userland,
+    repo_root: &Path,
+    label: &str,
+    argv: Vec<OsString>,
+) -> Result<GitRun, String> {
+    run_git_with(userland, repo_root, label, argv, MUTATION_TIMEOUT)
+}
+
+/// The shared body of the two above.
+fn run_git_with(
+    userland: &Userland,
+    repo_root: &Path,
+    label: &str,
+    argv: Vec<OsString>,
+    timeout: Duration,
+) -> Result<GitRun, String> {
     // What was actually run, which is the one thing missing when a command
     // works by hand in the terminal and fails here.
     log::debug!("{label}: {argv:?}");
     let retry_argv = argv.clone();
-    let output = guest::capture(
+    let output = captured(
         userland,
         &git_command(label, repo_root, wrapped_argv(argv)),
-        COMMAND_TIMEOUT,
-    )
-    .ok_or_else(|| "Could not run git in the Linux userland".to_owned())?;
+        label,
+        timeout,
+    )?;
     let run = parse_run(&output)?;
     if run.status == 0 {
         return Ok(run);
@@ -1168,15 +1244,35 @@ pub(crate) fn run_git(
     // terminal session alive, and only ever once in a row.
     if run.output.contains("cannot change to") {
         log::debug!("{label}: the guest lost the project; running it once more");
-        let output = guest::capture(
+        let output = captured(
             userland,
             &git_command(label, repo_root, wrapped_argv(retry_argv)),
-            COMMAND_TIMEOUT,
-        )
-        .ok_or_else(|| "Could not run git in the Linux userland".to_owned())?;
+            label,
+            timeout,
+        )?;
         return parse_run(&output);
     }
     Ok(run)
+}
+
+/// One capture, with the deadline's own sentence kept apart from the guest
+/// failing to run git at all: by the time a deadline fires git *was* running,
+/// and a mutating command killed mid-flight may have partly applied — the
+/// error has to say so rather than blame the userland.
+fn captured(
+    userland: &Userland,
+    command: &GuestCommand,
+    label: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    match guest::capture_outcome(userland, command, timeout) {
+        guest::Captured::Output(output) => Ok(output),
+        guest::Captured::TimedOut => Err(format!(
+            "{label} was stopped after {} seconds and may have partly applied; check the repository before retrying",
+            timeout.as_secs()
+        )),
+        guest::Captured::Failed => Err("Could not run git in the Linux userland".to_owned()),
+    }
 }
 
 /// git's argv, wrapped in the shell that makes its failure readable.
@@ -1205,6 +1301,120 @@ fn parse_run(output: &[u8]) -> Result<GitRun, String> {
     Ok(GitRun {
         status: after.trim().parse().unwrap_or(-1),
         output: before.to_owned(),
+    })
+}
+
+/// What the split wrapper prints between the two streams.
+const STDERR_MARKER: &str = "conquest-stderr:";
+
+/// A second wrapper, for the commands whose two streams *mean* different
+/// things. Zed's remote-output toasts read them separately — a pull's file
+/// count is parsed off stdout while the fetch progress scrolls by on stderr,
+/// and a push's "Everything up-to-date" is a stderr sentence
+/// (`crates/git_ui/src/remote_output.rs:82-186`) — so merging them the way
+/// [`WRAPPER`] does would leave nothing to format.
+///
+/// stderr is parked in a file while stdout streams through, then replayed
+/// after its marker; both markers are printed with no added newline so each
+/// stream comes back byte-for-byte, trailing newlines included — the toast
+/// rules end on `\n` and have to keep matching.
+///
+/// The park is `/tmp` **literally**, never `$TMPDIR`. This wrapper only ever
+/// runs inside our own Debian rootfs, where `/tmp` always exists — while
+/// TMPDIR is whatever the environment happened to hand the shell, and on
+/// Android the app process carries one naming the *host* cache directory, a
+/// path that does not exist inside the fake root. `sh` then fails the
+/// redirection before git ever runs and moves on: exit 2, both streams
+/// empty, and the sentence explaining it all on sh's own stderr, which the
+/// capture does not return. A fetch that failed for a real reason came back
+/// as "git exited with 2" with nothing to show — the guest environment now
+/// pins TMPDIR too ([`crate::guest`]), and this wrapper additionally refuses
+/// to trust it.
+const SPLIT_WRAPPER: &str = r#"t="/tmp/conquest-stderr.$$"; "$@" 2>"$t"; s=$?; printf 'conquest-stderr:'; cat "$t" 2>/dev/null; rm -f "$t"; printf 'conquest-exit:%d' "$s""#;
+
+/// What one split-stream command did.
+pub(crate) struct GitSplitRun {
+    pub status: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// [`run_git`] with the two streams kept apart — for fetch, pull and push,
+/// whose output the UI formats rather than merely shows. Same guest, same
+/// retry, and every caller is a mutation that talks to a network, so the
+/// deadline is [`MUTATION_TIMEOUT`]'s safety net rather than a short one that
+/// would kill a legitimate first fetch of a real repository over a phone's
+/// network — mid-merge, refs already moved.
+pub(crate) fn run_git_split(
+    userland: &Userland,
+    repo_root: &Path,
+    label: &str,
+    argv: Vec<OsString>,
+) -> Result<GitSplitRun, String> {
+    log::debug!("{label}: {argv:?}");
+    let retry_argv = argv.clone();
+    let output = captured(
+        userland,
+        &git_command(label, repo_root, split_wrapped_argv(argv)),
+        label,
+        MUTATION_TIMEOUT,
+    )?;
+    let run = parse_split_run(&output)?;
+    if run.status == 0 {
+        return Ok(run);
+    }
+    log::debug!(
+        "{label} exited {}: stdout {:?} stderr {:?}",
+        run.status,
+        run.stdout,
+        run.stderr
+    );
+    // The same not-ready-guest retry `run_git` documents.
+    if run.stderr.contains("cannot change to") {
+        log::debug!("{label}: the guest lost the project; running it once more");
+        let output = captured(
+            userland,
+            &git_command(label, repo_root, split_wrapped_argv(retry_argv)),
+            label,
+            MUTATION_TIMEOUT,
+        )?;
+        return parse_split_run(&output);
+    }
+    Ok(run)
+}
+
+/// git's argv under the split wrapper — [`wrapped_argv`]'s twin.
+fn split_wrapped_argv(argv: Vec<OsString>) -> Vec<OsString> {
+    let mut wrapped: Vec<OsString> = vec![
+        OsString::from("/bin/sh"),
+        OsString::from("-c"),
+        OsString::from(SPLIT_WRAPPER),
+        OsString::from("conquest-git"),
+    ];
+    wrapped.extend(argv);
+    wrapped
+}
+
+/// Split the split wrapper's output back into stdout, stderr and the status.
+///
+/// The exit marker is taken from the *last* occurrence for the same reason
+/// [`parse_run`] does. The stderr marker is taken from the *first*: the
+/// wrapper prints it exactly once, between the streams, so an occurrence git
+/// itself wrote can only sit inside one of them — and a remote command's
+/// stdout containing the literal is a curiosity, not a failure mode worth a
+/// byte-count protocol.
+fn parse_split_run(output: &[u8]) -> Result<GitSplitRun, String> {
+    let output = String::from_utf8_lossy(output).into_owned();
+    let (before, after) = output
+        .rsplit_once(EXIT_MARKER)
+        .ok_or_else(|| "git produced no result".to_owned())?;
+    let (stdout, stderr) = before
+        .split_once(STDERR_MARKER)
+        .ok_or_else(|| "git produced no result".to_owned())?;
+    Ok(GitSplitRun {
+        status: after.trim().parse().unwrap_or(-1),
+        stdout: stdout.to_owned(),
+        stderr: stderr.to_owned(),
     })
 }
 
@@ -1252,7 +1462,7 @@ impl crate::Engine {
     /// Without this the panel would sit on the pre-command status until the
     /// worktree happened to change — and staging a file changes the index, not
     /// the worktree, so for staging that is *never*.
-    fn git_state_changed(&self, id: ProjectId) {
+    pub(crate) fn git_state_changed(&self, id: ProjectId) {
         if let Some(cache) = self.git.projects.lock().unwrap().get(&id).cloned() {
             cache.lock().unwrap().scanned = false;
         }
@@ -1268,13 +1478,17 @@ impl crate::Engine {
         let paths = checked_paths(paths)?;
         let mut args: Vec<OsString> = ["add", "-A", "--"].iter().map(OsString::from).collect();
         args.extend(paths.iter().map(OsString::from));
-        let run = run_git(
+        let run = run_git_mutating(
             &repo.userland,
             &repo.repo_root,
             "git add",
             git_argv(&repo.project_root, &args),
-        )?;
+        );
+        // On the Err path too: a run the guest lost may still have moved the
+        // index before the kill landed, and a `?` that skipped the bump left
+        // the panel sitting on the pre-command state exactly then.
         self.git_state_changed(id);
+        let run = run?;
         if run.status == 0 {
             Ok(())
         } else {
@@ -1298,14 +1512,16 @@ impl crate::Engine {
             .map(OsString::from)
             .collect();
         args.extend(paths.iter().map(OsString::from));
-        let run = run_git(
+        let run = run_git_mutating(
             &repo.userland,
             &repo.repo_root,
             "git restore --staged",
             git_argv(&repo.project_root, &args),
-        )?;
+        );
+        // Ok or Err alike — the run may have moved the index either way.
+        self.git_state_changed(id);
+        let run = run?;
         if run.status == 0 {
-            self.git_state_changed(id);
             return Ok(());
         }
 
@@ -1314,13 +1530,14 @@ impl crate::Engine {
             .map(OsString::from)
             .collect();
         args.extend(paths.iter().map(OsString::from));
-        let fallback = run_git(
+        let fallback = run_git_mutating(
             &repo.userland,
             &repo.repo_root,
             "git rm --cached",
             git_argv(&repo.project_root, &args),
-        )?;
+        );
         self.git_state_changed(id);
+        let fallback = fallback?;
         if fallback.status == 0 {
             Ok(())
         } else {
@@ -1398,12 +1615,20 @@ impl crate::Engine {
             .map(OsString::from)
             .collect();
             args.extend(restore.iter().map(OsString::from));
-            let run = run_git(
+            let run = match run_git_mutating(
                 &repo.userland,
                 &repo.repo_root,
                 "git restore",
                 git_argv(&repo.project_root, &args),
-            )?;
+            ) {
+                Ok(run) => run,
+                Err(err) => {
+                    // The restore may have partly run before the guest lost
+                    // it; the cache must not keep the pre-command state.
+                    self.git_state_changed(id);
+                    return Err(err);
+                }
+            };
             if run.status != 0 {
                 failures.push(run.message());
             }
@@ -1437,7 +1662,7 @@ impl crate::Engine {
                     .map(OsString::from)
                     .collect();
             args.push(OsString::from(&path));
-            let _ = run_git(
+            let _ = run_git_mutating(
                 &repo.userland,
                 &repo.repo_root,
                 "git rm --cached",
@@ -1459,25 +1684,34 @@ impl crate::Engine {
     /// --allow-empty-message` is not passed, so git would refuse it too, but it
     /// would do so after a process spawn and with a sentence about editors. A
     /// message that is only whitespace is empty — git strips it and ends up in
-    /// the same place.
-    pub fn git_commit(&self, id: ProjectId, message: &str) -> Result<(), String> {
+    /// the same place. That refusal covers amending too: Zed's editor arrives
+    /// prefilled with the old message, so a blank one is still a mistake.
+    ///
+    /// The three flags are the three of Zed's `CommitOptions` its panel can
+    /// set: the split-button's Amend, Signoff and Skip Hooks entries
+    /// (git_panel.rs:5568-5610). See [`commit_args`] for the argv.
+    pub fn git_commit(
+        &self,
+        id: ProjectId,
+        message: &str,
+        amend: bool,
+        signoff: bool,
+        no_verify: bool,
+    ) -> Result<(), String> {
         if message.trim().is_empty() {
             return Err("Write a commit message first".to_owned());
         }
         let repo = self.repo_for(id)?;
-        let args: Vec<OsString> = vec![
-            OsString::from("commit"),
-            OsString::from("--quiet"),
-            OsString::from("-m"),
-            OsString::from(message),
-        ];
-        let run = run_git(
+        let args = commit_args(message, amend, signoff, no_verify);
+        let run = run_git_mutating(
             &repo.userland,
             &repo.repo_root,
             "git commit",
             git_argv(&repo.project_root, &args),
-        )?;
+        );
+        // Ok or Err alike — a lost run may still have committed.
         self.git_state_changed(id);
+        let run = run?;
         if run.status == 0 {
             Ok(())
         } else {
@@ -1485,54 +1719,130 @@ impl crate::Engine {
         }
     }
 
-    /// Send commits to the remote — Zed's push, and its "Publish" when the
-    /// branch has no upstream yet (that is the only difference: `-u`).
+    /// Undo the last commit, keeping everything it held staged — Zed's
+    /// Uncommit. What runs is exactly `git reset --soft HEAD^`
+    /// (git_panel.rs:3164, repository.rs:1501-1504): always `--soft`, whatever
+    /// the button's tooltip implies about a mixed reset. Blocking.
     ///
-    /// There is no credential helper inside the guest and nothing here can
-    /// answer a password prompt, so `GIT_TERMINAL_PROMPT=0` (already set by
-    /// [`git_command`]) makes an HTTPS remote fail immediately with git's own
-    /// explanation rather than hanging until the deadline. SSH with a key in
-    /// the userland's `~/.ssh` works.
-    ///
-    /// **Blocking**: it talks to the network.
-    pub fn git_push(
-        &self,
-        id: ProjectId,
-        branch: &str,
-        set_upstream: bool,
-    ) -> Result<String, String> {
-        let branch = checked_branch(branch)?;
+    /// Nothing here asks anything. The caller is expected to have warned when
+    /// the commit was already pushed — [`Engine::git_head_pushed_remotes`] is
+    /// that check — and to have read the old message back for the commit box
+    /// *before* resetting, while HEAD still names it.
+    pub fn git_uncommit(&self, id: ProjectId) -> Result<(), String> {
         let repo = self.repo_for(id)?;
-        // The remote the branch actually tracks, when it tracks one: pushing
-        // `fork/main` to `origin` would send it to a different repository from
-        // the one the ahead count was measured against.
-        let remote = self
-            .with_git(id, |git| git.branch.clone())
-            .flatten()
-            .and_then(|branch| branch.upstream)
-            .and_then(|upstream| {
-                upstream
-                    .split_once('/')
-                    .map(|(remote, _)| remote.to_owned())
-            })
-            .unwrap_or_else(|| "origin".to_owned());
-        let mut args: Vec<OsString> = vec![OsString::from("push")];
-        if set_upstream {
-            args.push(OsString::from("--set-upstream"));
+        let args: Vec<OsString> = ["reset", "--soft", "HEAD^"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let run = run_git_mutating(
+            &repo.userland,
+            &repo.repo_root,
+            "git reset",
+            git_argv(&repo.project_root, &args),
+        );
+        // Ok or Err alike — a lost run may still have moved HEAD.
+        self.git_state_changed(id);
+        let run = run?;
+        if run.status == 0 {
+            Ok(())
+        } else {
+            Err(run.message())
         }
-        args.push(OsString::from(checked_branch(&remote)?));
-        args.push(OsString::from(&branch));
+    }
+
+    /// Every `remote/branch` whose remote-tracking ref already contains HEAD —
+    /// the commit Uncommit is about to undo has been pushed there, and the
+    /// user should be asked first. Zed's `check_for_pushed_commit`
+    /// (repository.rs:2907-2933): `git for-each-ref --format=%(refname)
+    /// --contains HEAD refs/remotes/`, minus every `…/HEAD` symref. A repo
+    /// with no remotes answers with an empty list, and so does a failed run —
+    /// Zed proceeds silently there, and refusing to uncommit because a *check*
+    /// failed would be worse than not asking. **Blocking**.
+    pub fn git_head_pushed_remotes(&self, id: ProjectId) -> Result<Vec<String>, String> {
+        let repo = self.repo_for(id)?;
+        let args: Vec<OsString> = [
+            "for-each-ref",
+            "--format=%(refname)",
+            "--contains",
+            "HEAD",
+            "refs/remotes/",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
         let run = run_git(
             &repo.userland,
             &repo.repo_root,
-            "git push",
+            "git for-each-ref",
             git_argv(&repo.project_root, &args),
         )?;
+        if run.status != 0 {
+            // An unborn HEAD makes `--contains HEAD` fail, and there is
+            // nothing pushed in that world either.
+            return Ok(Vec::new());
+        }
+        Ok(parse_pushed_remotes(&run.output))
+    }
+
+    /// Make the project a repository — the panel's "Initialize Repository"
+    /// empty state. Zed's two commands exactly (fs.rs:1208-1235): ask
+    /// `git config --global --get init.defaultBranch` first, use its answer
+    /// when there is one, and fall back to the caller's name — Zed's setting
+    /// defaults it to `main` — for `git init -b <branch>`. **Blocking**.
+    ///
+    /// The one git operation that must not go through [`Engine::repo_for`],
+    /// whose "Not a git repository" is the very state this fixes.
+    pub fn git_init(&self, id: ProjectId, fallback_branch: &str) -> Result<(), String> {
+        let project = self
+            .projects
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| "That project is not open".to_owned())?;
+        let project_root = project.lock().unwrap().root.clone();
+        let userland = self
+            .userland()
+            .filter(|userland| userland.is_installed())
+            .ok_or_else(|| "The Linux userland is not installed".to_owned())?;
+
+        let config_args: Vec<OsString> = ["config", "--global", "--get", "init.defaultBranch"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let configured = run_git(
+            &userland,
+            &project_root,
+            "git config",
+            git_argv(&project_root, &config_args),
+        )
+        .ok()
+        // Exit 1 with no output is "unset", which is an answer; and a value
+        // this could not hand to git as an argument falls back too, rather
+        // than making the empty state unusable over one odd config line.
+        .filter(|run| run.status == 0)
+        .and_then(|run| checked_branch(run.output.trim()).ok());
+        let branch = match configured {
+            Some(branch) => branch,
+            None => checked_branch(fallback_branch)?,
+        };
+
+        let args: Vec<OsString> = vec![
+            OsString::from("init"),
+            OsString::from("-b"),
+            OsString::from(&branch),
+        ];
+        let run = run_git_mutating(
+            &userland,
+            &project_root,
+            "git init",
+            git_argv(&project_root, &args),
+        );
+        // Ok or Err alike — a lost run may still have created the repository.
         self.git_state_changed(id);
+        let run = run?;
         if run.status == 0 {
-            // git writes its progress to stderr and says nothing on stdout;
-            // the wrapper merges them, so this is what actually happened.
-            Ok(run.output.trim().to_owned())
+            Ok(())
         } else {
             Err(run.message())
         }
@@ -1619,28 +1929,93 @@ impl crate::Engine {
     }
 }
 
+/// The commit argv, flag for flag as Zed builds it (repository.rs:2638-2663):
+/// `--cleanup=strip` right after the message, then `--amend`, `--signoff`,
+/// `--no-verify`, in that order. Zed's order also holds `--allow-empty` and
+/// `--author` between the last two, which its panel never passes — it commits
+/// with `allow_empty: false` and `name_and_email: None` (git_panel.rs:3046-
+/// 3053) — so neither exists here.
+pub(crate) fn commit_args(
+    message: &str,
+    amend: bool,
+    signoff: bool,
+    no_verify: bool,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        OsString::from("commit"),
+        OsString::from("--quiet"),
+        OsString::from("-m"),
+        OsString::from(message),
+        OsString::from("--cleanup=strip"),
+    ];
+    if amend {
+        args.push(OsString::from("--amend"));
+    }
+    if signoff {
+        args.push(OsString::from("--signoff"));
+    }
+    if no_verify {
+        args.push(OsString::from("--no-verify"));
+    }
+    args
+}
+
+/// `for-each-ref --format=%(refname) --contains HEAD refs/remotes/`, read the
+/// way Zed reads it (repository.rs:2927-2933): every line is a remote-tracking
+/// ref that already holds HEAD, `…/HEAD` symrefs dropped — `origin/HEAD` names
+/// the remote's default branch, not a place anything was pushed — and the
+/// `refs/remotes/` prefix stripped, leaving `origin/main`.
+pub(crate) fn parse_pushed_remotes(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.ends_with("/HEAD"))
+        .filter_map(|line| line.strip_prefix("refs/remotes/"))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// A branch or remote name this will hand to git as an argument.
 ///
-/// Not a general `check-ref-format`: a *whitelist*, because the failure mode
-/// is git reading the value as something else entirely. `+main` is a legal
-/// branch name **and** a force refspec — push it and git happily force-updates
-/// a different branch on the remote and discards a commit — which is exactly
-/// what a guard that only refused `-`, spaces and `:` let through.
+/// The argv never crosses a shell as *syntax*: `GuestCommand` execs proot
+/// with these strings as real arguments, and the `sh -c '"$@" …'` wrapper
+/// re-expands them as its own positional parameters — unsplit, unglobbed,
+/// never re-parsed. So the only reader who can misread a name is git itself,
+/// and the extra rules beyond git's own are exactly those two misreadings:
+///
+/// * option parsing — a leading `-` reads as a flag;
+/// * refspec and rev syntax, where a name becomes `<branch>:<remote_branch>`
+///   or `<branch>@{upstream}` — a leading `+` is a force marker (`git push
+///   origin +main` force-updates `main` on the remote and discards commits),
+///   and `:` would split the refspec. `*`, `@{` and a bare `@` are already
+///   git's own refusals.
+///
+/// Everything else is `git check-ref-format`'s rulebook, so any name git
+/// itself lists — unicode, `#`, a `@` or `+` mid-name — passes, and the rows
+/// [`crate::Engine::git_branches`] and [`crate::Engine::git_remotes`] hand
+/// the pickers stay actionable. The old ASCII whitelist refused those and
+/// left legal branches permanently un-actionable.
 pub(crate) fn checked_branch(name: &str) -> Result<String, String> {
     let name = name.trim();
-    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-');
+    // What check-ref-format refuses anywhere in a refname: ASCII control
+    // bytes, space, and these metacharacters.
+    let forbidden = |c: char| {
+        c.is_ascii_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    };
     if name.is_empty()
         || name.len() > 255
-        || !name.chars().all(allowed)
+        || name == "@"
+        || name.chars().any(forbidden)
         || name.starts_with('-')
-        || name.starts_with('.')
-        || name.starts_with('/')
-        || name.ends_with('/')
-        || name.ends_with(".lock")
+        || name.starts_with('+')
+        || name.ends_with('.')
         || name.contains("..")
-        || name.contains("//")
+        || name.contains("@{")
+        || name
+            .split('/')
+            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
     {
-        return Err(format!("{name:?} is not a name this can push"));
+        return Err(format!("{name:?} is not a branch or remote name this can use"));
     }
     Ok(name.to_owned())
 }
@@ -2239,6 +2614,81 @@ mod tests {
     }
 
     #[test]
+    fn a_split_run_keeps_the_two_streams_apart() {
+        let run = parse_split_run(
+            b"Updating abc..def\n 1 file changed\nconquest-stderr:From github.com:x/y\nconquest-exit:0",
+        )
+        .unwrap();
+        assert_eq!(run.status, 0);
+        assert_eq!(run.stdout, "Updating abc..def\n 1 file changed\n");
+        assert_eq!(run.stderr, "From github.com:x/y\n");
+
+        // Both streams empty is still an answer — a fetch with nothing to
+        // say, which is exactly the "Already up to date" toast's evidence.
+        let run = parse_split_run(b"conquest-stderr:conquest-exit:0").unwrap();
+        assert_eq!(run.status, 0);
+        assert!(run.stdout.is_empty() && run.stderr.is_empty());
+
+        // A failure's one-liner comes off stderr, where git says why — the
+        // shared summarizer over stdout-then-stderr finds the marked line.
+        let run = parse_split_run(
+            b"conquest-stderr:fatal: could not read from remote repository\nconquest-exit:128",
+        )
+        .unwrap();
+        assert_eq!(run.status, 128);
+        assert_eq!(
+            failure_line(&format!("{}\n{}", run.stdout, run.stderr), run.status),
+            "could not read from remote repository"
+        );
+
+        // Half a wrapper is no wrapper: without both markers there is
+        // nothing to believe.
+        assert!(parse_split_run(b"conquest-exit:0").is_err());
+        assert!(parse_split_run(b"killed").is_err());
+    }
+
+    /// The split wrapper through the host's real `sh`, with a command that
+    /// writes to both streams — every assertion above is about bytes we wrote
+    /// ourselves, and the wrapper is shell this test can actually run.
+    #[test]
+    fn the_real_shell_runs_the_split_wrapper() {
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(SPLIT_WRAPPER)
+            .arg("conquest-git")
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("printf 'out\\n'; printf 'err\\n' >&2; exit 3")
+            .output()
+            .expect("failed to run sh");
+        let run = parse_split_run(&out.stdout).unwrap();
+        assert_eq!(run.status, 3);
+        assert_eq!(run.stdout, "out\n");
+        assert_eq!(run.stderr, "err\n");
+
+        // And with a TMPDIR naming a directory that does not exist — the
+        // environment every Android app process hands its children, where
+        // TMPDIR is the app's *host* cache directory, unreachable inside the
+        // fake root. A wrapper that trusted it failed its own redirection
+        // before the command ever ran: exit 2, both streams empty, and a
+        // remote failure reduced to "git exited with 2" with nothing to show.
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(SPLIT_WRAPPER)
+            .arg("conquest-git")
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("printf 'out\\n'; printf 'fatal: no\\n' >&2; exit 128")
+            .env("TMPDIR", "/definitely/not/there")
+            .output()
+            .expect("failed to run sh");
+        let run = parse_split_run(&out.stdout).unwrap();
+        assert_eq!(run.status, 128, "the real exit status was lost");
+        assert_eq!(run.stdout, "out\n");
+        assert_eq!(run.stderr, "fatal: no\n", "stderr was lost");
+    }
+
+    #[test]
     fn a_message_is_the_line_git_marked_or_the_last_thing_it_said() {
         // git's own shape for an identity it cannot guess: a heading, a
         // paragraph of advice, and the actual reason at the bottom.
@@ -2329,7 +2779,7 @@ mod tests {
         // Refused before anything is resolved — there is no userland here, and
         // the message says nothing about one.
         assert_eq!(
-            engine.git_commit(id, "   \n\t "),
+            engine.git_commit(id, "   \n\t ", false, false, false),
             Err("Write a commit message first".to_owned())
         );
     }
@@ -2345,7 +2795,7 @@ mod tests {
             engine.git_stage(id, &paths),
             engine.git_unstage(id, &paths),
             engine.git_discard(id, &paths),
-            engine.git_commit(id, "a message"),
+            engine.git_commit(id, "a message", false, false, false),
         ] {
             assert_eq!(
                 result,
@@ -2728,6 +3178,125 @@ mod tests {
         );
     }
 
+    /// Zed's flag order, exactly — the tooltip previews `git commit --amend
+    /// --signoff --no-verify` in that order and the argv must be the command
+    /// it previews (git_panel.rs:6097-6109, repository.rs:2638-2663).
+    #[test]
+    fn the_commit_argv_carries_zeds_flags_in_zeds_order() {
+        let all: Vec<OsString> = [
+            "commit",
+            "--quiet",
+            "-m",
+            "msg",
+            "--cleanup=strip",
+            "--amend",
+            "--signoff",
+            "--no-verify",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(commit_args("msg", true, true, true), all);
+
+        let plain: Vec<OsString> = ["commit", "--quiet", "-m", "msg", "--cleanup=strip"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(commit_args("msg", false, false, false), plain);
+
+        // Each flag stands alone: skipping hooks must not imply amending.
+        assert!(
+            commit_args("msg", false, false, true)
+                .contains(&OsString::from("--no-verify"))
+        );
+        assert!(
+            !commit_args("msg", false, false, true)
+                .contains(&OsString::from("--amend"))
+        );
+    }
+
+    /// The uncommit confirmation's evidence: remote refs that hold HEAD, with
+    /// the two shapes that must *not* count — a `…/HEAD` symref, and a local
+    /// ref that somehow got in.
+    #[test]
+    fn pushed_remotes_drop_head_symrefs_and_keep_the_short_names() {
+        assert_eq!(
+            parse_pushed_remotes(
+                "refs/remotes/origin/HEAD\nrefs/remotes/origin/main\n  refs/remotes/fork/main  \nrefs/heads/main\n"
+            ),
+            vec!["origin/main".to_owned(), "fork/main".to_owned()]
+        );
+        assert!(parse_pushed_remotes("").is_empty());
+    }
+
+    /// The new command argvs — commit with Zed's flags, uncommit, init —
+    /// through the real binary, for the same reason as the test above: every
+    /// flag test asserts about strings we wrote ourselves.
+    #[test]
+    fn real_git_accepts_the_commit_flags_uncommit_and_init() {
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: no git on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+
+        // `git init -b <branch>` is the argv `git_init` sends.
+        let argv: Vec<OsString> = ["init", "-b", "trunk"].iter().map(OsString::from).collect();
+        let out = run_argv(repo, git_argv(repo, &argv));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        std::fs::write(repo.join("README"), "one\n").unwrap();
+        assert!(host_git(repo, &["add", "README"]).status.success());
+        let out = run_argv(repo, git_argv(repo, &commit_args("first", false, false, false)));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        std::fs::write(repo.join("README"), "two\n").unwrap();
+        assert!(host_git(repo, &["add", "README"]).status.success());
+        let out = run_argv(repo, git_argv(repo, &commit_args("second", false, false, false)));
+        assert!(out.status.success());
+
+        // Uncommit: exactly `git reset --soft HEAD^`, and the undone commit's
+        // content stays staged — that is what "soft" promises the panel.
+        let argv: Vec<OsString> = ["reset", "--soft", "HEAD^"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let out = run_argv(repo, git_argv(repo, &argv));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let staged = host_git(repo, &["diff", "--cached", "--name-only"]);
+        assert!(String::from_utf8_lossy(&staged.stdout).contains("README"));
+
+        // And amend with every flag: the staged change folds into `first`.
+        let out = run_argv(repo, git_argv(repo, &commit_args("first, again", true, true, true)));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let log = host_git(repo, &["log", "--format=%s"]);
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).trim(),
+            "first, again",
+            "one commit, the amended one"
+        );
+        // `--signoff` really was in effect: the trailer names the committer.
+        let body = host_git(repo, &["log", "-1", "--format=%b"]);
+        assert!(String::from_utf8_lossy(&body.stdout).contains("Signed-off-by: test"));
+    }
+
     #[test]
     fn the_branch_header_is_read_in_every_shape_git_writes_it() {
         let branch = |header: &str| parse_branch(&porcelain(&[header])).unwrap();
@@ -2744,6 +3313,14 @@ mod tests {
 
         let ahead = branch("## main...origin/main [ahead 1]");
         assert_eq!((ahead.ahead, ahead.behind), (1, 0));
+        assert!(!ahead.upstream_gone);
+
+        // The upstream is configured but deleted on the remote — the shape
+        // that turns the remote button into "Republish".
+        let gone = branch("## feature...origin/feature [gone]");
+        assert_eq!(gone.upstream.as_deref(), Some("origin/feature"));
+        assert!(gone.upstream_gone);
+        assert_eq!((gone.ahead, gone.behind), (0, 0));
 
         let unborn = branch("## No commits yet on main");
         assert_eq!(unborn.name.as_deref(), Some("main"));
@@ -2925,7 +3502,9 @@ mod tests {
 
         // Committing with nothing staged is git's own refusal, in git's own
         // words — which is the whole reason the wrapper exists.
-        let refused = engine.git_commit(id, "nothing here").unwrap_err();
+        let refused = engine
+            .git_commit(id, "nothing here", false, false, false)
+            .unwrap_err();
         assert!(
             refused.to_lowercase().contains("nothing"),
             "expected git's own complaint, got {refused:?}"
@@ -2934,9 +3513,223 @@ mod tests {
         // And a real commit lands.
         std::fs::write(repo.join("README"), "three\n").unwrap();
         engine.git_stage(id, &["README".to_owned()]).unwrap();
-        engine.git_commit(id, "second").unwrap();
+        engine.git_commit(id, "second", false, false, false).unwrap();
         let log = host_git(&repo, &["log", "--format=%s"]);
         assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "second\nfirst");
+    }
+
+    /// A failing remote command through the whole split-stream chain —
+    /// [`run_git_split`], the fake guest, a real `/bin/sh`, a real git — in
+    /// the environment an Android app process actually spawns from: TMPDIR
+    /// names a directory that only exists on the host. What must come back
+    /// is git's own "fatal:" sentence and git's own exit status.
+    ///
+    /// This is the device defect pinned down: the split wrapper parked
+    /// stderr under `${TMPDIR}`, the app's inherited TMPDIR pointed at the
+    /// host cache directory (set by the runtime after fork, invisible in the
+    /// initial `/proc/<pid>/environ`), `sh` failed the redirection before
+    /// git ever ran, and every failed fetch surfaced as "git exited with 2"
+    /// with both streams empty — while the same command in the app's own
+    /// terminal printed two `fatal:` lines and exited 128.
+    #[test]
+    #[cfg(unix)]
+    fn a_hostile_tmpdir_cannot_swallow_what_a_failing_fetch_said() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: no git on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let repo = projects.join("thing");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(
+            host_git(&repo, &["init", "--quiet", "-b", "main"])
+                .status
+                .success()
+        );
+        assert!(
+            host_git(&repo, &["remote", "add", "origin", "/nonexistent-repo"])
+                .status
+                .success()
+        );
+
+        // The fake guest, with the one addition that matters here: it hands
+        // the wrapper the hostile TMPDIR, overriding the sane one the fixed
+        // guest environment now pins — because the wrapper itself must not
+        // trust whatever the environment says by the time it runs.
+        let proot = dir.path().join("fake-proot");
+        std::fs::write(
+            &proot,
+            format!(
+                "#!/bin/sh\n\
+                 while [ \"$1\" != \"-w\" ]; do shift; done\n\
+                 shift 2\n\
+                 TMPDIR={gone}\n\
+                 GIT_CONFIG_GLOBAL=/dev/null\n\
+                 GIT_CONFIG_SYSTEM=/dev/null\n\
+                 export TMPDIR GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM\n\
+                 exec \"$@\"\n",
+                gone = dir.path().join("not-there").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&proot, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let engine = crate::Engine::new();
+        engine.set_userland(&proot, dir.path(), dir.path(), &projects);
+        let userland = engine.userland().unwrap();
+
+        let run = run_git_split(
+            &userland,
+            &repo,
+            "git fetch",
+            git_argv(&repo, &["fetch", "--all"]),
+        )
+        .expect("the guest ran");
+        assert!(
+            run.stderr.contains("fatal:"),
+            "git's own words were lost: status {} stdout {:?} stderr {:?}",
+            run.status,
+            run.stdout,
+            run.stderr
+        );
+        assert_ne!(run.status, 0, "a failing fetch reported success");
+        assert_ne!(
+            run.status, 2,
+            "the wrapper's own redirection failure leaked through as git's exit"
+        );
+    }
+
+    /// A command past its deadline gets the deadline's own sentence — by then
+    /// git *was* running, and a mutation killed mid-flight may have partly
+    /// applied — never the userland-installation error, which would send the
+    /// user reinstalling Debian over a slow network.
+    #[test]
+    #[cfg(unix)]
+    fn a_command_past_its_deadline_says_it_may_have_partly_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::Engine::new();
+        engine.set_userland(&fake_guest(dir.path()), dir.path(), dir.path(), dir.path());
+        let userland = engine.userland().unwrap();
+        // Detached from the pipes, because the fake guest has no proot to
+        // take tracees down on the kill: an orphan holding stdout would make
+        // `capture`'s readers wait out the whole sleep.
+        let argv: Vec<OsString> = ["/bin/sh", "-c", "exec sleep 5 >/dev/null 2>&1"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let err = run_git_with(
+            &userland,
+            dir.path(),
+            "git sleep",
+            argv,
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("may have partly applied"),
+            "expected the deadline's own sentence, got {err:?}"
+        );
+        assert!(
+            !err.contains("Linux userland"),
+            "a deadline must not read as a missing userland: {err:?}"
+        );
+    }
+
+    /// A mutation the guest *lost* — spawn failed, deadline fired — must
+    /// still invalidate the status cache: the command may have run for a
+    /// while before dying, and a `?` that skipped the bump left the panel
+    /// sitting on the pre-command state until an unrelated worktree event.
+    #[test]
+    #[cfg(unix)]
+    fn a_mutation_the_guest_lost_still_invalidates_the_status_cache() {
+        if !has_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, repo) = live_repo(dir.path());
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        let id = engine.open_project(&repo);
+        await_change(&engine, id, "a.txt");
+        // Let any in-flight status run finish: one completing *after* the
+        // failed commit below would set `scanned` back and fake a pass.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while engine.with_git(id, |git| git.running).unwrap_or(false) {
+            assert!(Instant::now() < deadline, "the status run never settled");
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(engine.with_git(id, |git| git.scanned), Some(true));
+
+        // A proot that exists but cannot run: `is_installed` passes, the
+        // spawn fails — the same shape as a rootfs pulled out mid-session.
+        let broken = dir.path().join("broken-proot");
+        std::fs::write(&broken, "").unwrap();
+        engine.set_userland(&broken, dir.path(), dir.path(), &dir.path().join("projects"));
+
+        let err = engine
+            .git_commit(id, "doomed", false, false, false)
+            .unwrap_err();
+        assert!(err.contains("Could not run git"), "{err:?}");
+        assert_eq!(
+            engine.with_git(id, |git| git.scanned),
+            Some(false),
+            "the Err path must invalidate the cache too"
+        );
+    }
+
+    /// An invalidation whose rescan finds an *identical* snapshot — a failed
+    /// push, a commit git refused — must still move the version: the panel
+    /// reads the state mid-invalidation, renders "Asking git…", and from then
+    /// on re-reads only when [`Engine::git_status_version`] moves. A version
+    /// pegged to content never told it the answer came back, and the panel
+    /// sat on that transient forever — through tab switches and reopen both.
+    #[test]
+    #[cfg(unix)]
+    fn a_rescan_with_an_identical_snapshot_still_moves_the_version() {
+        if !has_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, repo) = live_repo(dir.path());
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        let id = engine.open_project(&repo);
+        await_change(&engine, id, "a.txt");
+        // Let the run settle completely, so the baseline version below cannot
+        // be moved by anything but the invalidation's own rescan.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while engine.with_git(id, |git| git.running).unwrap_or(false) {
+            assert!(Instant::now() < deadline, "the status run never settled");
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(engine.with_git(id, |git| git.scanned), Some(true));
+        let before = engine.with_git(id, |git| git.version).unwrap();
+
+        // What every mutating command does — and the worktree is untouched,
+        // so the rescan's snapshot will be byte-identical to the cache.
+        engine.git_state_changed(id);
+
+        // The panel's loop: poll the version, which is also what schedules
+        // the rescan. Without the flag-flip bump this never moves.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if engine.git_status_version(id) != before {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "an identical rescan never moved the version; \
+                 the panel would show 'Asking git…' forever"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        // And the reread the bump provokes must see the settled state again.
+        assert_eq!(engine.with_git(id, |git| git.scanned), Some(true));
+        // The snapshot really was identical — the bump came from the flag.
+        let changes = engine.git_changes(id);
+        assert_eq!(changes.entries.len(), 1);
+        assert_eq!(changes.entries[0].path, "a.txt");
     }
 
     /// Wait for the status cache to catch up with a command, and hand back what
@@ -3035,6 +3828,42 @@ mod tests {
         assert!(checked_branch("HEAD~2").is_err());
         assert!(checked_branch("main^{}").is_err());
         assert!(checked_branch("").is_err());
+    }
+
+    /// The gate is git's own `check-ref-format` rulebook plus the two argv
+    /// misreadings (leading `-`, leading `+`), **not** an ASCII whitelist:
+    /// the listings hand the pickers whatever git prints, and a legal branch
+    /// the checker refuses is a row no operation can act on. Found with
+    /// `wip@review` — checkout, delete, pull and push all failed on a branch
+    /// the picker itself listed.
+    #[test]
+    fn names_git_itself_lists_pass_the_gate() {
+        // Legal per check-ref-format, once refused by the old whitelist.
+        assert!(checked_branch("wip@review").is_ok());
+        assert!(checked_branch("fix#123").is_ok());
+        assert!(checked_branch("feature+x").is_ok());
+        assert!(checked_branch("héllo").is_ok());
+        assert!(checked_branch("功能分支").is_ok());
+        assert!(checked_branch("wip{2024}").is_ok());
+
+        // Still refused: what check-ref-format itself refuses…
+        assert!(checked_branch("@").is_err());
+        assert!(checked_branch("a@{b").is_err());
+        assert!(checked_branch("done.").is_err());
+        assert!(checked_branch("feat/.hidden").is_err());
+        assert!(checked_branch("sub/name.lock").is_err());
+        assert!(checked_branch("/lead").is_err());
+        assert!(checked_branch("trail/").is_err());
+        assert!(checked_branch("a//b").is_err());
+        assert!(checked_branch("glob*").is_err());
+        assert!(checked_branch("what?").is_err());
+        assert!(checked_branch("set[1]").is_err());
+        assert!(checked_branch("back\\slash").is_err());
+        assert!(checked_branch("tab\there").is_err());
+        assert!(checked_branch("nl\nhere").is_err());
+        // …and the two shapes git would misread in an argv or refspec.
+        assert!(checked_branch("-b").is_err());
+        assert!(checked_branch("+force/me").is_err());
     }
 
     /// The upstream half of porcelain's branch header is what tells "push"

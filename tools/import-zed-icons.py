@@ -270,12 +270,32 @@ internal val ZED_ICON_DRAWABLE: Map<String, String> = mapOf(
 
 UI_ICONS = (
     "ai_zed.svg",
+    "arrow_circle.svg",
+    "arrow_down.svg",
+    "arrow_up.svg",
+    "check.svg",
+    "chevron_down.svg",
+    "chevron_up.svg",
+    "close.svg",
+    "envelope.svg",
+    "expand_up.svg",
     "eye.svg",
     "eye_off.svg",
     "file_tree.svg",
+    "filter.svg",
     "git_branch.svg",
+    "git_branch_plus.svg",
+    "git_commit.svg",
+    "git_graph.svg",
+    "github.svg",
+    "hash.svg",
+    "load_circle.svg",
     "magnifying_glass.svg",
+    "plus.svg",
+    "server.svg",
     "terminal.svg",
+    "trash.svg",
+    "undo.svg",
 )
 
 

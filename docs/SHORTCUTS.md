@@ -64,6 +64,7 @@ editor.
 | `Ctrl` `Shift` `T` | Reopen the tab you closed last |
 | `Ctrl` `Shift` `E` | Reveal the open file in the project panel |
 | `Ctrl` `Shift` `G` | Show/hide the git panel |
+| `Ctrl` `Alt` `Shift` `B` | Switch git branch (the branch picker) |
 | `Ctrl` `Alt` `A` | Show/hide the agent panel |
 | `Ctrl` `,` | Open settings |
 | — | Edit settings.json as a tab (`zed: open settings file` in the palette, or the ☰ menu) |
@@ -137,6 +138,18 @@ accurate one. There is no credential helper inside the userland, so an HTTPS
 remote will fail with git's own words about authentication — SSH with a key in
 the userland's `~/.ssh` is the way that works today.
 
+## The branch picker
+
+The branch name — in the git panel's header, or in the title bar — opens the
+**branch picker**, Zed's own: every local and remote branch with its last
+commit, filtered as you type, `Enter` checks out. A remote branch checks out
+by growing a local tracking branch named after it, exactly as Zed does. A name
+no branch has becomes a **Create Branch** entry — `Enter` branches off HEAD,
+`Ctrl` `Enter` off the repository's default branch. `Ctrl` `Shift`
+`Backspace` deletes the selected branch (`Alt` on top force-deletes; a branch
+that is not fully merged asks first), `Ctrl` `Shift` `I` cycles the
+all/local/remote filter and `Ctrl` `K` opens it as a menu.
+
 ## The commit graph
 
 **Graph** in the git panel's History tab — or `git: open graph` in the palette,
@@ -202,7 +215,37 @@ out of a focused terminal.
 | `Enter` | Open it |
 | `Delete` / `Backspace` | Discard its changes, after a prompt that names it |
 | `Ctrl` `Enter` | Commit what is staged, from anywhere in the panel |
+| `Ctrl` `Shift` `Enter` | Amend — the first press enters amend mode, the second commits |
+| `Ctrl` `Space` | Stage everything |
+| `Ctrl` `Shift` `Space` | Unstage everything |
+| `Ctrl` `1` / `Ctrl` `2` | The Changes / History tab |
 | `Esc`, or `✕` | Close the panel |
+
+### The `Ctrl` `G` chords
+
+While the panel has the keyboard, `Ctrl` `G` is a **leader**, exactly as in
+Zed's `GitPanel` keymap context: press it, and the next keystroke completes a
+two-step chord. A small `Ctrl G …` chip above the commit box says the chord
+is waiting. A key that matches nothing cancels it — and does nothing else,
+as in Zed — and so do `Esc` and saying nothing for a few seconds, which Zed
+(with a status bar that echoes pending keys) does not need. In the editor,
+`Ctrl` `G` is still go-to-line, and in a terminal it is still BEL.
+
+| Chord | Action |
+|---|---|
+| `Ctrl` `G`, `Ctrl` `G` | Fetch |
+| `Ctrl` `G`, `↑` | Push |
+| `Ctrl` `G`, `↓` | Pull |
+| `Ctrl` `G`, `Shift` `↑` | Force push (`--force-with-lease`) |
+| `Ctrl` `G`, `Shift` `↓` | Pull with rebase |
+| `Ctrl` `G`, `D` | Open the whole project's diff |
+
+Every one of these is also a command in the palette — `git: fetch`,
+`git: push`, `git: pull`, `git: force push`, `git: pull rebase`,
+`git: stage all`, `git: unstage all`, `git: diff` — which is the route with
+no keyboard at all, and the route from a focused terminal. Run from there,
+the command opens the git panel and runs in it, so the spinner and whatever
+git says back have somewhere to be seen.
 
 The first commit in a fresh userland fails: git guesses an identity from the
 hostname (`root@localhost.(none)`), refuses to use it, and says so. The panel
@@ -387,7 +430,8 @@ Cancelling really does put everything back: the selection you had, every extra
 cursor, and the exact scroll position — not just the line number.
 
 `Ctrl` `G` is deliberately not offered while a terminal has the keyboard, where
-it is BEL and readline's abort.
+it is BEL and readline's abort — and while the git panel has it, `Ctrl` `G` is
+that panel's chord leader instead, exactly as in Zed (see **Git panel**).
 
 ## Outline
 

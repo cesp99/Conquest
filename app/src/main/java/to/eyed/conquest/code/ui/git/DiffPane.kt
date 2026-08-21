@@ -25,6 +25,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.mutableStateOf
@@ -59,10 +60,41 @@ data class DiffTarget(
     val path: String?,
     /** The index against HEAD, rather than the working tree against HEAD. */
     val staged: Boolean = false,
+    /**
+     * A commit's hash: the tab is then that commit against its first parent —
+     * Zed's CommitView — rather than the working tree, and [path] narrows it
+     * to one file (the graph sidebar's per-file "View Changes"). A commit
+     * never changes, so the pane reads it once instead of polling.
+     */
+    val commit: String? = null,
+    /** The commit's subject line, which is most of its tab title. */
+    val subject: String = "",
+    /**
+     * A branch name: the tab is then the whole branch against its merge base
+     * with that branch — Zed's Branch Diff ("Changes since {branch}",
+     * branch_diff.rs:43), the clean tree's "View Branch Diff". Worktree
+     * contents included, so it polls like the plain diff.
+     */
+    val mergeBase: String? = null,
 ) {
     /** What the tab strip calls it. */
-    val title: String =
-        if (path == null) "All changes" else "Diff: ${path.substringAfterLast('/')}"
+    val title: String = when {
+        commit != null -> commitTabTitle(commit, subject)
+        mergeBase != null -> "Changes since $mergeBase"
+        path == null -> "All changes"
+        else -> "Diff: ${path.substringAfterLast('/')}"
+    }
+}
+
+/**
+ * Zed's commit tab title: `"{7-char sha} — {subject truncated to 20 chars}"`,
+ * the truncation adding an ellipsis (commit_view.rs:1073-1077, via
+ * `truncate_and_trailoff`).
+ */
+internal fun commitTabTitle(sha: String, subject: String): String {
+    val short = sha.take(7)
+    val trimmed = if (subject.length > 20) subject.take(20) + "…" else subject
+    return "$short — $trimmed"
 }
 
 /**
@@ -91,14 +123,32 @@ fun DiffPane(
     // fifteen milliseconds — which is wasteful at best, and the second of the
     // pair is what the pane ended up showing.
     var patch by remember(session, target) { mutableStateOf<PatchResult?>(null) }
-    ResumedEffect(session, target) {
-        pollVersion(
-            intervalMs = 400,
-            version = { session.version },
-            // IO, not the loop's own Default: the patch is git under proot.
-            read = { withContext(Dispatchers.IO) { session.patch(target.path, target.staged) } },
-            apply = { patch = it },
-        )
+    if (target.commit != null) {
+        // A commit is immutable: one read, no poll loop watching it.
+        LaunchedEffect(session, target) {
+            patch = withContext(Dispatchers.IO) {
+                session.commitPatch(target.commit, target.path)
+            }
+        }
+    } else {
+        ResumedEffect(session, target) {
+            pollVersion(
+                intervalMs = 400,
+                version = { session.version },
+                // IO, not the loop's own Default: the patch is git under proot.
+                read = {
+                    withContext(Dispatchers.IO) {
+                        val base = target.mergeBase
+                        if (base != null) {
+                            session.branchPatch(base)
+                        } else {
+                            session.patch(target.path, target.staged)
+                        }
+                    }
+                },
+                apply = { patch = it },
+            )
+        }
     }
 
     val result = patch
@@ -111,10 +161,15 @@ fun DiffPane(
             result == null -> Notice("Reading the diff…")
             result.error != null -> Notice(result.error!!, isError = true)
             result.files.isEmpty() -> Notice(
-                if (target.path == null) {
-                    "Nothing has changed since the last commit"
-                } else {
-                    "${target.path} matches the last commit"
+                when {
+                    // An empty commit — `--allow-empty` exists — or a merge
+                    // whose first-parent diff is nothing.
+                    target.commit != null -> "This commit changed no files"
+                    // Nothing since the merge base: the branch has not
+                    // actually diverged from the base branch.
+                    target.mergeBase != null -> "This branch matches ${target.mergeBase}"
+                    target.path == null -> "Nothing has changed since the last commit"
+                    else -> "${target.path} matches the last commit"
                 }
             )
             else -> DiffBody(result.files, onOpenFile)
@@ -170,7 +225,7 @@ internal fun DiffBody(files: List<FileDiff>, onOpenFile: (String) -> Unit) {
             }
             if (file.hunks.isEmpty()) {
                 item(key = "empty:$fileIndex") {
-                    Notice("Only the file's mode changed.")
+                    Notice(hunklessCaption(file))
                 }
                 continue
             }
@@ -202,6 +257,20 @@ internal fun DiffBody(files: List<FileDiff>, onOpenFile: (String) -> Unit) {
             }
         }
     }
+}
+
+/**
+ * What a text file's section with no hunks means. git prints a bare header
+ * for four different reasons, and only one of them is about modes: calling an
+ * empty new file "Only the file's mode changed." was wrong on its face — a
+ * new file has no old mode.
+ */
+internal fun hunklessCaption(file: FileDiff): String = when {
+    file.created -> "Empty file added."
+    file.deleted -> "Empty file deleted."
+    // A pure rename: `rename from`/`rename to` and not a line of content.
+    file.original != null -> "Renamed — the contents are unchanged."
+    else -> "Only the file's mode changed."
 }
 
 /**

@@ -175,7 +175,7 @@ fun matchCommands(
 }
 
 /** What a hit is worth, and which characters to highlight. */
-private class Hit(val score: Int, val positions: List<Int>)
+internal class Hit(val score: Int, val positions: List<Int>)
 
 private const val UNREACHABLE = Int.MIN_VALUE / 2
 
@@ -200,7 +200,9 @@ private const val WORD_SEPARATORS = " :_-./"
  * `fuzzy` crate is reachable only through `find_files`, which matches a
  * project's paths and nothing else; matching fourteen short strings in Kotlin
  * is not worth a JNI call, and a `match_strings` entry point is the right way
- * to share the real thing later (noted for the bridge).
+ * to share the real thing later (noted for the bridge). The branch picker
+ * ranks its branch names through this same function, so every in-app list
+ * that is not a worktree matches the same way.
  *
  * The search is exhaustive rather than greedy — every way of laying the query
  * over the name, best kept — because greedy matching highlights the wrong
@@ -208,7 +210,7 @@ private const val WORD_SEPARATORS = " :_-./"
  * panel: toggle" is exactly that case. It costs O(query × name²) over a
  * table this size, which is nothing.
  */
-private fun fuzzyMatch(name: String, query: String, smartCase: Boolean): Hit? {
+internal fun fuzzyMatch(name: String, query: String, smartCase: Boolean): Hit? {
     if (query.length > name.length) return null
     val rows = query.length
     val columns = name.length

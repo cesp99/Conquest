@@ -586,8 +586,8 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitStatusVersi
 }
 
 /// The branch record the project is on, from the cached status run, as JSON —
-/// `{name, ahead, behind, unborn, upstream}`, the same object `gitChanges`
-/// nests — with no JSON of the changed files and no git run: the title bar's
+/// `{name, ahead, behind, unborn, upstream, upstream_gone}`, the same object
+/// `gitChanges` nests — with no JSON of the changed files and no git run: the title bar's
 /// drift arrows and the history views' reload keys ride the same half-second
 /// poll the name does. Null when nothing is known: no repository, or no
 /// completed run yet. A detached HEAD is a present object whose `name` is
@@ -647,7 +647,8 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitStatus(
 }
 
 /// Everything the git panel draws, as JSON: `scanned`, `has_repo`, `branch`
-/// (`{name, ahead, behind, unborn, upstream}` or null), `head` (the commit id
+/// (`{name, ahead, behind, unborn, upstream, upstream_gone}` or null), `head`
+/// (the commit id
 /// it names, or null when unknown) and `entries`, each
 /// `{path, staged, unstaged, conflicted, in_head}` with the two statuses using
 /// the same names `gitStatus` does, or null.
@@ -730,32 +731,290 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitDiscard(
 }
 
 /// Commit what is staged. An empty or whitespace-only message is refused here
-/// rather than becoming an empty commit. **Blocking**.
+/// rather than becoming an empty commit. The three flags are Zed's Amend,
+/// Signoff and Skip Hooks menu entries, appended to the argv in Zed's order.
+/// **Blocking**.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitCommit(
     mut env: JNIEnv,
     _class: JClass,
     project_id: jlong,
     message: JString,
+    amend: jboolean,
+    signoff: jboolean,
+    no_verify: jboolean,
 ) -> jstring {
     let message = get_string(&mut env, &message);
-    command_result(&env, engine().git_commit(project_id as u64, &message))
+    command_result(
+        &env,
+        engine().git_commit(
+            project_id as u64,
+            &message,
+            amend != 0,
+            signoff != 0,
+            no_verify != 0,
+        ),
+    )
 }
 
-/// Push the named branch to `origin`, setting its upstream when it has none —
-/// Zed's "Publish". Null when it worked (git's own output is logged), and the
-/// reason when it did not. **Blocking**: it talks to the network.
+/// Undo the last commit, keeping its changes staged — exactly `git reset
+/// --soft HEAD^`, Zed's Uncommit. Nothing here asks anything: read
+/// `gitHeadPushedRemotes` and the old message *first*. Null when it worked.
+/// **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitUncommit(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    command_result(&env, engine().git_uncommit(project_id as u64))
+}
+
+/// Every `remote/branch` that already holds HEAD, as JSON `{"remotes":[…]}` —
+/// the uncommit confirmation's evidence that the commit was pushed. Empty for
+/// nothing pushed *and* for a check git could not run, as in Zed, which
+/// proceeds silently there; `{"error":…}` only when there is no repository to
+/// ask. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitHeadPushedRemotes(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    let json = match engine().git_head_pushed_remotes(project_id as u64) {
+        Ok(remotes) => serde_json::json!({ "remotes": remotes }).to_string(),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    };
+    to_jstring(&env, json)
+}
+
+/// Make the project a repository — the panel's "Initialize Repository". Runs
+/// Zed's two commands: the guest's `init.defaultBranch` names the branch when
+/// it is set, [fallback_branch] when it is not, then `git init -b <branch>`.
+/// Null when it worked. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitInit(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    fallback_branch: JString,
+) -> jstring {
+    let fallback_branch = get_string(&mut env, &fallback_branch);
+    command_result(&env, engine().git_init(project_id as u64, &fallback_branch))
+}
+
+/// Every local and remote-tracking branch, as JSON — `{"branches":[{name,
+/// is_remote, is_head, sha, subject, committer_date, author, has_parent,
+/// upstream, ahead, behind, upstream_gone}], "error":…}`. `error` is null
+/// unless git could only list some of them, in which case the partial listing
+/// is kept and the message rides beside it, as in Zed's picker banner.
+/// `{"error":…}` alone when there is no repository at all. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitBranches(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    let json = match engine().git_branches(project_id as u64) {
+        Ok(list) => serde_json::to_string(&list)
+            .unwrap_or_else(|_| "{\"error\":\"could not encode the branches\"}".to_owned()),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    };
+    to_jstring(&env, json)
+}
+
+/// Check out a branch by the name `gitBranches` listed. A remote name
+/// (`origin/feature`) grows a local tracking branch named after it first,
+/// exactly as Zed does. Null when it worked, git's refusal — a dirty worktree
+/// above all — when it did not. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitChangeBranch(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    name: JString,
+) -> jstring {
+    let name = get_string(&mut env, &name);
+    command_result(&env, engine().git_change_branch(project_id as u64, &name))
+}
+
+/// Create a branch and switch to it — `git switch -c <name> [<base>]`. An
+/// empty [base] branches off HEAD, which is what the picker's plain Create
+/// does. Null when it worked. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitCreateBranch(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    name: JString,
+    base: JString,
+) -> jstring {
+    let name = get_string(&mut env, &name);
+    let base = get_string(&mut env, &base);
+    let base = Some(base.as_str()).filter(|base| !base.is_empty());
+    command_result(
+        &env,
+        engine().git_create_branch(project_id as u64, &name, base),
+    )
+}
+
+/// Delete a branch — `git branch -d|-D|-dr|-Dr <name>`, Zed's flag table. An
+/// unmerged branch comes back with git's "not fully merged", which is the
+/// picker's cue to offer force. Null when it worked. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitDeleteBranch(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    name: JString,
+    is_remote: jboolean,
+    force: jboolean,
+) -> jstring {
+    let name = get_string(&mut env, &name);
+    command_result(
+        &env,
+        engine().git_delete_branch(project_id as u64, &name, is_remote != 0, force != 0),
+    )
+}
+
+/// The repository's default branch — Zed's chain: `upstream/HEAD`, then
+/// `origin/HEAD`, then `init.defaultBranch` if that local branch exists, then
+/// local `main`, then `master`. Null when nothing matches or git could not be
+/// asked; the picker simply drops its "Create New From" entry then.
+/// **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitDefaultBranch(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    match engine().git_default_branch(project_id as u64) {
+        Ok(Some(branch)) => to_jstring(&env, branch),
+        Ok(None) | Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// What a remote command (fetch, pull, push) said, as JSON — never null:
+/// `{"remote":…, "stdout":…, "stderr":…, "error":…}`. `remote` is the remote
+/// it ran against (null for fetch-all), the two streams are git's own words —
+/// which the UI formats into Zed's toasts, whose rules read the streams
+/// *separately* — and `error` is null on success, the one-line reason
+/// otherwise, with the streams still alongside for the log view.
+fn remote_result(
+    env: &JNIEnv,
+    result: Result<engine::RemoteOutput, String>,
+) -> jstring {
+    let json = match result {
+        Ok(output) => serde_json::json!({
+            "remote": output.remote,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+            "error": (!output.ok()).then(|| output.message()),
+        })
+        .to_string(),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    };
+    to_jstring(env, json)
+}
+
+/// Every remote with its fetch URL, as JSON — `{"remotes":[{name, url}]}`,
+/// in `git remote -v`'s (alphabetical) order, or `{"error":…}`. The Fetch
+/// From / Push To pickers' listing, and where github.com detection reads the
+/// URL. **Blocking**: it runs git.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitRemotes(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    let json = match engine().git_remotes(project_id as u64) {
+        Ok(remotes) => serde_json::json!({ "remotes": remotes }).to_string(),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    };
+    to_jstring(&env, json)
+}
+
+/// The remote the branch is configured to push to ([is_push]) or pull from,
+/// or null when none is — the caller's cue to list `gitRemotes` and ask,
+/// Zed's `get_remote` flow. Null also when git could not be asked: a failed
+/// *question* falls back to the listing rather than blocking the command.
+/// **Blocking**: it runs git.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitBranchRemote(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    branch: JString,
+    is_push: jboolean,
+) -> jstring {
+    let branch = get_string(&mut env, &branch);
+    match engine().git_branch_remote(project_id as u64, &branch, is_push != 0) {
+        Ok(Some(remote)) => to_jstring(&env, remote),
+        Ok(None) | Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Fetch from one remote, or — [remote] empty — from all of them, Zed's
+/// `git fetch --all`. Returns the remote-command JSON (see [remote_result]).
+/// **Blocking**: it talks to the network.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitFetch(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    remote: JString,
+) -> jstring {
+    let remote = get_string(&mut env, &remote);
+    let remote = Some(remote.as_str()).filter(|remote| !remote.is_empty());
+    remote_result(&env, engine().git_fetch(project_id as u64, remote))
+}
+
+/// Pull [branch] from [remote], with `--rebase` when asked — Zed's Pull and
+/// Pull (Rebase). The branch name joins the argv only when the branch has no
+/// upstream. Returns the remote-command JSON. **Blocking**: network.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitPull(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    branch: JString,
+    remote: JString,
+    rebase: jboolean,
+) -> jstring {
+    let branch = get_string(&mut env, &branch);
+    let remote = get_string(&mut env, &remote);
+    remote_result(
+        &env,
+        engine().git_pull(project_id as u64, &branch, &remote, rebase != 0),
+    )
+}
+
+/// Push [branch] to [remote] — with `--set-upstream` for Zed's Publish and
+/// Republish, or `--force-with-lease` (never plain `--force`) for its Force
+/// Push; force wins when both are set, as in Zed. Returns the remote-command
+/// JSON. **Blocking**: it talks to the network.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitPush(
     mut env: JNIEnv,
     _class: JClass,
     project_id: jlong,
     branch: JString,
+    remote: JString,
     set_upstream: jboolean,
+    force: jboolean,
 ) -> jstring {
     let branch = get_string(&mut env, &branch);
-    let result = engine().git_push(project_id as u64, &branch, set_upstream != 0);
-    command_result(&env, result.map(|_| ()))
+    let remote = get_string(&mut env, &remote);
+    remote_result(
+        &env,
+        engine().git_push(
+            project_id as u64,
+            &branch,
+            &remote,
+            set_upstream != 0,
+            force != 0,
+        ),
+    )
 }
 
 /// The working tree's diff as a patch, as JSON — `{"files":[…]}` with each
@@ -782,6 +1041,8 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitPatch(
 
 /// A page of commit history, newest first, as a JSON array of
 /// `{sha, parents, author, author_email, author_time, subject, refs}`.
+/// `all_refs` walks every branch, remote and tag in `--date-order` — the
+/// graph's view; false is the plain HEAD walk the History tab shows.
 /// `[]` for a repository with no commits; the error text when git failed.
 /// **Blocking**.
 #[unsafe(no_mangle)]
@@ -791,9 +1052,54 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitLog(
     project_id: jlong,
     limit: jlong,
     skip: jlong,
+    all_refs: jboolean,
 ) -> jstring {
-    let json = match engine().git_log(project_id as u64, limit as u32, skip.max(0) as u32) {
+    let json = match engine().git_log(
+        project_id as u64,
+        limit as u32,
+        skip.max(0) as u32,
+        all_refs != 0,
+    ) {
         Ok(commits) => serde_json::json!({ "commits": commits }).to_string(),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    };
+    to_jstring(&env, json)
+}
+
+/// The branch's changes since it left `base` — the merge-base diff behind the
+/// panel's "View Branch Diff", in `gitPatch`'s JSON shape: `{"files":[…]}` or
+/// `{"error":…}`. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitBranchPatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    base: JString,
+) -> jstring {
+    let base = get_string(&mut env, &base);
+    let json = match engine().git_branch_patch(project_id as u64, &base) {
+        Ok(files) => serde_json::json!({ "files": files }).to_string(),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    };
+    to_jstring(&env, json)
+}
+
+/// What one commit changed against its first parent, in `gitPatch`'s JSON
+/// shape — `{"files":[…]}` or `{"error":…}`. An empty `path` is the whole
+/// commit; a path narrows it to one file. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitCommitPatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    sha: JString,
+    path: JString,
+) -> jstring {
+    let sha = get_string(&mut env, &sha);
+    let path = get_string(&mut env, &path);
+    let path = Some(path.as_str()).filter(|path| !path.is_empty());
+    let json = match engine().git_commit_patch(project_id as u64, &sha, path) {
+        Ok(files) => serde_json::json!({ "files": files }).to_string(),
         Err(error) => serde_json::json!({ "error": error }).to_string(),
     };
     to_jstring(&env, json)

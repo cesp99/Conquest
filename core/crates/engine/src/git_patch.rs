@@ -19,6 +19,13 @@ pub struct FileDiff {
     pub original: Option<String>,
     /// True when git said the content is binary; [`hunks`] is then empty.
     pub is_binary: bool,
+    /// `new file mode` stood in the header: the diff creates this file. What
+    /// tells an *empty* new file — no hunks — from a mode-only change, which
+    /// is otherwise the same hunkless shape.
+    pub created: bool,
+    /// `deleted file mode`: the diff removes the file — again the only sign,
+    /// when the file was empty.
+    pub deleted: bool,
     pub hunks: Vec<PatchHunk>,
 }
 
@@ -114,6 +121,82 @@ impl crate::Engine {
         Ok(new_file_patch(&repo.project_root, path))
     }
 
+    /// The branch's changes since it left `base` — Zed's Branch Diff
+    /// (`DeployBranchDiff`, branch_diff.rs:80-137), which diffs against the
+    /// *merge base* with the default branch, worktree contents included
+    /// (git_store.rs `test_merge_base_status_uses_worktree_contents`).
+    ///
+    /// `git diff <base>...` is exactly that: git defines it as `git diff
+    /// $(git merge-base <base> HEAD)` against the working tree — so a clean
+    /// worktree still shows everything the branch has *committed* since the
+    /// merge base, which is the whole point of the panel's "View Branch Diff"
+    /// button appearing only over a clean tree.
+    ///
+    /// **Blocking**: it runs git inside the guest.
+    pub fn git_branch_patch(&self, id: ProjectId, base: &str) -> Result<Vec<FileDiff>, String> {
+        let base = crate::git::checked_branch(base)?;
+        let repo = self.repo_for(id)?;
+        let run = run_git(
+            &repo.userland,
+            &repo.repo_root,
+            "git diff",
+            git_argv(&repo.project_root, &branch_patch_args(&base)),
+        )?;
+        if run.status != 0 {
+            return Err(run.message());
+        }
+        Ok(parse_patch(&run.output))
+    }
+
+    /// What one commit changed, against its first parent — the patch behind
+    /// the graph's "View Commit" tab.
+    ///
+    /// `git show` rather than a second walk: Zed's `load_commit` runs
+    /// `git show --format= -z --no-renames --raw --no-abbrev --first-parent`
+    /// and rebuilds both texts itself (repository.rs:1384-1490); ours reads
+    /// the unified patch the same `show` can print, because that is the shape
+    /// the diff view already draws. `--first-parent` is kept — a merge shows
+    /// what the merge itself brought in, not everything on the side branch.
+    ///
+    /// `path` narrows it to one file — the sidebar's per-file "View Changes".
+    ///
+    /// **Blocking**: it runs git inside the guest.
+    pub fn git_commit_patch(
+        &self,
+        id: ProjectId,
+        sha: &str,
+        path: Option<&str>,
+    ) -> Result<Vec<FileDiff>, String> {
+        let sha = crate::git_history::checked_sha(sha)?;
+        let repo = self.repo_for(id)?;
+        let mut args: Vec<OsString> = vec![
+            OsString::from("show"),
+            // No header: the sidebar already shows the message, and the
+            // parser wants a patch that starts at `diff --git`.
+            OsString::from("--format="),
+            OsString::from("--first-parent"),
+            OsString::from("--no-color"),
+            OsString::from("--no-ext-diff"),
+            OsString::from("--find-renames"),
+            OsString::from("-U3"),
+            OsString::from(&sha),
+        ];
+        if let Some(path) = path {
+            args.push(OsString::from("--"));
+            args.push(OsString::from(crate::git::checked_path(path)?));
+        }
+        let run = run_git(
+            &repo.userland,
+            &repo.repo_root,
+            "git show",
+            git_argv(&repo.project_root, &args),
+        )?;
+        if run.status != 0 {
+            return Err(run.message());
+        }
+        Ok(parse_patch(&run.output))
+    }
+
     /// Whether the project's last `git status` called this path untracked.
     ///
     /// Read from the cache every other git surface shares rather than asked
@@ -126,6 +209,21 @@ impl crate::Engine {
         })
         .unwrap_or(false)
     }
+}
+
+/// The branch diff's argv, minus the `-C` — one place, so the host test can
+/// run the very strings the device sends. The `...` spelling is the merge-base
+/// diff; `base` has been through [`crate::git::checked_branch`], whose
+/// leading-`-` refusal is what keeps the first argument an argument.
+fn branch_patch_args(base: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("diff"),
+        OsString::from(format!("{base}...")),
+        OsString::from("--no-color"),
+        OsString::from("--no-ext-diff"),
+        OsString::from("--find-renames"),
+        OsString::from("-U3"),
+    ]
 }
 
 /// A file git has never seen, as the patch it would be: every line added.
@@ -158,6 +256,8 @@ fn new_file_patch(project_root: &std::path::Path, path: &str) -> Vec<FileDiff> {
             path: path.to_owned(),
             original: None,
             is_binary: true,
+            created: true,
+            deleted: false,
             hunks: Vec::new(),
         }];
     }
@@ -170,10 +270,15 @@ fn new_file_patch(project_root: &std::path::Path, path: &str) -> Vec<FileDiff> {
         lines
     };
     if lines.is_empty() {
+        // An untracked *empty* file: no lines, but still a new file — the
+        // `created` flag is all that keeps the view from misreading the
+        // hunkless shape as a mode change.
         return vec![FileDiff {
             path: path.to_owned(),
             original: None,
             is_binary: false,
+            created: true,
+            deleted: false,
             hunks: Vec::new(),
         }];
     }
@@ -196,6 +301,8 @@ fn new_file_patch(project_root: &std::path::Path, path: &str) -> Vec<FileDiff> {
         path: path.to_owned(),
         original: None,
         is_binary: false,
+        created: true,
+        deleted: false,
         hunks: vec![hunk],
     }]
 }
@@ -236,6 +343,8 @@ pub(crate) fn parse_patch(output: &str) -> Vec<FileDiff> {
                 path: String::new(),
                 original: None,
                 is_binary: false,
+                created: false,
+                deleted: false,
                 hunks: Vec::new(),
             });
             continue;
@@ -259,6 +368,14 @@ pub(crate) fn parse_patch(output: &str) -> Vec<FileDiff> {
             if let Some(path) = strip_prefix_path(rest, "b/") {
                 file.path = path;
             }
+            continue;
+        }
+        if line.starts_with("new file mode ") {
+            file.created = true;
+            continue;
+        }
+        if line.starts_with("deleted file mode ") {
+            file.deleted = true;
             continue;
         }
         if let Some(from) = line.strip_prefix("rename from ") {
@@ -540,6 +657,8 @@ Binary files a/logo.png and b/logo.png differ\n",
         );
         assert_eq!(created[0].path, "new.txt");
         assert!(created[0].original.is_none(), "a new file was not renamed");
+        assert!(created[0].created, "`new file mode` marks a creation");
+        assert!(!created[0].deleted);
         assert_eq!(created[0].hunks[0].lines[0].new_line, 1);
 
         let deleted = parse_patch(
@@ -555,6 +674,57 @@ Binary files a/logo.png and b/logo.png differ\n",
         );
         assert_eq!(deleted[0].path, "gone.txt");
         assert!(deleted[0].original.is_none());
+        assert!(deleted[0].deleted, "`deleted file mode` marks a deletion");
+        assert!(!deleted[0].created);
+    }
+
+    /// An **empty** file added or deleted prints a bare header: no `---`/`+++`
+    /// pair, no hunks — the exact shape of a mode-only change, which is why
+    /// the flags exist. The device test caught the diff view captioning a
+    /// commit's empty new `.gitignore` with "Only the file's mode changed."
+    #[test]
+    fn empty_files_are_creations_and_deletions_not_mode_changes() {
+        let created = parse_patch(
+            &[
+                "diff --git a/empty b/empty",
+                "new file mode 100644",
+                "index 0000000..e69de29",
+                "",
+            ]
+            .join("\n"),
+        );
+        assert_eq!(created[0].path, "empty", "the header names the file");
+        assert!(created[0].created);
+        assert!(!created[0].deleted);
+        assert!(created[0].hunks.is_empty());
+
+        let deleted = parse_patch(
+            &[
+                "diff --git a/gone b/gone",
+                "deleted file mode 100644",
+                "index e69de29..0000000",
+                "",
+            ]
+            .join("\n"),
+        );
+        assert_eq!(deleted[0].path, "gone");
+        assert!(deleted[0].deleted);
+        assert!(!deleted[0].created);
+
+        // And a real mode-only change stays exactly what it was: neither.
+        let mode = parse_patch(
+            &[
+                "diff --git a/tool.sh b/tool.sh",
+                "old mode 100644",
+                "new mode 100755",
+                "",
+            ]
+            .join("\n"),
+        );
+        assert_eq!(mode[0].path, "tool.sh");
+        assert!(!mode[0].created);
+        assert!(!mode[0].deleted);
+        assert!(mode[0].hunks.is_empty());
     }
 
     /// A carriage return belongs to the line's content; dropping it makes the
@@ -599,5 +769,70 @@ Binary files a/logo.png and b/logo.png differ\n",
     fn nothing_in_nothing_out() {
         assert!(parse_patch("").is_empty());
         assert!(parse_patch("not a patch at all\n").is_empty());
+    }
+
+    /// The branch-diff argv through the real binary: a branch's committed
+    /// changes show against the merge base even over a **clean worktree**,
+    /// which is the only state the panel's "View Branch Diff" button is
+    /// reachable in — and commits made on `main` after the branch left it do
+    /// not bleed in, which is what `...` (merge base) means and a plain
+    /// two-dot diff would get wrong.
+    #[test]
+    fn real_git_branch_diff_shows_the_branch_against_the_merge_base() {
+        use std::process::Command;
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: no git on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(repo)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        git(&["init", "--quiet", "-b", "main"]);
+        std::fs::write(repo.join("README"), "one\n").unwrap();
+        git(&["add", "README"]);
+        git(&["commit", "--quiet", "-m", "first"]);
+        git(&["checkout", "--quiet", "-b", "feature"]);
+        std::fs::write(repo.join("feature.txt"), "branch work\n").unwrap();
+        git(&["add", "feature.txt"]);
+        git(&["commit", "--quiet", "-m", "branch work"]);
+        // `main` moves on after the branch left it; the merge-base diff must
+        // not report main's own change as the branch's.
+        git(&["checkout", "--quiet", "main"]);
+        std::fs::write(repo.join("mainline.txt"), "mainline\n").unwrap();
+        git(&["add", "mainline.txt"]);
+        git(&["commit", "--quiet", "-m", "mainline"]);
+        git(&["checkout", "--quiet", "feature"]);
+
+        let argv = crate::git::git_argv(repo, &branch_patch_args("main"));
+        let out = Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let files = parse_patch(&String::from_utf8_lossy(&out.stdout));
+        assert_eq!(files.len(), 1, "only the branch's own change shows");
+        assert_eq!(files[0].path, "feature.txt");
+        assert_eq!(files[0].hunks[0].lines[0].kind, '+');
     }
 }
