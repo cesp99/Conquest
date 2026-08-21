@@ -1208,13 +1208,17 @@ fun GitPanel(
             } else
             Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
                 if (rows.isEmpty()) {
+                    // The list must leave the composition entirely here, not
+                    // just render nothing: an empty LazyColumn still fills the
+                    // Box and its scroll modifier wins sibling hit-testing, so
+                    // the empty state's buttons underneath never saw a tap.
                     EmptyMessage(
                         state = state,
                         busy = ops.busy,
                         onViewBranchDiff = ::viewBranchDiff,
                         onInitRepository = ::initRepository,
                     )
-                }
+                } else
                 LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                     itemsIndexed(rows, key = { _, row -> row.key }) { index, row ->
                         when (row) {
