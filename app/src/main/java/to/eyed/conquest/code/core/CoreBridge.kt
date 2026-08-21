@@ -432,9 +432,18 @@ object CoreBridge {
 
     /**
      * A page of commit history, newest first, as JSON — `{"commits":[…]}` or
-     * `{"error":…}`. **Blocking** — it runs git.
+     * `{"error":…}`. [allRefs] walks every branch, remote and tag in
+     * `--date-order` — the graph's view; false is the plain HEAD walk the
+     * History tab shows. **Blocking** — it runs git.
      */
-    external fun gitLog(projectId: Long, limit: Long, skip: Long): String
+    external fun gitLog(projectId: Long, limit: Long, skip: Long, allRefs: Boolean): String
+
+    /**
+     * What one commit changed against its first parent, in [gitPatch]'s JSON
+     * shape. An empty [path] is the whole commit; a path narrows it to one
+     * file. **Blocking** — it runs git.
+     */
+    external fun gitCommitPatch(projectId: Long, sha: String, path: String): String
 
     /**
      * One commit in full: its fields, its whole message and the paths it

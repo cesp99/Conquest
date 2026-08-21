@@ -106,15 +106,33 @@ class GitSession(private val project: ProjectSession) {
 
     /**
      * A page of history, newest first. Empty for a repository with no commits.
+     * [allRefs] is the graph's walk — every branch, remote and tag in
+     * `--date-order`, Zed's `LogSource::All`; the default is the plain HEAD
+     * walk the panel's History tab shows.
      *
      * **Blocking** — call it from [kotlinx.coroutines.Dispatchers.IO].
      */
-    fun log(limit: Int = 100, skip: Int = 0): CommitPage {
-        val root = JSONObject(CoreBridge.gitLog(project.id, limit.toLong(), skip.toLong()))
+    fun log(limit: Int = 100, skip: Int = 0, allRefs: Boolean = false): CommitPage {
+        val root = JSONObject(CoreBridge.gitLog(project.id, limit.toLong(), skip.toLong(), allRefs))
         if (!root.isNull("error")) return CommitPage(error = root.getString("error"))
         val array = root.optJSONArray("commits") ?: JSONArray()
         return CommitPage(
             commits = List(array.length()) { index -> Commit.parse(array.getJSONObject(index)) },
+        )
+    }
+
+    /**
+     * What one commit changed against its first parent, as the patch the diff
+     * view draws. A [path] narrows it to one file — the sidebar's per-file
+     * "View Changes". **Blocking** — call it from
+     * [kotlinx.coroutines.Dispatchers.IO].
+     */
+    fun commitPatch(sha: String, path: String? = null): PatchResult {
+        val root = JSONObject(CoreBridge.gitCommitPatch(project.id, sha, path.orEmpty()))
+        if (!root.isNull("error")) return PatchResult(error = root.getString("error"))
+        val files = root.optJSONArray("files") ?: JSONArray()
+        return PatchResult(
+            files = List(files.length()) { index -> FileDiff.parse(files.getJSONObject(index)) },
         )
     }
 

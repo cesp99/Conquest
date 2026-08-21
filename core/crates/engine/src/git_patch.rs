@@ -114,6 +114,55 @@ impl crate::Engine {
         Ok(new_file_patch(&repo.project_root, path))
     }
 
+    /// What one commit changed, against its first parent — the patch behind
+    /// the graph's "View Commit" tab.
+    ///
+    /// `git show` rather than a second walk: Zed's `load_commit` runs
+    /// `git show --format= -z --no-renames --raw --no-abbrev --first-parent`
+    /// and rebuilds both texts itself (repository.rs:1384-1490); ours reads
+    /// the unified patch the same `show` can print, because that is the shape
+    /// the diff view already draws. `--first-parent` is kept — a merge shows
+    /// what the merge itself brought in, not everything on the side branch.
+    ///
+    /// `path` narrows it to one file — the sidebar's per-file "View Changes".
+    ///
+    /// **Blocking**: it runs git inside the guest.
+    pub fn git_commit_patch(
+        &self,
+        id: ProjectId,
+        sha: &str,
+        path: Option<&str>,
+    ) -> Result<Vec<FileDiff>, String> {
+        let sha = crate::git_history::checked_sha(sha)?;
+        let repo = self.repo_for(id)?;
+        let mut args: Vec<OsString> = vec![
+            OsString::from("show"),
+            // No header: the sidebar already shows the message, and the
+            // parser wants a patch that starts at `diff --git`.
+            OsString::from("--format="),
+            OsString::from("--first-parent"),
+            OsString::from("--no-color"),
+            OsString::from("--no-ext-diff"),
+            OsString::from("--find-renames"),
+            OsString::from("-U3"),
+            OsString::from(&sha),
+        ];
+        if let Some(path) = path {
+            args.push(OsString::from("--"));
+            args.push(OsString::from(crate::git::checked_path(path)?));
+        }
+        let run = run_git(
+            &repo.userland,
+            &repo.repo_root,
+            "git show",
+            git_argv(&repo.project_root, &args),
+        )?;
+        if run.status != 0 {
+            return Err(run.message());
+        }
+        Ok(parse_patch(&run.output))
+    }
+
     /// Whether the project's last `git status` called this path untracked.
     ///
     /// Read from the cache every other git surface shares rather than asked

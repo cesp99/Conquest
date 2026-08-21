@@ -1041,6 +1041,8 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitPatch(
 
 /// A page of commit history, newest first, as a JSON array of
 /// `{sha, parents, author, author_email, author_time, subject, refs}`.
+/// `all_refs` walks every branch, remote and tag in `--date-order` — the
+/// graph's view; false is the plain HEAD walk the History tab shows.
 /// `[]` for a repository with no commits; the error text when git failed.
 /// **Blocking**.
 #[unsafe(no_mangle)]
@@ -1050,9 +1052,36 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitLog(
     project_id: jlong,
     limit: jlong,
     skip: jlong,
+    all_refs: jboolean,
 ) -> jstring {
-    let json = match engine().git_log(project_id as u64, limit as u32, skip.max(0) as u32) {
+    let json = match engine().git_log(
+        project_id as u64,
+        limit as u32,
+        skip.max(0) as u32,
+        all_refs != 0,
+    ) {
         Ok(commits) => serde_json::json!({ "commits": commits }).to_string(),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    };
+    to_jstring(&env, json)
+}
+
+/// What one commit changed against its first parent, in `gitPatch`'s JSON
+/// shape — `{"files":[…]}` or `{"error":…}`. An empty `path` is the whole
+/// commit; a path narrows it to one file. **Blocking**.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_gitCommitPatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+    sha: JString,
+    path: JString,
+) -> jstring {
+    let sha = get_string(&mut env, &sha);
+    let path = get_string(&mut env, &path);
+    let path = Some(path.as_str()).filter(|path| !path.is_empty());
+    let json = match engine().git_commit_patch(project_id as u64, &sha, path) {
+        Ok(files) => serde_json::json!({ "files": files }).to_string(),
         Err(error) => serde_json::json!({ "error": error }).to_string(),
     };
     to_jstring(&env, json)
