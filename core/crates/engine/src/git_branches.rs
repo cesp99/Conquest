@@ -17,7 +17,7 @@
 use std::ffi::OsString;
 
 use crate::ProjectId;
-use crate::git::{checked_branch, git_argv, run_git};
+use crate::git::{checked_branch, git_argv, run_git, run_git_mutating};
 
 /// `for-each-ref`'s format: Zed's nine fields, joined with `%00` so git
 /// separates them with NUL — the one byte a subject, an author, and a ref name
@@ -162,11 +162,25 @@ impl crate::Engine {
                 git_argv(&repo.project_root, &args),
             )
         };
+        // For the commands that *change* the repository: the long safety-net
+        // deadline — a checkout of thousands of files under proot must not be
+        // killed mid worktree update — and the cache invalidated on the Err
+        // path too, since a lost run may still have moved things.
+        let change = |label: &str, args: &[&str]| {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            let run = run_git_mutating(
+                &repo.userland,
+                &repo.repo_root,
+                label,
+                git_argv(&repo.project_root, &args),
+            );
+            self.git_state_changed(id);
+            run
+        };
 
         let local_ref = format!("refs/heads/{name}");
         if run("git show-ref", &["show-ref", "--verify", "--quiet", &local_ref])?.status == 0 {
-            let checkout = run("git checkout", &["checkout", &name])?;
-            self.git_state_changed(id);
+            let checkout = change("git checkout", &["checkout", &name])?;
             return if checkout.status == 0 {
                 Ok(())
             } else {
@@ -199,19 +213,17 @@ impl crate::Engine {
             .status
                 == 0
             {
-                run(
+                change(
                     "git branch",
                     &["branch", "--set-upstream-to", &name, &branch_name],
                 )?
             } else {
-                run("git branch", &["branch", "--track", &branch_name, &name])?
+                change("git branch", &["branch", "--track", &branch_name, &name])?
             };
             if tracked.status != 0 {
-                self.git_state_changed(id);
                 return Err(tracked.message());
             }
-            let checkout = run("git checkout", &["checkout", &branch_name])?;
-            self.git_state_changed(id);
+            let checkout = change("git checkout", &["checkout", &branch_name])?;
             return if checkout.status == 0 {
                 Ok(())
             } else {
@@ -242,13 +254,15 @@ impl crate::Engine {
         if let Some(base) = base {
             args.push(OsString::from(checked_branch(base)?));
         }
-        let run = run_git(
+        let run = run_git_mutating(
             &repo.userland,
             &repo.repo_root,
             "git switch",
             git_argv(&repo.project_root, &args),
-        )?;
+        );
+        // Ok or Err alike — a lost run may still have switched.
         self.git_state_changed(id);
+        let run = run?;
         if run.status == 0 {
             Ok(())
         } else {
@@ -274,13 +288,15 @@ impl crate::Engine {
             OsString::from(delete_branch_flag(is_remote, force)),
             OsString::from(&name),
         ];
-        let run = run_git(
+        let run = run_git_mutating(
             &repo.userland,
             &repo.repo_root,
             "git branch",
             git_argv(&repo.project_root, &args),
-        )?;
+        );
+        // Ok or Err alike — a lost run may still have deleted.
         self.git_state_changed(id);
+        let run = run?;
         if run.status == 0 {
             Ok(())
         } else {

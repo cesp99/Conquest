@@ -1089,16 +1089,23 @@ fn summary(tier: u8, from: GitStatus) -> GitStatus {
 // when it refuses.
 // ---------------------------------------------------------------------------
 
-/// A command that takes longer than this has gone wrong. Shorter than the
-/// query's deadline because somebody is waiting on it with a finger on a
-/// button, and a spinner that never ends is worse than an error.
+/// A *read-only* command that takes longer than this has gone wrong. Shorter
+/// than the query's deadline because somebody is waiting on it with a finger
+/// on a button, and a spinner that never ends is worse than an error. Only
+/// reads may be killed this eagerly — a killed read costs a retry and nothing
+/// else; a killed write is [`MUTATION_TIMEOUT`]'s story.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The deadline for fetch, pull and push, which move commits over a network
-/// that may be a phone's. Thirty seconds kills a legitimate first fetch of a
-/// real repository; two minutes is still an ending, which Zed's (deadline-less)
-/// remote commands do not promise at all.
-pub(crate) const REMOTE_TIMEOUT: Duration = Duration::from_secs(120);
+/// The safety net for commands that *change* the repository — a checkout, a
+/// commit, and the remote trio that moves commits over a network that may be
+/// a phone's. Deliberately not a responsiveness promise: killing a mutation
+/// mid-flight leaves half-applied state behind — a fetch that already moved
+/// remote refs, a merge with `MERGE_HEAD` in place, a stale `index.lock`
+/// nothing in the app can clean up — which is strictly worse than a long
+/// wait. Zed's equivalents run with no deadline at all; ten minutes is the
+/// something-is-truly-wedged backstop, not a duration any healthy command
+/// reaches.
+pub(crate) const MUTATION_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// What the shell wrapper prints after the command it ran.
 const EXIT_MARKER: &str = "conquest-exit:";
@@ -1123,6 +1130,7 @@ const EXIT_MARKER: &str = "conquest-exit:";
 const WRAPPER: &str = r#""$@" 2>&1; printf 'conquest-exit:%d' "$?""#;
 
 /// What one command did.
+#[derive(Debug)]
 pub(crate) struct GitRun {
     /// git's own exit status.
     pub status: i32,
@@ -1162,27 +1170,54 @@ pub(crate) fn failure_line(output: &str, status: i32) -> String {
     }
 }
 
-/// Run one git command inside the guest and read back everything it said.
+/// Run one *read-only* git command inside the guest and read back everything
+/// it said.
 ///
-/// `Err` means the *guest* failed — no proot, no `sh`, a deadline — which is
-/// not something git said and not something the user can act on beyond
-/// installing the userland.
+/// `Err` means the *guest* failed — no proot, no `sh`, the deadline — which
+/// is not something git said. A command that changes the repository goes
+/// through [`run_git_mutating`] instead, whose deadline is a safety net
+/// rather than a promise of responsiveness.
 pub(crate) fn run_git(
     userland: &Userland,
     repo_root: &Path,
     label: &str,
     argv: Vec<OsString>,
 ) -> Result<GitRun, String> {
+    run_git_with(userland, repo_root, label, argv, COMMAND_TIMEOUT)
+}
+
+/// [`run_git`] for a command that *changes* the repository. Same guest, same
+/// wrapper, same retry — but the deadline is [`MUTATION_TIMEOUT`]: killing
+/// `git checkout` or `git commit` mid-flight leaves a half-switched worktree
+/// or a stale `index.lock` behind, which is strictly worse than a long wait,
+/// so only a truly wedged command is ever killed.
+pub(crate) fn run_git_mutating(
+    userland: &Userland,
+    repo_root: &Path,
+    label: &str,
+    argv: Vec<OsString>,
+) -> Result<GitRun, String> {
+    run_git_with(userland, repo_root, label, argv, MUTATION_TIMEOUT)
+}
+
+/// The shared body of the two above.
+fn run_git_with(
+    userland: &Userland,
+    repo_root: &Path,
+    label: &str,
+    argv: Vec<OsString>,
+    timeout: Duration,
+) -> Result<GitRun, String> {
     // What was actually run, which is the one thing missing when a command
     // works by hand in the terminal and fails here.
     log::debug!("{label}: {argv:?}");
     let retry_argv = argv.clone();
-    let output = guest::capture(
+    let output = captured(
         userland,
         &git_command(label, repo_root, wrapped_argv(argv)),
-        COMMAND_TIMEOUT,
-    )
-    .ok_or_else(|| "Could not run git in the Linux userland".to_owned())?;
+        label,
+        timeout,
+    )?;
     let run = parse_run(&output)?;
     if run.status == 0 {
         return Ok(run);
@@ -1194,15 +1229,35 @@ pub(crate) fn run_git(
     // terminal session alive, and only ever once in a row.
     if run.output.contains("cannot change to") {
         log::debug!("{label}: the guest lost the project; running it once more");
-        let output = guest::capture(
+        let output = captured(
             userland,
             &git_command(label, repo_root, wrapped_argv(retry_argv)),
-            COMMAND_TIMEOUT,
-        )
-        .ok_or_else(|| "Could not run git in the Linux userland".to_owned())?;
+            label,
+            timeout,
+        )?;
         return parse_run(&output);
     }
     Ok(run)
+}
+
+/// One capture, with the deadline's own sentence kept apart from the guest
+/// failing to run git at all: by the time a deadline fires git *was* running,
+/// and a mutating command killed mid-flight may have partly applied — the
+/// error has to say so rather than blame the userland.
+fn captured(
+    userland: &Userland,
+    command: &GuestCommand,
+    label: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    match guest::capture_outcome(userland, command, timeout) {
+        guest::Captured::Output(output) => Ok(output),
+        guest::Captured::TimedOut => Err(format!(
+            "{label} was stopped after {} seconds and may have partly applied; check the repository before retrying",
+            timeout.as_secs()
+        )),
+        guest::Captured::Failed => Err("Could not run git in the Linux userland".to_owned()),
+    }
 }
 
 /// git's argv, wrapped in the shell that makes its failure readable.
@@ -1259,7 +1314,10 @@ pub(crate) struct GitSplitRun {
 
 /// [`run_git`] with the two streams kept apart — for fetch, pull and push,
 /// whose output the UI formats rather than merely shows. Same guest, same
-/// retry, longer deadline ([`REMOTE_TIMEOUT`]): these talk to a network.
+/// retry, and every caller is a mutation that talks to a network, so the
+/// deadline is [`MUTATION_TIMEOUT`]'s safety net rather than a short one that
+/// would kill a legitimate first fetch of a real repository over a phone's
+/// network — mid-merge, refs already moved.
 pub(crate) fn run_git_split(
     userland: &Userland,
     repo_root: &Path,
@@ -1268,12 +1326,12 @@ pub(crate) fn run_git_split(
 ) -> Result<GitSplitRun, String> {
     log::debug!("{label}: {argv:?}");
     let retry_argv = argv.clone();
-    let output = guest::capture(
+    let output = captured(
         userland,
         &git_command(label, repo_root, split_wrapped_argv(argv)),
-        REMOTE_TIMEOUT,
-    )
-    .ok_or_else(|| "Could not run git in the Linux userland".to_owned())?;
+        label,
+        MUTATION_TIMEOUT,
+    )?;
     let run = parse_split_run(&output)?;
     if run.status == 0 {
         return Ok(run);
@@ -1287,12 +1345,12 @@ pub(crate) fn run_git_split(
     // The same not-ready-guest retry `run_git` documents.
     if run.stderr.contains("cannot change to") {
         log::debug!("{label}: the guest lost the project; running it once more");
-        let output = guest::capture(
+        let output = captured(
             userland,
             &git_command(label, repo_root, split_wrapped_argv(retry_argv)),
-            REMOTE_TIMEOUT,
-        )
-        .ok_or_else(|| "Could not run git in the Linux userland".to_owned())?;
+            label,
+            MUTATION_TIMEOUT,
+        )?;
         return parse_split_run(&output);
     }
     Ok(run)
@@ -1393,13 +1451,17 @@ impl crate::Engine {
         let paths = checked_paths(paths)?;
         let mut args: Vec<OsString> = ["add", "-A", "--"].iter().map(OsString::from).collect();
         args.extend(paths.iter().map(OsString::from));
-        let run = run_git(
+        let run = run_git_mutating(
             &repo.userland,
             &repo.repo_root,
             "git add",
             git_argv(&repo.project_root, &args),
-        )?;
+        );
+        // On the Err path too: a run the guest lost may still have moved the
+        // index before the kill landed, and a `?` that skipped the bump left
+        // the panel sitting on the pre-command state exactly then.
         self.git_state_changed(id);
+        let run = run?;
         if run.status == 0 {
             Ok(())
         } else {
@@ -1423,14 +1485,16 @@ impl crate::Engine {
             .map(OsString::from)
             .collect();
         args.extend(paths.iter().map(OsString::from));
-        let run = run_git(
+        let run = run_git_mutating(
             &repo.userland,
             &repo.repo_root,
             "git restore --staged",
             git_argv(&repo.project_root, &args),
-        )?;
+        );
+        // Ok or Err alike — the run may have moved the index either way.
+        self.git_state_changed(id);
+        let run = run?;
         if run.status == 0 {
-            self.git_state_changed(id);
             return Ok(());
         }
 
@@ -1439,13 +1503,14 @@ impl crate::Engine {
             .map(OsString::from)
             .collect();
         args.extend(paths.iter().map(OsString::from));
-        let fallback = run_git(
+        let fallback = run_git_mutating(
             &repo.userland,
             &repo.repo_root,
             "git rm --cached",
             git_argv(&repo.project_root, &args),
-        )?;
+        );
         self.git_state_changed(id);
+        let fallback = fallback?;
         if fallback.status == 0 {
             Ok(())
         } else {
@@ -1523,12 +1588,20 @@ impl crate::Engine {
             .map(OsString::from)
             .collect();
             args.extend(restore.iter().map(OsString::from));
-            let run = run_git(
+            let run = match run_git_mutating(
                 &repo.userland,
                 &repo.repo_root,
                 "git restore",
                 git_argv(&repo.project_root, &args),
-            )?;
+            ) {
+                Ok(run) => run,
+                Err(err) => {
+                    // The restore may have partly run before the guest lost
+                    // it; the cache must not keep the pre-command state.
+                    self.git_state_changed(id);
+                    return Err(err);
+                }
+            };
             if run.status != 0 {
                 failures.push(run.message());
             }
@@ -1562,7 +1635,7 @@ impl crate::Engine {
                     .map(OsString::from)
                     .collect();
             args.push(OsString::from(&path));
-            let _ = run_git(
+            let _ = run_git_mutating(
                 &repo.userland,
                 &repo.repo_root,
                 "git rm --cached",
@@ -1603,13 +1676,15 @@ impl crate::Engine {
         }
         let repo = self.repo_for(id)?;
         let args = commit_args(message, amend, signoff, no_verify);
-        let run = run_git(
+        let run = run_git_mutating(
             &repo.userland,
             &repo.repo_root,
             "git commit",
             git_argv(&repo.project_root, &args),
-        )?;
+        );
+        // Ok or Err alike — a lost run may still have committed.
         self.git_state_changed(id);
+        let run = run?;
         if run.status == 0 {
             Ok(())
         } else {
@@ -1632,13 +1707,15 @@ impl crate::Engine {
             .iter()
             .map(OsString::from)
             .collect();
-        let run = run_git(
+        let run = run_git_mutating(
             &repo.userland,
             &repo.repo_root,
             "git reset",
             git_argv(&repo.project_root, &args),
-        )?;
+        );
+        // Ok or Err alike — a lost run may still have moved HEAD.
         self.git_state_changed(id);
+        let run = run?;
         if run.status == 0 {
             Ok(())
         } else {
@@ -1728,13 +1805,15 @@ impl crate::Engine {
             OsString::from("-b"),
             OsString::from(&branch),
         ];
-        let run = run_git(
+        let run = run_git_mutating(
             &userland,
             &project_root,
             "git init",
             git_argv(&project_root, &args),
-        )?;
+        );
+        // Ok or Err alike — a lost run may still have created the repository.
         self.git_state_changed(id);
+        let run = run?;
         if run.status == 0 {
             Ok(())
         } else {
@@ -1871,26 +1950,45 @@ pub(crate) fn parse_pushed_remotes(output: &str) -> Vec<String> {
 
 /// A branch or remote name this will hand to git as an argument.
 ///
-/// Not a general `check-ref-format`: a *whitelist*, because the failure mode
-/// is git reading the value as something else entirely. `+main` is a legal
-/// branch name **and** a force refspec — push it and git happily force-updates
-/// a different branch on the remote and discards a commit — which is exactly
-/// what a guard that only refused `-`, spaces and `:` let through.
+/// The argv never crosses a shell as *syntax*: `GuestCommand` execs proot
+/// with these strings as real arguments, and the `sh -c '"$@" …'` wrapper
+/// re-expands them as its own positional parameters — unsplit, unglobbed,
+/// never re-parsed. So the only reader who can misread a name is git itself,
+/// and the extra rules beyond git's own are exactly those two misreadings:
+///
+/// * option parsing — a leading `-` reads as a flag;
+/// * refspec and rev syntax, where a name becomes `<branch>:<remote_branch>`
+///   or `<branch>@{upstream}` — a leading `+` is a force marker (`git push
+///   origin +main` force-updates `main` on the remote and discards commits),
+///   and `:` would split the refspec. `*`, `@{` and a bare `@` are already
+///   git's own refusals.
+///
+/// Everything else is `git check-ref-format`'s rulebook, so any name git
+/// itself lists — unicode, `#`, a `@` or `+` mid-name — passes, and the rows
+/// [`crate::Engine::git_branches`] and [`crate::Engine::git_remotes`] hand
+/// the pickers stay actionable. The old ASCII whitelist refused those and
+/// left legal branches permanently un-actionable.
 pub(crate) fn checked_branch(name: &str) -> Result<String, String> {
     let name = name.trim();
-    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-');
+    // What check-ref-format refuses anywhere in a refname: ASCII control
+    // bytes, space, and these metacharacters.
+    let forbidden = |c: char| {
+        c.is_ascii_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    };
     if name.is_empty()
         || name.len() > 255
-        || !name.chars().all(allowed)
+        || name == "@"
+        || name.chars().any(forbidden)
         || name.starts_with('-')
-        || name.starts_with('.')
-        || name.starts_with('/')
-        || name.ends_with('/')
-        || name.ends_with(".lock")
+        || name.starts_with('+')
+        || name.ends_with('.')
         || name.contains("..")
-        || name.contains("//")
+        || name.contains("@{")
+        || name
+            .split('/')
+            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
     {
-        return Err(format!("{name:?} is not a name this can push"));
+        return Err(format!("{name:?} is not a branch or remote name this can use"));
     }
     Ok(name.to_owned())
 }
@@ -3372,6 +3470,83 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "second\nfirst");
     }
 
+    /// A command past its deadline gets the deadline's own sentence — by then
+    /// git *was* running, and a mutation killed mid-flight may have partly
+    /// applied — never the userland-installation error, which would send the
+    /// user reinstalling Debian over a slow network.
+    #[test]
+    #[cfg(unix)]
+    fn a_command_past_its_deadline_says_it_may_have_partly_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::Engine::new();
+        engine.set_userland(&fake_guest(dir.path()), dir.path(), dir.path(), dir.path());
+        let userland = engine.userland().unwrap();
+        // Detached from the pipes, because the fake guest has no proot to
+        // take tracees down on the kill: an orphan holding stdout would make
+        // `capture`'s readers wait out the whole sleep.
+        let argv: Vec<OsString> = ["/bin/sh", "-c", "exec sleep 5 >/dev/null 2>&1"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let err = run_git_with(
+            &userland,
+            dir.path(),
+            "git sleep",
+            argv,
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("may have partly applied"),
+            "expected the deadline's own sentence, got {err:?}"
+        );
+        assert!(
+            !err.contains("Linux userland"),
+            "a deadline must not read as a missing userland: {err:?}"
+        );
+    }
+
+    /// A mutation the guest *lost* — spawn failed, deadline fired — must
+    /// still invalidate the status cache: the command may have run for a
+    /// while before dying, and a `?` that skipped the bump left the panel
+    /// sitting on the pre-command state until an unrelated worktree event.
+    #[test]
+    #[cfg(unix)]
+    fn a_mutation_the_guest_lost_still_invalidates_the_status_cache() {
+        if !has_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, repo) = live_repo(dir.path());
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        let id = engine.open_project(&repo);
+        await_change(&engine, id, "a.txt");
+        // Let any in-flight status run finish: one completing *after* the
+        // failed commit below would set `scanned` back and fake a pass.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while engine.with_git(id, |git| git.running).unwrap_or(false) {
+            assert!(Instant::now() < deadline, "the status run never settled");
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(engine.with_git(id, |git| git.scanned), Some(true));
+
+        // A proot that exists but cannot run: `is_installed` passes, the
+        // spawn fails — the same shape as a rootfs pulled out mid-session.
+        let broken = dir.path().join("broken-proot");
+        std::fs::write(&broken, "").unwrap();
+        engine.set_userland(&broken, dir.path(), dir.path(), &dir.path().join("projects"));
+
+        let err = engine
+            .git_commit(id, "doomed", false, false, false)
+            .unwrap_err();
+        assert!(err.contains("Could not run git"), "{err:?}");
+        assert_eq!(
+            engine.with_git(id, |git| git.scanned),
+            Some(false),
+            "the Err path must invalidate the cache too"
+        );
+    }
+
     /// Wait for the status cache to catch up with a command, and hand back what
     /// it says about one path. Commands invalidate the cache rather than
     /// refilling it — refilling means a `git status` the caller did not ask for
@@ -3468,6 +3643,42 @@ mod tests {
         assert!(checked_branch("HEAD~2").is_err());
         assert!(checked_branch("main^{}").is_err());
         assert!(checked_branch("").is_err());
+    }
+
+    /// The gate is git's own `check-ref-format` rulebook plus the two argv
+    /// misreadings (leading `-`, leading `+`), **not** an ASCII whitelist:
+    /// the listings hand the pickers whatever git prints, and a legal branch
+    /// the checker refuses is a row no operation can act on. Found with
+    /// `wip@review` — checkout, delete, pull and push all failed on a branch
+    /// the picker itself listed.
+    #[test]
+    fn names_git_itself_lists_pass_the_gate() {
+        // Legal per check-ref-format, once refused by the old whitelist.
+        assert!(checked_branch("wip@review").is_ok());
+        assert!(checked_branch("fix#123").is_ok());
+        assert!(checked_branch("feature+x").is_ok());
+        assert!(checked_branch("héllo").is_ok());
+        assert!(checked_branch("功能分支").is_ok());
+        assert!(checked_branch("wip{2024}").is_ok());
+
+        // Still refused: what check-ref-format itself refuses…
+        assert!(checked_branch("@").is_err());
+        assert!(checked_branch("a@{b").is_err());
+        assert!(checked_branch("done.").is_err());
+        assert!(checked_branch("feat/.hidden").is_err());
+        assert!(checked_branch("sub/name.lock").is_err());
+        assert!(checked_branch("/lead").is_err());
+        assert!(checked_branch("trail/").is_err());
+        assert!(checked_branch("a//b").is_err());
+        assert!(checked_branch("glob*").is_err());
+        assert!(checked_branch("what?").is_err());
+        assert!(checked_branch("set[1]").is_err());
+        assert!(checked_branch("back\\slash").is_err());
+        assert!(checked_branch("tab\there").is_err());
+        assert!(checked_branch("nl\nhere").is_err());
+        // …and the two shapes git would misread in an argv or refspec.
+        assert!(checked_branch("-b").is_err());
+        assert!(checked_branch("+force/me").is_err());
     }
 
     /// The upstream half of porcelain's branch header is what tells "push"

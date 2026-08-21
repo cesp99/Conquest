@@ -23,7 +23,7 @@
 use std::ffi::OsString;
 
 use crate::ProjectId;
-use crate::git::{checked_branch, failure_line, git_argv, run_git, run_git_split};
+use crate::git::{Repo, checked_branch, failure_line, git_argv, run_git, run_git_split};
 
 /// One remote, as `git remote -v` lists it: the name the pickers show and the
 /// argvs take, and the fetch URL — which is what tells a github.com remote
@@ -162,8 +162,11 @@ impl crate::Engine {
             &repo.repo_root,
             "git fetch",
             git_argv(&repo.project_root, &fetch_args(remote.as_deref())),
-        )?;
+        );
+        // "Either way" includes the guest failing: a fetch the deadline
+        // killed may still have moved remote refs before the kill landed.
         self.git_state_changed(id);
+        let run = run?;
         Ok(RemoteOutput {
             remote,
             stdout: run.stdout,
@@ -188,19 +191,19 @@ impl crate::Engine {
         let branch = checked_branch(branch)?;
         let remote = checked_branch(remote)?;
         let repo = self.repo_for(id)?;
-        let has_upstream = self
-            .with_git(id, |git| git.branch.clone())
-            .flatten()
-            .and_then(|info| info.upstream)
-            .is_some();
+        let has_upstream = has_configured_upstream(&repo, &branch)?;
         let publish_branch = (!has_upstream).then_some(branch.as_str());
         let run = run_git_split(
             &repo.userland,
             &repo.repo_root,
             "git pull",
             git_argv(&repo.project_root, &pull_args(&remote, rebase, publish_branch)),
-        )?;
+        );
+        // Ok or Err alike: a pull the deadline killed may already have moved
+        // remote refs or begun a merge, and the panel must not keep showing
+        // the pre-command state.
         self.git_state_changed(id);
+        let run = run?;
         Ok(RemoteOutput {
             remote: Some(remote),
             stdout: run.stdout,
@@ -228,14 +231,13 @@ impl crate::Engine {
         let branch = checked_branch(branch)?;
         let remote = checked_branch(remote)?;
         let repo = self.repo_for(id)?;
-        // The upstream comes from the cached status run, like the old
-        // resolve-the-remote did; what symbolic names git gave us still pass
-        // the same gate the caller's arguments do before joining an argv.
-        let remote_branch = match self
-            .with_git(id, |git| git.branch.clone())
-            .flatten()
-            .filter(|info| !info.upstream_gone)
-            .and_then(|info| info.upstream)
+        // The upstream is asked of git *now*, for this exact branch — never
+        // read from the cached status snapshot, which can still describe the
+        // previously checked-out branch and would pair this branch with that
+        // one's upstream: `git push origin feature:main`, silently. What git
+        // answers still passes the same gate the caller's arguments do
+        // before joining an argv.
+        let remote_branch = match tracked_upstream(&repo, &branch)?
             .and_then(|upstream| upstream.split_once('/').map(|(_, name)| name.to_owned()))
         {
             Some(name) => checked_branch(&name)?,
@@ -249,8 +251,10 @@ impl crate::Engine {
                 &repo.project_root,
                 &push_args(&remote, &branch, &remote_branch, set_upstream, force),
             ),
-        )?;
+        );
+        // Ok or Err alike: even a killed push may have reached the remote.
         self.git_state_changed(id);
+        let run = run?;
         Ok(RemoteOutput {
             remote: Some(remote),
             stdout: run.stdout,
@@ -258,6 +262,60 @@ impl crate::Engine {
             status: run.status,
         })
     }
+}
+
+/// The `remote/branch` upstream this exact branch tracks *right now*, asked
+/// of git — `git rev-parse --abbrev-ref <branch>@{upstream}` — rather than
+/// read from the cached status snapshot. The cache can still be describing
+/// the previously checked-out branch for the seconds a status run takes on
+/// device, and pairing the caller's `branch` with that other branch's
+/// upstream is how a refspec goes silently wrong. Zed cannot make that
+/// mistake — its name and upstream travel in one snapshot object — so the
+/// live question is what keeps parity.
+///
+/// A failed run is `None`, which is an answer: no upstream configured, or
+/// its remote-tracking ref gone — `@{upstream}` resolves only a live one,
+/// which is exactly the tracked-and-not-gone filter the push refspec wants
+/// (git_panel.rs:3961-3971). `Err` stays what it means everywhere: the guest
+/// itself failed.
+fn tracked_upstream(repo: &Repo, branch: &str) -> Result<Option<String>, String> {
+    let args = vec![
+        OsString::from("rev-parse"),
+        OsString::from("--abbrev-ref"),
+        OsString::from(format!("{branch}@{{upstream}}")),
+    ];
+    let run = run_git(
+        &repo.userland,
+        &repo.repo_root,
+        "git rev-parse",
+        git_argv(&repo.project_root, &args),
+    )?;
+    if run.status != 0 {
+        return Ok(None);
+    }
+    let name = run.output.trim();
+    Ok((!name.is_empty()).then(|| name.to_owned()))
+}
+
+/// Whether the branch has an upstream *configured* — `branch.<name>.merge`
+/// exists — which is a different question from [`tracked_upstream`]'s: a
+/// gone upstream is still configured, and Zed's pull omits the branch
+/// argument for it (`branch.upstream.is_none()`, git_panel.rs:3868-3871)
+/// where its push falls back to the local name. Asked of git at call time
+/// for the same staleness reason.
+fn has_configured_upstream(repo: &Repo, branch: &str) -> Result<bool, String> {
+    let args = vec![
+        OsString::from("config"),
+        OsString::from("--get"),
+        OsString::from(format!("branch.{branch}.merge")),
+    ];
+    let run = run_git(
+        &repo.userland,
+        &repo.repo_root,
+        "git config",
+        git_argv(&repo.project_root, &args),
+    )?;
+    Ok(run.status == 0 && !run.output.trim().is_empty())
 }
 
 /// The fetch argv: `["fetch", <remote>]`, where no remote means `--all` —
@@ -574,5 +632,190 @@ fork\tgit@example.com:someone/fork.git (push)\n";
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// A guest that is just the host: strips proot's flags and execs the
+    /// rest, with a HOME of the test's own so git can read a config —
+    /// `git.rs`'s `fake_guest`, repeated here because the two staleness tests
+    /// below need the engine's *cache* in the loop rather than a bare argv.
+    #[cfg(unix)]
+    fn fake_guest(dir: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[user]\n\tname = test\n\temail = test@example.invalid\n",
+        )
+        .unwrap();
+
+        let path = dir.join("fake-proot");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 while [ \"$1\" != \"-w\" ]; do shift; done\n\
+                 shift 2\n\
+                 HOME={home}\n\
+                 GIT_CONFIG_GLOBAL={home}/.gitconfig\n\
+                 GIT_CONFIG_SYSTEM=/dev/null\n\
+                 export HOME GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM\n\
+                 exec \"$@\"\n",
+                home = home.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A working repository whose `main` is published to a bare stand-in
+    /// remote, an engine watching it through the fake guest, and the status
+    /// cache already describing main-with-its-upstream — the stale snapshot
+    /// the two regression tests below then race against.
+    #[cfg(unix)]
+    fn published_repo(
+        dir: &Path,
+    ) -> (
+        crate::Engine,
+        crate::ProjectId,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let remote = dir.join("remote.git");
+        let projects = dir.join("projects");
+        let work = projects.join("thing");
+        std::fs::create_dir_all(&work).unwrap();
+        assert!(
+            host_git(dir, &["init", "--quiet", "--bare", "remote.git"])
+                .status
+                .success()
+        );
+        assert!(host_git(&work, &["init", "--quiet", "-b", "main"]).status.success());
+        std::fs::write(work.join("README"), "one\n").unwrap();
+        assert!(host_git(&work, &["add", "README"]).status.success());
+        assert!(
+            host_git(&work, &["commit", "--quiet", "-m", "first"])
+                .status
+                .success()
+        );
+        assert!(
+            host_git(&work, &["remote", "add", "origin", remote.to_str().unwrap()])
+                .status
+                .success()
+        );
+        assert!(
+            host_git(&work, &["push", "--quiet", "--set-upstream", "origin", "main"])
+                .status
+                .success()
+        );
+
+        let engine = crate::Engine::new();
+        engine.set_userland(&fake_guest(dir), dir, dir, &projects);
+        let id = engine.open_project(&work);
+        // Poll until the cache holds main's upstream — the snapshot the old
+        // code trusted — then stop polling, so nothing refreshes it before
+        // the command under test runs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(branch) = engine.git_branch(id)
+                && branch.upstream.is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the status cache never learned the upstream"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        (engine, id, work, remote)
+    }
+
+    #[cfg(unix)]
+    fn sha_of(dir: &Path, rev: &str) -> String {
+        let out = host_git(dir, &["rev-parse", rev]);
+        assert!(
+            out.status.success(),
+            "rev-parse {rev}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// The wrong-refspec race, pinned: the cached status snapshot still
+    /// describes `main` (upstream `origin/main`) while the caller pushes
+    /// `feature` — the pairing that used to build `git push origin
+    /// feature:main` and silently fast-forward the remote's `main` with
+    /// feature's commits. The upstream must be asked of git for the exact
+    /// branch being pushed.
+    #[test]
+    #[cfg(unix)]
+    fn a_push_right_after_checkout_cannot_borrow_the_old_branchs_upstream() {
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: no git on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, id, work, remote) = published_repo(dir.path());
+
+        // The race, frozen: a new branch, a commit of its own, and a push
+        // before any status run has described it.
+        assert!(
+            host_git(&work, &["checkout", "--quiet", "-b", "feature"])
+                .status
+                .success()
+        );
+        std::fs::write(work.join("extra"), "x\n").unwrap();
+        assert!(host_git(&work, &["add", "extra"]).status.success());
+        assert!(
+            host_git(&work, &["commit", "--quiet", "-m", "second"])
+                .status
+                .success()
+        );
+
+        let out = engine.git_push(id, "feature", "origin", false, false).unwrap();
+        assert!(out.ok(), "stdout {:?} stderr {:?}", out.stdout, out.stderr);
+
+        // feature went to *feature*; the remote's main did not move.
+        assert_eq!(
+            sha_of(&remote, "main"),
+            sha_of(&work, "main"),
+            "origin/main must not receive feature's commits"
+        );
+        assert_eq!(sha_of(&remote, "feature"), sha_of(&work, "feature"));
+    }
+
+    /// Pull's publish-or-not question is the same staleness: pulling a
+    /// just-created branch while the cache still says the old branch had an
+    /// upstream used to run `git pull origin` with no branch name, and git
+    /// refused with "no tracking information". The question belongs to the
+    /// branch being pulled, asked at call time.
+    #[test]
+    #[cfg(unix)]
+    fn a_pull_of_a_new_branch_names_it_rather_than_trusting_the_stale_upstream() {
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: no git on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, id, work, _remote) = published_repo(dir.path());
+
+        // A branch the remote holds but the local repo does not track: no
+        // `--set-upstream`, so `branch.feature.merge` stays unset.
+        assert!(
+            host_git(&work, &["checkout", "--quiet", "-b", "feature"])
+                .status
+                .success()
+        );
+        assert!(
+            host_git(&work, &["push", "--quiet", "origin", "feature"])
+                .status
+                .success()
+        );
+
+        let out = engine.git_pull(id, "feature", "origin", false).unwrap();
+        assert!(out.ok(), "stdout {:?} stderr {:?}", out.stdout, out.stderr);
     }
 }
