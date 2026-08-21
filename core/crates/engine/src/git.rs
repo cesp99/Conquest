@@ -255,8 +255,10 @@ pub(crate) struct ProjectGit {
     /// Where the enclosing repository is, once a run has looked. `None` after
     /// a completed run means the project is not in a repository.
     repo_root: Option<PathBuf>,
-    /// Bumped when anything above actually changed, so a poll loop that sees a
-    /// steady number can skip the JNI read entirely.
+    /// Bumped when anything above actually changed — and when a run completed
+    /// that a reader could have seen pending (`scanned` was false, or `ran`
+    /// flipped), so a poll loop that sees a steady number can skip the JNI
+    /// read entirely and still never sits on a transient "asking git" state.
     version: u64,
     /// A run has completed at least once (successfully or not).
     scanned: bool,
@@ -491,18 +493,31 @@ fn run_until_settled(
             // Compared on the unreduced changes rather than the rolled-up map:
             // staging a file moves its letters without moving its colour, and
             // a panel watching this counter has to see that.
-            if *git.changes != outcome.changes
+            let content_changed = *git.changes != outcome.changes
                 || git.branch != outcome.branch
                 || git.head != outcome.head
-                || git.repo_root != outcome.repo_root
-            {
+                || git.repo_root != outcome.repo_root;
+            if content_changed {
                 git.statuses = Arc::new(outcome.statuses);
                 git.changes = Arc::new(outcome.changes);
                 git.branch = outcome.branch;
                 git.head = outcome.head;
                 git.repo_root = outcome.repo_root;
-                git.version += 1;
                 bump_generation();
+            }
+            // The version moves for a flag flip too, not only for content: a
+            // mutation calls [`Engine::git_state_changed`], which drops
+            // `scanned`, and whoever reads the state right then renders
+            // "Asking git…". When this run's snapshot turns out *identical* —
+            // a push that failed, a commit git refused — a version pegged to
+            // content would never tell the poll loop that the answer came
+            // back, and the panel sat on that transient forever. Same for
+            // `ran`: git becoming reachable (or not) changes what the panel
+            // says without changing a single path. The generation above stays
+            // content-only — the diff gutter's base text cannot go stale on a
+            // no-op.
+            if content_changed || !git.scanned || git.ran != outcome.ran {
+                git.version += 1;
             }
             git.scanned = true;
             git.ran = outcome.ran;
@@ -3662,6 +3677,59 @@ mod tests {
             Some(false),
             "the Err path must invalidate the cache too"
         );
+    }
+
+    /// An invalidation whose rescan finds an *identical* snapshot — a failed
+    /// push, a commit git refused — must still move the version: the panel
+    /// reads the state mid-invalidation, renders "Asking git…", and from then
+    /// on re-reads only when [`Engine::git_status_version`] moves. A version
+    /// pegged to content never told it the answer came back, and the panel
+    /// sat on that transient forever — through tab switches and reopen both.
+    #[test]
+    #[cfg(unix)]
+    fn a_rescan_with_an_identical_snapshot_still_moves_the_version() {
+        if !has_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, repo) = live_repo(dir.path());
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        let id = engine.open_project(&repo);
+        await_change(&engine, id, "a.txt");
+        // Let the run settle completely, so the baseline version below cannot
+        // be moved by anything but the invalidation's own rescan.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while engine.with_git(id, |git| git.running).unwrap_or(false) {
+            assert!(Instant::now() < deadline, "the status run never settled");
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(engine.with_git(id, |git| git.scanned), Some(true));
+        let before = engine.with_git(id, |git| git.version).unwrap();
+
+        // What every mutating command does — and the worktree is untouched,
+        // so the rescan's snapshot will be byte-identical to the cache.
+        engine.git_state_changed(id);
+
+        // The panel's loop: poll the version, which is also what schedules
+        // the rescan. Without the flag-flip bump this never moves.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if engine.git_status_version(id) != before {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "an identical rescan never moved the version; \
+                 the panel would show 'Asking git…' forever"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        // And the reread the bump provokes must see the settled state again.
+        assert_eq!(engine.with_git(id, |git| git.scanned), Some(true));
+        // The snapshot really was identical — the bump came from the flag.
+        let changes = engine.git_changes(id);
+        assert_eq!(changes.entries.len(), 1);
+        assert_eq!(changes.entries[0].path, "a.txt");
     }
 
     /// Wait for the status cache to catch up with a command, and hand back what
