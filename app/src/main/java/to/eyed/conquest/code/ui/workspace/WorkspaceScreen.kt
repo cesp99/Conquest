@@ -78,7 +78,7 @@ import to.eyed.conquest.code.core.ProjectSearchMatch
 import to.eyed.conquest.code.ui.search.BufferSearchBar
 import to.eyed.conquest.code.ui.search.ProjectSearchPanel
 import to.eyed.conquest.code.ui.search.revealProjectSearchMatch
-import to.eyed.conquest.code.ui.diagnostics.DiagnosticsPanel
+import to.eyed.conquest.code.ui.diagnostics.DiagnosticsPane
 import to.eyed.conquest.code.ui.diagnostics.revealDiagnosticTarget
 import to.eyed.conquest.code.ui.editor.Diagnostic
 import to.eyed.conquest.code.ui.editor.EditReceipt
@@ -640,6 +640,28 @@ fun WorkspaceScreen(
         }
     }
 
+    /**
+     * Project diagnostics, as a tab for the graph's reason: Zed opens it as a
+     * pane item (diagnostics/src/diagnostics.rs deploys it into the active
+     * pane), so a second visit selects the tab that is already there.
+     */
+    fun openDiagnosticsTab() {
+        if (project == null) return
+        val key = "diagnostics:"
+        val existing = files.indexOfPath(key)
+        if (existing >= 0) {
+            files.select(existing)
+        } else {
+            files.open(OpenFile(path = key, editor = null, diagnostics = true))
+        }
+        diagnosticsFocus++
+        dockTookWorkArea?.let { side ->
+            docks.closeDock(side)
+            terminalFocused = false
+            rootFocus.requestFocus()
+        }
+    }
+
     /** Whether [panel] is not just open but on screen. See [drawnDocks]. */
     fun panelIsDrawn(panel: WorkspacePanel): Boolean =
         docks.isOpen(panel, settings) && panel.sideIn(settings) in drawnDocks
@@ -862,9 +884,9 @@ fun WorkspaceScreen(
                 if (project == null) return false
                 if (togglePanel(WorkspacePanel.Git)) gitPanelFocus++
             }
-            WorkspaceCommand.ToggleDiagnostics -> {
+            WorkspaceCommand.OpenDiagnostics -> {
                 if (project == null) return false
-                if (togglePanel(WorkspacePanel.Diagnostics)) diagnosticsFocus++
+                openDiagnosticsTab()
             }
             // The git family runs in the panel — see requestGitPanelCommand.
             WorkspaceCommand.GitFetch ->
@@ -956,11 +978,11 @@ fun WorkspaceScreen(
     }
 
     /**
-     * A diagnostics-panel row: open its file and put the caret on the
-     * problem, exactly as a search hit is opened. A diagnostic in a file
-     * outside the project keeps an absolute path the opener cannot resolve;
-     * [openFile] fails it quietly, which matches what go-to-definition does
-     * with the same paths.
+     * A diagnostics row: open its file and put the caret on the problem,
+     * exactly as a search hit is opened. A diagnostic in a file outside the
+     * project keeps an absolute path the opener cannot resolve; [openFile]
+     * fails it quietly, which matches what go-to-definition does with the
+     * same paths.
      */
     fun openDiagnostic(path: String, diagnostic: Diagnostic) {
         val open = project ?: return
@@ -1295,8 +1317,7 @@ fun WorkspaceScreen(
             docks.reconcile(settings)
             fun panelHasSubject(panel: WorkspacePanel): Boolean = when (panel) {
                 WorkspacePanel.Preview -> canPreviewActiveFile()
-                WorkspacePanel.Search, WorkspacePanel.Git,
-                WorkspacePanel.Diagnostics -> project != null
+                WorkspacePanel.Search, WorkspacePanel.Git -> project != null
                 // An agent runs in the userland and works on a project, so a
                 // build without one never shows this panel at all.
                 WorkspacePanel.Agent -> project != null && isAgentPanelSupported
@@ -1330,12 +1351,10 @@ fun WorkspaceScreen(
                         onGitRequestHandled = { gitPanelRequest = null },
                         onGitFocusChanged = { gitPanelFocused = it },
                         agentFocus = agentPanelFocus,
-                        diagnosticsFocus = diagnosticsFocus,
                         revealRequest = revealInPanel,
                         onRevealHandled = { revealInPanel = false },
                         onOpenEntry = onOpenEntry,
                         onOpenMatch = ::openMatch,
-                        onOpenDiagnostic = ::openDiagnostic,
                         onOpenPath = ::openFromDock,
                         onOpenSettings = { runCommand(WorkspaceCommand.OpenSettings) },
                         onOpenDiff = ::openDiff,
@@ -1390,6 +1409,8 @@ fun WorkspaceScreen(
                                     isPreviewOpen = docks.isOpen(WorkspacePanel.Preview, settings),
                                     onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
                                     diffProject = project,
+                                    diagnosticsFocus = diagnosticsFocus,
+                                    onOpenDiagnostic = ::openDiagnostic,
                                     onOpenPath = { path -> project?.let { openFile(it, path) } },
                                     onOpenCommit = ::openCommitDiff,
                                     softWrap = settings.softWrap,
@@ -1454,12 +1475,10 @@ fun WorkspaceScreen(
                                         onGitRequestHandled = { gitPanelRequest = null },
                                         onGitFocusChanged = { gitPanelFocused = it },
                                         agentFocus = agentPanelFocus,
-                                        diagnosticsFocus = diagnosticsFocus,
                                         revealRequest = revealInPanel,
                                         onRevealHandled = { revealInPanel = false },
                                         onOpenEntry = onOpenEntry,
                                         onOpenMatch = ::openMatch,
-                                        onOpenDiagnostic = ::openDiagnostic,
                                         onOpenPath = ::openFromDock,
                                         onOpenSettings = {
                                             runCommand(WorkspaceCommand.OpenSettings)
@@ -1568,10 +1587,6 @@ fun WorkspaceScreen(
                 .filter { it != WorkspacePanel.Project || project != null }
                 .filter { it !in setOf(WorkspacePanel.Search, WorkspacePanel.Git) || project != null }
                 .filter { it != WorkspacePanel.Agent || (project != null && isAgentPanelSupported) }
-                // The diagnostics panel's button is the status bar's summary
-                // itself — the counts are the affordance, exactly as Zed's
-                // indicator is — so it gets no second icon in the row.
-                .filter { it != WorkspacePanel.Diagnostics }
                 .map { panel ->
                     PanelButton(
                         panel = panel,
@@ -1590,8 +1605,6 @@ fun WorkspaceScreen(
                                     runCommand(WorkspaceCommand.ToggleProjectPanel)
                                 WorkspacePanel.Agent ->
                                     runCommand(WorkspaceCommand.ToggleAgentPanel)
-                                WorkspacePanel.Diagnostics ->
-                                    runCommand(WorkspaceCommand.ToggleDiagnostics)
                             }
                         },
                     )
@@ -1625,7 +1638,7 @@ fun WorkspaceScreen(
                 cursorDiagnostic = active?.editor?.diagnosticAtCursor(),
                 onGoToDiagnostic = active?.editor?.let { it::goToNextDiagnostic },
                 onOpenDiagnostics = if (project != null) {
-                    { runCommand(WorkspaceCommand.ToggleDiagnostics) }
+                    { runCommand(WorkspaceCommand.OpenDiagnostics) }
                 } else {
                     null
                 },
@@ -1964,6 +1977,10 @@ private fun EditorArea(
     onTogglePreview: () -> Unit,
     /** For a diff tab, which needs the project rather than a buffer. */
     diffProject: ProjectSession?,
+    /** Bumped when the diagnostics tab opens, to hand it the keyboard. */
+    diagnosticsFocus: Int,
+    /** A diagnostics row opening its file with the caret on the problem. */
+    onOpenDiagnostic: (String, Diagnostic) -> Unit,
     onOpenPath: (String) -> Unit,
     /** The graph asking for a commit's diff tab, whole or one file of it. */
     onOpenCommit: (sha: String, subject: String, path: String?) -> Unit,
@@ -2068,6 +2085,18 @@ private fun EditorArea(
             GitGraphPane(
                 project = diffProject,
                 onOpenCommit = onOpenCommit,
+                modifier = Modifier.weight(1f),
+            )
+        } else if (active.diagnostics && diffProject != null) {
+            DiagnosticsPane(
+                project = diffProject,
+                focusToken = diagnosticsFocus,
+                onOpenDiagnostic = onOpenDiagnostic,
+                // The toolbar's close closes the tab, exactly as the strip's
+                // own button would.
+                onDismiss = {
+                    files.indexOfPath(active.path).takeIf { it >= 0 }?.let(files::close)
+                },
                 modifier = Modifier.weight(1f),
             )
         } else if (active.diff != null && diffProject != null) {
@@ -2204,14 +2233,11 @@ private fun DockPanel(
     /** The git panel reporting whether it holds the keyboard. */
     onGitFocusChanged: (Boolean) -> Unit,
     agentFocus: Int,
-    diagnosticsFocus: Int,
     revealRequest: Boolean,
     openedPath: String?,
     onRevealHandled: () -> Unit,
     onOpenEntry: (ProjectEntry) -> Unit,
     onOpenMatch: (String, ProjectSearchMatch) -> Unit,
-    /** A diagnostics-panel row opening its file with the caret on the problem. */
-    onOpenDiagnostic: (String, Diagnostic) -> Unit,
     onOpenPath: (String) -> Unit,
     onOpenDiff: (String?) -> Unit,
     /** The git panel's "View Branch Diff" opening the branch-vs-base tab. */
@@ -2272,12 +2298,6 @@ private fun DockPanel(
             focusToken = agentFocus,
             onOpenPath = onOpenPath,
             onOpenSettings = onOpenSettings,
-        )
-        WorkspacePanel.Diagnostics -> DiagnosticsPanel(
-            project = project ?: return,
-            focusToken = diagnosticsFocus,
-            onOpenDiagnostic = onOpenDiagnostic,
-            onDismiss = onDismiss,
         )
     }
 }

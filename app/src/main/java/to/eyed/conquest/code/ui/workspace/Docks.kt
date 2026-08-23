@@ -29,16 +29,7 @@ enum class WorkspacePanel(
     Git("git_panel", "Git panel", R.drawable.ic_ui_git_branch),
     Search("project_search", "Project search", R.drawable.ic_ui_magnifying_glass),
     Preview("preview", "Preview", R.drawable.ic_ui_eye),
-    Agent("agent_panel", "Agent panel", R.drawable.ic_ui_ai_zed),
-
-    /**
-     * Zed's project diagnostics, as a dock panel rather than a pane item —
-     * the same translation Search got, and for the same reason: a phone has
-     * no room for a second editor pane. Its way in is the status bar's
-     * diagnostic summary, which is the button Zed gives it, so it is the one
-     * panel [WorkspaceScreen]'s button row deliberately skips.
-     */
-    Diagnostics("diagnostics", "Diagnostics", R.drawable.ic_ui_warning);
+    Agent("agent_panel", "Agent panel", R.drawable.ic_ui_ai_zed);
 
     /** Which side this panel is docked on right now. */
     fun sideIn(settings: AppSettings): DockSide = settings.panel(settingsKey).dock

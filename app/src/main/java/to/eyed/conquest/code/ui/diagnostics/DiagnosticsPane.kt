@@ -90,7 +90,7 @@ private fun lineNumberWidth(line: Int): Dp {
 private const val PAGE_ROWS = 10
 
 /**
- * Whether warnings were showing when the panel was last closed. Session-lived
+ * Whether warnings were showing when the tab was last closed. Session-lived
  * on purpose, like the search panel's remembered query: Zed keeps
  * `include_warnings` per workspace, and this is that in the small.
  */
@@ -118,20 +118,21 @@ suspend fun EditorState.revealDiagnosticTarget(target: Diagnostic) {
  * Every problem in the project, grouped by file — Zed's project diagnostics
  * (crates/diagnostics), which there is an editor of excerpts inside a pane.
  *
- * We have no pane, so this is a panel, the same translation project search
- * got: a dock beside the editor on a wide screen, the whole work area on a
- * compact one. What that costs is Zed's editable excerpts; what it buys is a
- * list that survives on a phone, and one tap from the status bar's summary —
- * which is the button Zed gives its diagnostics editor too.
+ * A tab in the work area, exactly where Zed deploys it: `diagnostics::Deploy`
+ * puts the diagnostics editor into the active pane as an item, beside the
+ * files, and the git graph made the same translation here first. What this
+ * costs is Zed's editable excerpts — the rows are a list, not buffers — and
+ * its way in is the status bar's summary, which is the button Zed gives its
+ * diagnostics editor too.
  *
  * The list is project-wide and outlives tabs: rows come from
  * [rememberProjectDiagnostics], which reads what servers have published for
  * the whole workspace, not what happens to be open.
  */
 @Composable
-fun DiagnosticsPanel(
+fun DiagnosticsPane(
     project: ProjectSession,
-    /** Bumped by the workspace to put the keyboard back in the panel. */
+    /** Bumped by the workspace to put the keyboard back in the pane. */
     focusToken: Int,
     onOpenDiagnostic: (path: String, diagnostic: Diagnostic) -> Unit,
     onDismiss: () -> Unit,
@@ -277,7 +278,7 @@ fun DiagnosticsPanel(
                     WarningGlyph(color = color)
                 }
                 ToolbarToggle(
-                    description = "Close the diagnostics panel",
+                    description = "Close diagnostics",
                     selected = false,
                     onClick = onDismiss,
                 ) { color ->

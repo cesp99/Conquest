@@ -189,21 +189,25 @@ class OpenFile(
     val diff: DiffTarget? = null,
     /** True for the commit graph, which is a view of the repository itself. */
     val graph: Boolean = false,
+    /** True for project diagnostics, a view of what the servers published. */
+    val diagnostics: Boolean = false,
     /** The file on disk, for a tab the engine never opened. */
     val absolutePath: String? = null,
 ) {
     val session: BufferSession? get() = editor?.session
 
     /**
-     * Whether Ctrl+Shift+T could bring this back. A diff, the graph and a
-     * picture are opened by a *view*, not by a path the file opener knows, and
-     * pushing their keys onto the reopen stack spent a keypress on a file that
-     * cannot be opened — and skipped the real last file.
+     * Whether Ctrl+Shift+T could bring this back. A diff, the graph, the
+     * diagnostics and a picture are opened by a *view*, not by a path the
+     * file opener knows, and pushing their keys onto the reopen stack spent a
+     * keypress on a file that cannot be opened — and skipped the real last
+     * file.
      */
-    val isReopenable: Boolean get() = diff == null && !graph
+    val isReopenable: Boolean get() = diff == null && !graph && !diagnostics
 
     val name: String = when {
         graph -> "Git graph"
+        diagnostics -> "Diagnostics"
         diff != null -> diff.title
         else -> path.substringAfterLast('/')
     }

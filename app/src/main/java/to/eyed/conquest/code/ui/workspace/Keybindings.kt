@@ -287,15 +287,16 @@ enum class WorkspaceCommand(
     ),
 
     /**
-     * Show or hide the diagnostics panel — Zed's `diagnostics::Deploy`, which
-     * its status-bar summary dispatches (diagnostics/src/items.rs:53-56), and
-     * so does ours: tapping the error and warning counts is the panel's way
-     * in. No chord — Zed's `ctrl-shift-m` went to the preview here first, and
-     * the summary is one tap from anywhere.
+     * Open the diagnostics tab — Zed's `diagnostics::Deploy`, which deploys
+     * project diagnostics into the active pane and which its status-bar
+     * summary dispatches (diagnostics/src/items.rs:53-56); so does ours:
+     * tapping the error and warning counts is the tab's way in. No chord —
+     * Zed's `ctrl-shift-m` went to the preview here first, and the summary is
+     * one tap from anywhere.
      */
-    ToggleDiagnostics(
+    OpenDiagnostics(
         "diagnostics::Deploy",
-        isAvailable = { it.hasProject && "diagnostics" !in it.hiddenPanels },
+        isAvailable = { it.hasProject },
     ),
 
     /**
