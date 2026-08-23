@@ -115,6 +115,20 @@ if ! grep -q "CONQUEST PATCH" "$ashmem"; then
     sed -i '0,/#include <stdlib.h>/s//#include <stdlib.h>\n#include <string.h>     \/* CONQUEST PATCH: strcmp\/memset *\//' "$ashmem"
 fi
 
+# CONQUEST PATCH: execve(2) from a non-leader thread. The kernel gives the
+# exec'ing thread the leader's tid before PTRACE_EVENT_EXEC, so proot's
+# per-tid execve state (load info, saved registers, the PTRACE_SYSCALL
+# restart the exit stage needs) is stranded on a Tracee whose tid no longer
+# exists, the loader runs with no load script, and the new program dies with
+# SIGSEGV. Go's toolchain switch (go.mod requiring a newer Go than the
+# installed one) execs from a worker thread and hit this every time; verified
+# on a Galaxy Z Fold. The patch adopts the former thread's state at
+# PTRACE_EVENT_EXEC using PTRACE_GETEVENTMSG. Idempotent.
+event_c="proot-$PROOT_VERSION/src/tracee/event.c"
+if ! grep -q "adopt_thread_exec_state" "$event_c"; then
+    patch -p1 -d "proot-$PROOT_VERSION" < "$repo_root/tools/proot-thread-execve.patch"
+fi
+
 build_abi() { # abi triple
     local abi="$1" triple="$2"
     local cc="$toolchain/${triple}${API}-clang"
