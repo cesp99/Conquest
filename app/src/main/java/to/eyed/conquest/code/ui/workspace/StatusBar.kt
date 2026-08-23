@@ -43,6 +43,7 @@ import to.eyed.conquest.code.R
 import to.eyed.conquest.code.ui.editor.Diagnostic
 import to.eyed.conquest.code.ui.editor.DiagnosticSummary
 import to.eyed.conquest.code.ui.editor.LspServer
+import to.eyed.conquest.code.ui.editor.LspServerState
 import to.eyed.conquest.code.ui.theme.LocalUiFontSize
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import to.eyed.conquest.code.ui.theme.ZedRadius
@@ -209,14 +210,21 @@ fun StatusBar(
                     ?.let { install -> { install(blocked) } },
             )
         } else {
-            // What a quiet server is busy with — rust-analyzer's "indexing
-            // (45%)" — in the note's slot: the two never show together,
-            // because a server that could not start reports no progress, and
-            // the broken one is the more urgent sentence.
+            // What a working server is up to, in the note's slot — never
+            // beside the note, because a server that could not start reports
+            // no progress and the broken one is the more urgent sentence.
+            // Progress ("indexing (45%)") outranks the spawn-and-initialize
+            // phase ("starting…"), which is what shows the moment a folder
+            // opens and its tooling comes up.
             val busy = servers.firstOrNull { it.progress != null }
-            if (busy != null) {
+            val text = when {
+                busy != null -> "${busy.name}: ${busy.progress}"
+                else -> servers.firstOrNull { it.state == LspServerState.Starting }
+                    ?.let { "${it.name} is starting…" }
+            }
+            if (text != null) {
                 Text(
-                    text = "${busy.name}: ${busy.progress}",
+                    text = text,
                     style = MaterialTheme.typography.labelMedium,
                     color = theme.color("text.muted", MaterialTheme.colorScheme.onSurfaceVariant),
                     maxLines = 1,

@@ -2814,6 +2814,24 @@ async fn start_server(request: StartRequest, cx: &mut AsyncApp) {
         server_handle.on_request::<lsp::request::WorkDoneProgressCreate, _, _>(
             |_params, _cx: &mut AsyncApp| async move { anyhow::Ok(()) },
         ),
+        // What the server *says* — its own errors above all. gopls explaining
+        // why `go list` failed arrives here and nowhere else, and dropping it
+        // is how a broken toolchain becomes an unexplained silence. Into the
+        // log, where `adb logcat` can read it back.
+        server_handle.on_notification::<lsp::notification::ShowMessage, _>(
+            move |params: lsp::ShowMessageParams, _cx: &mut AsyncApp| {
+                log::warn!("lsp: {} says: {}", server.name, params.message);
+            },
+        ),
+        server_handle.on_notification::<lsp::notification::LogMessage, _>(
+            move |params: lsp::LogMessageParams, _cx: &mut AsyncApp| {
+                if params.typ == lsp::MessageType::ERROR {
+                    log::warn!("lsp: {} logged: {}", server.name, params.message);
+                } else {
+                    log::debug!("lsp: {} logged: {}", server.name, params.message);
+                }
+            },
+        ),
         // …and the reports on the tokens the request above created: what the
         // server is doing, kept per token on the slot so the status bar can
         // say "indexing (45%)" instead of an unexplained silence.
