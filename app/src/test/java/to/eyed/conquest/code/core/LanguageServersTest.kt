@@ -298,8 +298,11 @@ class LanguageServersTest {
                 go,
             ),
         )
+        // The sentence names the whole package list — since golang-go rode
+        // along (gopls loads the workspace with `go list`), "could not find"
+        // names both, exactly as the install prompt does.
         assertEquals(
-            "Debian could not find gopls",
+            "Debian could not find gopls and golang-go",
             LanguageServers.explainInstall("E: Unable to locate package gopls", go),
         )
         assertEquals(
@@ -319,7 +322,7 @@ class LanguageServersTest {
         // Anything else keeps apt's own words underneath and says the honest
         // little it knows.
         assertEquals(
-            "Could not install gopls",
+            "Could not install gopls and golang-go",
             LanguageServers.explainInstall("dpkg: error processing archive", go),
         )
     }

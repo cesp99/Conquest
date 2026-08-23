@@ -147,8 +147,16 @@ object LanguageServers {
             language = "Go",
             server = "gopls",
             grammars = listOf("go"),
-            // Debian stable/main, 2:0.16.1+ds-1.
-            packages = listOf("gopls"),
+            // Debian stable/main, 2:0.16.1+ds-1 — **and `golang-go`**, which
+            // gopls does not depend on and cannot work without: it loads the
+            // workspace by running `go list`, so without the toolchain it
+            // starts, initializes, and marks every file "No active builds
+            // contain <file>: consider opening a new workspace folder".
+            // Proved on the device. The cargo and pyflakes lesson, a third
+            // time — a server that runs and says nothing useful is the
+            // failure mode this table exists to prevent.
+            packages = listOf("gopls", "golang-go"),
+            note = "gopls loads the workspace with the go tool, so both are installed.",
         ),
     )
 
