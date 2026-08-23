@@ -1896,6 +1896,30 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspDiagnostics
     to_jstring(&env, json)
 }
 
+/// Every diagnostic in the project, messages included, as JSON:
+/// `{version, files: [{path, rows: [{row, col_utf16, end_row, end_col_utf16,
+/// severity, message, source, code}]}]}`. Paths are spelled as
+/// `lspDiagnostics` spells them; rows as `bufferDiagnostics` spells them,
+/// sorted by position. Versioned by `lspVersion`, like the counts.
+///
+/// This is the diagnostics *panel's* read and it serializes every message in
+/// the project — poll `lspVersion` and call this only when the counter moves
+/// and the panel is actually showing. The status bar keeps to
+/// `lspDiagnostics`. Never blocks, never null.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspDiagnosticRows(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    let diagnostics = engine().lsp_diagnostic_rows(project_id as u64);
+    let json = serde_json::to_string(&diagnostics).unwrap_or_else(|err| {
+        log::warn!("lspDiagnosticRows failed to serialize: {err}");
+        "{}".to_owned()
+    });
+    to_jstring(&env, json)
+}
+
 /// Generation counter for one buffer's diagnostics; 0 until a server has
 /// published for its file. Poll this per open tab — it is a hash lookup, where
 /// `bufferDiagnostics` clones and serializes every row.

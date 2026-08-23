@@ -113,8 +113,15 @@ impl crate::Engine {
     /// [`Engine::project_version`] for the scan filling in.
     pub fn open_project(&self, path: &Path) -> ProjectId {
         let id = self.next_project_id();
+        // Canonicalized, because everything this root is compared against or
+        // handed to already is: buffer paths (`Engine::open_file`), published
+        // diagnostic paths (lsp.rs), the watcher root below. On Android the
+        // caller's spelling is /data/user/0/<pkg>/…, a symlink to
+        // /data/data/<pkg> — kept as-is, `project_for_path` would say every
+        // buffer lies outside its own project, and a language server would be
+        // rooted at a URI none of its documents are under.
         let state = Arc::new(Mutex::new(ProjectState {
-            root: path.to_path_buf(),
+            root: std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
             ..Default::default()
         }));
         self.projects.lock().unwrap().insert(id, state.clone());

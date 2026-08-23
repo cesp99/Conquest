@@ -810,6 +810,20 @@ object CoreBridge {
     external fun lspDiagnostics(projectId: Long): String
 
     /**
+     * Every diagnostic in the project, messages included, as JSON:
+     * `{version, files: [{path, rows: [{row, col_utf16, end_row, end_col_utf16,
+     * severity, message, source, code}]}]}`. Paths are spelled as
+     * [lspDiagnostics] spells them; rows as [bufferDiagnostics] spells them,
+     * sorted by position. Versioned by [lspVersion], like the counts.
+     *
+     * This is the diagnostics *panel's* read, and it serializes every message
+     * in the project — poll [lspVersion] and call it only when the counter
+     * moves and the panel is showing. The status bar keeps to
+     * [lspDiagnostics]. Never blocks, never null.
+     */
+    external fun lspDiagnosticRows(projectId: Long): String
+
+    /**
      * Generation counter for one buffer's diagnostics; 0 until a server has
      * published for its file. Poll this per open tab: it is a hash lookup,
      * where [bufferDiagnostics] clones and serializes every row.

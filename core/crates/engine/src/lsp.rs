@@ -422,6 +422,29 @@ pub struct FileDiagnosticCounts {
     pub counts: Counts,
 }
 
+/// Every diagnostic a project's servers have published, messages and all —
+/// what a diagnostics panel lists, where [`ProjectDiagnostics`] only counts.
+///
+/// A separate read rather than rows on [`ProjectDiagnostics`], because that
+/// one is polled twice a second by a status bar that wants four integers; this
+/// one serializes every message in the project and is read only while a panel
+/// is showing them.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ProjectDiagnosticRows {
+    /// The value [`Engine::lsp_version`] returns.
+    pub version: u64,
+    /// Files with at least one diagnostic, sorted by path.
+    pub files: Vec<FileDiagnosticRows>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FileDiagnosticRows {
+    /// Spelled exactly as [`FileDiagnosticCounts::path`] is.
+    pub path: String,
+    /// Sorted by position, like [`BufferDiagnostics::rows`].
+    pub rows: Vec<DiagnosticRow>,
+}
+
 /// What one server in a project is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1187,6 +1210,27 @@ impl crate::Engine {
         ProjectDiagnostics {
             version: self.lsp.store.version(project),
             totals,
+            files: rows,
+        }
+    }
+
+    /// Every diagnostic in the project, messages included — the panel's read,
+    /// where [`Engine::lsp_diagnostics`] is the status bar's. Reads a cache;
+    /// never blocks; empty when no server has ever published.
+    pub fn lsp_diagnostic_rows(&self, project: ProjectId) -> ProjectDiagnosticRows {
+        let root = self.project_root(project);
+        let files = self.lsp.store.files.lock().unwrap();
+        let mut rows: Vec<FileDiagnosticRows> = files
+            .iter()
+            .filter(|(_, file)| file.project == project && !file.rows.is_empty())
+            .map(|(path, file)| FileDiagnosticRows {
+                path: relative_path(root.as_deref(), path),
+                rows: (*file.rows).clone(),
+            })
+            .collect();
+        rows.sort_by(|a, b| a.path.cmp(&b.path));
+        ProjectDiagnosticRows {
+            version: self.lsp.store.version(project),
             files: rows,
         }
     }
@@ -3335,6 +3379,107 @@ mod tests {
         assert!(engine.close_project(project));
         assert_eq!(engine.lsp_diagnostics(project).files.len(), 0);
         assert_eq!(engine.lsp_version(project), 0);
+    }
+
+    /// What the diagnostics panel reads: every row in the project, messages
+    /// and all, grouped by file and sorted the way the counts are.
+    #[test]
+    fn the_panel_reads_every_row_in_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("projects")).unwrap();
+        let main = project_with_file(dir.path(), "main.rs", "fn main() {}\n");
+        let lib = project_with_file(dir.path(), "lib.rs", "fn lib() {}\n");
+        let engine = Engine::new();
+        let project = engine.open_project(main.parent().unwrap());
+
+        assert_eq!(engine.lsp_diagnostic_rows(project).files.len(), 0);
+
+        let main = std::fs::canonicalize(&main).unwrap();
+        let lib = std::fs::canonicalize(&lib).unwrap();
+        engine.lsp.store.publish(
+            project,
+            main.clone(),
+            publish(
+                &main,
+                None,
+                vec![
+                    diagnostic(3, 4, lsp::DiagnosticSeverity::ERROR),
+                    diagnostic(9, 0, lsp::DiagnosticSeverity::WARNING),
+                ],
+            ),
+        );
+        engine.lsp.store.publish(
+            project,
+            lib.clone(),
+            publish(&lib, None, vec![diagnostic(1, 2, lsp::DiagnosticSeverity::HINT)]),
+        );
+
+        let rows = engine.lsp_diagnostic_rows(project);
+        assert_eq!(rows.version, engine.lsp_version(project));
+        // Sorted by path, spelled project-relative like the counts.
+        assert_eq!(rows.files.len(), 2);
+        assert_eq!(rows.files[0].path, "lib.rs");
+        assert_eq!(rows.files[1].path, "main.rs");
+        assert_eq!(rows.files[0].rows.len(), 1);
+        assert_eq!(rows.files[1].rows.len(), 2);
+        assert_eq!(rows.files[1].rows[0].row, 3);
+        assert_eq!(rows.files[1].rows[0].message, "mismatched types");
+        assert_eq!(rows.files[1].rows[0].severity, Severity::Error);
+
+        // The shape the Kotlin side parses, exactly.
+        let json = serde_json::to_value(&rows).unwrap();
+        let file = &json["files"][0];
+        assert_eq!(file["path"], "lib.rs");
+        let row = &file["rows"][0];
+        assert_eq!(row["row"], 1);
+        assert_eq!(row["col_utf16"], 2);
+        assert_eq!(row["severity"], "hint");
+        assert_eq!(row["message"], "mismatched types");
+        assert_eq!(row["source"], "rustc");
+        assert_eq!(row["code"], "E0308");
+    }
+
+    /// A project opened through a symlinked spelling of its root — which is
+    /// every project on Android, where `filesDir` is /data/user/0/<pkg>, a
+    /// link to /data/data/<pkg> — still owns its files.
+    ///
+    /// Buffers and published diagnostics hold canonical paths, so a root kept
+    /// in the caller's spelling would fail every `starts_with` against them:
+    /// `lsp_did_open` would file the buffer under no project (no server, no
+    /// diagnostics, no error), and a server that did start would be rooted at
+    /// a URI none of its documents are under — single-file mode, in a
+    /// workspace.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_opened_through_a_symlink_still_owns_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("projects")).unwrap();
+        let file = project_with_file(dir.path(), "main.rs", "fn main() {}\n");
+        let real_root = file.parent().unwrap();
+        let linked_root = dir.path().join("linked");
+        std::os::unix::fs::symlink(real_root, &linked_root).unwrap();
+
+        let engine = Engine::new();
+        let project = engine.open_project(&linked_root);
+        let buffer = engine.open_file(&file).unwrap();
+        let path = engine.buffer_path(buffer).unwrap();
+
+        assert_eq!(
+            engine.project_for_path(&path),
+            Some(project),
+            "the canonical buffer path resolves to the project opened by link"
+        );
+
+        // A publish under the canonical spelling lands in the project, and its
+        // path reads project-relative rather than absolute.
+        engine.lsp.store.publish(
+            project,
+            path.clone(),
+            publish(&path, None, vec![diagnostic(0, 0, lsp::DiagnosticSeverity::ERROR)]),
+        );
+        let summary = engine.lsp_diagnostics(project);
+        assert_eq!(summary.files.len(), 1);
+        assert_eq!(summary.files[0].path, "main.rs");
     }
 
     // -----------------------------------------------------------------------
