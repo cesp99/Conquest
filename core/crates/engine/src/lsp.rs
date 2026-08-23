@@ -70,7 +70,9 @@ use lsp::{
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncSaveOptions, Uri,
     VersionedTextDocumentIdentifier, WorkDoneProgressParams,
 };
+use path::PathStyle;
 use rope::PointUtf16;
+use util::paths::PathMatcher;
 
 use crate::guest::{self, GuestCommand};
 use crate::project::ProjectId;
@@ -804,7 +806,7 @@ struct OpenDoc {
 }
 
 /// One server instance for one project.
-struct Slot {
+pub(crate) struct Slot {
     project: ProjectId,
     server: Server,
     state: ServerState,
@@ -871,11 +873,11 @@ impl Slot {
     }
 }
 
-type SlotMap = HashMap<(ProjectId, &'static str), Slot>;
+pub(crate) type SlotMap = HashMap<(ProjectId, &'static str), Slot>;
 
 /// The server registry, shared so a runtime job can install the server it
 /// finished starting without holding a borrow on the engine.
-type Slots = Arc<Mutex<SlotMap>>;
+pub(crate) type Slots = Arc<Mutex<SlotMap>>;
 
 type DocMap = HashMap<BufferId, OpenDoc>;
 
@@ -883,6 +885,184 @@ type DocMap = HashMap<BufferId, OpenDoc>;
 /// document registered while its server was still initializing is sent by that
 /// server's own start job.
 type Docs = Arc<Mutex<DocMap>>;
+
+/// The file watchers each server registered through `client/registerCapability`
+/// — rust-analyzer watches `**/Cargo.toml`, gopls watches `**/*.go` — keyed by
+/// the server's own registration id so `client/unregisterCapability` can take
+/// exactly what it names. Shared for the slots' reason: registrations arrive on
+/// the runtime, changes arrive from the worktree's watcher.
+pub(crate) type Watchers =
+    Arc<Mutex<HashMap<(ProjectId, &'static str), HashMap<String, PathMatcher>>>>;
+
+/// Install what one `client/registerCapability` said about watched files.
+///
+/// Anything that is not a watched-files registration is acknowledged and
+/// ignored — dynamic registration of *providers* changes nothing for a client
+/// that consults server capabilities per request. A glob that will not compile
+/// is logged and dropped rather than failing the registration: the server is
+/// entitled to `Ok`, and a watcher we cannot honour is a change notification
+/// the server does not get, which is the state it was in anyway.
+fn register_watchers(
+    watchers: &Watchers,
+    project: ProjectId,
+    server: &'static str,
+    params: &lsp::RegistrationParams,
+) {
+    for registration in &params.registrations {
+        if registration.method != "workspace/didChangeWatchedFiles" {
+            continue;
+        }
+        let Some(options) = registration.register_options.clone() else {
+            continue;
+        };
+        let Ok(options) =
+            serde_json::from_value::<lsp::DidChangeWatchedFilesRegistrationOptions>(options)
+        else {
+            log::warn!("lsp: {server} sent watchers this client cannot read");
+            continue;
+        };
+        let globs: Vec<String> = options
+            .watchers
+            .iter()
+            .map(|watcher| match &watcher.glob_pattern {
+                lsp::GlobPattern::String(pattern) => pattern.clone(),
+                // A relative pattern is a base URI and a glob under it; spelled
+                // out it is the same thing as an absolute string pattern.
+                lsp::GlobPattern::Relative(relative) => {
+                    let base = match &relative.base_uri {
+                        lsp::OneOf::Left(folder) => folder.uri.clone(),
+                        lsp::OneOf::Right(uri) => uri.clone(),
+                    };
+                    match base.to_file_path() {
+                        Ok(base) => format!(
+                            "{}/{}",
+                            base.to_string_lossy().trim_end_matches('/'),
+                            relative.pattern
+                        ),
+                        Err(()) => relative.pattern.clone(),
+                    }
+                }
+            })
+            .collect();
+        match PathMatcher::new(&globs, PathStyle::Unix) {
+            Ok(matcher) => {
+                watchers
+                    .lock()
+                    .unwrap()
+                    .entry((project, server))
+                    .or_default()
+                    .insert(registration.id.clone(), matcher);
+            }
+            Err(err) => log::warn!("lsp: {server} registered an unreadable glob: {err}"),
+        }
+    }
+}
+
+/// The unregister half: remove exactly the registrations the server names.
+fn unregister_watchers(
+    watchers: &Watchers,
+    project: ProjectId,
+    server: &'static str,
+    params: &lsp::UnregistrationParams,
+) {
+    let mut watchers = watchers.lock().unwrap();
+    let Some(registered) = watchers.get_mut(&(project, server)) else {
+        return;
+    };
+    for unregistration in &params.unregisterations {
+        if unregistration.method == "workspace/didChangeWatchedFiles" {
+            registered.remove(&unregistration.id);
+        }
+    }
+}
+
+/// worktree's `PathChange`, in the words LSP's `FileChangeType` has for it —
+/// and `None` for the one that must never be forwarded: `Loaded` is the
+/// initial scan finding a file that was always there, and forwarding it would
+/// hand every server one event per file in the tree at startup.
+pub(crate) fn watched_change_type(change: &worktree::PathChange) -> Option<lsp::FileChangeType> {
+    match change {
+        worktree::PathChange::Added => Some(lsp::FileChangeType::CREATED),
+        worktree::PathChange::Removed => Some(lsp::FileChangeType::DELETED),
+        worktree::PathChange::Updated => Some(lsp::FileChangeType::CHANGED),
+        // The watcher could not tell which; `CHANGED` is the answer a server
+        // treats as "go look", which is the safe reading of not knowing.
+        worktree::PathChange::AddedOrUpdated => Some(lsp::FileChangeType::CHANGED),
+        worktree::PathChange::Loaded => None,
+    }
+}
+
+/// The events each of a project's servers asked to hear about, out of one
+/// batch of disk changes. Pure over the watcher table, which is what makes it
+/// testable without a server on the other end.
+fn collect_watched(
+    watchers: &HashMap<(ProjectId, &'static str), HashMap<String, PathMatcher>>,
+    project: ProjectId,
+    root: &Path,
+    changes: &[(PathBuf, lsp::FileChangeType)],
+) -> Vec<(&'static str, Vec<lsp::FileEvent>)> {
+    watchers
+        .iter()
+        .filter(|((id, _), registered)| *id == project && !registered.is_empty())
+        .filter_map(|((_, server), registered)| {
+            let events: Vec<lsp::FileEvent> = changes
+                .iter()
+                .filter(|(path, _)| {
+                    // Servers spell their globs both ways — gopls's
+                    // `**/*.go` speaks in suffixes, a `RelativePattern` in
+                    // absolute paths — so a change matches on either its
+                    // absolute spelling or its root-relative one.
+                    registered.values().any(|matcher| {
+                        matcher.is_match_std_path(path)
+                            || path
+                                .strip_prefix(root)
+                                .is_ok_and(|relative| matcher.is_match_std_path(relative))
+                    })
+                })
+                .filter_map(|(path, kind)| {
+                    Some(lsp::FileEvent::new(Uri::from_file_path(path).ok()?, *kind))
+                })
+                .collect();
+            (!events.is_empty()).then_some((*server, events))
+        })
+        .collect()
+}
+
+/// Tell every server that registered a matching watcher about a batch of disk
+/// changes — the worktree's subscription calls this, already on the runtime.
+///
+/// The one comparable traffic a server gets without asking, and like
+/// `publishDiagnostics` it is proof of life: the activity clock moves so the
+/// idle sweep does not stop a server mid-reindex.
+pub(crate) fn notify_watched_files(
+    slots: &Slots,
+    watchers: &Watchers,
+    project: ProjectId,
+    root: &Path,
+    changes: &[(PathBuf, lsp::FileChangeType)],
+) {
+    if changes.is_empty() {
+        return;
+    }
+    let interested = collect_watched(&watchers.lock().unwrap(), project, root, changes);
+    for (server, events) in interested {
+        let handle = {
+            let mut slots = slots.lock().unwrap();
+            let Some(slot) = slots.get_mut(&(project, server)) else {
+                continue;
+            };
+            slot.last_activity = Instant::now();
+            slot.handle.clone()
+        };
+        if let Some(handle) = handle {
+            handle
+                .notify::<lsp::notification::DidChangeWatchedFiles>(
+                    lsp::DidChangeWatchedFilesParams { changes: events },
+                )
+                .ok();
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The two decisions the budget comes down to, as functions of nothing but
@@ -1052,6 +1232,8 @@ pub(crate) struct LspState {
     servers: Slots,
     docs: Docs,
     store: Arc<DiagnosticStore>,
+    /// What each server asked to be told about the disk — see [`Watchers`].
+    watchers: Watchers,
     requests: Arc<Mutex<Requests>>,
     next_request_id: AtomicU64,
     next_server_id: AtomicU64,
@@ -1551,6 +1733,11 @@ impl crate::Engine {
             .unwrap()
             .retain(|_, doc| doc.project != project);
         self.lsp.store.forget_project(project);
+        self.lsp
+            .watchers
+            .lock()
+            .unwrap()
+            .retain(|(id, _), _| *id != project);
         if dropped.is_empty() {
             return;
         }
@@ -1563,6 +1750,12 @@ impl crate::Engine {
     /// [`Engine::edit`] skip building a [`TextChange`] entirely.
     pub(crate) fn lsp_is_live(&self) -> bool {
         self.lsp.live.load(Ordering::Relaxed)
+    }
+
+    /// The pieces the worktree's subscription needs to forward disk changes
+    /// to servers — cloned, so the subscription owns no borrow on the engine.
+    pub(crate) fn lsp_watch_handles(&self) -> (Slots, Watchers) {
+        (self.lsp.servers.clone(), self.lsp.watchers.clone())
     }
 
     /// Whether some live server negotiated whole-document sync, and therefore
@@ -1676,6 +1869,10 @@ impl crate::Engine {
             root.display()
         );
 
+        // A previous incarnation's watcher registrations died with it; the new
+        // server registers its own, under ids of its own choosing.
+        self.lsp.watchers.lock().unwrap().remove(&(project, server.name));
+
         let started = StartRequest {
             project,
             server,
@@ -1686,6 +1883,7 @@ impl crate::Engine {
             buffers: self.buffers.clone(),
             slots: self.lsp.servers.clone(),
             docs: self.lsp.docs.clone(),
+            watchers: self.lsp.watchers.clone(),
             wants_full_text: self.lsp.wants_full_text.clone(),
         };
         self.runtime().spawn(move |cx| {
@@ -1998,6 +2196,7 @@ struct StartRequest {
     buffers: Buffers,
     slots: Slots,
     docs: Docs,
+    watchers: Watchers,
     wants_full_text: Arc<AtomicBool>,
 }
 
@@ -2012,6 +2211,7 @@ async fn start_server(request: StartRequest, cx: &mut AsyncApp) {
         buffers,
         slots,
         docs,
+        watchers,
         wants_full_text,
     } = request;
 
@@ -2079,20 +2279,33 @@ async fn start_server(request: StartRequest, cx: &mut AsyncApp) {
 
     // Servers ask things back, and a request with no handler is answered with
     // a "method not found" *error* — which degrades exactly the
-    // workspace-wide behaviour the server is for: rust-analyzer and gopls
-    // register their file watchers through `client/registerCapability`, and
-    // more than one server stalls its settings on `workspace/configuration`.
-    // Zed answers these; we answer with the emptiest legal reply —
-    // acknowledged, and no settings — which a server reads as "use your
-    // defaults" rather than "this client is broken". Registered before
-    // `initialize` for the diagnostics handler's reason.
+    // workspace-wide behaviour the server is for. `client/registerCapability`
+    // is honoured for what matters: watched-files registrations land in the
+    // watcher table and the worktree's subscription feeds them (see
+    // [`notify_watched_files`]); everything else a server dynamically
+    // registers changes nothing for a client that consults capabilities per
+    // request. `workspace/configuration` gets the emptiest legal reply — no
+    // settings — which a server reads as "use your defaults". Registered
+    // before `initialize` for the diagnostics handler's reason.
     let acknowledgements = vec![
-        server_handle.on_request::<lsp::request::RegisterCapability, _, _>(
-            |_params, _cx: &mut AsyncApp| async move { anyhow::Ok(()) },
-        ),
-        server_handle.on_request::<lsp::request::UnregisterCapability, _, _>(
-            |_params, _cx: &mut AsyncApp| async move { anyhow::Ok(()) },
-        ),
+        {
+            let watchers = watchers.clone();
+            server_handle.on_request::<lsp::request::RegisterCapability, _, _>(
+                move |params: lsp::RegistrationParams, _cx: &mut AsyncApp| {
+                    register_watchers(&watchers, project, server.name, &params);
+                    async move { anyhow::Ok(()) }
+                },
+            )
+        },
+        {
+            let watchers = watchers.clone();
+            server_handle.on_request::<lsp::request::UnregisterCapability, _, _>(
+                move |params: lsp::UnregistrationParams, _cx: &mut AsyncApp| {
+                    unregister_watchers(&watchers, project, server.name, &params);
+                    async move { anyhow::Ok(()) }
+                },
+            )
+        },
         server_handle.on_request::<lsp::request::WorkspaceConfiguration, _, _>(
             |params: lsp::ConfigurationParams, _cx: &mut AsyncApp| async move {
                 anyhow::Ok(vec![serde_json::Value::Null; params.items.len()])
@@ -3507,6 +3720,100 @@ mod tests {
         let summary = engine.lsp_diagnostics(project);
         assert_eq!(summary.files.len(), 1);
         assert_eq!(summary.files[0].path, "main.rs");
+    }
+
+    // -----------------------------------------------------------------------
+    // Watched files
+    // -----------------------------------------------------------------------
+
+    fn registration(id: &str, globs: &[&str]) -> lsp::RegistrationParams {
+        lsp::RegistrationParams {
+            registrations: vec![lsp::Registration {
+                id: id.to_owned(),
+                method: "workspace/didChangeWatchedFiles".to_owned(),
+                register_options: Some(
+                    serde_json::to_value(lsp::DidChangeWatchedFilesRegistrationOptions {
+                        watchers: globs
+                            .iter()
+                            .map(|glob| lsp::FileSystemWatcher {
+                                glob_pattern: lsp::GlobPattern::String((*glob).to_owned()),
+                                kind: None,
+                            })
+                            .collect(),
+                    })
+                    .unwrap(),
+                ),
+            }],
+        }
+    }
+
+    /// The round trip a rust-analyzer makes: register `**/Cargo.toml`, and be
+    /// told when a Cargo.toml changes — and only a Cargo.toml, and only the
+    /// server that asked.
+    #[test]
+    fn a_registered_watcher_hears_its_globs_and_nothing_else() {
+        let watchers: Watchers = Default::default();
+        register_watchers(&watchers, 1, "rust-analyzer", &registration("w", &["**/Cargo.toml"]));
+        register_watchers(&watchers, 1, "gopls", &registration("g", &["**/*.go"]));
+        // Another project's server must not hear project 1's changes.
+        register_watchers(&watchers, 2, "gopls", &registration("g", &["**/*.go"]));
+
+        let root = Path::new("/p/thing");
+        let changes = vec![
+            (PathBuf::from("/p/thing/Cargo.toml"), lsp::FileChangeType::CHANGED),
+            (PathBuf::from("/p/thing/src/main.go"), lsp::FileChangeType::CREATED),
+            (PathBuf::from("/p/thing/notes.md"), lsp::FileChangeType::CHANGED),
+        ];
+        let mut heard = collect_watched(&watchers.lock().unwrap(), 1, root, &changes);
+        heard.sort_by_key(|(server, _)| *server);
+
+        assert_eq!(heard.len(), 2);
+        let (server, events) = &heard[0];
+        assert_eq!(*server, "gopls");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].typ, lsp::FileChangeType::CREATED);
+        let (server, events) = &heard[1];
+        assert_eq!(*server, "rust-analyzer");
+        assert_eq!(events.len(), 1);
+        assert!(events[0].uri.to_string().ends_with("Cargo.toml"));
+
+        // Unregistering by the server's own id silences it.
+        unregister_watchers(
+            &watchers,
+            1,
+            "rust-analyzer",
+            &lsp::UnregistrationParams {
+                unregisterations: vec![lsp::Unregistration {
+                    id: "w".to_owned(),
+                    method: "workspace/didChangeWatchedFiles".to_owned(),
+                }],
+            },
+        );
+        let heard = collect_watched(&watchers.lock().unwrap(), 1, root, &changes);
+        assert_eq!(heard.len(), 1, "only gopls is still listening");
+    }
+
+    /// The initial scan is not change: forwarding `Loaded` would hand a server
+    /// one event per file in the tree the moment it starts.
+    #[test]
+    fn the_initial_scan_is_not_a_change() {
+        assert_eq!(watched_change_type(&worktree::PathChange::Loaded), None);
+        assert_eq!(
+            watched_change_type(&worktree::PathChange::Added),
+            Some(lsp::FileChangeType::CREATED)
+        );
+        assert_eq!(
+            watched_change_type(&worktree::PathChange::Removed),
+            Some(lsp::FileChangeType::DELETED)
+        );
+        assert_eq!(
+            watched_change_type(&worktree::PathChange::Updated),
+            Some(lsp::FileChangeType::CHANGED)
+        );
+        assert_eq!(
+            watched_change_type(&worktree::PathChange::AddedOrUpdated),
+            Some(lsp::FileChangeType::CHANGED)
+        );
     }
 
     // -----------------------------------------------------------------------

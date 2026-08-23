@@ -128,6 +128,7 @@ impl crate::Engine {
 
         let path: Arc<Path> = Arc::from(path);
         let buffers = self.buffers.clone();
+        let (lsp_slots, lsp_watchers) = self.lsp_watch_handles();
         self.runtime().spawn(move |cx| {
             let global = cx.global::<FsGlobal>();
             let fs = global.fs.clone();
@@ -194,6 +195,31 @@ impl crate::Engine {
                                     .map(|(path, _, _)| root.join(path.as_std_path()))
                                     .collect();
                                 crate::file::note_disk_changes(&buffers, &paths);
+                                // The same batch, for the servers that
+                                // registered watchers — minus what must not
+                                // travel: the initial scan (see
+                                // `watched_change_type`) and the save path's
+                                // own `.conquest-tmp` staging files, which
+                                // appear and vanish on every save.
+                                let watched: Vec<_> = changes
+                                    .iter()
+                                    .filter_map(|(path, _, change)| {
+                                        let kind = crate::lsp::watched_change_type(change)?;
+                                        let path = root.join(path.as_std_path());
+                                        let temp = path
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .is_some_and(|name| name.ends_with(".conquest-tmp"));
+                                        (!temp).then_some((path, kind))
+                                    })
+                                    .collect();
+                                crate::lsp::notify_watched_files(
+                                    &lsp_slots,
+                                    &lsp_watchers,
+                                    id,
+                                    &root,
+                                    &watched,
+                                );
                             }
                             mirror(&worktree, &mirrored, cx);
                         });
