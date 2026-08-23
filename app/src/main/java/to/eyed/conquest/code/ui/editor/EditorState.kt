@@ -2362,6 +2362,26 @@ class EditorState private constructor(
         scrollY = scrollY.coerceIn(0f, maxScrollY)
     }
 
+    /**
+     * The buffer was edited from below — a workspace edit the engine applied
+     * (a rename, a formatting, a quick fix) — so every cached measurement,
+     * the folds and the carets are suspect. The same resync a history step
+     * needs, made public for the workspace to call on each editor the apply
+     * receipt names.
+     */
+    fun noteExternalEdit() = afterHistoryChange()
+
+    /**
+     * The word under the caret, trimmed — what a rename dialog prefills.
+     * Empty when the caret sits on whitespace or punctuation.
+     */
+    fun wordUnderCaret(): String {
+        val line = line(cursorRow)
+        val (start, end) = wordAround(line, cursorCol)
+        val word = line.substring(start, end).trim()
+        return if (word.any { it.isLetterOrDigit() || it == '_' }) word else ""
+    }
+
     private fun afterHistoryChange() {
         refreshLineCount()
         // Undoing a multi-caret edit restores the text, not the carets that

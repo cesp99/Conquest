@@ -143,8 +143,17 @@ internal fun parseLspRange(json: JSONObject?): LspRange? {
     )
 }
 
-/** The three questions the bridge will ask a server. */
-enum class LspRequestKind { Completion, Hover, Definition }
+/** The questions the bridge will ask a server. */
+enum class LspRequestKind {
+    Completion,
+    Hover,
+    Definition,
+    References,
+    CodeAction,
+    CodeActionApply,
+    Rename,
+    Formatting,
+}
 
 /**
  * What became of a request. `done` with an empty payload is a real answer —
@@ -193,6 +202,11 @@ class LspAnswer(
                         "completion" -> LspRequestKind.Completion
                         "hover" -> LspRequestKind.Hover
                         "definition" -> LspRequestKind.Definition
+                        "references" -> LspRequestKind.References
+                        "code_action" -> LspRequestKind.CodeAction
+                        "code_action_apply" -> LspRequestKind.CodeActionApply
+                        "rename" -> LspRequestKind.Rename
+                        "formatting" -> LspRequestKind.Formatting
                         else -> null
                     },
                     state = when (root.jsonStringOrNull("state")) {
@@ -279,8 +293,28 @@ internal suspend fun requestLsp(
                 CoreBridge.lspRequestHover(bufferId, row.toLong(), colUtf16.toLong())
             LspRequestKind.Definition ->
                 CoreBridge.lspRequestDefinition(bufferId, row.toLong(), colUtf16.toLong())
+            LspRequestKind.References ->
+                CoreBridge.lspRequestReferences(bufferId, row.toLong(), colUtf16.toLong())
+            LspRequestKind.CodeAction ->
+                CoreBridge.lspRequestCodeActions(bufferId, row.toLong(), colUtf16.toLong())
+            // These carry arguments a (kind, position) call cannot: start
+            // them through their own helpers in WorkspaceEditActions.kt,
+            // which hand the id to [pollLspRequest]. -1 is the bridge's own
+            // failure convention, so asking here answers null.
+            LspRequestKind.CodeActionApply,
+            LspRequestKind.Rename,
+            LspRequestKind.Formatting -> -1L
         }
     }
+    return pollLspRequest(id)
+}
+
+/**
+ * The polling half of [requestLsp], for a request already started: wait for
+ * it to settle, cancelling it at the engine if this coroutine is cancelled
+ * first. Same contract, same threading.
+ */
+internal suspend fun pollLspRequest(id: Long): LspAnswer? {
     // 0 cannot be a live id — it is the value `lspRequestVersion` uses for one
     // the engine has forgotten, so an id of 0 could never be polled — and a
     // negative id is the bridge's failure convention.

@@ -81,6 +81,7 @@ import to.eyed.conquest.code.ui.search.revealProjectSearchMatch
 import to.eyed.conquest.code.ui.diagnostics.DiagnosticsPanel
 import to.eyed.conquest.code.ui.diagnostics.revealDiagnosticTarget
 import to.eyed.conquest.code.ui.editor.Diagnostic
+import to.eyed.conquest.code.ui.editor.EditReceipt
 import to.eyed.conquest.code.ui.editor.EditorPane
 import to.eyed.conquest.code.ui.editor.DefinitionTarget
 import to.eyed.conquest.code.ui.editor.EditorState
@@ -225,6 +226,8 @@ private class WorkspaceOverlays {
     /** Ctrl+G. A surface rather than a command: it answers for itself. */
     var goToLineOpen by mutableStateOf(false)
     var outlineOpen by mutableStateOf(false)
+    /** The rename-symbol dialog, over the active editor. */
+    var renameOpen by mutableStateOf(false)
     /** The branch picker — Zed's `git::Switch`, from the panel's branch button. */
     var branchPickerOpen by mutableStateOf(false)
 }
@@ -970,6 +973,24 @@ fun WorkspaceScreen(
     }
 
     /**
+     * A workspace edit — a rename, a quick fix, a formatting — landed
+     * engine-side, and the receipt names every file it touched. The engine
+     * changed those buffers *underneath* their editors, so each open one is
+     * resynced ([EditorState.noteExternalEdit]), and every tab's dirty dot
+     * re-read: an applied edit makes clean buffers dirty.
+     */
+    fun resyncAfterWorkspaceEdit(receipt: EditReceipt) {
+        if (receipt.files.isEmpty()) return
+        for (tab in files.tabs) {
+            val id = tab.session?.id
+            if (id != null && receipt.files.any { it.bufferId == id }) {
+                tab.editor?.noteExternalEdit()
+            }
+            tab.refreshStatus()
+        }
+    }
+
+    /**
      * A path a dock asked for — a changed file in the git panel, a relative
      * link in the preview.
      *
@@ -1394,6 +1415,8 @@ fun WorkspaceScreen(
                                             }
                                         }
                                     },
+                                    onWorkspaceEditApplied = ::resyncAfterWorkspaceEdit,
+                                    onRenameSymbol = { overlays.renameOpen = true },
                                     modifier = Modifier.weight(1f),
                                 )
                             }
@@ -1475,6 +1498,22 @@ fun WorkspaceScreen(
                         editor = goToLineEditor,
                         onDismiss = {
                             overlays.goToLineOpen = false
+                            rootFocus.requestFocus()
+                        },
+                        modifier = Modifier.align(Alignment.TopCenter),
+                    )
+                }
+                // Gated like go-to-line, and placed where it is: a rename is
+                // about the caret's symbol, which a full-screen panel hides.
+                val renameEditor = active?.editor
+                if (overlays.renameOpen && renameEditor != null &&
+                    plan.fullScreen == null && !terminalIsFullScreen
+                ) {
+                    RenameSymbol(
+                        editor = renameEditor,
+                        onApplied = ::resyncAfterWorkspaceEdit,
+                        onDismiss = {
+                            overlays.renameOpen = false
                             rootFocus.requestFocus()
                         },
                         modifier = Modifier.align(Alignment.TopCenter),
@@ -1935,6 +1974,10 @@ private fun EditorArea(
      * on the target — the same shape as a project-search hit.
      */
     onOpenDefinition: (DefinitionTarget) -> Unit,
+    /** A workspace edit landed; the workspace resyncs every editor it names. */
+    onWorkspaceEditApplied: (EditReceipt) -> Unit,
+    /** Raise the rename dialog over the active editor. */
+    onRenameSymbol: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val active = files.active
@@ -2017,6 +2060,8 @@ private fun EditorArea(
                 softWrap = softWrap,
                 showInlineBlame = showInlineBlame,
                 onOpenDefinition = onOpenDefinition,
+                onWorkspaceEditApplied = onWorkspaceEditApplied,
+                onRenameSymbol = onRenameSymbol,
             )
         } else if (active.graph && diffProject != null) {
             GitGraphPane(

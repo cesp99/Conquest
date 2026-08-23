@@ -875,6 +875,69 @@ object CoreBridge {
     external fun lspRequestDefinition(bufferId: Long, row: Long, colUtf16: Long): Long
 
     /**
+     * Everywhere the symbol under the caret is used, declaration included.
+     * Same contract as [lspRequestCompletion]; the payload is definition's
+     * targets, each with `line_text` — the trimmed text of its line — when
+     * the file could be read.
+     */
+    external fun lspRequestReferences(bufferId: Long, row: Long, colUtf16: Long): Long
+
+    /**
+     * The code actions at a caret — quick fixes for the diagnostics under it,
+     * refactorings otherwise. Same polling contract as [lspRequestCompletion];
+     * the payload is `{actions: [{index, title, kind, is_preferred,
+     * disabled}]}`, `disabled` being null for an action that can run and a
+     * sentence when it cannot. The actions themselves stay in the engine,
+     * keyed by `index`, for [lspRequestCodeActionApply] — so the request must
+     * stay uncancelled until the pick is made.
+     */
+    external fun lspRequestCodeActions(bufferId: Long, row: Long, colUtf16: Long): Long
+
+    /**
+     * Picks one action out of a settled [lspRequestCodeActions] answer and
+     * readies its edit, resolving through the server when it was sent lazy.
+     * Returns a new request id on the same polling contract: it settles
+     * `done` with `{files, edits, resource_ops}` — or `{error}` when the
+     * server offered no edit — and the edit itself waits for
+     * [lspApplyPendingEdit]. A stale list id or bad index settles
+     * `unavailable`.
+     */
+    external fun lspRequestCodeActionApply(requestId: Long, index: Long): Long
+
+    /**
+     * Renames the symbol under the caret to [newName], everywhere the server
+     * knows about. Same polling contract as [lspRequestCompletion]; settles
+     * `done` with `{files, edits, resource_ops}` — or `{error}` when there is
+     * nothing here to rename — and **changes nothing** until
+     * [lspApplyPendingEdit].
+     */
+    external fun lspRequestRename(bufferId: Long, row: Long, colUtf16: Long, newName: String): Long
+
+    /**
+     * Formats the whole document with the workspace's tab size. Same polling
+     * contract as [lspRequestCompletion]; settles `done` with `{files, edits,
+     * resource_ops}` — zero edits is a well-formatted file — and applies
+     * nothing until [lspApplyPendingEdit].
+     */
+    external fun lspRequestFormatting(bufferId: Long): Long
+
+    /**
+     * Lands the edit a settled rename, formatting or code-action-apply
+     * request is holding, and says what was touched: `{applied, error,
+     * files: [{path, buffer_id, edits}]}`.
+     *
+     * Open buffers take the edits through the normal edit path — `didChange`,
+     * undo history and version bumps included — and files nobody has open are
+     * rewritten atomically on disk. `path` is absolute and canonical: match
+     * it against open tabs, and **call `noteExternalEdit` on the editor of
+     * every file whose `buffer_id` is not null** — the engine changed those
+     * buffers underneath the UI. The edit is taken: a second call reports
+     * "nothing to apply". **Blocking**, like [saveBuffer]; call it off the
+     * main thread.
+     */
+    external fun lspApplyPendingEdit(requestId: Long): String
+
+    /**
      * Generation counter for a request: 1 while in flight, 2 once settled, 0
      * for an id the engine has forgotten (superseded, cancelled, or its buffer
      * closed). Poll it exactly like [projectSearchVersion].
@@ -885,7 +948,9 @@ object CoreBridge {
      * A request's answer, as JSON: `{id, kind, state, version, buffer_id, row,
      * col_utf16, buffer_version, payload}`.
      *
-     * `kind` is `completion`, `hover` or `definition`. `state` is `pending`,
+     * `kind` is `completion`, `hover`, `definition`, `references`,
+     * `code_action`, `code_action_apply`, `rename` or `formatting`. `state`
+     * is `pending`,
      * `done`, `timeout`, `unavailable` or `cancelled` — `done` with an empty
      * payload is a real answer ("no completions here"); the other three are
      * not, and must not be cached as one. `row`, `col_utf16` and
@@ -908,6 +973,11 @@ object CoreBridge {
      *    end_col_utf16}]}`. `path` is absolute and openable with [openFile];
      *    targets in URIs that are not files are dropped rather than handed over
      *    as paths that do not exist.
+     *  * `references` — definition's shape plus `line_text` per target.
+     *  * `code_action` — see [lspRequestCodeActions].
+     *  * `code_action_apply`, `rename`, `formatting` — `{files, edits,
+     *    resource_ops}` when an edit is waiting for [lspApplyPendingEdit], or
+     *    `{error}` when the server had nothing to offer.
      *
      * Never null: a forgotten id reports itself `cancelled` with a null
      * payload — and every other field of *that* answer is a placeholder,
