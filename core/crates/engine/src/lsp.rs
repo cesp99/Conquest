@@ -2077,6 +2077,32 @@ async fn start_server(request: StartRequest, cx: &mut AsyncApp) {
         )
     };
 
+    // Servers ask things back, and a request with no handler is answered with
+    // a "method not found" *error* — which degrades exactly the
+    // workspace-wide behaviour the server is for: rust-analyzer and gopls
+    // register their file watchers through `client/registerCapability`, and
+    // more than one server stalls its settings on `workspace/configuration`.
+    // Zed answers these; we answer with the emptiest legal reply —
+    // acknowledged, and no settings — which a server reads as "use your
+    // defaults" rather than "this client is broken". Registered before
+    // `initialize` for the diagnostics handler's reason.
+    let acknowledgements = vec![
+        server_handle.on_request::<lsp::request::RegisterCapability, _, _>(
+            |_params, _cx: &mut AsyncApp| async move { anyhow::Ok(()) },
+        ),
+        server_handle.on_request::<lsp::request::UnregisterCapability, _, _>(
+            |_params, _cx: &mut AsyncApp| async move { anyhow::Ok(()) },
+        ),
+        server_handle.on_request::<lsp::request::WorkspaceConfiguration, _, _>(
+            |params: lsp::ConfigurationParams, _cx: &mut AsyncApp| async move {
+                anyhow::Ok(vec![serde_json::Value::Null; params.items.len()])
+            },
+        ),
+        server_handle.on_request::<lsp::request::WorkDoneProgressCreate, _, _>(
+            |_params, _cx: &mut AsyncApp| async move { anyhow::Ok(()) },
+        ),
+    ];
+
     // `initialize` with the capabilities Zed advertises, which is where UTF-16
     // positions are agreed (vendor/lsp/src/lsp.rs:808) — the reason every
     // column this module hands the UI is already in the units the UI wants.
@@ -2136,6 +2162,7 @@ async fn start_server(request: StartRequest, cx: &mut AsyncApp) {
         slot.sync = sync;
         slot.wants_save = wants_save;
         slot.subscriptions.push(subscription);
+        slot.subscriptions.extend(acknowledgements);
         // Initializing can take a minute on a cold rust-analyzer, and it is the
         // opposite of idle: the clock starts here, not when we spawned it.
         slot.last_activity = Instant::now();
