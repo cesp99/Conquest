@@ -113,14 +113,22 @@ impl crate::Engine {
     /// [`Engine::project_version`] for the scan filling in.
     pub fn open_project(&self, path: &Path) -> ProjectId {
         let id = self.next_project_id();
+        // Canonicalized, because everything this root is compared against or
+        // handed to already is: buffer paths (`Engine::open_file`), published
+        // diagnostic paths (lsp.rs), the watcher root below. On Android the
+        // caller's spelling is /data/user/0/<pkg>/…, a symlink to
+        // /data/data/<pkg> — kept as-is, `project_for_path` would say every
+        // buffer lies outside its own project, and a language server would be
+        // rooted at a URI none of its documents are under.
         let state = Arc::new(Mutex::new(ProjectState {
-            root: path.to_path_buf(),
+            root: std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
             ..Default::default()
         }));
         self.projects.lock().unwrap().insert(id, state.clone());
 
         let path: Arc<Path> = Arc::from(path);
         let buffers = self.buffers.clone();
+        let (lsp_slots, lsp_watchers) = self.lsp_watch_handles();
         self.runtime().spawn(move |cx| {
             let global = cx.global::<FsGlobal>();
             let fs = global.fs.clone();
@@ -187,6 +195,31 @@ impl crate::Engine {
                                     .map(|(path, _, _)| root.join(path.as_std_path()))
                                     .collect();
                                 crate::file::note_disk_changes(&buffers, &paths);
+                                // The same batch, for the servers that
+                                // registered watchers — minus what must not
+                                // travel: the initial scan (see
+                                // `watched_change_type`) and the save path's
+                                // own `.conquest-tmp` staging files, which
+                                // appear and vanish on every save.
+                                let watched: Vec<_> = changes
+                                    .iter()
+                                    .filter_map(|(path, _, change)| {
+                                        let kind = crate::lsp::watched_change_type(change)?;
+                                        let path = root.join(path.as_std_path());
+                                        let temp = path
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .is_some_and(|name| name.ends_with(".conquest-tmp"));
+                                        (!temp).then_some((path, kind))
+                                    })
+                                    .collect();
+                                crate::lsp::notify_watched_files(
+                                    &lsp_slots,
+                                    &lsp_watchers,
+                                    id,
+                                    &root,
+                                    &watched,
+                                );
                             }
                             mirror(&worktree, &mirrored, cx);
                         });
@@ -253,6 +286,12 @@ impl crate::Engine {
     pub fn project_scan_complete(&self, id: ProjectId) -> bool {
         self.with_project(id, |state| state.scan_complete)
             .unwrap_or(false)
+    }
+
+    /// The mirrored worktree snapshot, for a reader outside this module —
+    /// the LSP module walks it to learn which languages the tree holds.
+    pub(crate) fn project_snapshot(&self, id: ProjectId) -> Option<Snapshot> {
+        self.with_project(id, |state| state.snapshot.clone()).flatten()
     }
 
     /// The error that stopped the project from opening, if any.

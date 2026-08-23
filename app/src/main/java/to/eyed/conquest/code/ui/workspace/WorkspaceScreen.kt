@@ -78,6 +78,10 @@ import to.eyed.conquest.code.core.ProjectSearchMatch
 import to.eyed.conquest.code.ui.search.BufferSearchBar
 import to.eyed.conquest.code.ui.search.ProjectSearchPanel
 import to.eyed.conquest.code.ui.search.revealProjectSearchMatch
+import to.eyed.conquest.code.ui.diagnostics.DiagnosticsPane
+import to.eyed.conquest.code.ui.diagnostics.revealDiagnosticTarget
+import to.eyed.conquest.code.ui.editor.Diagnostic
+import to.eyed.conquest.code.ui.editor.EditReceipt
 import to.eyed.conquest.code.ui.editor.EditorPane
 import to.eyed.conquest.code.ui.editor.DefinitionTarget
 import to.eyed.conquest.code.ui.editor.EditorState
@@ -222,6 +226,8 @@ private class WorkspaceOverlays {
     /** Ctrl+G. A surface rather than a command: it answers for itself. */
     var goToLineOpen by mutableStateOf(false)
     var outlineOpen by mutableStateOf(false)
+    /** The rename-symbol dialog, over the active editor. */
+    var renameOpen by mutableStateOf(false)
     /** The branch picker — Zed's `git::Switch`, from the panel's branch button. */
     var branchPickerOpen by mutableStateOf(false)
 }
@@ -290,6 +296,8 @@ fun WorkspaceScreen(
     /** Ctrl+Shift+G, the same way: press it again to put focus back on the list. */
     var gitPanelFocus by remember { mutableIntStateOf(0) }
     var agentPanelFocus by remember { mutableIntStateOf(0) }
+    /** The diagnostics panel's keyboard, pulled back the same way. */
+    var diagnosticsFocus by remember { mutableIntStateOf(0) }
     /**
      * Whether the git panel holds the keyboard. It is what lets Ctrl+G be
      * the panel's chord leader there and go-to-line everywhere else — the
@@ -632,6 +640,28 @@ fun WorkspaceScreen(
         }
     }
 
+    /**
+     * Project diagnostics, as a tab for the graph's reason: Zed opens it as a
+     * pane item (diagnostics/src/diagnostics.rs deploys it into the active
+     * pane), so a second visit selects the tab that is already there.
+     */
+    fun openDiagnosticsTab() {
+        if (project == null) return
+        val key = "diagnostics:"
+        val existing = files.indexOfPath(key)
+        if (existing >= 0) {
+            files.select(existing)
+        } else {
+            files.open(OpenFile(path = key, editor = null, diagnostics = true))
+        }
+        diagnosticsFocus++
+        dockTookWorkArea?.let { side ->
+            docks.closeDock(side)
+            terminalFocused = false
+            rootFocus.requestFocus()
+        }
+    }
+
     /** Whether [panel] is not just open but on screen. See [drawnDocks]. */
     fun panelIsDrawn(panel: WorkspacePanel): Boolean =
         docks.isOpen(panel, settings) && panel.sideIn(settings) in drawnDocks
@@ -854,6 +884,10 @@ fun WorkspaceScreen(
                 if (project == null) return false
                 if (togglePanel(WorkspacePanel.Git)) gitPanelFocus++
             }
+            WorkspaceCommand.OpenDiagnostics -> {
+                if (project == null) return false
+                openDiagnosticsTab()
+            }
             // The git family runs in the panel — see requestGitPanelCommand.
             WorkspaceCommand.GitFetch ->
                 if (!requestGitPanelCommand(GitPanelCommand.Fetch)) return false
@@ -940,6 +974,41 @@ fun WorkspaceScreen(
             dockTookWorkArea?.let(docks::closeDock)
             terminalFocused = false
             rootFocus.requestFocus()
+        }
+    }
+
+    /**
+     * A diagnostics row: open its file and put the caret on the problem,
+     * exactly as a search hit is opened. A diagnostic in a file outside the
+     * project keeps an absolute path the opener cannot resolve; [openFile]
+     * fails it quietly, which matches what go-to-definition does with the
+     * same paths.
+     */
+    fun openDiagnostic(path: String, diagnostic: Diagnostic) {
+        val open = project ?: return
+        openFile(open, path) { file -> file.editor?.revealDiagnosticTarget(diagnostic) }
+        if (dockTookWorkArea != null) {
+            dockTookWorkArea?.let(docks::closeDock)
+            terminalFocused = false
+            rootFocus.requestFocus()
+        }
+    }
+
+    /**
+     * A workspace edit — a rename, a quick fix, a formatting — landed
+     * engine-side, and the receipt names every file it touched. The engine
+     * changed those buffers *underneath* their editors, so each open one is
+     * resynced ([EditorState.noteExternalEdit]), and every tab's dirty dot
+     * re-read: an applied edit makes clean buffers dirty.
+     */
+    fun resyncAfterWorkspaceEdit(receipt: EditReceipt) {
+        if (receipt.files.isEmpty()) return
+        for (tab in files.tabs) {
+            val id = tab.session?.id
+            if (id != null && receipt.files.any { it.bufferId == id }) {
+                tab.editor?.noteExternalEdit()
+            }
+            tab.refreshStatus()
         }
     }
 
@@ -1340,6 +1409,8 @@ fun WorkspaceScreen(
                                     isPreviewOpen = docks.isOpen(WorkspacePanel.Preview, settings),
                                     onTogglePreview = { runCommand(WorkspaceCommand.TogglePreview) },
                                     diffProject = project,
+                                    diagnosticsFocus = diagnosticsFocus,
+                                    onOpenDiagnostic = ::openDiagnostic,
                                     onOpenPath = { path -> project?.let { openFile(it, path) } },
                                     onOpenCommit = ::openCommitDiff,
                                     softWrap = settings.softWrap,
@@ -1365,6 +1436,8 @@ fun WorkspaceScreen(
                                             }
                                         }
                                     },
+                                    onWorkspaceEditApplied = ::resyncAfterWorkspaceEdit,
+                                    onRenameSymbol = { overlays.renameOpen = true },
                                     modifier = Modifier.weight(1f),
                                 )
                             }
@@ -1449,6 +1522,22 @@ fun WorkspaceScreen(
                         modifier = Modifier.align(Alignment.TopCenter),
                     )
                 }
+                // Gated like go-to-line, and placed where it is: a rename is
+                // about the caret's symbol, which a full-screen panel hides.
+                val renameEditor = active?.editor
+                if (overlays.renameOpen && renameEditor != null &&
+                    plan.fullScreen == null && !terminalIsFullScreen
+                ) {
+                    RenameSymbol(
+                        editor = renameEditor,
+                        onApplied = ::resyncAfterWorkspaceEdit,
+                        onDismiss = {
+                            overlays.renameOpen = false
+                            rootFocus.requestFocus()
+                        },
+                        modifier = Modifier.align(Alignment.TopCenter),
+                    )
+                }
                 // Gated like go-to-line: previewing moves the caret, which is
                 // pointless — and invisible — behind a full-screen panel.
                 val outlineEditor = active?.editor
@@ -1521,10 +1610,11 @@ fun WorkspaceScreen(
                     )
                 }
             // One counter for everything this project's servers have said.
-            // Polling it is also what *starts* a server for a file that was
-            // open before its project, or before `apt install` put the binary
-            // in the userland — so it runs whenever a project is open, not
-            // only when the status bar has something to show.
+            // Polling it is also what *starts* servers — for the languages
+            // the scanned tree holds, tabs or no tabs, and for a file that
+            // was open before its project or before `apt install` put the
+            // binary in the userland — so it runs whenever a project is
+            // open, not only when the status bar has something to show.
             val lsp = rememberLspState(project?.id)
             StatusBar(
                 cursorRow = active?.editor?.cursorRow ?: 0,
@@ -1547,6 +1637,11 @@ fun WorkspaceScreen(
                 servers = lsp.servers,
                 cursorDiagnostic = active?.editor?.diagnosticAtCursor(),
                 onGoToDiagnostic = active?.editor?.let { it::goToNextDiagnostic },
+                onOpenDiagnostics = if (project != null) {
+                    { runCommand(WorkspaceCommand.OpenDiagnostics) }
+                } else {
+                    null
+                },
                 onInstallServer = { server: LspServer ->
                     // The grammar the server is actually registered against
                     // beats the table's first one: clangd opened from a .cpp
@@ -1882,6 +1977,10 @@ private fun EditorArea(
     onTogglePreview: () -> Unit,
     /** For a diff tab, which needs the project rather than a buffer. */
     diffProject: ProjectSession?,
+    /** Bumped when the diagnostics tab opens, to hand it the keyboard. */
+    diagnosticsFocus: Int,
+    /** A diagnostics row opening its file with the caret on the problem. */
+    onOpenDiagnostic: (String, Diagnostic) -> Unit,
     onOpenPath: (String) -> Unit,
     /** The graph asking for a commit's diff tab, whole or one file of it. */
     onOpenCommit: (sha: String, subject: String, path: String?) -> Unit,
@@ -1893,6 +1992,10 @@ private fun EditorArea(
      * on the target — the same shape as a project-search hit.
      */
     onOpenDefinition: (DefinitionTarget) -> Unit,
+    /** A workspace edit landed; the workspace resyncs every editor it names. */
+    onWorkspaceEditApplied: (EditReceipt) -> Unit,
+    /** Raise the rename dialog over the active editor. */
+    onRenameSymbol: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val active = files.active
@@ -1975,11 +2078,25 @@ private fun EditorArea(
                 softWrap = softWrap,
                 showInlineBlame = showInlineBlame,
                 onOpenDefinition = onOpenDefinition,
+                onWorkspaceEditApplied = onWorkspaceEditApplied,
+                onRenameSymbol = onRenameSymbol,
             )
         } else if (active.graph && diffProject != null) {
             GitGraphPane(
                 project = diffProject,
                 onOpenCommit = onOpenCommit,
+                modifier = Modifier.weight(1f),
+            )
+        } else if (active.diagnostics && diffProject != null) {
+            DiagnosticsPane(
+                project = diffProject,
+                focusToken = diagnosticsFocus,
+                onOpenDiagnostic = onOpenDiagnostic,
+                // The toolbar's close closes the tab, exactly as the strip's
+                // own button would.
+                onDismiss = {
+                    files.indexOfPath(active.path).takeIf { it >= 0 }?.let(files::close)
+                },
                 modifier = Modifier.weight(1f),
             )
         } else if (active.diff != null && diffProject != null) {

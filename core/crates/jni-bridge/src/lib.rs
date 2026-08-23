@@ -1839,9 +1839,12 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferText(
 /// diagnostics for any of its files, and the servers' own state. 0 until
 /// something has. Poll it exactly like `projectVersion`.
 ///
-/// Polling also schedules server startup for files that were already open when
-/// the userland arrived — `apt install clangd` in the terminal while the editor
-/// is running. It never waits for a server.
+/// Polling is also what *starts* servers, and opening the folder is reason
+/// enough: the scanned tree's languages start their servers with no tab open
+/// at all, so a workspace-wide analysis (rust-analyzer's cargo check) runs
+/// from the moment the project is up. The same poll covers files that were
+/// open before the userland arrived — `apt install clangd` in the terminal
+/// while the editor is running. It never waits for a server.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspVersion(
     _env: JNIEnv,
@@ -1852,11 +1855,13 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspVersion(
 }
 
 /// What each of the project's servers is doing, as a JSON array of
-/// `{name, state, error, languages}`. `state` is `starting`, `running` or
-/// `unavailable`; `error` carries the server's own last line of stderr when it
-/// could not be started, which is usually "command not found" and is the user's
-/// cue to install it. Versioned by `lspVersion`. Never blocks, never null,
-/// `[]` when there is nothing running.
+/// `{name, state, error, languages, progress}`. `state` is `starting`,
+/// `running` or `unavailable`; `error` carries the server's own last line of
+/// stderr when it could not be started, which is usually "command not found"
+/// and is the user's cue to install it; `progress` is the server's own
+/// one-line `$/progress` report ("indexing (45%)") or null while it is quiet.
+/// Versioned by `lspVersion`. Never blocks, never null, `[]` when there is
+/// nothing running.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspServers(
     env: JNIEnv,
@@ -1891,6 +1896,30 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspDiagnostics
     let diagnostics = engine().lsp_diagnostics(project_id as u64);
     let json = serde_json::to_string(&diagnostics).unwrap_or_else(|err| {
         log::warn!("lspDiagnostics failed to serialize: {err}");
+        "{}".to_owned()
+    });
+    to_jstring(&env, json)
+}
+
+/// Every diagnostic in the project, messages included, as JSON:
+/// `{version, files: [{path, rows: [{row, col_utf16, end_row, end_col_utf16,
+/// severity, message, source, code}]}]}`. Paths are spelled as
+/// `lspDiagnostics` spells them; rows as `bufferDiagnostics` spells them,
+/// sorted by position. Versioned by `lspVersion`, like the counts.
+///
+/// This is the diagnostics *panel's* read and it serializes every message in
+/// the project — poll `lspVersion` and call this only when the counter moves
+/// and the panel is actually showing. The status bar keeps to
+/// `lspDiagnostics`. Never blocks, never null.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspDiagnosticRows(
+    env: JNIEnv,
+    _class: JClass,
+    project_id: jlong,
+) -> jstring {
+    let diagnostics = engine().lsp_diagnostic_rows(project_id as u64);
+    let json = serde_json::to_string(&diagnostics).unwrap_or_else(|err| {
+        log::warn!("lspDiagnosticRows failed to serialize: {err}");
         "{}".to_owned()
     });
     to_jstring(&env, json)
@@ -1994,6 +2023,115 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspRequestDefi
     engine().lsp_request_definition(buffer_id as u64, row, col) as jlong
 }
 
+/// Everywhere the symbol under the caret is used, declaration included. Same
+/// contract as `lspRequestCompletion`; the payload is
+/// `{targets: [{path, row, col_utf16, end_row, end_col_utf16, line_text}]}` —
+/// definition's targets, each with the trimmed text of its line when it could
+/// be read.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspRequestReferences(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+    row: jlong,
+    col_utf16: jlong,
+) -> jlong {
+    let (row, col) = caret(row, col_utf16);
+    engine().lsp_request_references(buffer_id as u64, row, col) as jlong
+}
+
+/// The code actions available at a caret — quick fixes for the diagnostics
+/// under it, refactorings otherwise. Same polling contract as
+/// `lspRequestCompletion`; the payload is
+/// `{actions: [{index, title, kind, is_preferred, disabled}]}`, where
+/// `disabled` is null for an action that can run and a sentence when it
+/// cannot. The actions themselves stay in the engine, keyed by `index`, for
+/// `lspRequestCodeActionApply` — so keep this request alive (do not cancel
+/// it) until the pick is made.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspRequestCodeActions(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+    row: jlong,
+    col_utf16: jlong,
+) -> jlong {
+    let (row, col) = caret(row, col_utf16);
+    engine().lsp_request_code_actions(buffer_id as u64, row, col) as jlong
+}
+
+/// Pick one action out of a settled `lspRequestCodeActions` answer by its
+/// `index` and ready its edit, resolving through `codeAction/resolve` when
+/// the server sent it lazy. Returns a new request id on the same polling
+/// contract; it settles `done` with `{files, edits, resource_ops}` — or
+/// `{error}` when the server offered no edit — and the edit itself waits for
+/// `lspApplyPendingEdit`. A stale list id or bad index settles `unavailable`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspRequestCodeActionApply(
+    _env: JNIEnv,
+    _class: JClass,
+    request_id: jlong,
+    index: jlong,
+) -> jlong {
+    engine().lsp_request_code_action_apply(request_id as u64, index.max(0) as usize) as jlong
+}
+
+/// Rename the symbol under the caret to `newName`, everywhere the server
+/// knows about. Same polling contract as `lspRequestCompletion`; settles
+/// `done` with `{files, edits, resource_ops}` — or `{error}` when there is
+/// nothing to rename — and **changes nothing** until `lspApplyPendingEdit`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspRequestRename(
+    mut env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+    row: jlong,
+    col_utf16: jlong,
+    new_name: JString,
+) -> jlong {
+    let new_name = get_string(&mut env, &new_name);
+    let (row, col) = caret(row, col_utf16);
+    engine().lsp_request_rename(buffer_id as u64, row, col, &new_name) as jlong
+}
+
+/// Format the whole document with the workspace's tab size. Same polling
+/// contract as `lspRequestCompletion`; settles `done` with
+/// `{files, edits, resource_ops}` — zero edits is a well-formatted file —
+/// and applies nothing until `lspApplyPendingEdit`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspRequestFormatting(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_id: jlong,
+) -> jlong {
+    engine().lsp_request_formatting(buffer_id as u64) as jlong
+}
+
+/// Land the edit a settled rename, formatting or code-action-apply request is
+/// holding, and say what was touched:
+/// `{applied, error, files: [{path, buffer_id, edits}]}`.
+///
+/// Open buffers take the edits through the normal edit path — `didChange`,
+/// undo history and version bumps included — and files nobody has open are
+/// rewritten atomically on disk. `path` is absolute and canonical: match it
+/// against open tabs, and **refresh the editor of every file whose
+/// `buffer_id` is not null** — the engine changed those buffers underneath
+/// the UI. The edit is taken: a second call reports "nothing to apply".
+/// Blocking, like `saveBuffer`; call it off the main thread.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspApplyPendingEdit(
+    env: JNIEnv,
+    _class: JClass,
+    request_id: jlong,
+) -> jstring {
+    let receipt = engine().lsp_apply_pending_edit(request_id as u64);
+    let json = serde_json::to_string(&receipt).unwrap_or_else(|err| {
+        log::warn!("lspApplyPendingEdit failed to serialize: {err}");
+        "{}".to_owned()
+    });
+    to_jstring(&env, json)
+}
+
 /// Generation counter for a request: 1 while it is in flight, 2 once it has
 /// settled, 0 for an id the engine has forgotten (superseded, cancelled, or its
 /// buffer closed). Poll it like `projectSearchVersion`.
@@ -2010,7 +2148,9 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspRequestVers
 /// `{id, kind, state, version, buffer_id, row, col_utf16, buffer_version,
 /// payload}`.
 ///
-/// `kind` is `completion`, `hover` or `definition`. `state` is `pending`,
+/// `kind` is `completion`, `hover`, `definition`, `references`,
+/// `code_action`, `code_action_apply`, `rename` or `formatting`. `state` is
+/// `pending`,
 /// `done`, `timeout`, `unavailable` or `cancelled` — `done` with an empty
 /// payload is a real answer ("no completions here"), the other three are not,
 /// and a UI should not cache them. `row`, `col_utf16` and `buffer_version` echo
@@ -2031,6 +2171,12 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspRequestVers
 /// * `definition` — `{targets: [{path, row, col_utf16, end_row,
 ///   end_col_utf16}]}`. `path` is absolute and openable with `openFile`;
 ///   targets in URIs that are not files are dropped rather than handed over.
+/// * `references` — definition's shape plus `line_text` per target.
+/// * `code_action` — `{actions: [{index, title, kind, is_preferred,
+///   disabled}]}`; see `lspRequestCodeActions`.
+/// * `code_action_apply`, `rename`, `formatting` — `{files, edits,
+///   resource_ops}` when an edit is waiting for `lspApplyPendingEdit`, or
+///   `{error}` when the server had nothing to offer.
 ///
 /// Never null. A forgotten id reports itself `cancelled` with a null payload;
 /// every other field of that answer is a placeholder, `kind` included — the

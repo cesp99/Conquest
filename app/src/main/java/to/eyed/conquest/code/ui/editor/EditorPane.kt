@@ -261,6 +261,19 @@ fun EditorPane(
      * anything outside it.
      */
     onOpenDefinition: ((DefinitionTarget) -> Unit)? = null,
+    /**
+     * A workspace edit landed — a quick fix, a formatting — and the receipt
+     * names every file the engine changed underneath the UI. The workspace
+     * resyncs the editors it holds for them ([EditorState.noteExternalEdit]),
+     * this pane's own included. Null leaves the apply features off, which is
+     * the host tests' state.
+     */
+    onWorkspaceEditApplied: ((EditReceipt) -> Unit)? = null,
+    /**
+     * Raise the rename dialog — the workspace's, because the edit lands in
+     * files this pane cannot open. Null leaves `F2` unclaimed.
+     */
+    onRenameSymbol: (() -> Unit)? = null,
 ) {
     val theme = LocalZedTheme.current
     val settings = LocalAppSettings.current
@@ -356,6 +369,11 @@ fun EditorPane(
     val menu = rememberCompletionMenu(state)
     val hover = rememberHoverCard(state)
     val definition = rememberDefinition(state) { target -> onOpenDefinition?.invoke(target) }
+    val references = rememberReferences(state) { target -> onOpenDefinition?.invoke(target) }
+    val codeActions = rememberCodeActions(state) { receipt ->
+        onWorkspaceEditApplied?.invoke(receipt)
+    }
+    val format = rememberFormat(state) { receipt -> onWorkspaceEditApplied?.invoke(receipt) }
     // A long press that finds nothing to say was an ordinary long press, and
     // an ordinary long press ends with the clipboard toolbar.
     hover.onNothingToSay = { actions.showToolbar() }
@@ -383,7 +401,19 @@ fun EditorPane(
                 .focusRequester(focusRequester)
                 .editorTextInput(state)
                 .onKeyEvent { event ->
-                    handleEditorKey(state, actions, menu, hover, definition, event, onSave)
+                    handleEditorKey(
+                        state = state,
+                        actions = actions,
+                        menu = menu,
+                        hover = hover,
+                        definition = definition,
+                        references = references,
+                        codeActions = codeActions,
+                        format = format,
+                        event = event,
+                        onSave = onSave,
+                        onRenameSymbol = onRenameSymbol,
+                    )
                 }
                 .focusable()
                 // The scrollbar is a real handle, not a picture: a drag on it
@@ -1317,6 +1347,10 @@ fun EditorPane(
         EditorActionRow(
             state = state,
             menu = menu,
+            codeActions = codeActions,
+            references = references,
+            format = format,
+            onRenameSymbol = onRenameSymbol,
             paneCoordinates = paneCoordinates,
             onActed = { focusRequester.requestFocus() },
             modifier = Modifier.align(Alignment.BottomStart),
@@ -1328,6 +1362,8 @@ fun EditorPane(
             menu = menu,
             hover = hover,
             definition = definition,
+            references = references,
+            codeActions = codeActions,
             layoutCache = layoutCache,
             paneCoordinates = paneCoordinates,
             onActed = { focusRequester.requestFocus() },
@@ -1383,11 +1419,15 @@ private fun EditorPopups(
     menu: CompletionMenuState,
     hover: HoverCardState,
     definition: DefinitionState,
+    references: ReferencesState,
+    codeActions: CodeActionsState,
     layoutCache: TextLayoutCache,
     paneCoordinates: LayoutCoordinates?,
     onActed: () -> Unit,
 ) {
-    if (!menu.isOpen && !hover.isShowing) return
+    if (!menu.isOpen && !hover.isShowing && !references.isShowing && !codeActions.isShowing) {
+        return
+    }
     val coordinates = paneCoordinates?.takeIf { it.isAttached } ?: return
     val paneHeight = coordinates.size.height.toFloat()
     val paneWidth = coordinates.size.width.toFloat()
@@ -1437,6 +1477,36 @@ private fun EditorPopups(
                 val restoreToolbar = hover.onNothingToSay
                 hover.clear()
                 if (byTouch) restoreToolbar?.invoke()
+                onActed()
+            },
+        )
+    }
+    if (references.isShowing) {
+        val anchor = anchorPx(state, layoutCache, references.row, references.col)
+        ReferencesPopup(
+            references = references,
+            anchorX = anchor.x,
+            anchorTop = anchor.y,
+            lineHeight = state.lineHeightPx,
+            areaWidth = paneWidth,
+            areaBottom = areaBottom,
+            onDismiss = {
+                references.clear()
+                onActed()
+            },
+        )
+    }
+    if (codeActions.isShowing) {
+        val anchor = anchorPx(state, layoutCache, codeActions.row, codeActions.col)
+        CodeActionsPopup(
+            actions = codeActions,
+            anchorX = anchor.x,
+            anchorTop = anchor.y,
+            lineHeight = state.lineHeightPx,
+            areaWidth = paneWidth,
+            areaBottom = areaBottom,
+            onDismiss = {
+                codeActions.dismiss()
                 onActed()
             },
         )
@@ -1512,6 +1582,10 @@ private fun imeOverlapPx(paneCoordinates: LayoutCoordinates?): Float {
 private fun EditorActionRow(
     state: EditorState,
     menu: CompletionMenuState,
+    codeActions: CodeActionsState,
+    references: ReferencesState,
+    format: FormatState,
+    onRenameSymbol: (() -> Unit)?,
     paneCoordinates: LayoutCoordinates?,
     onActed: () -> Unit,
     modifier: Modifier = Modifier,
@@ -1550,6 +1624,14 @@ private fun EditorActionRow(
         // route to asking for completions on a phone is this key. The menu it
         // opens is then worked by touch: tap a row to accept it.
         ActionKey("suggest", act { menu.showCompletions() })
+        // The workspace-edit family: Zed's `ctrl-.`, `f2`, `shift-f12` and
+        // `ctrl-shift-i`, which a soft keyboard cannot say at all.
+        ActionKey("fix", act { codeActions.invokeAtCaret() })
+        if (onRenameSymbol != null) {
+            ActionKey("rename", act { onRenameSymbol() })
+        }
+        ActionKey("refs", act { references.findAtCaret() })
+        ActionKey("format", act { format.format() })
         ActionKey("undo", act { state.undo() })
         ActionKey("redo", act { state.redo() })
         ActionKey("＋cur↑", act { state.addCaretVertically(-1) })
@@ -1770,8 +1852,12 @@ private fun handleEditorKey(
     menu: CompletionMenuState,
     hover: HoverCardState,
     definition: DefinitionState,
+    references: ReferencesState,
+    codeActions: CodeActionsState,
+    format: FormatState,
     event: KeyEvent,
     onSave: (() -> Unit)?,
+    onRenameSymbol: (() -> Unit)?,
 ): Boolean {
     if (event.type != KeyEventType.KeyDown) return false
     val ctrl = event.isCtrlPressed
@@ -1893,6 +1979,17 @@ private fun handleEditorKey(
                 shift
             }
             Key.Slash -> state.toggleComment()
+            // Zed's `editor::ToggleCodeActions` (default-linux.json's
+            // `ctrl-.`). Always handled, like F12: the answer arrives later.
+            Key.Period -> {
+                codeActions.invokeAtCaret()
+                true
+            }
+            // Zed's `editor::Format`, on its Linux chord `ctrl-shift-i`.
+            Key.I -> {
+                if (shift) format.format()
+                shift
+            }
             // Zed's fold pair: `ctrl-{` is ctrl-shift-[ on the keyboards
             // that reach this handler, and `ctrl-}` its twin
             // (editor::Fold / editor::UnfoldLines,
@@ -1935,17 +2032,28 @@ private fun handleEditorKey(
         // whatever the platform wants it to mean in a file with no
         // diagnostics, rather than silently eating it.
         Key.F8 -> state.goToDiagnostic(forward = !shift)
-        // Zed's `editor::GoToDefinition` (default-linux.json:566). Always
-        // handled: the answer arrives later, and reporting the key unhandled
-        // would leave it free to mean something else while the request is out.
+        // Zed's `editor::GoToDefinition` (default-linux.json:566), and its
+        // `editor::FindAllReferences` on the shifted twin. Always handled:
+        // the answer arrives later, and reporting the key unhandled would
+        // leave it free to mean something else while the request is out.
         Key.F12 -> {
-            definition.goToCaret()
+            if (shift) references.findAtCaret() else definition.goToCaret()
             true
         }
-        // A hover card is the first thing Escape gives up, before the extra
-        // carets and the selection — it is the newest thing on screen, and
-        // Zed's Cancel works the same way outwards.
-        Key.Escape -> hover.clear() || state.cancel()
+        // Zed's `editor::Rename` (`f2`). Claimed only where the workspace
+        // gave the dialog to raise.
+        Key.F2 -> {
+            onRenameSymbol?.invoke()
+            onRenameSymbol != null
+        }
+        // The popups are the first things Escape gives up, before the extra
+        // carets and the selection — newest thing on screen first, and Zed's
+        // Cancel works the same way outwards.
+        Key.Escape -> {
+            val hadReferences = references.isShowing
+            references.clear()
+            hadReferences || codeActions.dismiss() || hover.clear() || state.cancel()
+        }
         Key.Backspace -> {
             state.backspace()
             true

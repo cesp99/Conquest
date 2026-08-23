@@ -241,31 +241,39 @@ class BufferDiagnostics(
                 if (version == 0L) return EMPTY
                 val bufferVersion =
                     if (root.isNull("buffer_version")) null else root.optLong("buffer_version")
-                val array = root.optJSONArray("rows")
-                val rows = ArrayList<Diagnostic>(array?.length() ?: 0)
-                for (i in 0 until (array?.length() ?: 0)) {
-                    val entry = array!!.optJSONObject(i) ?: continue
-                    val startRow = entry.optInt("row", 0)
-                    val startCol = entry.optInt("col_utf16", 0)
-                    rows.add(
-                        Diagnostic(
-                            row = startRow,
-                            colUtf16 = startCol,
-                            endRow = entry.optInt("end_row", startRow),
-                            endColUtf16 = entry.optInt("end_col_utf16", startCol),
-                            severity = DiagnosticSeverity.from(entry.stringOrNull("severity")),
-                            message = entry.optString("message", ""),
-                            source = entry.stringOrNull("source"),
-                            code = entry.stringOrNull("code"),
-                        )
-                    )
-                }
-                BufferDiagnostics(version, bufferVersion, rows)
+                BufferDiagnostics(version, bufferVersion, parseRows(root.optJSONArray("rows")))
             } catch (_: org.json.JSONException) {
                 EMPTY
             }
         }
     }
+}
+
+/**
+ * The rows of one file, in the shape both `bufferDiagnostics` and
+ * `lspDiagnosticRows` publish them. Skips what it cannot read rather than
+ * throwing — the callers' contract.
+ */
+private fun parseRows(array: org.json.JSONArray?): List<Diagnostic> {
+    val rows = ArrayList<Diagnostic>(array?.length() ?: 0)
+    for (i in 0 until (array?.length() ?: 0)) {
+        val entry = array!!.optJSONObject(i) ?: continue
+        val startRow = entry.optInt("row", 0)
+        val startCol = entry.optInt("col_utf16", 0)
+        rows.add(
+            Diagnostic(
+                row = startRow,
+                colUtf16 = startCol,
+                endRow = entry.optInt("end_row", startRow),
+                endColUtf16 = entry.optInt("end_col_utf16", startCol),
+                severity = DiagnosticSeverity.from(entry.stringOrNull("severity")),
+                message = entry.optString("message", ""),
+                source = entry.stringOrNull("source"),
+                code = entry.stringOrNull("code"),
+            )
+        )
+    }
+    return rows
 }
 
 /** (row, col) is inside this diagnostic, both ends included. */
@@ -374,6 +382,74 @@ data class DiagnosticSummary(
     }
 }
 
+/** One file's diagnostics, messages included, as `lspDiagnosticRows` lists it. */
+data class FileDiagnosticRows(
+    /** Spelled exactly as [FileDiagnostics.path] is. */
+    val path: String,
+    /** Sorted by position, like a buffer's rows. */
+    val rows: List<Diagnostic>,
+)
+
+/**
+ * Every diagnostic a project's servers have published, messages and all —
+ * what the diagnostics panel lists, where [DiagnosticSummary] only counts.
+ * Read only while the panel is showing: the payload is every message in the
+ * project, which is why the status bar keeps to the counts.
+ */
+data class ProjectDiagnosticRows(
+    val version: Long,
+    /** Files with at least one diagnostic, sorted by path. */
+    val files: List<FileDiagnosticRows>,
+) {
+    companion object {
+        val EMPTY = ProjectDiagnosticRows(0L, emptyList())
+
+        /** Parse what `lspDiagnosticRows` returned. Never throws. */
+        fun parse(json: String?): ProjectDiagnosticRows {
+            if (json.isNullOrEmpty()) return EMPTY
+            return try {
+                val root = JSONObject(json)
+                val array = root.optJSONArray("files")
+                val files = ArrayList<FileDiagnosticRows>(array?.length() ?: 0)
+                for (i in 0 until (array?.length() ?: 0)) {
+                    val entry = array!!.optJSONObject(i) ?: continue
+                    files.add(
+                        FileDiagnosticRows(
+                            path = entry.optString("path", ""),
+                            rows = parseRows(entry.optJSONArray("rows")),
+                        )
+                    )
+                }
+                ProjectDiagnosticRows(version = root.optLong("version", 0L), files = files)
+            } catch (_: org.json.JSONException) {
+                EMPTY
+            }
+        }
+    }
+}
+
+/**
+ * Poll a project's full diagnostic rows, for as long as the caller is
+ * composed — which must be only while the diagnostics panel is showing: this
+ * read serializes every message in the project on each move of the counter.
+ * The counter is [CoreBridge.lspVersion], the same one [rememberLspState]
+ * polls, so the panel and the status bar agree on when something changed.
+ */
+@Composable
+fun rememberProjectDiagnostics(projectId: Long?): ProjectDiagnosticRows {
+    var state by remember(projectId) { mutableStateOf(ProjectDiagnosticRows.EMPTY) }
+    ResumedEffect(projectId) {
+        if (projectId == null || projectId < 0) return@ResumedEffect
+        pollVersion(
+            intervalMs = PROJECT_POLL_MILLIS,
+            version = { CoreBridge.lspVersion(projectId) },
+            read = { ProjectDiagnosticRows.parse(CoreBridge.lspDiagnosticRows(projectId)) },
+            apply = { state = it },
+        )
+    }
+    return state
+}
+
 /** What the engine says one server is doing. */
 enum class LspServerState { Starting, Running, Unavailable }
 
@@ -385,6 +461,12 @@ data class LspServer(
     val error: String?,
     /** Grammar names, sorted, of the buffers currently registered with it. */
     val languages: List<String>,
+    /**
+     * What the server says it is doing right now — rust-analyzer's
+     * "indexing (45%)" — or null while it is quiet. One line; the engine
+     * already picked which token to show.
+     */
+    val progress: String? = null,
 ) {
     /**
      * What to tell the user about a server that is not running, in words —
@@ -443,6 +525,7 @@ fun parseLspServers(json: String?): List<LspServer> {
                     languages = (0 until (languages?.length() ?: 0)).mapNotNull {
                         languages?.optString(it)?.takeIf(String::isNotEmpty)
                     },
+                    progress = entry.stringOrNull("progress"),
                 )
             )
         }

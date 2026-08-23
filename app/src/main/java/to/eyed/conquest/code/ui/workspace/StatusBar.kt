@@ -43,6 +43,7 @@ import to.eyed.conquest.code.R
 import to.eyed.conquest.code.ui.editor.Diagnostic
 import to.eyed.conquest.code.ui.editor.DiagnosticSummary
 import to.eyed.conquest.code.ui.editor.LspServer
+import to.eyed.conquest.code.ui.editor.LspServerState
 import to.eyed.conquest.code.ui.theme.LocalUiFontSize
 import to.eyed.conquest.code.ui.theme.LocalZedTheme
 import to.eyed.conquest.code.ui.theme.ZedRadius
@@ -171,6 +172,11 @@ fun StatusBar(
     /** Go to the next diagnostic in the active editor — Zed's button action. */
     onGoToDiagnostic: (() -> Unit)? = null,
     /**
+     * Open the diagnostics panel — what tapping the summary does, exactly as
+     * Zed's indicator deploys its project-diagnostics editor (items.rs:53-56).
+     */
+    onOpenDiagnostics: (() -> Unit)? = null,
+    /**
      * Install the server that could not start. Null where there is no
      * userland to install into, which leaves the note as plain text rather
      * than a button that cannot work.
@@ -203,9 +209,32 @@ fun StatusBar(
                     ?.takeIf { blocked.installable }
                     ?.let { install -> { install(blocked) } },
             )
+        } else {
+            // What a working server is up to, in the note's slot — never
+            // beside the note, because a server that could not start reports
+            // no progress and the broken one is the more urgent sentence.
+            // Progress ("indexing (45%)") outranks the spawn-and-initialize
+            // phase ("starting…"), which is what shows the moment a folder
+            // opens and its tooling comes up.
+            val busy = servers.firstOrNull { it.progress != null }
+            val text = when {
+                busy != null -> "${busy.name}: ${busy.progress}"
+                else -> servers.firstOrNull { it.state == LspServerState.Starting }
+                    ?.let { "${it.name} is starting…" }
+            }
+            if (text != null) {
+                Text(
+                    text = text,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = theme.color("text.muted", MaterialTheme.colorScheme.onSurfaceVariant),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = ItemGap),
+                )
+            }
         }
         if (diagnostics != null) {
-            DiagnosticIndicator(summary = diagnostics, onClick = onGoToDiagnostic)
+            DiagnosticIndicator(summary = diagnostics, onClick = onOpenDiagnostics)
         }
 
         // The message of the diagnostic under the caret, taking whatever room
@@ -337,9 +366,8 @@ private fun StatusIconAction(
  * check. And each half appears only when its own count is above zero, so a
  * file with warnings and no errors shows one icon, not a zero.
  *
- * Zed's click deploys its project-diagnostics editor, which we do not have
- * yet; ours goes to the next diagnostic in the active file, which is what
- * Zed's *other* diagnostic button does (items.rs:83).
+ * Zed's click deploys its project-diagnostics editor (items.rs:53-56), and
+ * ours opens the diagnostics panel, which is that editor in dock-panel form.
  */
 @Composable
 private fun DiagnosticIndicator(summary: DiagnosticSummary, onClick: (() -> Unit)?) {

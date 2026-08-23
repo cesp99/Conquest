@@ -1073,6 +1073,13 @@ class EditorState private constructor(
     fun goToDiagnosticOnRow(row: Int): Boolean = revealDiagnostic(diagnostics.onRow(row))
 
     /**
+     * Land on [target] wherever it came from — the diagnostics panel hands
+     * over rows read project-wide, which this buffer's own list may not hold
+     * yet. The same clamping and unfolding as every other diagnostic jump.
+     */
+    fun goToDiagnosticTarget(target: Diagnostic): Boolean = revealDiagnostic(target)
+
+    /**
      * Land on a diagnostic the way Zed's `activate_diagnostic` does: unfold
      * anything hiding it *first*, then put a bare caret on its start — not a
      * selection over it, because Zed selects `start..start`
@@ -2353,6 +2360,26 @@ class EditorState private constructor(
             if (++turns >= MAX_SETTLE_TURNS) break
         }
         scrollY = scrollY.coerceIn(0f, maxScrollY)
+    }
+
+    /**
+     * The buffer was edited from below — a workspace edit the engine applied
+     * (a rename, a formatting, a quick fix) — so every cached measurement,
+     * the folds and the carets are suspect. The same resync a history step
+     * needs, made public for the workspace to call on each editor the apply
+     * receipt names.
+     */
+    fun noteExternalEdit() = afterHistoryChange()
+
+    /**
+     * The word under the caret, trimmed — what a rename dialog prefills.
+     * Empty when the caret sits on whitespace or punctuation.
+     */
+    fun wordUnderCaret(): String {
+        val line = line(cursorRow)
+        val (start, end) = wordAround(line, cursorCol)
+        val word = line.substring(start, end).trim()
+        return if (word.any { it.isLetterOrDigit() || it == '_' }) word else ""
     }
 
     private fun afterHistoryChange() {

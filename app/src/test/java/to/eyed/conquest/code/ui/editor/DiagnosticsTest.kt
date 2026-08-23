@@ -335,18 +335,59 @@ class DiagnosticsTest {
         assertEquals(DiagnosticSummary.EMPTY, DiagnosticSummary.parse(null))
     }
 
+    // ---- lspDiagnosticRows ----
+
+    @Test
+    fun parsesTheProjectRows() {
+        val rows = ProjectDiagnosticRows.parse(
+            """
+            {"version":4,"files":[
+              {"path":"src/lib.rs","rows":[
+                {"row":1,"col_utf16":2,"end_row":1,"end_col_utf16":5,
+                 "severity":"hint","message":"unused","source":"clippy","code":null}]},
+              {"path":"src/main.rs","rows":[
+                {"row":3,"col_utf16":4,"end_row":3,"end_col_utf16":7,
+                 "severity":"error","message":"mismatched types",
+                 "source":"rustc","code":"E0308"}]}
+            ]}
+            """.trimIndent()
+        )
+
+        assertEquals(4L, rows.version)
+        assertEquals(2, rows.files.size)
+        assertEquals("src/lib.rs", rows.files[0].path)
+        assertEquals(DiagnosticSeverity.Hint, rows.files[0].rows[0].severity)
+        // org.json's null trap: a JSON null must come back as Kotlin null,
+        // not the string "null" — the same guard the buffer parse has.
+        assertNull(rows.files[0].rows[0].code)
+        val error = rows.files[1].rows[0]
+        assertEquals(3, error.row)
+        assertEquals(4, error.colUtf16)
+        assertEquals("mismatched types", error.message)
+        assertEquals("mismatched types (rustc E0308)", error.label)
+    }
+
+    @Test
+    fun unreadableProjectRowsAreNoRows() {
+        assertEquals(ProjectDiagnosticRows.EMPTY, ProjectDiagnosticRows.parse("["))
+        assertEquals(ProjectDiagnosticRows.EMPTY, ProjectDiagnosticRows.parse(null))
+        assertEquals(ProjectDiagnosticRows.EMPTY, ProjectDiagnosticRows.parse(""))
+    }
+
     // ---- lspServers ----
 
     @Test
     fun parsesTheServerList() {
         val servers = parseLspServers(
-            """[{"name":"clangd","state":"running","error":null,"languages":["c","cpp"]}]"""
+            """[{"name":"clangd","state":"running","error":null,
+                "languages":["c","cpp"],"progress":"indexing (45%)"}]"""
         )
         assertEquals(1, servers.size)
         assertEquals("clangd", servers[0].name)
         assertEquals(LspServerState.Running, servers[0].state)
         assertNull(servers[0].error)
         assertEquals(listOf("c", "cpp"), servers[0].languages)
+        assertEquals("indexing (45%)", servers[0].progress)
         assertNull(servers[0].note)
     }
 

@@ -53,7 +53,7 @@
 //! `unavailable` with a sentence, exactly like one that is not installed, so
 //! there is nothing new for the UI to render and nothing silently missing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -70,7 +70,9 @@ use lsp::{
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncSaveOptions, Uri,
     VersionedTextDocumentIdentifier, WorkDoneProgressParams,
 };
+use path::PathStyle;
 use rope::PointUtf16;
+use util::paths::PathMatcher;
 
 use crate::guest::{self, GuestCommand};
 use crate::project::ProjectId;
@@ -87,6 +89,13 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(4);
 const HOVER_TIMEOUT: Duration = Duration::from_secs(4);
 const DEFINITION_TIMEOUT: Duration = Duration::from_secs(8);
+const REFERENCES_TIMEOUT: Duration = Duration::from_secs(8);
+const CODE_ACTION_TIMEOUT: Duration = Duration::from_secs(8);
+/// Rename walks the same index references does, then writes; formatting can
+/// spawn a formatter binary inside the guest. Both are asked for and waited
+/// on, never raced against typing, so they get the longest deadline.
+const RENAME_TIMEOUT: Duration = Duration::from_secs(15);
+const FORMATTING_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ---------------------------------------------------------------------------
 // The process budget (P5-4)
@@ -422,6 +431,29 @@ pub struct FileDiagnosticCounts {
     pub counts: Counts,
 }
 
+/// Every diagnostic a project's servers have published, messages and all —
+/// what a diagnostics panel lists, where [`ProjectDiagnostics`] only counts.
+///
+/// A separate read rather than rows on [`ProjectDiagnostics`], because that
+/// one is polled twice a second by a status bar that wants four integers; this
+/// one serializes every message in the project and is read only while a panel
+/// is showing them.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ProjectDiagnosticRows {
+    /// The value [`Engine::lsp_version`] returns.
+    pub version: u64,
+    /// Files with at least one diagnostic, sorted by path.
+    pub files: Vec<FileDiagnosticRows>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FileDiagnosticRows {
+    /// Spelled exactly as [`FileDiagnosticCounts::path`] is.
+    pub path: String,
+    /// Sorted by position, like [`BufferDiagnostics::rows`].
+    pub rows: Vec<DiagnosticRow>,
+}
+
 /// What one server in a project is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -441,6 +473,10 @@ pub struct ServerStatus {
     pub error: Option<String>,
     /// The grammars this instance is serving, sorted.
     pub languages: Vec<String>,
+    /// What the server says it is doing right now — rust-analyzer's
+    /// "indexing (45%)" — or null when it is quiet. One line, first token
+    /// wins: the bar has one line of room.
+    pub progress: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +489,16 @@ pub enum RequestKind {
     Completion,
     Hover,
     Definition,
+    References,
+    /// The list of actions at a position. Holds the parsed actions back for
+    /// [`RequestKind::CodeActionApply`] to pick from.
+    CodeAction,
+    /// Resolving one chosen action and readying its edit. Its own kind, not a
+    /// re-use of [`RequestKind::CodeAction`]: applying must not supersede the
+    /// list it is picking from.
+    CodeActionApply,
+    Rename,
+    Formatting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -517,6 +563,36 @@ impl RequestResult {
     }
 }
 
+/// What a settled request holds back from its JSON payload: the parsed
+/// artefacts the *next* step needs. The payload the UI reads is a summary;
+/// a `WorkspaceEdit` crossing the JNI boundary and back would only be
+/// re-parsed into exactly this.
+enum StoredWork {
+    None,
+    /// The actions a [`RequestKind::CodeAction`] answered with, in payload
+    /// order, waiting for [`Engine::lsp_request_code_action_apply`] to pick.
+    Actions(Vec<lsp::CodeActionOrCommand>),
+    /// The edit a rename, a formatting or a resolved code action produced,
+    /// waiting for [`Engine::lsp_apply_pending_edit`].
+    Edit(lsp::WorkspaceEdit),
+}
+
+/// What a request needs beyond its position — gathered on the caller's
+/// thread, carried into [`perform`] by value so the runtime job owns no
+/// borrows.
+enum RequestArgs {
+    None,
+    /// The diagnostics under the position, which is the context
+    /// `textDocument/codeAction` wants — a server offers "fix this" only for
+    /// problems the client says it is looking at.
+    CodeActions { diagnostics: Vec<lsp::Diagnostic> },
+    /// The action [`Engine::lsp_request_code_action_apply`] picked out of the
+    /// list request's [`StoredWork::Actions`].
+    CodeActionApply { action: Box<lsp::CodeActionOrCommand> },
+    Rename { new_name: String },
+    Formatting { tab_size: u32 },
+}
+
 struct Pending {
     id: u64,
     kind: RequestKind,
@@ -525,6 +601,9 @@ struct Pending {
     col_utf16: u32,
     buffer_version: u64,
     answer: Mutex<(RequestState, u64, serde_json::Value)>,
+    /// See [`StoredWork`]. Written before the answer settles, so a reader
+    /// that has seen the settle can trust what it finds here.
+    stored: Mutex<StoredWork>,
 }
 
 impl Pending {
@@ -781,7 +860,7 @@ struct OpenDoc {
 }
 
 /// One server instance for one project.
-struct Slot {
+pub(crate) struct Slot {
     project: ProjectId,
     server: Server,
     state: ServerState,
@@ -802,6 +881,10 @@ struct Slot {
     /// Also, for a slot with no documents left, the moment the last one
     /// closed — which is the same thing, because closing sends `didClose`.
     last_activity: Instant,
+    /// What the server says it is doing, per `$/progress` token — "indexing",
+    /// "cargo check" — while it is doing it. Emptied token by token as the
+    /// `End` reports arrive; the status bar shows whatever is left.
+    progress: HashMap<String, ServerProgress>,
     /// This slot holds no process: it is the *record* of a server the cap
     /// refused, kept so the status bar can say so and so the next poll does
     /// not try again while the budget is still spent.
@@ -825,6 +908,7 @@ impl Slot {
             wants_save: false,
             subscriptions: Vec::new(),
             last_activity: Instant::now(),
+            progress: HashMap::new(),
             capped: false,
         }
     }
@@ -848,11 +932,37 @@ impl Slot {
     }
 }
 
-type SlotMap = HashMap<(ProjectId, &'static str), Slot>;
+/// One `$/progress` token's state, as the server last reported it. Kept as
+/// parts rather than a rendered line, because a `Report` may carry only a
+/// percentage and the title it belongs to arrived in the `Begin`.
+#[derive(Clone)]
+pub(crate) struct ServerProgress {
+    title: String,
+    message: Option<String>,
+    percentage: Option<u32>,
+}
+
+impl ServerProgress {
+    /// "indexing: 3/10 crates (30%)" — the whole of it in one line, which is
+    /// all a status bar has room to say.
+    fn line(&self) -> String {
+        let mut line = self.title.clone();
+        if let Some(message) = &self.message {
+            line.push_str(": ");
+            line.push_str(message);
+        }
+        if let Some(percentage) = self.percentage {
+            line.push_str(&format!(" ({percentage}%)"));
+        }
+        line
+    }
+}
+
+pub(crate) type SlotMap = HashMap<(ProjectId, &'static str), Slot>;
 
 /// The server registry, shared so a runtime job can install the server it
 /// finished starting without holding a borrow on the engine.
-type Slots = Arc<Mutex<SlotMap>>;
+pub(crate) type Slots = Arc<Mutex<SlotMap>>;
 
 type DocMap = HashMap<BufferId, OpenDoc>;
 
@@ -860,6 +970,197 @@ type DocMap = HashMap<BufferId, OpenDoc>;
 /// document registered while its server was still initializing is sent by that
 /// server's own start job.
 type Docs = Arc<Mutex<DocMap>>;
+
+/// The file watchers each server registered through `client/registerCapability`
+/// — rust-analyzer watches `**/Cargo.toml`, gopls watches `**/*.go` — keyed by
+/// the server's own registration id so `client/unregisterCapability` can take
+/// exactly what it names. Shared for the slots' reason: registrations arrive on
+/// the runtime, changes arrive from the worktree's watcher.
+pub(crate) type Watchers =
+    Arc<Mutex<HashMap<(ProjectId, &'static str), HashMap<String, PathMatcher>>>>;
+
+/// Which servers each open project's *tree* calls for — a folder of `.rs`
+/// files wants rust-analyzer whether or not a tab is open — cached against
+/// the project's mirror version so the walk runs when the tree changes, not
+/// on every poll. Shared because the sweep reads it from the background.
+pub(crate) type ProjectWants = Arc<Mutex<HashMap<ProjectId, (u64, Vec<Server>)>>>;
+
+/// The tree-wanted servers the sweep has put to rest. Without this the poll
+/// would restart a swept server on the next frame and the sweep would be a
+/// stutter rather than a budget — the same loop [`OpenDoc::dormant`] breaks
+/// for documents. Cleared by *activity*: a buffer of the language opening,
+/// a save waking the server, the project closing.
+pub(crate) type Rested = Arc<Mutex<HashSet<(ProjectId, &'static str)>>>;
+
+/// Install what one `client/registerCapability` said about watched files.
+///
+/// Anything that is not a watched-files registration is acknowledged and
+/// ignored — dynamic registration of *providers* changes nothing for a client
+/// that consults server capabilities per request. A glob that will not compile
+/// is logged and dropped rather than failing the registration: the server is
+/// entitled to `Ok`, and a watcher we cannot honour is a change notification
+/// the server does not get, which is the state it was in anyway.
+fn register_watchers(
+    watchers: &Watchers,
+    project: ProjectId,
+    server: &'static str,
+    params: &lsp::RegistrationParams,
+) {
+    for registration in &params.registrations {
+        if registration.method != "workspace/didChangeWatchedFiles" {
+            continue;
+        }
+        let Some(options) = registration.register_options.clone() else {
+            continue;
+        };
+        let Ok(options) =
+            serde_json::from_value::<lsp::DidChangeWatchedFilesRegistrationOptions>(options)
+        else {
+            log::warn!("lsp: {server} sent watchers this client cannot read");
+            continue;
+        };
+        let globs: Vec<String> = options
+            .watchers
+            .iter()
+            .map(|watcher| match &watcher.glob_pattern {
+                lsp::GlobPattern::String(pattern) => pattern.clone(),
+                // A relative pattern is a base URI and a glob under it; spelled
+                // out it is the same thing as an absolute string pattern.
+                lsp::GlobPattern::Relative(relative) => {
+                    let base = match &relative.base_uri {
+                        lsp::OneOf::Left(folder) => folder.uri.clone(),
+                        lsp::OneOf::Right(uri) => uri.clone(),
+                    };
+                    match base.to_file_path() {
+                        Ok(base) => format!(
+                            "{}/{}",
+                            base.to_string_lossy().trim_end_matches('/'),
+                            relative.pattern
+                        ),
+                        Err(()) => relative.pattern.clone(),
+                    }
+                }
+            })
+            .collect();
+        match PathMatcher::new(&globs, PathStyle::Unix) {
+            Ok(matcher) => {
+                watchers
+                    .lock()
+                    .unwrap()
+                    .entry((project, server))
+                    .or_default()
+                    .insert(registration.id.clone(), matcher);
+            }
+            Err(err) => log::warn!("lsp: {server} registered an unreadable glob: {err}"),
+        }
+    }
+}
+
+/// The unregister half: remove exactly the registrations the server names.
+fn unregister_watchers(
+    watchers: &Watchers,
+    project: ProjectId,
+    server: &'static str,
+    params: &lsp::UnregistrationParams,
+) {
+    let mut watchers = watchers.lock().unwrap();
+    let Some(registered) = watchers.get_mut(&(project, server)) else {
+        return;
+    };
+    for unregistration in &params.unregisterations {
+        if unregistration.method == "workspace/didChangeWatchedFiles" {
+            registered.remove(&unregistration.id);
+        }
+    }
+}
+
+/// worktree's `PathChange`, in the words LSP's `FileChangeType` has for it —
+/// and `None` for the one that must never be forwarded: `Loaded` is the
+/// initial scan finding a file that was always there, and forwarding it would
+/// hand every server one event per file in the tree at startup.
+pub(crate) fn watched_change_type(change: &worktree::PathChange) -> Option<lsp::FileChangeType> {
+    match change {
+        worktree::PathChange::Added => Some(lsp::FileChangeType::CREATED),
+        worktree::PathChange::Removed => Some(lsp::FileChangeType::DELETED),
+        worktree::PathChange::Updated => Some(lsp::FileChangeType::CHANGED),
+        // The watcher could not tell which; `CHANGED` is the answer a server
+        // treats as "go look", which is the safe reading of not knowing.
+        worktree::PathChange::AddedOrUpdated => Some(lsp::FileChangeType::CHANGED),
+        worktree::PathChange::Loaded => None,
+    }
+}
+
+/// The events each of a project's servers asked to hear about, out of one
+/// batch of disk changes. Pure over the watcher table, which is what makes it
+/// testable without a server on the other end.
+fn collect_watched(
+    watchers: &HashMap<(ProjectId, &'static str), HashMap<String, PathMatcher>>,
+    project: ProjectId,
+    root: &Path,
+    changes: &[(PathBuf, lsp::FileChangeType)],
+) -> Vec<(&'static str, Vec<lsp::FileEvent>)> {
+    watchers
+        .iter()
+        .filter(|((id, _), registered)| *id == project && !registered.is_empty())
+        .filter_map(|((_, server), registered)| {
+            let events: Vec<lsp::FileEvent> = changes
+                .iter()
+                .filter(|(path, _)| {
+                    // Servers spell their globs both ways — gopls's
+                    // `**/*.go` speaks in suffixes, a `RelativePattern` in
+                    // absolute paths — so a change matches on either its
+                    // absolute spelling or its root-relative one.
+                    registered.values().any(|matcher| {
+                        matcher.is_match_std_path(path)
+                            || path
+                                .strip_prefix(root)
+                                .is_ok_and(|relative| matcher.is_match_std_path(relative))
+                    })
+                })
+                .filter_map(|(path, kind)| {
+                    Some(lsp::FileEvent::new(Uri::from_file_path(path).ok()?, *kind))
+                })
+                .collect();
+            (!events.is_empty()).then_some((*server, events))
+        })
+        .collect()
+}
+
+/// Tell every server that registered a matching watcher about a batch of disk
+/// changes — the worktree's subscription calls this, already on the runtime.
+///
+/// The one comparable traffic a server gets without asking, and like
+/// `publishDiagnostics` it is proof of life: the activity clock moves so the
+/// idle sweep does not stop a server mid-reindex.
+pub(crate) fn notify_watched_files(
+    slots: &Slots,
+    watchers: &Watchers,
+    project: ProjectId,
+    root: &Path,
+    changes: &[(PathBuf, lsp::FileChangeType)],
+) {
+    if changes.is_empty() {
+        return;
+    }
+    let interested = collect_watched(&watchers.lock().unwrap(), project, root, changes);
+    for (server, events) in interested {
+        let handle = {
+            let mut slots = slots.lock().unwrap();
+            let Some(slot) = slots.get_mut(&(project, server)) else {
+                continue;
+            };
+            slot.last_activity = Instant::now();
+            slot.handle.clone()
+        };
+        if let Some(handle) = handle {
+            handle
+                .notify::<lsp::notification::DidChangeWatchedFiles>(
+                    lsp::DidChangeWatchedFilesParams { changes: events },
+                )
+                .ok();
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The two decisions the budget comes down to, as functions of nothing but
@@ -916,7 +1217,7 @@ enum Retire {
     Silent,
 }
 
-/// The whole of the idle policy, as a function of three numbers.
+/// The whole of the idle policy, as a function of four values.
 ///
 /// `under_pressure` is a start being refused right now. It only shortens the
 /// no-documents grace, and it shortens it to nothing: that grace exists because
@@ -925,8 +1226,15 @@ enum Retire {
 /// shorten the silence limit — a server with a document open is one the user
 /// may still be reading, and evicting it to start another would mean two
 /// servers each paying a cold index to serve one file apiece.
-fn retire(documents: usize, idle_for: Duration, under_pressure: bool) -> Retire {
-    if documents == 0 {
+///
+/// `tree_wants` is a server the project's own files call for — started at
+/// folder-open, tabs or no tabs. It is judged by the *silence* rule rather
+/// than the no-documents one, because "no tab open" is its normal working
+/// state — except under pressure, where a docless server loses to one
+/// actually serving a tab whatever the tree says: the budget is real and the
+/// tab is the user's stated interest.
+fn retire(documents: usize, tree_wants: bool, idle_for: Duration, under_pressure: bool) -> Retire {
+    if documents == 0 && (!tree_wants || under_pressure) {
         if under_pressure || idle_for >= IDLE_WITHOUT_DOCUMENTS {
             return Retire::NoDocuments;
         }
@@ -953,12 +1261,22 @@ fn sweep(
     slots: &Slots,
     docs: &Docs,
     store: &DiagnosticStore,
+    wants: &ProjectWants,
+    rested: &Rested,
     now: Instant,
     under_pressure: bool,
 ) -> Vec<Slot> {
     let mut stopped: Vec<(ProjectId, Slot)> = Vec::new();
     let mut orphaned: Vec<PathBuf> = Vec::new();
     {
+        let tree_wants: HashSet<(ProjectId, &'static str)> = wants
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(project, (_, servers))| {
+                servers.iter().map(|server| (*project, server.name))
+            })
+            .collect();
         let mut servers = slots.lock().unwrap();
         let mut docs = docs.lock().unwrap();
 
@@ -973,6 +1291,7 @@ fn sweep(
             .filter_map(|(key, slot)| {
                 let verdict = retire(
                     documents.get(key).copied().unwrap_or(0),
+                    tree_wants.contains(key),
                     // Saturating: `now` is passed in so tests can name it, and
                     // a caller naming one before a slot was created should get
                     // "no time has passed", not a panic.
@@ -1002,6 +1321,9 @@ fn sweep(
                 doc.dormant = true;
                 orphaned.push(doc.path.clone());
             }
+            // The tree still wants it; only activity may bring it back, or
+            // the poll would restart it before this sweep's locks are cold.
+            rested.lock().unwrap().insert(key);
             stopped.push((key.0, slot));
         }
     }
@@ -1029,6 +1351,12 @@ pub(crate) struct LspState {
     servers: Slots,
     docs: Docs,
     store: Arc<DiagnosticStore>,
+    /// What each server asked to be told about the disk — see [`Watchers`].
+    watchers: Watchers,
+    /// What each project's tree calls for — see [`ProjectWants`].
+    wants: ProjectWants,
+    /// Tree-wanted servers the sweep stopped — see [`Rested`].
+    rested: Rested,
     requests: Arc<Mutex<Requests>>,
     next_request_id: AtomicU64,
     next_server_id: AtomicU64,
@@ -1154,11 +1482,17 @@ impl crate::Engine {
                 let mut languages = languages.remove(slot.server.name).unwrap_or_default();
                 languages.sort();
                 languages.dedup();
+                let mut tokens: Vec<&String> = slot.progress.keys().collect();
+                tokens.sort();
                 ServerStatus {
                     name: slot.server.name.to_owned(),
                     state: slot.state,
                     error: slot.error.clone(),
                     languages,
+                    progress: tokens
+                        .first()
+                        .and_then(|token| slot.progress.get(*token))
+                        .map(ServerProgress::line),
                 }
             })
             .collect();
@@ -1187,6 +1521,27 @@ impl crate::Engine {
         ProjectDiagnostics {
             version: self.lsp.store.version(project),
             totals,
+            files: rows,
+        }
+    }
+
+    /// Every diagnostic in the project, messages included — the panel's read,
+    /// where [`Engine::lsp_diagnostics`] is the status bar's. Reads a cache;
+    /// never blocks; empty when no server has ever published.
+    pub fn lsp_diagnostic_rows(&self, project: ProjectId) -> ProjectDiagnosticRows {
+        let root = self.project_root(project);
+        let files = self.lsp.store.files.lock().unwrap();
+        let mut rows: Vec<FileDiagnosticRows> = files
+            .iter()
+            .filter(|(_, file)| file.project == project && !file.rows.is_empty())
+            .map(|(path, file)| FileDiagnosticRows {
+                path: relative_path(root.as_deref(), path),
+                rows: (*file.rows).clone(),
+            })
+            .collect();
+        rows.sort_by(|a, b| a.path.cmp(&b.path));
+        ProjectDiagnosticRows {
+            version: self.lsp.store.version(project),
             files: rows,
         }
     }
@@ -1253,6 +1608,268 @@ impl crate::Engine {
         self.start_request(RequestKind::Definition, buffer, row, col_utf16)
     }
 
+    /// Everywhere the symbol under the caret is used, declaration included.
+    /// See [`Engine::lsp_request_completion`] for the contract.
+    pub fn lsp_request_references(&self, buffer: BufferId, row: u32, col_utf16: u32) -> u64 {
+        self.start_request(RequestKind::References, buffer, row, col_utf16)
+    }
+
+    /// The code actions available at a caret — quick fixes for the
+    /// diagnostics under it, refactorings otherwise. The answer is a list of
+    /// titles; the actions themselves stay here, keyed by index, for
+    /// [`Engine::lsp_request_code_action_apply`]. See
+    /// [`Engine::lsp_request_completion`] for the polling contract.
+    pub fn lsp_request_code_actions(&self, buffer: BufferId, row: u32, col_utf16: u32) -> u64 {
+        let diagnostics = self.diagnostics_under(buffer, row);
+        self.start_request_with(
+            RequestKind::CodeAction,
+            buffer,
+            row,
+            col_utf16,
+            RequestArgs::CodeActions { diagnostics },
+        )
+    }
+
+    /// Pick one action out of a settled [`Engine::lsp_request_code_actions`]
+    /// answer and ready its edit — resolving through `codeAction/resolve`
+    /// when the server sent it lazy. Settles `Done` with an edit summary;
+    /// [`Engine::lsp_apply_pending_edit`] then lands it. A stale list id or a
+    /// bad index settles `Unavailable` immediately, on the same one path.
+    pub fn lsp_request_code_action_apply(&self, list: u64, index: usize) -> u64 {
+        let picked = {
+            let requests = self.lsp.requests.lock().unwrap();
+            requests.live.get(&list).and_then(|pending| {
+                let stored = pending.stored.lock().unwrap();
+                match &*stored {
+                    StoredWork::Actions(actions) => actions
+                        .get(index)
+                        .cloned()
+                        .map(|action| (pending.buffer, pending.row, pending.col_utf16, action)),
+                    _ => None,
+                }
+            })
+        };
+        match picked {
+            Some((buffer, row, col_utf16, action)) => self.start_request_with(
+                RequestKind::CodeActionApply,
+                buffer,
+                row,
+                col_utf16,
+                RequestArgs::CodeActionApply {
+                    action: Box::new(action),
+                },
+            ),
+            // Buffer 0 is never a registered document, so this settles
+            // `Unavailable` on the ordinary path rather than inventing one.
+            None => self.start_request(RequestKind::CodeActionApply, 0, 0, 0),
+        }
+    }
+
+    /// Rename the symbol under the caret to [`new_name`], everywhere.
+    /// Settles `Done` with an edit summary and holds the edit for
+    /// [`Engine::lsp_apply_pending_edit`] — nothing is changed until then.
+    pub fn lsp_request_rename(
+        &self,
+        buffer: BufferId,
+        row: u32,
+        col_utf16: u32,
+        new_name: &str,
+    ) -> u64 {
+        self.start_request_with(
+            RequestKind::Rename,
+            buffer,
+            row,
+            col_utf16,
+            RequestArgs::Rename {
+                new_name: new_name.to_owned(),
+            },
+        )
+    }
+
+    /// Format the whole document, with the workspace's own tab size. Settles
+    /// `Done` with an edit summary — zero edits is a well-formatted file —
+    /// and holds the edit for [`Engine::lsp_apply_pending_edit`].
+    pub fn lsp_request_formatting(&self, buffer: BufferId) -> u64 {
+        let tab_size = self.settings().tab_size;
+        self.start_request_with(
+            RequestKind::Formatting,
+            buffer,
+            0,
+            0,
+            RequestArgs::Formatting { tab_size },
+        )
+    }
+
+    /// The diagnostics on a row, in the wire shape `textDocument/codeAction`
+    /// wants back as context. Row-level rather than caret-exact, because a
+    /// finger is not a caret: asking anywhere on the line means the line's
+    /// problems.
+    fn diagnostics_under(&self, buffer: BufferId, row: u32) -> Vec<lsp::Diagnostic> {
+        let Some(path) = self.buffer_path(buffer) else {
+            return Vec::new();
+        };
+        let files = self.lsp.store.files.lock().unwrap();
+        let Some(file) = files.get(&path) else {
+            return Vec::new();
+        };
+        file.rows
+            .iter()
+            .filter(|entry| entry.row <= row && row <= entry.end_row)
+            .map(|entry| lsp::Diagnostic {
+                range: Range::new(
+                    Position::new(entry.row, entry.col_utf16),
+                    Position::new(entry.end_row, entry.end_col_utf16),
+                ),
+                severity: Some(match entry.severity {
+                    Severity::Error => lsp::DiagnosticSeverity::ERROR,
+                    Severity::Warning => lsp::DiagnosticSeverity::WARNING,
+                    Severity::Info => lsp::DiagnosticSeverity::INFORMATION,
+                    Severity::Hint => lsp::DiagnosticSeverity::HINT,
+                }),
+                code: entry.code.clone().map(lsp::NumberOrString::String),
+                source: entry.source.clone(),
+                message: entry.message.clone(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    /// Land the edit a settled rename, formatting or code-action request is
+    /// holding. Synchronous: open buffers take the edits through the normal
+    /// edit path — `didChange`, undo history, version bumps and all — and
+    /// files nobody has open are rewritten atomically on disk.
+    ///
+    /// The edit is *taken*: a second call for the same id reports "nothing to
+    /// apply", which is what stops a double-tap applying a rename twice.
+    pub fn lsp_apply_pending_edit(&self, request: u64) -> ApplyReceipt {
+        let stored = {
+            let requests = self.lsp.requests.lock().unwrap();
+            let Some(pending) = requests.live.get(&request) else {
+                return ApplyReceipt::refused("the request is gone".to_owned());
+            };
+            std::mem::replace(&mut *pending.stored.lock().unwrap(), StoredWork::None)
+        };
+        let StoredWork::Edit(edit) = stored else {
+            return ApplyReceipt::refused("nothing to apply".to_owned());
+        };
+        let files = match normalize_workspace_edit(edit) {
+            Ok(files) => files,
+            Err(error) => return ApplyReceipt::refused(error),
+        };
+
+        // Validate everything before touching anything: a rename applied to
+        // three files and refused on the fourth is worse than one refused
+        // whole.
+        for file in &files {
+            if let Some(buffer) = self.buffer_for_path(&file.path) {
+                if let (Some(sent), Some(current)) = (
+                    file.version,
+                    self.lsp
+                        .docs
+                        .lock()
+                        .unwrap()
+                        .get(&buffer)
+                        .map(|doc| doc.lsp_version),
+                ) {
+                    if sent != current {
+                        return ApplyReceipt::refused(format!(
+                            "{} changed while the server was thinking — try again",
+                            file.path.display()
+                        ));
+                    }
+                }
+            } else if !file.path.exists() {
+                return ApplyReceipt::refused(format!(
+                    "{} is not there to edit",
+                    file.path.display()
+                ));
+            }
+        }
+
+        let mut receipt = ApplyReceipt {
+            applied: true,
+            error: None,
+            files: Vec::new(),
+        };
+        for file in files {
+            let applied = match self.buffer_for_path(&file.path) {
+                Some(buffer) => self
+                    .apply_edits_to_buffer(buffer, &file.edits)
+                    .map(|()| AppliedFile {
+                        path: file.path.to_string_lossy().into_owned(),
+                        buffer_id: Some(buffer),
+                        edits: file.edits.len(),
+                    }),
+                None => std::fs::read_to_string(&file.path)
+                    .map_err(|err| format!("{}: {err}", file.path.display()))
+                    .and_then(|text| {
+                        let text = apply_edits_to_text(&text, &file.edits);
+                        crate::file::write_atomically_io(&file.path, &text)
+                            .map_err(|err| format!("{}: {err}", file.path.display()))
+                    })
+                    .map(|()| AppliedFile {
+                        path: file.path.to_string_lossy().into_owned(),
+                        buffer_id: None,
+                        edits: file.edits.len(),
+                    }),
+            };
+            match applied {
+                Ok(file) => receipt.files.push(file),
+                Err(error) => {
+                    // Stop rather than go on: the receipt says what landed,
+                    // and the error says why the rest did not.
+                    receipt.error = Some(error);
+                    break;
+                }
+            }
+        }
+        receipt
+    }
+
+    /// The open-buffer half of the applier: offsets resolved against one
+    /// snapshot, applied back to front through [`Engine::edit`], bracketed
+    /// into one undo transaction the way a reload is.
+    fn apply_edits_to_buffer(&self, buffer: BufferId, edits: &[lsp::TextEdit]) -> Result<(), String> {
+        let mut resolved: Vec<(usize, usize, String)> = self
+            .with_buffer(buffer, |state| {
+                let rope = state.buffer.as_rope();
+                let offset_of = |position: Position| {
+                    let point = rope.clip_point_utf16(
+                        rope::Unclipped(PointUtf16::new(position.line, position.character)),
+                        text::Bias::Left,
+                    );
+                    rope.point_utf16_to_offset(point)
+                };
+                edits
+                    .iter()
+                    .map(|edit| {
+                        let start = offset_of(edit.range.start);
+                        let end = offset_of(edit.range.end).max(start);
+                        (start, end, edit.new_text.clone())
+                    })
+                    .collect()
+            })
+            .map_err(|err| format!("{err:?}"))?;
+        resolved.sort_by_key(|(start, end, _)| (*start, *end));
+
+        self.finalize_buffer_history(buffer);
+        for (start, end, text) in resolved.into_iter().rev() {
+            self.edit(buffer, start, end, &text)
+                .map_err(|err| format!("{err:?}"))?;
+        }
+        self.finalize_buffer_history(buffer);
+        Ok(())
+    }
+
+    /// Close whatever undo transaction is open on a buffer — the bracketing
+    /// a reload uses, for the same reason: an applied edit is a discrete
+    /// event, and must not merge into the typing before or after it.
+    fn finalize_buffer_history(&self, buffer: BufferId) {
+        if let Ok(state) = self.buffer(buffer) {
+            state.lock().unwrap().buffer.finalize_last_transaction();
+        }
+    }
+
     /// Generation counter for a request: 1 while it is in flight, 2 once it has
     /// settled, 0 for an id the engine has forgotten. Poll it like
     /// `project_search_version`.
@@ -1316,6 +1933,9 @@ impl crate::Engine {
             log::debug!("lsp: {} is not a file URI", path.display());
             return;
         };
+        // Opening a buffer of the language is exactly the activity that ends
+        // a tree-want's rest — see [`Rested`].
+        self.lsp.rested.lock().unwrap().remove(&(project, server.name));
 
         self.lsp.docs.lock().unwrap().insert(
             buffer,
@@ -1507,6 +2127,17 @@ impl crate::Engine {
             .unwrap()
             .retain(|_, doc| doc.project != project);
         self.lsp.store.forget_project(project);
+        self.lsp
+            .watchers
+            .lock()
+            .unwrap()
+            .retain(|(id, _), _| *id != project);
+        self.lsp.wants.lock().unwrap().remove(&project);
+        self.lsp
+            .rested
+            .lock()
+            .unwrap()
+            .retain(|(id, _)| *id != project);
         if dropped.is_empty() {
             return;
         }
@@ -1519,6 +2150,12 @@ impl crate::Engine {
     /// [`Engine::edit`] skip building a [`TextChange`] entirely.
     pub(crate) fn lsp_is_live(&self) -> bool {
         self.lsp.live.load(Ordering::Relaxed)
+    }
+
+    /// The pieces the worktree's subscription needs to forward disk changes
+    /// to servers — cloned, so the subscription owns no borrow on the engine.
+    pub(crate) fn lsp_watch_handles(&self) -> (Slots, Watchers) {
+        (self.lsp.servers.clone(), self.lsp.watchers.clone())
     }
 
     /// Whether some live server negotiated whole-document sync, and therefore
@@ -1632,6 +2269,10 @@ impl crate::Engine {
             root.display()
         );
 
+        // A previous incarnation's watcher registrations died with it; the new
+        // server registers its own, under ids of its own choosing.
+        self.lsp.watchers.lock().unwrap().remove(&(project, server.name));
+
         let started = StartRequest {
             project,
             server,
@@ -1642,6 +2283,7 @@ impl crate::Engine {
             buffers: self.buffers.clone(),
             slots: self.lsp.servers.clone(),
             docs: self.lsp.docs.clone(),
+            watchers: self.lsp.watchers.clone(),
             wants_full_text: self.lsp.wants_full_text.clone(),
         };
         self.runtime().spawn(move |cx| {
@@ -1724,6 +2366,8 @@ impl crate::Engine {
             &self.lsp.servers,
             &self.lsp.docs,
             &self.lsp.store,
+            &self.lsp.wants,
+            &self.lsp.rested,
             Instant::now(),
             under_pressure,
         );
@@ -1750,6 +2394,8 @@ impl crate::Engine {
         let slots = self.lsp.servers.clone();
         let docs = self.lsp.docs.clone();
         let store = self.lsp.store.clone();
+        let wants = self.lsp.wants.clone();
+        let rested = self.lsp.rested.clone();
         self.runtime().spawn(move |cx| {
             let executor = cx.background_executor().clone();
             let ticker = executor.clone();
@@ -1759,7 +2405,15 @@ impl crate::Engine {
                         ticker.timer(SWEEP_INTERVAL).await;
                         // Dropped here, on a background thread: the handshake
                         // wants an executor, and this *is* one.
-                        drop(sweep(&slots, &docs, &store, Instant::now(), false));
+                        drop(sweep(
+                            &slots,
+                            &docs,
+                            &store,
+                            &wants,
+                            &rested,
+                            Instant::now(),
+                            false,
+                        ));
                     }
                 })
                 .detach();
@@ -1785,6 +2439,9 @@ impl crate::Engine {
                 doc.dormant = false;
             }
         }
+        // A wake ends the tree-want's rest too, for the same reason it ends
+        // the documents' dormancy: this is the activity the sweep waits for.
+        self.lsp.rested.lock().unwrap().remove(&(project, server.name));
         log::info!("lsp: waking {} for project {project}", server.name);
         self.ensure_server(project, server);
     }
@@ -1798,8 +2455,11 @@ impl crate::Engine {
         doc.dormant.then_some((doc.project, doc.grammar))
     }
 
-    /// Servers for languages already open in a project that has none yet — the
-    /// `apt install` that happened while the editor was running.
+    /// Servers the project calls for and does not have yet: the languages of
+    /// its open documents, and the languages of its *tree* — opening a folder
+    /// of `.rs` files is what starts rust-analyzer, tabs or no tabs. Also
+    /// how the `apt install` that happened while the editor was running takes
+    /// effect: the poll keeps asking, and one day the binary is there.
     fn start_pending_servers(&self, project: ProjectId) {
         if self.userland().is_none() {
             return;
@@ -1819,7 +2479,7 @@ impl crate::Engine {
             .filter(|(id, _)| *id == project)
             .map(|(_, name)| *name)
             .collect();
-        let wanted: Vec<Server> = self
+        let mut wanted: Vec<Server> = self
             .lsp
             .docs
             .lock()
@@ -1832,9 +2492,75 @@ impl crate::Engine {
             .filter(|doc| doc.project == project && !doc.dormant && !known.contains(&doc.server))
             .filter_map(|doc| server_for(doc.grammar).map(|(server, _)| server))
             .collect();
+        // The tree's wants, minus what the sweep put to rest — rested is the
+        // tree's own dormancy, and only activity clears it. An open document
+        // outranks rested: it is on the docs list above, and `lsp_did_open`
+        // already cleared the flag when it arrived.
+        {
+            let rested = self.lsp.rested.lock().unwrap();
+            for server in self.project_tree_servers(project) {
+                if known.contains(&server.name) || rested.contains(&(project, server.name)) {
+                    continue;
+                }
+                if !wanted.iter().any(|wanted| wanted.name == server.name) {
+                    wanted.push(server);
+                }
+            }
+        }
         for server in wanted {
             self.ensure_server(project, server);
         }
+    }
+
+    /// The servers this project's tree calls for, from the mirrored worktree:
+    /// one walk over the file names when the mirror has moved, the cached
+    /// answer otherwise.
+    ///
+    /// While the initial scan is still running the walk is capped — the
+    /// mirror grows and bumps its version batch by batch, and rewalking an
+    /// unbounded prefix on every bump would make opening a big repository
+    /// O(files²). The cap is plenty to catch a repository's languages early;
+    /// the complete walk happens once, when the scan finishes, and is what
+    /// gets cached.
+    fn project_tree_servers(&self, project: ProjectId) -> Vec<Server> {
+        const EARLY_SCAN_FILES: usize = 2000;
+        let version = self.project_version(project);
+        if version == 0 {
+            return Vec::new();
+        }
+        if let Some((cached, servers)) = self.lsp.wants.lock().unwrap().get(&project) {
+            if *cached == version {
+                return servers.clone();
+            }
+        }
+        let Some(snapshot) = self.project_snapshot(project) else {
+            return Vec::new();
+        };
+        let complete = self.project_scan_complete(project);
+        let mut servers: Vec<Server> = Vec::new();
+        for (walked, entry) in snapshot.files(false, 0).enumerate() {
+            if !complete && walked >= EARLY_SCAN_FILES {
+                break;
+            }
+            let Some(grammar) = crate::highlight::language_for_path(entry.path.as_unix_str())
+            else {
+                continue;
+            };
+            let Some((server, _)) = server_for(grammar) else {
+                continue;
+            };
+            if !servers.iter().any(|known| known.name == server.name) {
+                servers.push(server);
+            }
+        }
+        if complete {
+            self.lsp
+                .wants
+                .lock()
+                .unwrap()
+                .insert(project, (version, servers.clone()));
+        }
+        servers
     }
 
     /// Register file-backed buffers that this project did not have when they
@@ -1870,6 +2596,17 @@ impl crate::Engine {
     }
 
     fn start_request(&self, kind: RequestKind, buffer: BufferId, row: u32, col_utf16: u32) -> u64 {
+        self.start_request_with(kind, buffer, row, col_utf16, RequestArgs::None)
+    }
+
+    fn start_request_with(
+        &self,
+        kind: RequestKind,
+        buffer: BufferId,
+        row: u32,
+        col_utf16: u32,
+        args: RequestArgs,
+    ) -> u64 {
         let id = self.lsp.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
         let buffer_version = self.version(buffer).unwrap_or(0);
         let pending = Arc::new(Pending {
@@ -1880,6 +2617,7 @@ impl crate::Engine {
             col_utf16,
             buffer_version,
             answer: Mutex::new((RequestState::Pending, 1, serde_json::Value::Null)),
+            stored: Mutex::new(StoredWork::None),
         });
         {
             let mut requests = self.lsp.requests.lock().unwrap();
@@ -1913,7 +2651,11 @@ impl crate::Engine {
         let requests = self.lsp.requests.clone();
         self.runtime().spawn(move |cx| {
             let task = cx.spawn(async move |_| {
-                let (state, payload) = perform(&handle, kind, uri, row, col_utf16).await;
+                let (state, payload, stored) =
+                    perform(&handle, kind, uri, row, col_utf16, args).await;
+                // Stored before settled, so a reader that has observed the
+                // settle can trust what it finds behind it.
+                *pending.stored.lock().unwrap() = stored;
                 pending.settle(state, payload);
             });
             // Superseded before the runtime got to it: dropping the task here
@@ -1954,6 +2696,7 @@ struct StartRequest {
     buffers: Buffers,
     slots: Slots,
     docs: Docs,
+    watchers: Watchers,
     wants_full_text: Arc<AtomicBool>,
 }
 
@@ -1968,6 +2711,7 @@ async fn start_server(request: StartRequest, cx: &mut AsyncApp) {
         buffers,
         slots,
         docs,
+        watchers,
         wants_full_text,
     } = request;
 
@@ -2033,6 +2777,119 @@ async fn start_server(request: StartRequest, cx: &mut AsyncApp) {
         )
     };
 
+    // Servers ask things back, and a request with no handler is answered with
+    // a "method not found" *error* — which degrades exactly the
+    // workspace-wide behaviour the server is for. `client/registerCapability`
+    // is honoured for what matters: watched-files registrations land in the
+    // watcher table and the worktree's subscription feeds them (see
+    // [`notify_watched_files`]); everything else a server dynamically
+    // registers changes nothing for a client that consults capabilities per
+    // request. `workspace/configuration` gets the emptiest legal reply — no
+    // settings — which a server reads as "use your defaults". Registered
+    // before `initialize` for the diagnostics handler's reason.
+    let acknowledgements = vec![
+        {
+            let watchers = watchers.clone();
+            server_handle.on_request::<lsp::request::RegisterCapability, _, _>(
+                move |params: lsp::RegistrationParams, _cx: &mut AsyncApp| {
+                    register_watchers(&watchers, project, server.name, &params);
+                    async move { anyhow::Ok(()) }
+                },
+            )
+        },
+        {
+            let watchers = watchers.clone();
+            server_handle.on_request::<lsp::request::UnregisterCapability, _, _>(
+                move |params: lsp::UnregistrationParams, _cx: &mut AsyncApp| {
+                    unregister_watchers(&watchers, project, server.name, &params);
+                    async move { anyhow::Ok(()) }
+                },
+            )
+        },
+        server_handle.on_request::<lsp::request::WorkspaceConfiguration, _, _>(
+            |params: lsp::ConfigurationParams, _cx: &mut AsyncApp| async move {
+                anyhow::Ok(vec![serde_json::Value::Null; params.items.len()])
+            },
+        ),
+        server_handle.on_request::<lsp::request::WorkDoneProgressCreate, _, _>(
+            |_params, _cx: &mut AsyncApp| async move { anyhow::Ok(()) },
+        ),
+        // What the server *says* — its own errors above all. gopls explaining
+        // why `go list` failed arrives here and nowhere else, and dropping it
+        // is how a broken toolchain becomes an unexplained silence. Into the
+        // log, where `adb logcat` can read it back.
+        server_handle.on_notification::<lsp::notification::ShowMessage, _>(
+            move |params: lsp::ShowMessageParams, _cx: &mut AsyncApp| {
+                log::warn!("lsp: {} says: {}", server.name, params.message);
+            },
+        ),
+        server_handle.on_notification::<lsp::notification::LogMessage, _>(
+            move |params: lsp::LogMessageParams, _cx: &mut AsyncApp| {
+                if params.typ == lsp::MessageType::ERROR {
+                    log::warn!("lsp: {} logged: {}", server.name, params.message);
+                } else {
+                    log::debug!("lsp: {} logged: {}", server.name, params.message);
+                }
+            },
+        ),
+        // …and the reports on the tokens the request above created: what the
+        // server is doing, kept per token on the slot so the status bar can
+        // say "indexing (45%)" instead of an unexplained silence.
+        {
+            let slots = slots.clone();
+            let store = store.clone();
+            server_handle.on_notification::<lsp::notification::Progress, _>(
+                move |params: lsp::ProgressParams, _cx: &mut AsyncApp| {
+                    let lsp::ProgressParamsValue::WorkDone(progress) = params.value else {
+                        return;
+                    };
+                    let token = match params.token {
+                        lsp::NumberOrString::Number(number) => number.to_string(),
+                        lsp::NumberOrString::String(string) => string,
+                    };
+                    {
+                        let mut slots = slots.lock().unwrap();
+                        let Some(slot) = slots.get_mut(&(project, server.name)) else {
+                            return;
+                        };
+                        // Progress is proof of life, exactly as a publish is:
+                        // a rust-analyzer chewing through a workspace is
+                        // working, not idle.
+                        slot.last_activity = Instant::now();
+                        match progress {
+                            lsp::WorkDoneProgress::Begin(begin) => {
+                                slot.progress.insert(
+                                    token,
+                                    ServerProgress {
+                                        title: begin.title,
+                                        message: begin.message,
+                                        percentage: begin.percentage,
+                                    },
+                                );
+                            }
+                            // A report may carry only the part that moved;
+                            // the rest keeps what the begin said.
+                            lsp::WorkDoneProgress::Report(report) => {
+                                if let Some(entry) = slot.progress.get_mut(&token) {
+                                    if report.message.is_some() {
+                                        entry.message = report.message;
+                                    }
+                                    if report.percentage.is_some() {
+                                        entry.percentage = report.percentage;
+                                    }
+                                }
+                            }
+                            lsp::WorkDoneProgress::End(_) => {
+                                slot.progress.remove(&token);
+                            }
+                        }
+                    }
+                    store.bump(project);
+                },
+            )
+        },
+    ];
+
     // `initialize` with the capabilities Zed advertises, which is where UTF-16
     // positions are agreed (vendor/lsp/src/lsp.rs:808) — the reason every
     // column this module hands the UI is already in the units the UI wants.
@@ -2092,6 +2949,7 @@ async fn start_server(request: StartRequest, cx: &mut AsyncApp) {
         slot.sync = sync;
         slot.wants_save = wants_save;
         slot.subscriptions.push(subscription);
+        slot.subscriptions.extend(acknowledgements);
         // Initializing can take a minute on a cold rust-analyzer, and it is the
         // opposite of idle: the clock starts here, not when we spawned it.
         slot.last_activity = Instant::now();
@@ -2165,20 +3023,24 @@ fn sync_of(capabilities: &lsp::ServerCapabilities) -> (TextDocumentSyncKind, boo
     }
 }
 
-/// Send one request and turn its answer into the JSON the UI reads.
+/// Send one request and turn its answer into the JSON the UI reads — and,
+/// for the kinds that produce work rather than words, the [`StoredWork`] the
+/// next step runs on.
 async fn perform(
     server: &LanguageServer,
     kind: RequestKind,
     uri: Uri,
     row: u32,
     col_utf16: u32,
-) -> (RequestState, serde_json::Value) {
+    args: RequestArgs,
+) -> (RequestState, serde_json::Value, StoredWork) {
     let position = TextDocumentPositionParams {
         text_document: TextDocumentIdentifier::new(uri),
         position: Position::new(row, col_utf16),
     };
-    match kind {
-        RequestKind::Completion => {
+    let plain = |(state, payload)| (state, payload, StoredWork::None);
+    match (kind, args) {
+        (RequestKind::Completion, _) => {
             let response = server
                 .request::<lsp::request::Completion>(
                     CompletionParams {
@@ -2190,9 +3052,9 @@ async fn perform(
                     COMPLETION_TIMEOUT,
                 )
                 .await;
-            settle(response, completion_json)
+            plain(settle(response, completion_json))
         }
-        RequestKind::Hover => {
+        (RequestKind::Hover, _) => {
             let response = server
                 .request::<lsp::request::HoverRequest>(
                     HoverParams {
@@ -2202,9 +3064,9 @@ async fn perform(
                     HOVER_TIMEOUT,
                 )
                 .await;
-            settle(response, hover_json)
+            plain(settle(response, hover_json))
         }
-        RequestKind::Definition => {
+        (RequestKind::Definition, _) => {
             let response = server
                 .request::<lsp::request::GotoDefinition>(
                     GotoDefinitionParams {
@@ -2215,8 +3077,194 @@ async fn perform(
                     DEFINITION_TIMEOUT,
                 )
                 .await;
-            settle(response, definition_json)
+            plain(settle(response, definition_json))
         }
+        (RequestKind::References, _) => {
+            let response = server
+                .request::<lsp::request::References>(
+                    lsp::ReferenceParams {
+                        text_document_position: position,
+                        work_done_progress_params: WorkDoneProgressParams::default(),
+                        partial_result_params: PartialResultParams::default(),
+                        context: lsp::ReferenceContext {
+                            // The declaration belongs in the list: "who uses
+                            // this" includes where it came from, and Zed
+                            // includes it too.
+                            include_declaration: true,
+                        },
+                    },
+                    REFERENCES_TIMEOUT,
+                )
+                .await;
+            plain(settle(response, references_json))
+        }
+        (RequestKind::CodeAction, RequestArgs::CodeActions { diagnostics }) => {
+            // The range the actions are for: the diagnostics under the caret
+            // when there are any — a fix should cover the whole problem, not
+            // the one character the caret is on — and the caret itself
+            // otherwise, which is how refactorings with nothing wrong appear.
+            let range = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.range)
+                .reduce(|a, b| Range::new(a.start.min(b.start), a.end.max(b.end)))
+                .unwrap_or_else(|| Range::new(position.position, position.position));
+            let response = server
+                .request::<lsp::request::CodeActionRequest>(
+                    lsp::CodeActionParams {
+                        text_document: position.text_document,
+                        range,
+                        context: lsp::CodeActionContext {
+                            diagnostics,
+                            only: None,
+                            trigger_kind: Some(lsp::CodeActionTriggerKind::INVOKED),
+                        },
+                        work_done_progress_params: WorkDoneProgressParams::default(),
+                        partial_result_params: PartialResultParams::default(),
+                    },
+                    CODE_ACTION_TIMEOUT,
+                )
+                .await;
+            match response {
+                util::ConnectionResult::Result(Ok(actions)) => {
+                    let actions = actions.unwrap_or_default();
+                    (
+                        RequestState::Done,
+                        code_actions_json(&actions),
+                        StoredWork::Actions(actions),
+                    )
+                }
+                other => plain(settle(other, |_: Option<lsp::CodeActionResponse>| {
+                    serde_json::Value::Null
+                })),
+            }
+        }
+        (RequestKind::CodeActionApply, RequestArgs::CodeActionApply { action }) => {
+            let action = match *action {
+                lsp::CodeActionOrCommand::CodeAction(action) => action,
+                // The list already marked bare commands disabled; reaching
+                // here with one is a client bug, answered rather than paniced.
+                lsp::CodeActionOrCommand::Command(_) => {
+                    return (
+                        RequestState::Unavailable,
+                        error_payload("this action runs a server command, which is not supported yet"),
+                        StoredWork::None,
+                    );
+                }
+            };
+            // An action may arrive lazy: no edit yet, a `data` field the
+            // server wants echoed back through `codeAction/resolve`. That is
+            // rust-analyzer's normal shape.
+            let resolved = if action.edit.is_none() && action.data.is_some() {
+                match server
+                    .request::<lsp::request::CodeActionResolveRequest>(
+                        action.clone(),
+                        CODE_ACTION_TIMEOUT,
+                    )
+                    .await
+                {
+                    util::ConnectionResult::Result(Ok(resolved)) => resolved,
+                    util::ConnectionResult::Result(Err(err)) => {
+                        log::debug!("lsp: codeAction/resolve failed: {err:#}");
+                        action
+                    }
+                    util::ConnectionResult::Timeout => {
+                        return (RequestState::Timeout, serde_json::Value::Null, StoredWork::None);
+                    }
+                    util::ConnectionResult::ConnectionReset => {
+                        return (
+                            RequestState::Unavailable,
+                            serde_json::Value::Null,
+                            StoredWork::None,
+                        );
+                    }
+                }
+            } else {
+                action
+            };
+            match resolved.edit {
+                Some(edit) => (
+                    RequestState::Done,
+                    edit_summary_json(&edit),
+                    StoredWork::Edit(edit),
+                ),
+                None => (
+                    RequestState::Done,
+                    error_payload("the server offered no edit for this action"),
+                    StoredWork::None,
+                ),
+            }
+        }
+        (RequestKind::Rename, RequestArgs::Rename { new_name }) => {
+            let response = server
+                .request::<lsp::request::Rename>(
+                    lsp::RenameParams {
+                        text_document_position: position,
+                        new_name,
+                        work_done_progress_params: WorkDoneProgressParams::default(),
+                    },
+                    RENAME_TIMEOUT,
+                )
+                .await;
+            match response {
+                util::ConnectionResult::Result(Ok(Some(edit))) => (
+                    RequestState::Done,
+                    edit_summary_json(&edit),
+                    StoredWork::Edit(edit),
+                ),
+                util::ConnectionResult::Result(Ok(None)) => (
+                    RequestState::Done,
+                    error_payload("the server had nothing to rename here"),
+                    StoredWork::None,
+                ),
+                other => plain(settle(other, |_: Option<lsp::WorkspaceEdit>| {
+                    serde_json::Value::Null
+                })),
+            }
+        }
+        (RequestKind::Formatting, RequestArgs::Formatting { tab_size }) => {
+            let uri = position.text_document.uri.clone();
+            let response = server
+                .request::<lsp::request::Formatting>(
+                    lsp::DocumentFormattingParams {
+                        text_document: position.text_document,
+                        options: lsp::FormattingOptions {
+                            tab_size,
+                            insert_spaces: true,
+                            ..Default::default()
+                        },
+                        work_done_progress_params: WorkDoneProgressParams::default(),
+                    },
+                    FORMATTING_TIMEOUT,
+                )
+                .await;
+            match response {
+                util::ConnectionResult::Result(Ok(edits)) => {
+                    let edits = edits.unwrap_or_default();
+                    // A formatter's answer is a WorkspaceEdit over one file,
+                    // so the one applier serves all three edit producers.
+                    let edit = lsp::WorkspaceEdit {
+                        changes: Some(HashMap::from([(uri, edits)])),
+                        document_changes: None,
+                        change_annotations: None,
+                    };
+                    (
+                        RequestState::Done,
+                        edit_summary_json(&edit),
+                        StoredWork::Edit(edit),
+                    )
+                }
+                other => plain(settle(other, |_: Option<Vec<lsp::TextEdit>>| {
+                    serde_json::Value::Null
+                })),
+            }
+        }
+        // A kind reached without the arguments it needs — unreachable from
+        // the public entry points, answered rather than paniced all the same.
+        (_, _) => (
+            RequestState::Unavailable,
+            serde_json::Value::Null,
+            StoredWork::None,
+        ),
     }
 }
 
@@ -2322,6 +3370,11 @@ struct TargetJson {
     /// The whole symbol, for selecting it on arrival.
     end_row: u32,
     end_col_utf16: u32,
+    /// The line the target sits on, trimmed — filled in for references, where
+    /// a list of bare positions would be unreadable, and absent elsewhere.
+    /// Read from disk, so it can trail an unsaved buffer by one save.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_text: Option<String>,
 }
 
 fn completion_json(response: Option<CompletionResponse>) -> serde_json::Value {
@@ -2476,7 +3529,369 @@ fn target(uri: Uri, range: Range) -> Option<TargetJson> {
         col_utf16: range.start.character,
         end_row: range.end.line,
         end_col_utf16: range.end.character,
+        line_text: None,
     })
+}
+
+#[derive(serde::Serialize)]
+struct ReferencesPayload {
+    targets: Vec<TargetJson>,
+}
+
+fn references_json(locations: Option<Vec<lsp::Location>>) -> serde_json::Value {
+    // One read per file, however many references it holds — a symbol used two
+    // hundred times in one module costs one file, not two hundred.
+    let mut lines_by_file: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
+    let targets: Vec<TargetJson> = locations
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|location| {
+            let mut target = target(location.uri, location.range)?;
+            let path = PathBuf::from(&target.path);
+            let lines = lines_by_file.entry(path.clone()).or_insert_with(|| {
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .map(|text| text.lines().map(|line| line.trim().to_owned()).collect())
+            });
+            target.line_text = lines
+                .as_ref()
+                .and_then(|lines| lines.get(target.row as usize).cloned());
+            Some(target)
+        })
+        .collect();
+    serde_json::to_value(ReferencesPayload { targets }).unwrap_or(serde_json::Value::Null)
+}
+
+/// `{"error": …}` — the shape a settled-but-empty answer takes, so the UI can
+/// put a sentence where a list or a receipt was hoped for.
+fn error_payload(message: &str) -> serde_json::Value {
+    serde_json::json!({ "error": message })
+}
+
+#[derive(serde::Serialize)]
+struct CodeActionsPayload {
+    actions: Vec<CodeActionJson>,
+}
+
+#[derive(serde::Serialize)]
+struct CodeActionJson {
+    /// Position in the stored list — what `lspRequestCodeActionApply` takes.
+    index: usize,
+    title: String,
+    /// LSP's kind string ("quickfix", "refactor.extract"), or null.
+    kind: Option<String>,
+    /// The server marked it the best answer; the UI puts it first.
+    is_preferred: bool,
+    /// Why it cannot run, when it cannot — the server's own reason, or this
+    /// client's ("runs a server command"). Null for an action that can.
+    disabled: Option<String>,
+}
+
+/// Why an action in the list cannot be applied here, if it cannot.
+fn action_disabled_reason(action: &lsp::CodeActionOrCommand) -> Option<String> {
+    match action {
+        // A bare command runs on the server and edits arrive by
+        // `workspace/applyEdit`, which this client does not take yet.
+        lsp::CodeActionOrCommand::Command(_) => {
+            Some("runs a server command, which is not supported yet".to_owned())
+        }
+        lsp::CodeActionOrCommand::CodeAction(action) => {
+            if let Some(disabled) = &action.disabled {
+                return Some(disabled.reason.clone());
+            }
+            // No edit, nothing to resolve one from, only a command: same
+            // boat as the bare command.
+            if action.edit.is_none() && action.data.is_none() && action.command.is_some() {
+                return Some("runs a server command, which is not supported yet".to_owned());
+            }
+            None
+        }
+    }
+}
+
+fn code_actions_json(actions: &[lsp::CodeActionOrCommand]) -> serde_json::Value {
+    let actions: Vec<CodeActionJson> = actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| CodeActionJson {
+            index,
+            title: match action {
+                lsp::CodeActionOrCommand::Command(command) => command.title.clone(),
+                lsp::CodeActionOrCommand::CodeAction(action) => action.title.clone(),
+            },
+            kind: match action {
+                lsp::CodeActionOrCommand::Command(_) => None,
+                lsp::CodeActionOrCommand::CodeAction(action) => {
+                    action.kind.as_ref().map(|kind| kind.as_str().to_owned())
+                }
+            },
+            is_preferred: matches!(
+                action,
+                lsp::CodeActionOrCommand::CodeAction(action) if action.is_preferred == Some(true)
+            ),
+            disabled: action_disabled_reason(action),
+        })
+        .collect();
+    serde_json::to_value(CodeActionsPayload { actions }).unwrap_or(serde_json::Value::Null)
+}
+
+/// What an edit will touch, said before it is applied — the payload a rename,
+/// a formatting or a resolved action settles with, so the UI can say
+/// "3 files, 14 edits" and then ask for the apply.
+fn edit_summary_json(edit: &lsp::WorkspaceEdit) -> serde_json::Value {
+    let mut files = 0usize;
+    let mut edits = 0usize;
+    let mut resource_ops = false;
+    if let Some(changes) = &edit.changes {
+        files += changes.len();
+        edits += changes.values().map(Vec::len).sum::<usize>();
+    }
+    match &edit.document_changes {
+        Some(lsp::DocumentChanges::Edits(documents)) => {
+            files += documents.len();
+            edits += documents.iter().map(|doc| doc.edits.len()).sum::<usize>();
+        }
+        Some(lsp::DocumentChanges::Operations(operations)) => {
+            for operation in operations {
+                match operation {
+                    lsp::DocumentChangeOperation::Edit(doc) => {
+                        files += 1;
+                        edits += doc.edits.len();
+                    }
+                    lsp::DocumentChangeOperation::Op(_) => resource_ops = true,
+                }
+            }
+        }
+        None => {}
+    }
+    serde_json::json!({ "files": files, "edits": edits, "resource_ops": resource_ops })
+}
+
+// ---------------------------------------------------------------------------
+// Applying a WorkspaceEdit
+// ---------------------------------------------------------------------------
+
+/// One file's slice of a normalized [`lsp::WorkspaceEdit`].
+struct FileEdits {
+    /// Canonicalized, for the same reason every path in this module is.
+    path: PathBuf,
+    /// The LSP document version the server dated its edits against, when it
+    /// did. Checked against the open document before anything is applied.
+    version: Option<i32>,
+    edits: Vec<lsp::TextEdit>,
+}
+
+/// Flatten the three shapes a [`lsp::WorkspaceEdit`] comes in into one list of
+/// per-file edit sets, refusing what this client cannot do yet.
+fn normalize_workspace_edit(edit: lsp::WorkspaceEdit) -> Result<Vec<FileEdits>, String> {
+    let mut files: Vec<FileEdits> = Vec::new();
+    let mut push = |uri: Uri, version: Option<i32>, edits: Vec<lsp::TextEdit>| -> Result<(), String> {
+        let path = uri
+            .to_file_path()
+            .map_err(|()| format!("the edit names a URI that is not a file: {uri}"))?;
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        files.push(FileEdits { path, version, edits });
+        Ok(())
+    };
+    if let Some(changes) = edit.changes {
+        for (uri, edits) in changes {
+            push(uri, None, edits)?;
+        }
+    }
+    match edit.document_changes {
+        Some(lsp::DocumentChanges::Edits(documents)) => {
+            for document in documents {
+                let edits = plain_edits(document.edits);
+                push(document.text_document.uri, document.text_document.version, edits)?;
+            }
+        }
+        Some(lsp::DocumentChanges::Operations(operations)) => {
+            for operation in operations {
+                match operation {
+                    lsp::DocumentChangeOperation::Edit(document) => {
+                        let edits = plain_edits(document.edits);
+                        push(
+                            document.text_document.uri,
+                            document.text_document.version,
+                            edits,
+                        )?;
+                    }
+                    // Creating, renaming and deleting files is real work this
+                    // client has not built yet — refusing the whole edit is
+                    // honest where applying half of it would corrupt.
+                    lsp::DocumentChangeOperation::Op(_) => {
+                        return Err(
+                            "the edit creates, renames or deletes files, \
+                             which is not supported yet"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+    // Sorted so a multi-file receipt reads in one order every time.
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+/// A document's edits, whatever mix of plain, annotated and snippet forms
+/// they arrived in, as plain text edits.
+fn plain_edits(edits: Vec<lsp::Edit>) -> Vec<lsp::TextEdit> {
+    edits
+        .into_iter()
+        .map(|edit| match edit {
+            lsp::Edit::Plain(edit) => edit,
+            lsp::Edit::Annotated(edit) => edit.text_edit,
+            // rust-analyzer sends snippet edits because the capabilities say
+            // we take them (workspace_edit.snippet_edit_support, vendored) —
+            // there is no caret to place from here, so the placeholders
+            // collapse to their text.
+            lsp::Edit::Snippet(edit) => lsp::TextEdit {
+                range: edit.range,
+                new_text: strip_snippet(&edit.snippet.value),
+            },
+        })
+        .collect()
+}
+
+/// LSP snippet syntax, reduced to the text it would leave behind: `$0` and
+/// `$1` vanish, `${1:body}` keeps its body, `${1|a,b|}` keeps its first
+/// choice, `\$` keeps its dollar. Nested placeholders unwrap recursively.
+fn strip_snippet(snippet: &str) -> String {
+    let mut out = String::with_capacity(snippet.len());
+    let mut chars = snippet.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                // An escaped character stands for itself; a trailing
+                // backslash is kept as one.
+                match chars.next() {
+                    Some(escaped) => out.push(escaped),
+                    None => out.push('\\'),
+                }
+            }
+            '$' => match chars.peek() {
+                // `$1` — a bare tabstop: nothing is left behind.
+                Some(digit) if digit.is_ascii_digit() => {
+                    while chars.peek().is_some_and(char::is_ascii_digit) {
+                        chars.next();
+                    }
+                }
+                Some('{') => {
+                    chars.next();
+                    // `${1:body}` / `${1|a,b|}` / `${1}` — collect to the
+                    // matching brace, then keep what the placeholder keeps.
+                    let mut depth = 1;
+                    let mut inner = String::new();
+                    for ch in chars.by_ref() {
+                        match ch {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        inner.push(ch);
+                    }
+                    if let Some(body) = inner.split_once(':').map(|(_, body)| body) {
+                        out.push_str(&strip_snippet(body));
+                    } else if let Some(choices) = inner.split_once('|').map(|(_, rest)| rest) {
+                        if let Some(first) = choices.trim_end_matches('|').split(',').next() {
+                            out.push_str(first);
+                        }
+                    }
+                    // `${1}` keeps nothing.
+                }
+                _ => out.push('$'),
+            },
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Apply [`lsp::TextEdit`]s to a document held as text — the closed-file
+/// half of the applier, and pure so it is testable on the host.
+///
+/// Positions are UTF-16 (line, character), clamped the way the spec says: a
+/// line past the end means the end of the document, a character past a line's
+/// end means the end of that line. Edits are applied back to front against
+/// one snapshot, which LSP's no-overlap rule makes safe.
+fn apply_edits_to_text(text: &str, edits: &[lsp::TextEdit]) -> String {
+    // Byte offset of each line start, plus one payload-end sentinel.
+    let mut line_starts: Vec<usize> = vec![0];
+    for (index, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            line_starts.push(index + 1);
+        }
+    }
+    let offset_of = |position: Position| -> usize {
+        let Some(&line_start) = line_starts.get(position.line as usize) else {
+            return text.len();
+        };
+        let line_end = line_starts
+            .get(position.line as usize + 1)
+            .map(|next| next - 1)
+            .unwrap_or(text.len());
+        let line = &text[line_start..line_end];
+        let mut utf16 = 0u32;
+        for (byte_index, ch) in line.char_indices() {
+            if utf16 >= position.character {
+                return line_start + byte_index;
+            }
+            utf16 += ch.len_utf16() as u32;
+        }
+        line_end
+    };
+    let mut resolved: Vec<(usize, usize, &str)> = edits
+        .iter()
+        .map(|edit| {
+            let start = offset_of(edit.range.start);
+            let end = offset_of(edit.range.end).max(start);
+            (start, end, edit.new_text.as_str())
+        })
+        .collect();
+    resolved.sort_by_key(|(start, end, _)| (*start, *end));
+    let mut out = text.to_owned();
+    for (start, end, new_text) in resolved.into_iter().rev() {
+        out.replace_range(start..end, new_text);
+    }
+    out
+}
+
+/// One applied file, in the receipt [`Engine::lsp_apply_pending_edit`] hands
+/// back so the UI knows which of its editors to resync.
+#[derive(serde::Serialize)]
+pub struct AppliedFile {
+    /// Absolute host path, canonical — match it against open tabs.
+    pub path: String,
+    /// The open buffer it landed in, or null for a file edited on disk.
+    pub buffer_id: Option<BufferId>,
+    pub edits: usize,
+}
+
+/// What applying a stored edit did.
+#[derive(serde::Serialize)]
+pub struct ApplyReceipt {
+    pub applied: bool,
+    /// Why nothing (or not everything) was applied. Null on success.
+    pub error: Option<String>,
+    pub files: Vec<AppliedFile>,
+}
+
+impl ApplyReceipt {
+    fn refused(error: String) -> Self {
+        Self {
+            applied: false,
+            error: Some(error),
+            files: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2765,32 +4180,42 @@ mod tests {
 
         // Documents open and traffic recently: the normal state of a server
         // being used, and it must survive every sweep.
-        assert_eq!(retire(1, moment, false), Retire::Keep);
-        assert_eq!(retire(1, IDLE_WITHOUT_DOCUMENTS, false), Retire::Keep);
+        assert_eq!(retire(1, false, moment, false), Retire::Keep);
+        assert_eq!(retire(1, false, IDLE_WITHOUT_DOCUMENTS, false), Retire::Keep);
 
-        // The last document closed. Zed drops the registration here; we drop
-        // the process too, but only after the grace.
-        assert_eq!(retire(0, moment, false), Retire::Keep);
+        // The last document closed and the tree does not call for the
+        // language. Zed drops the registration here; we drop the process
+        // too, but only after the grace.
+        assert_eq!(retire(0, false, moment, false), Retire::Keep);
         assert_eq!(
-            retire(0, IDLE_WITHOUT_DOCUMENTS, false),
+            retire(0, false, IDLE_WITHOUT_DOCUMENTS, false),
             Retire::NoDocuments
         );
 
         // Under pressure — somebody is being refused right now — the grace is
         // over at once.
-        assert_eq!(retire(0, Duration::ZERO, true), Retire::NoDocuments);
+        assert_eq!(retire(0, false, Duration::ZERO, true), Retire::NoDocuments);
 
         // The backstop Zed does not have: documents open, but nothing has
         // crossed the pipes in ten minutes.
-        assert_eq!(retire(2, IDLE_WITHOUT_TRAFFIC, false), Retire::Silent);
+        assert_eq!(retire(2, false, IDLE_WITHOUT_TRAFFIC, false), Retire::Silent);
         assert_eq!(
-            retire(2, IDLE_WITHOUT_TRAFFIC - moment, false),
+            retire(2, false, IDLE_WITHOUT_TRAFFIC - moment, false),
             Retire::Keep
         );
         // And pressure does not shorten *that* one: a document on screen is a
         // server the user may still be reading, and evicting it to start
         // another would leave two cold indexes serving one file each.
-        assert_eq!(retire(2, moment, true), Retire::Keep);
+        assert_eq!(retire(2, false, moment, true), Retire::Keep);
+
+        // A server the project's tree calls for is docless by *design*: no
+        // tab open is its working state, so it is judged by the silence rule.
+        assert_eq!(retire(0, true, IDLE_WITHOUT_DOCUMENTS, false), Retire::Keep);
+        assert_eq!(retire(0, true, IDLE_WITHOUT_TRAFFIC, false), Retire::Silent);
+        // …until the budget is contested: then a docless server loses to one
+        // actually serving a tab, whatever the tree says.
+        assert_eq!(retire(0, true, Duration::ZERO, true), Retire::NoDocuments);
+        assert_eq!(retire(1, true, moment, true), Retire::Keep);
     }
 
     /// The sweep itself: which slots go, what happens to their documents, and
@@ -2823,7 +4248,9 @@ mod tests {
             open.insert(2, open_doc(7, "quiet", Path::new("/p/b.rs")));
         }
 
-        let stopped = sweep(&slots, &docs, &store, now, false);
+        let wants = ProjectWants::default();
+        let rested = Rested::default();
+        let stopped = sweep(&slots, &docs, &store, &wants, &rested, now, false);
         assert_eq!(stopped.len(), 2, "the silent one and the docless one");
 
         let servers = slots.lock().unwrap();
@@ -2858,6 +4285,8 @@ mod tests {
         let slots: Slots = Slots::default();
         let docs: Docs = Docs::default();
         let store = DiagnosticStore::default();
+        let wants = ProjectWants::default();
+        let rested = Rested::default();
         let now = Instant::now();
         {
             slots
@@ -2874,14 +4303,47 @@ mod tests {
         }
 
         assert!(
-            sweep(&slots, &docs, &store, now, false).is_empty(),
+            sweep(&slots, &docs, &store, &wants, &rested, now, false).is_empty(),
             "inside the grace, an unpressed sweep takes nothing"
         );
-        let stopped = sweep(&slots, &docs, &store, now, true);
+        let stopped = sweep(&slots, &docs, &store, &wants, &rested, now, true);
         assert_eq!(stopped.len(), 1);
         let servers = slots.lock().unwrap();
         assert!(servers.contains_key(&(1, "busy")));
         assert!(!servers.contains_key(&(1, "idle")));
+    }
+
+    /// Opening a folder is what starts its tooling: a project of `.rs` files
+    /// wants rust-analyzer with no tab open at all. The mirror fills
+    /// asynchronously and the poll is what starts servers, so the test polls
+    /// exactly the way the UI does.
+    #[test]
+    fn opening_a_folder_starts_its_languages_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_with_userland(dir.path());
+        let file = project_with_file(dir.path(), "main.rs", "fn main() {}\n");
+        let project = engine.open_project(file.parent().unwrap());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            engine.lsp_version(project);
+            if engine
+                .lsp
+                .servers
+                .lock()
+                .unwrap()
+                .contains_key(&(project, "rust-analyzer"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the scanned tree never produced a server want"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // …and no document was ever opened: the folder alone was the reason.
+        assert!(engine.lsp.docs.lock().unwrap().is_empty());
     }
 
     /// A stopped server comes back when the user comes back — and *only* then.
@@ -2896,8 +4358,9 @@ mod tests {
         let buffer = engine.open_file(&file).unwrap();
         engine.lsp.live.store(true, Ordering::Relaxed);
 
-        // As the sweep leaves things: the slot gone, the document still open on
-        // screen and marked dormant.
+        // As the sweep leaves things: the slot gone, the document still open
+        // on screen and marked dormant, and the tree's want at rest — the
+        // sweep sets all three together, and the poll honours each.
         engine.lsp.servers.lock().unwrap().clear();
         {
             let mut docs = engine.lsp.docs.lock().unwrap();
@@ -2905,6 +4368,12 @@ mod tests {
             doc.opened = false;
             doc.dormant = true;
         }
+        engine
+            .lsp
+            .rested
+            .lock()
+            .unwrap()
+            .insert((project, "rust-analyzer"));
 
         engine.lsp_version(project);
         assert!(
@@ -2917,6 +4386,15 @@ mod tests {
         assert!(
             !engine.lsp.docs.lock().unwrap()[&buffer].dormant,
             "typing in the file is the evidence that the user wants it back"
+        );
+        assert!(
+            !engine
+                .lsp
+                .rested
+                .lock()
+                .unwrap()
+                .contains(&(project, "rust-analyzer")),
+            "the wake ends the tree-want's rest along with the dormancy"
         );
     }
 
@@ -3335,6 +4813,361 @@ mod tests {
         assert!(engine.close_project(project));
         assert_eq!(engine.lsp_diagnostics(project).files.len(), 0);
         assert_eq!(engine.lsp_version(project), 0);
+    }
+
+    /// What the diagnostics panel reads: every row in the project, messages
+    /// and all, grouped by file and sorted the way the counts are.
+    #[test]
+    fn the_panel_reads_every_row_in_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("projects")).unwrap();
+        let main = project_with_file(dir.path(), "main.rs", "fn main() {}\n");
+        let lib = project_with_file(dir.path(), "lib.rs", "fn lib() {}\n");
+        let engine = Engine::new();
+        let project = engine.open_project(main.parent().unwrap());
+
+        assert_eq!(engine.lsp_diagnostic_rows(project).files.len(), 0);
+
+        let main = std::fs::canonicalize(&main).unwrap();
+        let lib = std::fs::canonicalize(&lib).unwrap();
+        engine.lsp.store.publish(
+            project,
+            main.clone(),
+            publish(
+                &main,
+                None,
+                vec![
+                    diagnostic(3, 4, lsp::DiagnosticSeverity::ERROR),
+                    diagnostic(9, 0, lsp::DiagnosticSeverity::WARNING),
+                ],
+            ),
+        );
+        engine.lsp.store.publish(
+            project,
+            lib.clone(),
+            publish(&lib, None, vec![diagnostic(1, 2, lsp::DiagnosticSeverity::HINT)]),
+        );
+
+        let rows = engine.lsp_diagnostic_rows(project);
+        assert_eq!(rows.version, engine.lsp_version(project));
+        // Sorted by path, spelled project-relative like the counts.
+        assert_eq!(rows.files.len(), 2);
+        assert_eq!(rows.files[0].path, "lib.rs");
+        assert_eq!(rows.files[1].path, "main.rs");
+        assert_eq!(rows.files[0].rows.len(), 1);
+        assert_eq!(rows.files[1].rows.len(), 2);
+        assert_eq!(rows.files[1].rows[0].row, 3);
+        assert_eq!(rows.files[1].rows[0].message, "mismatched types");
+        assert_eq!(rows.files[1].rows[0].severity, Severity::Error);
+
+        // The shape the Kotlin side parses, exactly.
+        let json = serde_json::to_value(&rows).unwrap();
+        let file = &json["files"][0];
+        assert_eq!(file["path"], "lib.rs");
+        let row = &file["rows"][0];
+        assert_eq!(row["row"], 1);
+        assert_eq!(row["col_utf16"], 2);
+        assert_eq!(row["severity"], "hint");
+        assert_eq!(row["message"], "mismatched types");
+        assert_eq!(row["source"], "rustc");
+        assert_eq!(row["code"], "E0308");
+    }
+
+    /// A project opened through a symlinked spelling of its root — which is
+    /// every project on Android, where `filesDir` is /data/user/0/<pkg>, a
+    /// link to /data/data/<pkg> — still owns its files.
+    ///
+    /// Buffers and published diagnostics hold canonical paths, so a root kept
+    /// in the caller's spelling would fail every `starts_with` against them:
+    /// `lsp_did_open` would file the buffer under no project (no server, no
+    /// diagnostics, no error), and a server that did start would be rooted at
+    /// a URI none of its documents are under — single-file mode, in a
+    /// workspace.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_opened_through_a_symlink_still_owns_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("projects")).unwrap();
+        let file = project_with_file(dir.path(), "main.rs", "fn main() {}\n");
+        let real_root = file.parent().unwrap();
+        let linked_root = dir.path().join("linked");
+        std::os::unix::fs::symlink(real_root, &linked_root).unwrap();
+
+        let engine = Engine::new();
+        let project = engine.open_project(&linked_root);
+        let buffer = engine.open_file(&file).unwrap();
+        let path = engine.buffer_path(buffer).unwrap();
+
+        assert_eq!(
+            engine.project_for_path(&path),
+            Some(project),
+            "the canonical buffer path resolves to the project opened by link"
+        );
+
+        // A publish under the canonical spelling lands in the project, and its
+        // path reads project-relative rather than absolute.
+        engine.lsp.store.publish(
+            project,
+            path.clone(),
+            publish(&path, None, vec![diagnostic(0, 0, lsp::DiagnosticSeverity::ERROR)]),
+        );
+        let summary = engine.lsp_diagnostics(project);
+        assert_eq!(summary.files.len(), 1);
+        assert_eq!(summary.files[0].path, "main.rs");
+    }
+
+    // -----------------------------------------------------------------------
+    // Watched files
+    // -----------------------------------------------------------------------
+
+    fn registration(id: &str, globs: &[&str]) -> lsp::RegistrationParams {
+        lsp::RegistrationParams {
+            registrations: vec![lsp::Registration {
+                id: id.to_owned(),
+                method: "workspace/didChangeWatchedFiles".to_owned(),
+                register_options: Some(
+                    serde_json::to_value(lsp::DidChangeWatchedFilesRegistrationOptions {
+                        watchers: globs
+                            .iter()
+                            .map(|glob| lsp::FileSystemWatcher {
+                                glob_pattern: lsp::GlobPattern::String((*glob).to_owned()),
+                                kind: None,
+                            })
+                            .collect(),
+                    })
+                    .unwrap(),
+                ),
+            }],
+        }
+    }
+
+    /// The round trip a rust-analyzer makes: register `**/Cargo.toml`, and be
+    /// told when a Cargo.toml changes — and only a Cargo.toml, and only the
+    /// server that asked.
+    #[test]
+    fn a_registered_watcher_hears_its_globs_and_nothing_else() {
+        let watchers: Watchers = Default::default();
+        register_watchers(&watchers, 1, "rust-analyzer", &registration("w", &["**/Cargo.toml"]));
+        register_watchers(&watchers, 1, "gopls", &registration("g", &["**/*.go"]));
+        // Another project's server must not hear project 1's changes.
+        register_watchers(&watchers, 2, "gopls", &registration("g", &["**/*.go"]));
+
+        let root = Path::new("/p/thing");
+        let changes = vec![
+            (PathBuf::from("/p/thing/Cargo.toml"), lsp::FileChangeType::CHANGED),
+            (PathBuf::from("/p/thing/src/main.go"), lsp::FileChangeType::CREATED),
+            (PathBuf::from("/p/thing/notes.md"), lsp::FileChangeType::CHANGED),
+        ];
+        let mut heard = collect_watched(&watchers.lock().unwrap(), 1, root, &changes);
+        heard.sort_by_key(|(server, _)| *server);
+
+        assert_eq!(heard.len(), 2);
+        let (server, events) = &heard[0];
+        assert_eq!(*server, "gopls");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].typ, lsp::FileChangeType::CREATED);
+        let (server, events) = &heard[1];
+        assert_eq!(*server, "rust-analyzer");
+        assert_eq!(events.len(), 1);
+        assert!(events[0].uri.to_string().ends_with("Cargo.toml"));
+
+        // Unregistering by the server's own id silences it.
+        unregister_watchers(
+            &watchers,
+            1,
+            "rust-analyzer",
+            &lsp::UnregistrationParams {
+                unregisterations: vec![lsp::Unregistration {
+                    id: "w".to_owned(),
+                    method: "workspace/didChangeWatchedFiles".to_owned(),
+                }],
+            },
+        );
+        let heard = collect_watched(&watchers.lock().unwrap(), 1, root, &changes);
+        assert_eq!(heard.len(), 1, "only gopls is still listening");
+    }
+
+    /// The initial scan is not change: forwarding `Loaded` would hand a server
+    /// one event per file in the tree the moment it starts.
+    #[test]
+    fn the_initial_scan_is_not_a_change() {
+        assert_eq!(watched_change_type(&worktree::PathChange::Loaded), None);
+        assert_eq!(
+            watched_change_type(&worktree::PathChange::Added),
+            Some(lsp::FileChangeType::CREATED)
+        );
+        assert_eq!(
+            watched_change_type(&worktree::PathChange::Removed),
+            Some(lsp::FileChangeType::DELETED)
+        );
+        assert_eq!(
+            watched_change_type(&worktree::PathChange::Updated),
+            Some(lsp::FileChangeType::CHANGED)
+        );
+        assert_eq!(
+            watched_change_type(&worktree::PathChange::AddedOrUpdated),
+            Some(lsp::FileChangeType::CHANGED)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Workspace edits
+    // -----------------------------------------------------------------------
+
+    fn text_edit(
+        (row, col): (u32, u32),
+        (end_row, end_col): (u32, u32),
+        text: &str,
+    ) -> lsp::TextEdit {
+        lsp::TextEdit {
+            range: Range::new(Position::new(row, col), Position::new(end_row, end_col)),
+            new_text: text.to_owned(),
+        }
+    }
+
+    /// The closed-file applier: UTF-16 positions, back-to-front application,
+    /// and the spec's clamping for positions past the end.
+    #[test]
+    fn edits_land_in_text_by_utf16_position() {
+        let text = "fn main() {\n    let naïve = 1;\n}\n";
+        // Two edits on one line, in *ascending* order as servers send them:
+        // rename `naïve` and change its value. The ï is one UTF-16 unit but
+        // two bytes, which is exactly what this conversion is for.
+        let edited = apply_edits_to_text(
+            text,
+            &[
+                text_edit((1, 8), (1, 13), "clever"),
+                text_edit((1, 16), (1, 17), "2"),
+            ],
+        );
+        assert_eq!(edited, "fn main() {\n    let clever = 2;\n}\n");
+
+        // A position past the last line means the end of the document —
+        // how a formatter appends a missing trailing newline.
+        let appended = apply_edits_to_text("no newline", &[text_edit((5, 0), (5, 0), "\n")]);
+        assert_eq!(appended, "no newline\n");
+
+        // A character past a line's end means the end of that line.
+        let clamped = apply_edits_to_text("ab\ncd\n", &[text_edit((0, 99), (1, 0), "-")]);
+        assert_eq!(clamped, "ab-cd\n");
+    }
+
+    /// Snippet syntax reduced to the text it leaves behind — what
+    /// rust-analyzer's snippet edits collapse to when there is no caret to
+    /// place.
+    #[test]
+    fn snippets_collapse_to_their_text() {
+        assert_eq!(strip_snippet("let $0name = ${1:value};"), "let name = value;");
+        assert_eq!(strip_snippet("${1|first,second|}"), "first");
+        assert_eq!(strip_snippet("${1}"), "");
+        assert_eq!(strip_snippet("plain"), "plain");
+        assert_eq!(strip_snippet(r"\$literal"), "$literal");
+        assert_eq!(strip_snippet("${1:outer ${2:inner}}"), "outer inner");
+    }
+
+    /// Both shapes a `WorkspaceEdit` arrives in flatten to the same list, and
+    /// file operations are refused whole rather than half-applied.
+    #[test]
+    fn workspace_edits_normalize_and_resource_ops_are_refused() {
+        let uri = Uri::from_file_path(Path::new("/p/main.rs")).unwrap();
+        let simple = lsp::WorkspaceEdit {
+            changes: Some(HashMap::from([(
+                uri.clone(),
+                vec![text_edit((0, 0), (0, 1), "x")],
+            )])),
+            document_changes: None,
+            change_annotations: None,
+        };
+        let files = normalize_workspace_edit(simple).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("/p/main.rs"));
+        assert_eq!(files[0].version, None);
+        assert_eq!(files[0].edits.len(), 1);
+
+        let versioned = lsp::WorkspaceEdit {
+            changes: None,
+            document_changes: Some(lsp::DocumentChanges::Edits(vec![lsp::TextDocumentEdit {
+                text_document: lsp::OptionalVersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: Some(7),
+                },
+                edits: vec![lsp::Edit::Plain(text_edit((0, 0), (0, 1), "y"))],
+            }])),
+            change_annotations: None,
+        };
+        let files = normalize_workspace_edit(versioned).unwrap();
+        assert_eq!(files[0].version, Some(7));
+
+        let with_ops = lsp::WorkspaceEdit {
+            changes: None,
+            document_changes: Some(lsp::DocumentChanges::Operations(vec![
+                lsp::DocumentChangeOperation::Op(lsp::ResourceOp::Delete(lsp::DeleteFile {
+                    uri,
+                    options: None,
+                })),
+            ])),
+            change_annotations: None,
+        };
+        assert!(normalize_workspace_edit(with_ops).is_err());
+    }
+
+    /// The whole apply path against a real buffer: one undo step, a receipt
+    /// naming the buffer, and the closed-file half writing through to disk.
+    #[test]
+    fn a_pending_edit_lands_in_buffers_and_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("projects")).unwrap();
+        let open_file = project_with_file(dir.path(), "main.rs", "fn main() {}\n");
+        let closed_file = project_with_file(dir.path(), "lib.rs", "fn lib() {}\n");
+        let engine = Engine::new();
+        let _project = engine.open_project(open_file.parent().unwrap());
+        let buffer = engine.open_file(&open_file).unwrap();
+        let open_canonical = engine.buffer_path(buffer).unwrap();
+        let closed_canonical = std::fs::canonicalize(&closed_file).unwrap();
+
+        // Stage the edit the way a settled rename would have.
+        let edit = lsp::WorkspaceEdit {
+            changes: Some(HashMap::from([
+                (
+                    Uri::from_file_path(&open_canonical).unwrap(),
+                    vec![text_edit((0, 3), (0, 7), "start")],
+                ),
+                (
+                    Uri::from_file_path(&closed_canonical).unwrap(),
+                    vec![text_edit((0, 3), (0, 6), "start")],
+                ),
+            ])),
+            document_changes: None,
+            change_annotations: None,
+        };
+        let id = engine.start_request(RequestKind::Rename, buffer, 0, 3);
+        {
+            let requests = engine.lsp.requests.lock().unwrap();
+            let pending = requests.live.get(&id).unwrap();
+            *pending.stored.lock().unwrap() = StoredWork::Edit(edit);
+        }
+
+        let receipt = engine.lsp_apply_pending_edit(id);
+        assert!(receipt.applied, "refused: {:?}", receipt.error);
+        assert_eq!(receipt.error, None);
+        assert_eq!(receipt.files.len(), 2);
+        // Sorted by path: lib.rs before main.rs.
+        assert_eq!(receipt.files[0].buffer_id, None, "lib.rs is not open");
+        assert_eq!(receipt.files[1].buffer_id, Some(buffer));
+
+        assert_eq!(engine.text(buffer).unwrap(), "fn start() {}\n");
+        assert_eq!(
+            std::fs::read_to_string(&closed_canonical).unwrap(),
+            "fn start() {}\n"
+        );
+
+        // One undo step takes the whole edit back out of the open buffer.
+        engine.undo(buffer).unwrap();
+        assert_eq!(engine.text(buffer).unwrap(), "fn main() {}\n");
+
+        // The edit was taken: applying again has nothing to do.
+        let again = engine.lsp_apply_pending_edit(id);
+        assert!(!again.applied);
     }
 
     // -----------------------------------------------------------------------
