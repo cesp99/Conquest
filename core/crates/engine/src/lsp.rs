@@ -53,7 +53,7 @@
 //! `unavailable` with a sentence, exactly like one that is not installed, so
 //! there is nothing new for the UI to render and nothing silently missing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -979,6 +979,19 @@ type Docs = Arc<Mutex<DocMap>>;
 pub(crate) type Watchers =
     Arc<Mutex<HashMap<(ProjectId, &'static str), HashMap<String, PathMatcher>>>>;
 
+/// Which servers each open project's *tree* calls for — a folder of `.rs`
+/// files wants rust-analyzer whether or not a tab is open — cached against
+/// the project's mirror version so the walk runs when the tree changes, not
+/// on every poll. Shared because the sweep reads it from the background.
+pub(crate) type ProjectWants = Arc<Mutex<HashMap<ProjectId, (u64, Vec<Server>)>>>;
+
+/// The tree-wanted servers the sweep has put to rest. Without this the poll
+/// would restart a swept server on the next frame and the sweep would be a
+/// stutter rather than a budget — the same loop [`OpenDoc::dormant`] breaks
+/// for documents. Cleared by *activity*: a buffer of the language opening,
+/// a save waking the server, the project closing.
+pub(crate) type Rested = Arc<Mutex<HashSet<(ProjectId, &'static str)>>>;
+
 /// Install what one `client/registerCapability` said about watched files.
 ///
 /// Anything that is not a watched-files registration is acknowledged and
@@ -1204,7 +1217,7 @@ enum Retire {
     Silent,
 }
 
-/// The whole of the idle policy, as a function of three numbers.
+/// The whole of the idle policy, as a function of four values.
 ///
 /// `under_pressure` is a start being refused right now. It only shortens the
 /// no-documents grace, and it shortens it to nothing: that grace exists because
@@ -1213,8 +1226,15 @@ enum Retire {
 /// shorten the silence limit — a server with a document open is one the user
 /// may still be reading, and evicting it to start another would mean two
 /// servers each paying a cold index to serve one file apiece.
-fn retire(documents: usize, idle_for: Duration, under_pressure: bool) -> Retire {
-    if documents == 0 {
+///
+/// `tree_wants` is a server the project's own files call for — started at
+/// folder-open, tabs or no tabs. It is judged by the *silence* rule rather
+/// than the no-documents one, because "no tab open" is its normal working
+/// state — except under pressure, where a docless server loses to one
+/// actually serving a tab whatever the tree says: the budget is real and the
+/// tab is the user's stated interest.
+fn retire(documents: usize, tree_wants: bool, idle_for: Duration, under_pressure: bool) -> Retire {
+    if documents == 0 && (!tree_wants || under_pressure) {
         if under_pressure || idle_for >= IDLE_WITHOUT_DOCUMENTS {
             return Retire::NoDocuments;
         }
@@ -1241,12 +1261,22 @@ fn sweep(
     slots: &Slots,
     docs: &Docs,
     store: &DiagnosticStore,
+    wants: &ProjectWants,
+    rested: &Rested,
     now: Instant,
     under_pressure: bool,
 ) -> Vec<Slot> {
     let mut stopped: Vec<(ProjectId, Slot)> = Vec::new();
     let mut orphaned: Vec<PathBuf> = Vec::new();
     {
+        let tree_wants: HashSet<(ProjectId, &'static str)> = wants
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(project, (_, servers))| {
+                servers.iter().map(|server| (*project, server.name))
+            })
+            .collect();
         let mut servers = slots.lock().unwrap();
         let mut docs = docs.lock().unwrap();
 
@@ -1261,6 +1291,7 @@ fn sweep(
             .filter_map(|(key, slot)| {
                 let verdict = retire(
                     documents.get(key).copied().unwrap_or(0),
+                    tree_wants.contains(key),
                     // Saturating: `now` is passed in so tests can name it, and
                     // a caller naming one before a slot was created should get
                     // "no time has passed", not a panic.
@@ -1290,6 +1321,9 @@ fn sweep(
                 doc.dormant = true;
                 orphaned.push(doc.path.clone());
             }
+            // The tree still wants it; only activity may bring it back, or
+            // the poll would restart it before this sweep's locks are cold.
+            rested.lock().unwrap().insert(key);
             stopped.push((key.0, slot));
         }
     }
@@ -1319,6 +1353,10 @@ pub(crate) struct LspState {
     store: Arc<DiagnosticStore>,
     /// What each server asked to be told about the disk — see [`Watchers`].
     watchers: Watchers,
+    /// What each project's tree calls for — see [`ProjectWants`].
+    wants: ProjectWants,
+    /// Tree-wanted servers the sweep stopped — see [`Rested`].
+    rested: Rested,
     requests: Arc<Mutex<Requests>>,
     next_request_id: AtomicU64,
     next_server_id: AtomicU64,
@@ -1895,6 +1933,9 @@ impl crate::Engine {
             log::debug!("lsp: {} is not a file URI", path.display());
             return;
         };
+        // Opening a buffer of the language is exactly the activity that ends
+        // a tree-want's rest — see [`Rested`].
+        self.lsp.rested.lock().unwrap().remove(&(project, server.name));
 
         self.lsp.docs.lock().unwrap().insert(
             buffer,
@@ -2091,6 +2132,12 @@ impl crate::Engine {
             .lock()
             .unwrap()
             .retain(|(id, _), _| *id != project);
+        self.lsp.wants.lock().unwrap().remove(&project);
+        self.lsp
+            .rested
+            .lock()
+            .unwrap()
+            .retain(|(id, _)| *id != project);
         if dropped.is_empty() {
             return;
         }
@@ -2319,6 +2366,8 @@ impl crate::Engine {
             &self.lsp.servers,
             &self.lsp.docs,
             &self.lsp.store,
+            &self.lsp.wants,
+            &self.lsp.rested,
             Instant::now(),
             under_pressure,
         );
@@ -2345,6 +2394,8 @@ impl crate::Engine {
         let slots = self.lsp.servers.clone();
         let docs = self.lsp.docs.clone();
         let store = self.lsp.store.clone();
+        let wants = self.lsp.wants.clone();
+        let rested = self.lsp.rested.clone();
         self.runtime().spawn(move |cx| {
             let executor = cx.background_executor().clone();
             let ticker = executor.clone();
@@ -2354,7 +2405,15 @@ impl crate::Engine {
                         ticker.timer(SWEEP_INTERVAL).await;
                         // Dropped here, on a background thread: the handshake
                         // wants an executor, and this *is* one.
-                        drop(sweep(&slots, &docs, &store, Instant::now(), false));
+                        drop(sweep(
+                            &slots,
+                            &docs,
+                            &store,
+                            &wants,
+                            &rested,
+                            Instant::now(),
+                            false,
+                        ));
                     }
                 })
                 .detach();
@@ -2380,6 +2439,9 @@ impl crate::Engine {
                 doc.dormant = false;
             }
         }
+        // A wake ends the tree-want's rest too, for the same reason it ends
+        // the documents' dormancy: this is the activity the sweep waits for.
+        self.lsp.rested.lock().unwrap().remove(&(project, server.name));
         log::info!("lsp: waking {} for project {project}", server.name);
         self.ensure_server(project, server);
     }
@@ -2393,8 +2455,11 @@ impl crate::Engine {
         doc.dormant.then_some((doc.project, doc.grammar))
     }
 
-    /// Servers for languages already open in a project that has none yet — the
-    /// `apt install` that happened while the editor was running.
+    /// Servers the project calls for and does not have yet: the languages of
+    /// its open documents, and the languages of its *tree* — opening a folder
+    /// of `.rs` files is what starts rust-analyzer, tabs or no tabs. Also
+    /// how the `apt install` that happened while the editor was running takes
+    /// effect: the poll keeps asking, and one day the binary is there.
     fn start_pending_servers(&self, project: ProjectId) {
         if self.userland().is_none() {
             return;
@@ -2414,7 +2479,7 @@ impl crate::Engine {
             .filter(|(id, _)| *id == project)
             .map(|(_, name)| *name)
             .collect();
-        let wanted: Vec<Server> = self
+        let mut wanted: Vec<Server> = self
             .lsp
             .docs
             .lock()
@@ -2427,9 +2492,75 @@ impl crate::Engine {
             .filter(|doc| doc.project == project && !doc.dormant && !known.contains(&doc.server))
             .filter_map(|doc| server_for(doc.grammar).map(|(server, _)| server))
             .collect();
+        // The tree's wants, minus what the sweep put to rest — rested is the
+        // tree's own dormancy, and only activity clears it. An open document
+        // outranks rested: it is on the docs list above, and `lsp_did_open`
+        // already cleared the flag when it arrived.
+        {
+            let rested = self.lsp.rested.lock().unwrap();
+            for server in self.project_tree_servers(project) {
+                if known.contains(&server.name) || rested.contains(&(project, server.name)) {
+                    continue;
+                }
+                if !wanted.iter().any(|wanted| wanted.name == server.name) {
+                    wanted.push(server);
+                }
+            }
+        }
         for server in wanted {
             self.ensure_server(project, server);
         }
+    }
+
+    /// The servers this project's tree calls for, from the mirrored worktree:
+    /// one walk over the file names when the mirror has moved, the cached
+    /// answer otherwise.
+    ///
+    /// While the initial scan is still running the walk is capped — the
+    /// mirror grows and bumps its version batch by batch, and rewalking an
+    /// unbounded prefix on every bump would make opening a big repository
+    /// O(files²). The cap is plenty to catch a repository's languages early;
+    /// the complete walk happens once, when the scan finishes, and is what
+    /// gets cached.
+    fn project_tree_servers(&self, project: ProjectId) -> Vec<Server> {
+        const EARLY_SCAN_FILES: usize = 2000;
+        let version = self.project_version(project);
+        if version == 0 {
+            return Vec::new();
+        }
+        if let Some((cached, servers)) = self.lsp.wants.lock().unwrap().get(&project) {
+            if *cached == version {
+                return servers.clone();
+            }
+        }
+        let Some(snapshot) = self.project_snapshot(project) else {
+            return Vec::new();
+        };
+        let complete = self.project_scan_complete(project);
+        let mut servers: Vec<Server> = Vec::new();
+        for (walked, entry) in snapshot.files(false, 0).enumerate() {
+            if !complete && walked >= EARLY_SCAN_FILES {
+                break;
+            }
+            let Some(grammar) = crate::highlight::language_for_path(entry.path.as_unix_str())
+            else {
+                continue;
+            };
+            let Some((server, _)) = server_for(grammar) else {
+                continue;
+            };
+            if !servers.iter().any(|known| known.name == server.name) {
+                servers.push(server);
+            }
+        }
+        if complete {
+            self.lsp
+                .wants
+                .lock()
+                .unwrap()
+                .insert(project, (version, servers.clone()));
+        }
+        servers
     }
 
     /// Register file-backed buffers that this project did not have when they
@@ -4031,32 +4162,42 @@ mod tests {
 
         // Documents open and traffic recently: the normal state of a server
         // being used, and it must survive every sweep.
-        assert_eq!(retire(1, moment, false), Retire::Keep);
-        assert_eq!(retire(1, IDLE_WITHOUT_DOCUMENTS, false), Retire::Keep);
+        assert_eq!(retire(1, false, moment, false), Retire::Keep);
+        assert_eq!(retire(1, false, IDLE_WITHOUT_DOCUMENTS, false), Retire::Keep);
 
-        // The last document closed. Zed drops the registration here; we drop
-        // the process too, but only after the grace.
-        assert_eq!(retire(0, moment, false), Retire::Keep);
+        // The last document closed and the tree does not call for the
+        // language. Zed drops the registration here; we drop the process
+        // too, but only after the grace.
+        assert_eq!(retire(0, false, moment, false), Retire::Keep);
         assert_eq!(
-            retire(0, IDLE_WITHOUT_DOCUMENTS, false),
+            retire(0, false, IDLE_WITHOUT_DOCUMENTS, false),
             Retire::NoDocuments
         );
 
         // Under pressure — somebody is being refused right now — the grace is
         // over at once.
-        assert_eq!(retire(0, Duration::ZERO, true), Retire::NoDocuments);
+        assert_eq!(retire(0, false, Duration::ZERO, true), Retire::NoDocuments);
 
         // The backstop Zed does not have: documents open, but nothing has
         // crossed the pipes in ten minutes.
-        assert_eq!(retire(2, IDLE_WITHOUT_TRAFFIC, false), Retire::Silent);
+        assert_eq!(retire(2, false, IDLE_WITHOUT_TRAFFIC, false), Retire::Silent);
         assert_eq!(
-            retire(2, IDLE_WITHOUT_TRAFFIC - moment, false),
+            retire(2, false, IDLE_WITHOUT_TRAFFIC - moment, false),
             Retire::Keep
         );
         // And pressure does not shorten *that* one: a document on screen is a
         // server the user may still be reading, and evicting it to start
         // another would leave two cold indexes serving one file each.
-        assert_eq!(retire(2, moment, true), Retire::Keep);
+        assert_eq!(retire(2, false, moment, true), Retire::Keep);
+
+        // A server the project's tree calls for is docless by *design*: no
+        // tab open is its working state, so it is judged by the silence rule.
+        assert_eq!(retire(0, true, IDLE_WITHOUT_DOCUMENTS, false), Retire::Keep);
+        assert_eq!(retire(0, true, IDLE_WITHOUT_TRAFFIC, false), Retire::Silent);
+        // …until the budget is contested: then a docless server loses to one
+        // actually serving a tab, whatever the tree says.
+        assert_eq!(retire(0, true, Duration::ZERO, true), Retire::NoDocuments);
+        assert_eq!(retire(1, true, moment, true), Retire::Keep);
     }
 
     /// The sweep itself: which slots go, what happens to their documents, and
@@ -4089,7 +4230,9 @@ mod tests {
             open.insert(2, open_doc(7, "quiet", Path::new("/p/b.rs")));
         }
 
-        let stopped = sweep(&slots, &docs, &store, now, false);
+        let wants = ProjectWants::default();
+        let rested = Rested::default();
+        let stopped = sweep(&slots, &docs, &store, &wants, &rested, now, false);
         assert_eq!(stopped.len(), 2, "the silent one and the docless one");
 
         let servers = slots.lock().unwrap();
@@ -4124,6 +4267,8 @@ mod tests {
         let slots: Slots = Slots::default();
         let docs: Docs = Docs::default();
         let store = DiagnosticStore::default();
+        let wants = ProjectWants::default();
+        let rested = Rested::default();
         let now = Instant::now();
         {
             slots
@@ -4140,14 +4285,47 @@ mod tests {
         }
 
         assert!(
-            sweep(&slots, &docs, &store, now, false).is_empty(),
+            sweep(&slots, &docs, &store, &wants, &rested, now, false).is_empty(),
             "inside the grace, an unpressed sweep takes nothing"
         );
-        let stopped = sweep(&slots, &docs, &store, now, true);
+        let stopped = sweep(&slots, &docs, &store, &wants, &rested, now, true);
         assert_eq!(stopped.len(), 1);
         let servers = slots.lock().unwrap();
         assert!(servers.contains_key(&(1, "busy")));
         assert!(!servers.contains_key(&(1, "idle")));
+    }
+
+    /// Opening a folder is what starts its tooling: a project of `.rs` files
+    /// wants rust-analyzer with no tab open at all. The mirror fills
+    /// asynchronously and the poll is what starts servers, so the test polls
+    /// exactly the way the UI does.
+    #[test]
+    fn opening_a_folder_starts_its_languages_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_with_userland(dir.path());
+        let file = project_with_file(dir.path(), "main.rs", "fn main() {}\n");
+        let project = engine.open_project(file.parent().unwrap());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            engine.lsp_version(project);
+            if engine
+                .lsp
+                .servers
+                .lock()
+                .unwrap()
+                .contains_key(&(project, "rust-analyzer"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the scanned tree never produced a server want"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // …and no document was ever opened: the folder alone was the reason.
+        assert!(engine.lsp.docs.lock().unwrap().is_empty());
     }
 
     /// A stopped server comes back when the user comes back — and *only* then.
@@ -4162,8 +4340,9 @@ mod tests {
         let buffer = engine.open_file(&file).unwrap();
         engine.lsp.live.store(true, Ordering::Relaxed);
 
-        // As the sweep leaves things: the slot gone, the document still open on
-        // screen and marked dormant.
+        // As the sweep leaves things: the slot gone, the document still open
+        // on screen and marked dormant, and the tree's want at rest — the
+        // sweep sets all three together, and the poll honours each.
         engine.lsp.servers.lock().unwrap().clear();
         {
             let mut docs = engine.lsp.docs.lock().unwrap();
@@ -4171,6 +4350,12 @@ mod tests {
             doc.opened = false;
             doc.dormant = true;
         }
+        engine
+            .lsp
+            .rested
+            .lock()
+            .unwrap()
+            .insert((project, "rust-analyzer"));
 
         engine.lsp_version(project);
         assert!(
@@ -4183,6 +4368,15 @@ mod tests {
         assert!(
             !engine.lsp.docs.lock().unwrap()[&buffer].dormant,
             "typing in the file is the evidence that the user wants it back"
+        );
+        assert!(
+            !engine
+                .lsp
+                .rested
+                .lock()
+                .unwrap()
+                .contains(&(project, "rust-analyzer")),
+            "the wake ends the tree-want's rest along with the dormancy"
         );
     }
 

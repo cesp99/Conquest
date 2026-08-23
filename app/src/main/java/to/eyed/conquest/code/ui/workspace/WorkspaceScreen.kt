@@ -1597,10 +1597,11 @@ fun WorkspaceScreen(
                     )
                 }
             // One counter for everything this project's servers have said.
-            // Polling it is also what *starts* a server for a file that was
-            // open before its project, or before `apt install` put the binary
-            // in the userland — so it runs whenever a project is open, not
-            // only when the status bar has something to show.
+            // Polling it is also what *starts* servers — for the languages
+            // the scanned tree holds, tabs or no tabs, and for a file that
+            // was open before its project or before `apt install` put the
+            // binary in the userland — so it runs whenever a project is
+            // open, not only when the status bar has something to show.
             val lsp = rememberLspState(project?.id)
             StatusBar(
                 cursorRow = active?.editor?.cursorRow ?: 0,

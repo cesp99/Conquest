@@ -288,6 +288,12 @@ impl crate::Engine {
             .unwrap_or(false)
     }
 
+    /// The mirrored worktree snapshot, for a reader outside this module —
+    /// the LSP module walks it to learn which languages the tree holds.
+    pub(crate) fn project_snapshot(&self, id: ProjectId) -> Option<Snapshot> {
+        self.with_project(id, |state| state.snapshot.clone()).flatten()
+    }
+
     /// The error that stopped the project from opening, if any.
     pub fn project_error(&self, id: ProjectId) -> Option<String> {
         self.with_project(id, |state| state.error.clone()).flatten()

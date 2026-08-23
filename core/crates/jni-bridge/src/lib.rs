@@ -1839,9 +1839,12 @@ pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_bufferText(
 /// diagnostics for any of its files, and the servers' own state. 0 until
 /// something has. Poll it exactly like `projectVersion`.
 ///
-/// Polling also schedules server startup for files that were already open when
-/// the userland arrived — `apt install clangd` in the terminal while the editor
-/// is running. It never waits for a server.
+/// Polling is also what *starts* servers, and opening the folder is reason
+/// enough: the scanned tree's languages start their servers with no tab open
+/// at all, so a workspace-wide analysis (rust-analyzer's cargo check) runs
+/// from the moment the project is up. The same poll covers files that were
+/// open before the userland arrived — `apt install clangd` in the terminal
+/// while the editor is running. It never waits for a server.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_to_eyed_conquest_code_core_CoreBridge_lspVersion(
     _env: JNIEnv,
