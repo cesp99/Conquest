@@ -461,6 +461,12 @@ data class LspServer(
     val error: String?,
     /** Grammar names, sorted, of the buffers currently registered with it. */
     val languages: List<String>,
+    /**
+     * What the server says it is doing right now — rust-analyzer's
+     * "indexing (45%)" — or null while it is quiet. One line; the engine
+     * already picked which token to show.
+     */
+    val progress: String? = null,
 ) {
     /**
      * What to tell the user about a server that is not running, in words —
@@ -519,6 +525,7 @@ fun parseLspServers(json: String?): List<LspServer> {
                     languages = (0 until (languages?.length() ?: 0)).mapNotNull {
                         languages?.optString(it)?.takeIf(String::isNotEmpty)
                     },
+                    progress = entry.stringOrNull("progress"),
                 )
             )
         }

@@ -787,11 +787,13 @@ object CoreBridge {
 
     /**
      * What each of the project's servers is doing, as a JSON array of
-     * `{name, state, error, languages}`. `state` is `starting`, `running` or
-     * `unavailable`; `error` carries the server's own last line of stderr when
-     * it could not be started — usually "command not found", which is the
-     * user's cue to install it. Versioned by [lspVersion]. Never blocks, never
-     * null, `[]` when nothing is running.
+     * `{name, state, error, languages, progress}`. `state` is `starting`,
+     * `running` or `unavailable`; `error` carries the server's own last line
+     * of stderr when it could not be started — usually "command not found",
+     * which is the user's cue to install it; `progress` is the server's own
+     * one-line `$/progress` report ("indexing (45%)") or null while it is
+     * quiet. Versioned by [lspVersion]. Never blocks, never null, `[]` when
+     * nothing is running.
      */
     external fun lspServers(projectId: Long): String
 

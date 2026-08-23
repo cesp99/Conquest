@@ -379,13 +379,15 @@ class DiagnosticsTest {
     @Test
     fun parsesTheServerList() {
         val servers = parseLspServers(
-            """[{"name":"clangd","state":"running","error":null,"languages":["c","cpp"]}]"""
+            """[{"name":"clangd","state":"running","error":null,
+                "languages":["c","cpp"],"progress":"indexing (45%)"}]"""
         )
         assertEquals(1, servers.size)
         assertEquals("clangd", servers[0].name)
         assertEquals(LspServerState.Running, servers[0].state)
         assertNull(servers[0].error)
         assertEquals(listOf("c", "cpp"), servers[0].languages)
+        assertEquals("indexing (45%)", servers[0].progress)
         assertNull(servers[0].note)
     }
 

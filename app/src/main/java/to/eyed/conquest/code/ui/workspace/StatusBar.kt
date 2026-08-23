@@ -208,6 +208,22 @@ fun StatusBar(
                     ?.takeIf { blocked.installable }
                     ?.let { install -> { install(blocked) } },
             )
+        } else {
+            // What a quiet server is busy with — rust-analyzer's "indexing
+            // (45%)" — in the note's slot: the two never show together,
+            // because a server that could not start reports no progress, and
+            // the broken one is the more urgent sentence.
+            val busy = servers.firstOrNull { it.progress != null }
+            if (busy != null) {
+                Text(
+                    text = "${busy.name}: ${busy.progress}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = theme.color("text.muted", MaterialTheme.colorScheme.onSurfaceVariant),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = ItemGap),
+                )
+            }
         }
         if (diagnostics != null) {
             DiagnosticIndicator(summary = diagnostics, onClick = onOpenDiagnostics)

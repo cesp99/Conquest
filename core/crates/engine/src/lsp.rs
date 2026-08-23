@@ -473,6 +473,10 @@ pub struct ServerStatus {
     pub error: Option<String>,
     /// The grammars this instance is serving, sorted.
     pub languages: Vec<String>,
+    /// What the server says it is doing right now — rust-analyzer's
+    /// "indexing (45%)" — or null when it is quiet. One line, first token
+    /// wins: the bar has one line of room.
+    pub progress: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -877,6 +881,10 @@ pub(crate) struct Slot {
     /// Also, for a slot with no documents left, the moment the last one
     /// closed — which is the same thing, because closing sends `didClose`.
     last_activity: Instant,
+    /// What the server says it is doing, per `$/progress` token — "indexing",
+    /// "cargo check" — while it is doing it. Emptied token by token as the
+    /// `End` reports arrive; the status bar shows whatever is left.
+    progress: HashMap<String, ServerProgress>,
     /// This slot holds no process: it is the *record* of a server the cap
     /// refused, kept so the status bar can say so and so the next poll does
     /// not try again while the budget is still spent.
@@ -900,6 +908,7 @@ impl Slot {
             wants_save: false,
             subscriptions: Vec::new(),
             last_activity: Instant::now(),
+            progress: HashMap::new(),
             capped: false,
         }
     }
@@ -920,6 +929,32 @@ impl Slot {
     /// thing; an `Unavailable` one has neither and never will.
     fn holds_processes(&self) -> bool {
         matches!(self.state, ServerState::Starting | ServerState::Running)
+    }
+}
+
+/// One `$/progress` token's state, as the server last reported it. Kept as
+/// parts rather than a rendered line, because a `Report` may carry only a
+/// percentage and the title it belongs to arrived in the `Begin`.
+#[derive(Clone)]
+pub(crate) struct ServerProgress {
+    title: String,
+    message: Option<String>,
+    percentage: Option<u32>,
+}
+
+impl ServerProgress {
+    /// "indexing: 3/10 crates (30%)" — the whole of it in one line, which is
+    /// all a status bar has room to say.
+    fn line(&self) -> String {
+        let mut line = self.title.clone();
+        if let Some(message) = &self.message {
+            line.push_str(": ");
+            line.push_str(message);
+        }
+        if let Some(percentage) = self.percentage {
+            line.push_str(&format!(" ({percentage}%)"));
+        }
+        line
     }
 }
 
@@ -1409,11 +1444,17 @@ impl crate::Engine {
                 let mut languages = languages.remove(slot.server.name).unwrap_or_default();
                 languages.sort();
                 languages.dedup();
+                let mut tokens: Vec<&String> = slot.progress.keys().collect();
+                tokens.sort();
                 ServerStatus {
                     name: slot.server.name.to_owned(),
                     state: slot.state,
                     error: slot.error.clone(),
                     languages,
+                    progress: tokens
+                        .first()
+                        .and_then(|token| slot.progress.get(*token))
+                        .map(ServerProgress::line),
                 }
             })
             .collect();
@@ -2642,6 +2683,62 @@ async fn start_server(request: StartRequest, cx: &mut AsyncApp) {
         server_handle.on_request::<lsp::request::WorkDoneProgressCreate, _, _>(
             |_params, _cx: &mut AsyncApp| async move { anyhow::Ok(()) },
         ),
+        // …and the reports on the tokens the request above created: what the
+        // server is doing, kept per token on the slot so the status bar can
+        // say "indexing (45%)" instead of an unexplained silence.
+        {
+            let slots = slots.clone();
+            let store = store.clone();
+            server_handle.on_notification::<lsp::notification::Progress, _>(
+                move |params: lsp::ProgressParams, _cx: &mut AsyncApp| {
+                    let lsp::ProgressParamsValue::WorkDone(progress) = params.value else {
+                        return;
+                    };
+                    let token = match params.token {
+                        lsp::NumberOrString::Number(number) => number.to_string(),
+                        lsp::NumberOrString::String(string) => string,
+                    };
+                    {
+                        let mut slots = slots.lock().unwrap();
+                        let Some(slot) = slots.get_mut(&(project, server.name)) else {
+                            return;
+                        };
+                        // Progress is proof of life, exactly as a publish is:
+                        // a rust-analyzer chewing through a workspace is
+                        // working, not idle.
+                        slot.last_activity = Instant::now();
+                        match progress {
+                            lsp::WorkDoneProgress::Begin(begin) => {
+                                slot.progress.insert(
+                                    token,
+                                    ServerProgress {
+                                        title: begin.title,
+                                        message: begin.message,
+                                        percentage: begin.percentage,
+                                    },
+                                );
+                            }
+                            // A report may carry only the part that moved;
+                            // the rest keeps what the begin said.
+                            lsp::WorkDoneProgress::Report(report) => {
+                                if let Some(entry) = slot.progress.get_mut(&token) {
+                                    if report.message.is_some() {
+                                        entry.message = report.message;
+                                    }
+                                    if report.percentage.is_some() {
+                                        entry.percentage = report.percentage;
+                                    }
+                                }
+                            }
+                            lsp::WorkDoneProgress::End(_) => {
+                                slot.progress.remove(&token);
+                            }
+                        }
+                    }
+                    store.bump(project);
+                },
+            )
+        },
     ];
 
     // `initialize` with the capabilities Zed advertises, which is where UTF-16
