@@ -287,6 +287,18 @@ enum class WorkspaceCommand(
     ),
 
     /**
+     * Show or hide the diagnostics panel — Zed's `diagnostics::Deploy`, which
+     * its status-bar summary dispatches (diagnostics/src/items.rs:53-56), and
+     * so does ours: tapping the error and warning counts is the panel's way
+     * in. No chord — Zed's `ctrl-shift-m` went to the preview here first, and
+     * the summary is one tap from anywhere.
+     */
+    ToggleDiagnostics(
+        "diagnostics::Deploy",
+        isAvailable = { it.hasProject && "diagnostics" !in it.hiddenPanels },
+    ),
+
+    /**
      * Show or hide the agent panel — Zed's `agent::ToggleFocus`, on the chord
      * Zed gives it (default-linux.json: `ctrl-?`, which a phone keyboard
      * cannot reach, so this takes Zed's *other* agent chord `ctrl-alt-a`).

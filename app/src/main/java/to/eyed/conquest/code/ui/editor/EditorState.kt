@@ -1073,6 +1073,13 @@ class EditorState private constructor(
     fun goToDiagnosticOnRow(row: Int): Boolean = revealDiagnostic(diagnostics.onRow(row))
 
     /**
+     * Land on [target] wherever it came from — the diagnostics panel hands
+     * over rows read project-wide, which this buffer's own list may not hold
+     * yet. The same clamping and unfolding as every other diagnostic jump.
+     */
+    fun goToDiagnosticTarget(target: Diagnostic): Boolean = revealDiagnostic(target)
+
+    /**
      * Land on a diagnostic the way Zed's `activate_diagnostic` does: unfold
      * anything hiding it *first*, then put a bare caret on its start — not a
      * selection over it, because Zed selects `start..start`

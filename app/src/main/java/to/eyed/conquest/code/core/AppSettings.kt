@@ -122,6 +122,7 @@ data class AppSettings(
             "project_search" to PanelPlacement(DockSide.Right, 360f),
             "preview" to PanelPlacement(DockSide.Right, 400f),
             "agent_panel" to PanelPlacement(DockSide.Right, 400f),
+            "diagnostics" to PanelPlacement(DockSide.Right, 360f),
         )
         const val KEY_GITIGNORED = "project_panel.gitignored_files"
 

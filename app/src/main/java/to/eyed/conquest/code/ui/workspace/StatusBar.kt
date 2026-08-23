@@ -171,6 +171,11 @@ fun StatusBar(
     /** Go to the next diagnostic in the active editor — Zed's button action. */
     onGoToDiagnostic: (() -> Unit)? = null,
     /**
+     * Open the diagnostics panel — what tapping the summary does, exactly as
+     * Zed's indicator deploys its project-diagnostics editor (items.rs:53-56).
+     */
+    onOpenDiagnostics: (() -> Unit)? = null,
+    /**
      * Install the server that could not start. Null where there is no
      * userland to install into, which leaves the note as plain text rather
      * than a button that cannot work.
@@ -205,7 +210,7 @@ fun StatusBar(
             )
         }
         if (diagnostics != null) {
-            DiagnosticIndicator(summary = diagnostics, onClick = onGoToDiagnostic)
+            DiagnosticIndicator(summary = diagnostics, onClick = onOpenDiagnostics)
         }
 
         // The message of the diagnostic under the caret, taking whatever room
@@ -337,9 +342,8 @@ private fun StatusIconAction(
  * check. And each half appears only when its own count is above zero, so a
  * file with warnings and no errors shows one icon, not a zero.
  *
- * Zed's click deploys its project-diagnostics editor, which we do not have
- * yet; ours goes to the next diagnostic in the active file, which is what
- * Zed's *other* diagnostic button does (items.rs:83).
+ * Zed's click deploys its project-diagnostics editor (items.rs:53-56), and
+ * ours opens the diagnostics panel, which is that editor in dock-panel form.
  */
 @Composable
 private fun DiagnosticIndicator(summary: DiagnosticSummary, onClick: (() -> Unit)?) {
