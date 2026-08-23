@@ -89,6 +89,13 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(4);
 const HOVER_TIMEOUT: Duration = Duration::from_secs(4);
 const DEFINITION_TIMEOUT: Duration = Duration::from_secs(8);
+const REFERENCES_TIMEOUT: Duration = Duration::from_secs(8);
+const CODE_ACTION_TIMEOUT: Duration = Duration::from_secs(8);
+/// Rename walks the same index references does, then writes; formatting can
+/// spawn a formatter binary inside the guest. Both are asked for and waited
+/// on, never raced against typing, so they get the longest deadline.
+const RENAME_TIMEOUT: Duration = Duration::from_secs(15);
+const FORMATTING_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ---------------------------------------------------------------------------
 // The process budget (P5-4)
@@ -478,6 +485,16 @@ pub enum RequestKind {
     Completion,
     Hover,
     Definition,
+    References,
+    /// The list of actions at a position. Holds the parsed actions back for
+    /// [`RequestKind::CodeActionApply`] to pick from.
+    CodeAction,
+    /// Resolving one chosen action and readying its edit. Its own kind, not a
+    /// re-use of [`RequestKind::CodeAction`]: applying must not supersede the
+    /// list it is picking from.
+    CodeActionApply,
+    Rename,
+    Formatting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -542,6 +559,36 @@ impl RequestResult {
     }
 }
 
+/// What a settled request holds back from its JSON payload: the parsed
+/// artefacts the *next* step needs. The payload the UI reads is a summary;
+/// a `WorkspaceEdit` crossing the JNI boundary and back would only be
+/// re-parsed into exactly this.
+enum StoredWork {
+    None,
+    /// The actions a [`RequestKind::CodeAction`] answered with, in payload
+    /// order, waiting for [`Engine::lsp_request_code_action_apply`] to pick.
+    Actions(Vec<lsp::CodeActionOrCommand>),
+    /// The edit a rename, a formatting or a resolved code action produced,
+    /// waiting for [`Engine::lsp_apply_pending_edit`].
+    Edit(lsp::WorkspaceEdit),
+}
+
+/// What a request needs beyond its position — gathered on the caller's
+/// thread, carried into [`perform`] by value so the runtime job owns no
+/// borrows.
+enum RequestArgs {
+    None,
+    /// The diagnostics under the position, which is the context
+    /// `textDocument/codeAction` wants — a server offers "fix this" only for
+    /// problems the client says it is looking at.
+    CodeActions { diagnostics: Vec<lsp::Diagnostic> },
+    /// The action [`Engine::lsp_request_code_action_apply`] picked out of the
+    /// list request's [`StoredWork::Actions`].
+    CodeActionApply { action: Box<lsp::CodeActionOrCommand> },
+    Rename { new_name: String },
+    Formatting { tab_size: u32 },
+}
+
 struct Pending {
     id: u64,
     kind: RequestKind,
@@ -550,6 +597,9 @@ struct Pending {
     col_utf16: u32,
     buffer_version: u64,
     answer: Mutex<(RequestState, u64, serde_json::Value)>,
+    /// See [`StoredWork`]. Written before the answer settles, so a reader
+    /// that has seen the settle can trust what it finds here.
+    stored: Mutex<StoredWork>,
 }
 
 impl Pending {
@@ -1479,6 +1529,268 @@ impl crate::Engine {
         self.start_request(RequestKind::Definition, buffer, row, col_utf16)
     }
 
+    /// Everywhere the symbol under the caret is used, declaration included.
+    /// See [`Engine::lsp_request_completion`] for the contract.
+    pub fn lsp_request_references(&self, buffer: BufferId, row: u32, col_utf16: u32) -> u64 {
+        self.start_request(RequestKind::References, buffer, row, col_utf16)
+    }
+
+    /// The code actions available at a caret — quick fixes for the
+    /// diagnostics under it, refactorings otherwise. The answer is a list of
+    /// titles; the actions themselves stay here, keyed by index, for
+    /// [`Engine::lsp_request_code_action_apply`]. See
+    /// [`Engine::lsp_request_completion`] for the polling contract.
+    pub fn lsp_request_code_actions(&self, buffer: BufferId, row: u32, col_utf16: u32) -> u64 {
+        let diagnostics = self.diagnostics_under(buffer, row);
+        self.start_request_with(
+            RequestKind::CodeAction,
+            buffer,
+            row,
+            col_utf16,
+            RequestArgs::CodeActions { diagnostics },
+        )
+    }
+
+    /// Pick one action out of a settled [`Engine::lsp_request_code_actions`]
+    /// answer and ready its edit — resolving through `codeAction/resolve`
+    /// when the server sent it lazy. Settles `Done` with an edit summary;
+    /// [`Engine::lsp_apply_pending_edit`] then lands it. A stale list id or a
+    /// bad index settles `Unavailable` immediately, on the same one path.
+    pub fn lsp_request_code_action_apply(&self, list: u64, index: usize) -> u64 {
+        let picked = {
+            let requests = self.lsp.requests.lock().unwrap();
+            requests.live.get(&list).and_then(|pending| {
+                let stored = pending.stored.lock().unwrap();
+                match &*stored {
+                    StoredWork::Actions(actions) => actions
+                        .get(index)
+                        .cloned()
+                        .map(|action| (pending.buffer, pending.row, pending.col_utf16, action)),
+                    _ => None,
+                }
+            })
+        };
+        match picked {
+            Some((buffer, row, col_utf16, action)) => self.start_request_with(
+                RequestKind::CodeActionApply,
+                buffer,
+                row,
+                col_utf16,
+                RequestArgs::CodeActionApply {
+                    action: Box::new(action),
+                },
+            ),
+            // Buffer 0 is never a registered document, so this settles
+            // `Unavailable` on the ordinary path rather than inventing one.
+            None => self.start_request(RequestKind::CodeActionApply, 0, 0, 0),
+        }
+    }
+
+    /// Rename the symbol under the caret to [`new_name`], everywhere.
+    /// Settles `Done` with an edit summary and holds the edit for
+    /// [`Engine::lsp_apply_pending_edit`] — nothing is changed until then.
+    pub fn lsp_request_rename(
+        &self,
+        buffer: BufferId,
+        row: u32,
+        col_utf16: u32,
+        new_name: &str,
+    ) -> u64 {
+        self.start_request_with(
+            RequestKind::Rename,
+            buffer,
+            row,
+            col_utf16,
+            RequestArgs::Rename {
+                new_name: new_name.to_owned(),
+            },
+        )
+    }
+
+    /// Format the whole document, with the workspace's own tab size. Settles
+    /// `Done` with an edit summary — zero edits is a well-formatted file —
+    /// and holds the edit for [`Engine::lsp_apply_pending_edit`].
+    pub fn lsp_request_formatting(&self, buffer: BufferId) -> u64 {
+        let tab_size = self.settings().tab_size;
+        self.start_request_with(
+            RequestKind::Formatting,
+            buffer,
+            0,
+            0,
+            RequestArgs::Formatting { tab_size },
+        )
+    }
+
+    /// The diagnostics on a row, in the wire shape `textDocument/codeAction`
+    /// wants back as context. Row-level rather than caret-exact, because a
+    /// finger is not a caret: asking anywhere on the line means the line's
+    /// problems.
+    fn diagnostics_under(&self, buffer: BufferId, row: u32) -> Vec<lsp::Diagnostic> {
+        let Some(path) = self.buffer_path(buffer) else {
+            return Vec::new();
+        };
+        let files = self.lsp.store.files.lock().unwrap();
+        let Some(file) = files.get(&path) else {
+            return Vec::new();
+        };
+        file.rows
+            .iter()
+            .filter(|entry| entry.row <= row && row <= entry.end_row)
+            .map(|entry| lsp::Diagnostic {
+                range: Range::new(
+                    Position::new(entry.row, entry.col_utf16),
+                    Position::new(entry.end_row, entry.end_col_utf16),
+                ),
+                severity: Some(match entry.severity {
+                    Severity::Error => lsp::DiagnosticSeverity::ERROR,
+                    Severity::Warning => lsp::DiagnosticSeverity::WARNING,
+                    Severity::Info => lsp::DiagnosticSeverity::INFORMATION,
+                    Severity::Hint => lsp::DiagnosticSeverity::HINT,
+                }),
+                code: entry.code.clone().map(lsp::NumberOrString::String),
+                source: entry.source.clone(),
+                message: entry.message.clone(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    /// Land the edit a settled rename, formatting or code-action request is
+    /// holding. Synchronous: open buffers take the edits through the normal
+    /// edit path — `didChange`, undo history, version bumps and all — and
+    /// files nobody has open are rewritten atomically on disk.
+    ///
+    /// The edit is *taken*: a second call for the same id reports "nothing to
+    /// apply", which is what stops a double-tap applying a rename twice.
+    pub fn lsp_apply_pending_edit(&self, request: u64) -> ApplyReceipt {
+        let stored = {
+            let requests = self.lsp.requests.lock().unwrap();
+            let Some(pending) = requests.live.get(&request) else {
+                return ApplyReceipt::refused("the request is gone".to_owned());
+            };
+            std::mem::replace(&mut *pending.stored.lock().unwrap(), StoredWork::None)
+        };
+        let StoredWork::Edit(edit) = stored else {
+            return ApplyReceipt::refused("nothing to apply".to_owned());
+        };
+        let files = match normalize_workspace_edit(edit) {
+            Ok(files) => files,
+            Err(error) => return ApplyReceipt::refused(error),
+        };
+
+        // Validate everything before touching anything: a rename applied to
+        // three files and refused on the fourth is worse than one refused
+        // whole.
+        for file in &files {
+            if let Some(buffer) = self.buffer_for_path(&file.path) {
+                if let (Some(sent), Some(current)) = (
+                    file.version,
+                    self.lsp
+                        .docs
+                        .lock()
+                        .unwrap()
+                        .get(&buffer)
+                        .map(|doc| doc.lsp_version),
+                ) {
+                    if sent != current {
+                        return ApplyReceipt::refused(format!(
+                            "{} changed while the server was thinking — try again",
+                            file.path.display()
+                        ));
+                    }
+                }
+            } else if !file.path.exists() {
+                return ApplyReceipt::refused(format!(
+                    "{} is not there to edit",
+                    file.path.display()
+                ));
+            }
+        }
+
+        let mut receipt = ApplyReceipt {
+            applied: true,
+            error: None,
+            files: Vec::new(),
+        };
+        for file in files {
+            let applied = match self.buffer_for_path(&file.path) {
+                Some(buffer) => self
+                    .apply_edits_to_buffer(buffer, &file.edits)
+                    .map(|()| AppliedFile {
+                        path: file.path.to_string_lossy().into_owned(),
+                        buffer_id: Some(buffer),
+                        edits: file.edits.len(),
+                    }),
+                None => std::fs::read_to_string(&file.path)
+                    .map_err(|err| format!("{}: {err}", file.path.display()))
+                    .and_then(|text| {
+                        let text = apply_edits_to_text(&text, &file.edits);
+                        crate::file::write_atomically_io(&file.path, &text)
+                            .map_err(|err| format!("{}: {err}", file.path.display()))
+                    })
+                    .map(|()| AppliedFile {
+                        path: file.path.to_string_lossy().into_owned(),
+                        buffer_id: None,
+                        edits: file.edits.len(),
+                    }),
+            };
+            match applied {
+                Ok(file) => receipt.files.push(file),
+                Err(error) => {
+                    // Stop rather than go on: the receipt says what landed,
+                    // and the error says why the rest did not.
+                    receipt.error = Some(error);
+                    break;
+                }
+            }
+        }
+        receipt
+    }
+
+    /// The open-buffer half of the applier: offsets resolved against one
+    /// snapshot, applied back to front through [`Engine::edit`], bracketed
+    /// into one undo transaction the way a reload is.
+    fn apply_edits_to_buffer(&self, buffer: BufferId, edits: &[lsp::TextEdit]) -> Result<(), String> {
+        let mut resolved: Vec<(usize, usize, String)> = self
+            .with_buffer(buffer, |state| {
+                let rope = state.buffer.as_rope();
+                let offset_of = |position: Position| {
+                    let point = rope.clip_point_utf16(
+                        rope::Unclipped(PointUtf16::new(position.line, position.character)),
+                        text::Bias::Left,
+                    );
+                    rope.point_utf16_to_offset(point)
+                };
+                edits
+                    .iter()
+                    .map(|edit| {
+                        let start = offset_of(edit.range.start);
+                        let end = offset_of(edit.range.end).max(start);
+                        (start, end, edit.new_text.clone())
+                    })
+                    .collect()
+            })
+            .map_err(|err| format!("{err:?}"))?;
+        resolved.sort_by_key(|(start, end, _)| (*start, *end));
+
+        self.finalize_buffer_history(buffer);
+        for (start, end, text) in resolved.into_iter().rev() {
+            self.edit(buffer, start, end, &text)
+                .map_err(|err| format!("{err:?}"))?;
+        }
+        self.finalize_buffer_history(buffer);
+        Ok(())
+    }
+
+    /// Close whatever undo transaction is open on a buffer — the bracketing
+    /// a reload uses, for the same reason: an applied edit is a discrete
+    /// event, and must not merge into the typing before or after it.
+    fn finalize_buffer_history(&self, buffer: BufferId) {
+        if let Ok(state) = self.buffer(buffer) {
+            state.lock().unwrap().buffer.finalize_last_transaction();
+        }
+    }
+
     /// Generation counter for a request: 1 while it is in flight, 2 once it has
     /// settled, 0 for an id the engine has forgotten. Poll it like
     /// `project_search_version`.
@@ -2112,6 +2424,17 @@ impl crate::Engine {
     }
 
     fn start_request(&self, kind: RequestKind, buffer: BufferId, row: u32, col_utf16: u32) -> u64 {
+        self.start_request_with(kind, buffer, row, col_utf16, RequestArgs::None)
+    }
+
+    fn start_request_with(
+        &self,
+        kind: RequestKind,
+        buffer: BufferId,
+        row: u32,
+        col_utf16: u32,
+        args: RequestArgs,
+    ) -> u64 {
         let id = self.lsp.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
         let buffer_version = self.version(buffer).unwrap_or(0);
         let pending = Arc::new(Pending {
@@ -2122,6 +2445,7 @@ impl crate::Engine {
             col_utf16,
             buffer_version,
             answer: Mutex::new((RequestState::Pending, 1, serde_json::Value::Null)),
+            stored: Mutex::new(StoredWork::None),
         });
         {
             let mut requests = self.lsp.requests.lock().unwrap();
@@ -2155,7 +2479,11 @@ impl crate::Engine {
         let requests = self.lsp.requests.clone();
         self.runtime().spawn(move |cx| {
             let task = cx.spawn(async move |_| {
-                let (state, payload) = perform(&handle, kind, uri, row, col_utf16).await;
+                let (state, payload, stored) =
+                    perform(&handle, kind, uri, row, col_utf16, args).await;
+                // Stored before settled, so a reader that has observed the
+                // settle can trust what it finds behind it.
+                *pending.stored.lock().unwrap() = stored;
                 pending.settle(state, payload);
             });
             // Superseded before the runtime got to it: dropping the task here
@@ -2449,20 +2777,24 @@ fn sync_of(capabilities: &lsp::ServerCapabilities) -> (TextDocumentSyncKind, boo
     }
 }
 
-/// Send one request and turn its answer into the JSON the UI reads.
+/// Send one request and turn its answer into the JSON the UI reads — and,
+/// for the kinds that produce work rather than words, the [`StoredWork`] the
+/// next step runs on.
 async fn perform(
     server: &LanguageServer,
     kind: RequestKind,
     uri: Uri,
     row: u32,
     col_utf16: u32,
-) -> (RequestState, serde_json::Value) {
+    args: RequestArgs,
+) -> (RequestState, serde_json::Value, StoredWork) {
     let position = TextDocumentPositionParams {
         text_document: TextDocumentIdentifier::new(uri),
         position: Position::new(row, col_utf16),
     };
-    match kind {
-        RequestKind::Completion => {
+    let plain = |(state, payload)| (state, payload, StoredWork::None);
+    match (kind, args) {
+        (RequestKind::Completion, _) => {
             let response = server
                 .request::<lsp::request::Completion>(
                     CompletionParams {
@@ -2474,9 +2806,9 @@ async fn perform(
                     COMPLETION_TIMEOUT,
                 )
                 .await;
-            settle(response, completion_json)
+            plain(settle(response, completion_json))
         }
-        RequestKind::Hover => {
+        (RequestKind::Hover, _) => {
             let response = server
                 .request::<lsp::request::HoverRequest>(
                     HoverParams {
@@ -2486,9 +2818,9 @@ async fn perform(
                     HOVER_TIMEOUT,
                 )
                 .await;
-            settle(response, hover_json)
+            plain(settle(response, hover_json))
         }
-        RequestKind::Definition => {
+        (RequestKind::Definition, _) => {
             let response = server
                 .request::<lsp::request::GotoDefinition>(
                     GotoDefinitionParams {
@@ -2499,8 +2831,194 @@ async fn perform(
                     DEFINITION_TIMEOUT,
                 )
                 .await;
-            settle(response, definition_json)
+            plain(settle(response, definition_json))
         }
+        (RequestKind::References, _) => {
+            let response = server
+                .request::<lsp::request::References>(
+                    lsp::ReferenceParams {
+                        text_document_position: position,
+                        work_done_progress_params: WorkDoneProgressParams::default(),
+                        partial_result_params: PartialResultParams::default(),
+                        context: lsp::ReferenceContext {
+                            // The declaration belongs in the list: "who uses
+                            // this" includes where it came from, and Zed
+                            // includes it too.
+                            include_declaration: true,
+                        },
+                    },
+                    REFERENCES_TIMEOUT,
+                )
+                .await;
+            plain(settle(response, references_json))
+        }
+        (RequestKind::CodeAction, RequestArgs::CodeActions { diagnostics }) => {
+            // The range the actions are for: the diagnostics under the caret
+            // when there are any — a fix should cover the whole problem, not
+            // the one character the caret is on — and the caret itself
+            // otherwise, which is how refactorings with nothing wrong appear.
+            let range = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.range)
+                .reduce(|a, b| Range::new(a.start.min(b.start), a.end.max(b.end)))
+                .unwrap_or_else(|| Range::new(position.position, position.position));
+            let response = server
+                .request::<lsp::request::CodeActionRequest>(
+                    lsp::CodeActionParams {
+                        text_document: position.text_document,
+                        range,
+                        context: lsp::CodeActionContext {
+                            diagnostics,
+                            only: None,
+                            trigger_kind: Some(lsp::CodeActionTriggerKind::INVOKED),
+                        },
+                        work_done_progress_params: WorkDoneProgressParams::default(),
+                        partial_result_params: PartialResultParams::default(),
+                    },
+                    CODE_ACTION_TIMEOUT,
+                )
+                .await;
+            match response {
+                util::ConnectionResult::Result(Ok(actions)) => {
+                    let actions = actions.unwrap_or_default();
+                    (
+                        RequestState::Done,
+                        code_actions_json(&actions),
+                        StoredWork::Actions(actions),
+                    )
+                }
+                other => plain(settle(other, |_: Option<lsp::CodeActionResponse>| {
+                    serde_json::Value::Null
+                })),
+            }
+        }
+        (RequestKind::CodeActionApply, RequestArgs::CodeActionApply { action }) => {
+            let action = match *action {
+                lsp::CodeActionOrCommand::CodeAction(action) => action,
+                // The list already marked bare commands disabled; reaching
+                // here with one is a client bug, answered rather than paniced.
+                lsp::CodeActionOrCommand::Command(_) => {
+                    return (
+                        RequestState::Unavailable,
+                        error_payload("this action runs a server command, which is not supported yet"),
+                        StoredWork::None,
+                    );
+                }
+            };
+            // An action may arrive lazy: no edit yet, a `data` field the
+            // server wants echoed back through `codeAction/resolve`. That is
+            // rust-analyzer's normal shape.
+            let resolved = if action.edit.is_none() && action.data.is_some() {
+                match server
+                    .request::<lsp::request::CodeActionResolveRequest>(
+                        action.clone(),
+                        CODE_ACTION_TIMEOUT,
+                    )
+                    .await
+                {
+                    util::ConnectionResult::Result(Ok(resolved)) => resolved,
+                    util::ConnectionResult::Result(Err(err)) => {
+                        log::debug!("lsp: codeAction/resolve failed: {err:#}");
+                        action
+                    }
+                    util::ConnectionResult::Timeout => {
+                        return (RequestState::Timeout, serde_json::Value::Null, StoredWork::None);
+                    }
+                    util::ConnectionResult::ConnectionReset => {
+                        return (
+                            RequestState::Unavailable,
+                            serde_json::Value::Null,
+                            StoredWork::None,
+                        );
+                    }
+                }
+            } else {
+                action
+            };
+            match resolved.edit {
+                Some(edit) => (
+                    RequestState::Done,
+                    edit_summary_json(&edit),
+                    StoredWork::Edit(edit),
+                ),
+                None => (
+                    RequestState::Done,
+                    error_payload("the server offered no edit for this action"),
+                    StoredWork::None,
+                ),
+            }
+        }
+        (RequestKind::Rename, RequestArgs::Rename { new_name }) => {
+            let response = server
+                .request::<lsp::request::Rename>(
+                    lsp::RenameParams {
+                        text_document_position: position,
+                        new_name,
+                        work_done_progress_params: WorkDoneProgressParams::default(),
+                    },
+                    RENAME_TIMEOUT,
+                )
+                .await;
+            match response {
+                util::ConnectionResult::Result(Ok(Some(edit))) => (
+                    RequestState::Done,
+                    edit_summary_json(&edit),
+                    StoredWork::Edit(edit),
+                ),
+                util::ConnectionResult::Result(Ok(None)) => (
+                    RequestState::Done,
+                    error_payload("the server had nothing to rename here"),
+                    StoredWork::None,
+                ),
+                other => plain(settle(other, |_: Option<lsp::WorkspaceEdit>| {
+                    serde_json::Value::Null
+                })),
+            }
+        }
+        (RequestKind::Formatting, RequestArgs::Formatting { tab_size }) => {
+            let uri = position.text_document.uri.clone();
+            let response = server
+                .request::<lsp::request::Formatting>(
+                    lsp::DocumentFormattingParams {
+                        text_document: position.text_document,
+                        options: lsp::FormattingOptions {
+                            tab_size,
+                            insert_spaces: true,
+                            ..Default::default()
+                        },
+                        work_done_progress_params: WorkDoneProgressParams::default(),
+                    },
+                    FORMATTING_TIMEOUT,
+                )
+                .await;
+            match response {
+                util::ConnectionResult::Result(Ok(edits)) => {
+                    let edits = edits.unwrap_or_default();
+                    // A formatter's answer is a WorkspaceEdit over one file,
+                    // so the one applier serves all three edit producers.
+                    let edit = lsp::WorkspaceEdit {
+                        changes: Some(HashMap::from([(uri, edits)])),
+                        document_changes: None,
+                        change_annotations: None,
+                    };
+                    (
+                        RequestState::Done,
+                        edit_summary_json(&edit),
+                        StoredWork::Edit(edit),
+                    )
+                }
+                other => plain(settle(other, |_: Option<Vec<lsp::TextEdit>>| {
+                    serde_json::Value::Null
+                })),
+            }
+        }
+        // A kind reached without the arguments it needs — unreachable from
+        // the public entry points, answered rather than paniced all the same.
+        (_, _) => (
+            RequestState::Unavailable,
+            serde_json::Value::Null,
+            StoredWork::None,
+        ),
     }
 }
 
@@ -2606,6 +3124,11 @@ struct TargetJson {
     /// The whole symbol, for selecting it on arrival.
     end_row: u32,
     end_col_utf16: u32,
+    /// The line the target sits on, trimmed — filled in for references, where
+    /// a list of bare positions would be unreadable, and absent elsewhere.
+    /// Read from disk, so it can trail an unsaved buffer by one save.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_text: Option<String>,
 }
 
 fn completion_json(response: Option<CompletionResponse>) -> serde_json::Value {
@@ -2760,7 +3283,369 @@ fn target(uri: Uri, range: Range) -> Option<TargetJson> {
         col_utf16: range.start.character,
         end_row: range.end.line,
         end_col_utf16: range.end.character,
+        line_text: None,
     })
+}
+
+#[derive(serde::Serialize)]
+struct ReferencesPayload {
+    targets: Vec<TargetJson>,
+}
+
+fn references_json(locations: Option<Vec<lsp::Location>>) -> serde_json::Value {
+    // One read per file, however many references it holds — a symbol used two
+    // hundred times in one module costs one file, not two hundred.
+    let mut lines_by_file: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
+    let targets: Vec<TargetJson> = locations
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|location| {
+            let mut target = target(location.uri, location.range)?;
+            let path = PathBuf::from(&target.path);
+            let lines = lines_by_file.entry(path.clone()).or_insert_with(|| {
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .map(|text| text.lines().map(|line| line.trim().to_owned()).collect())
+            });
+            target.line_text = lines
+                .as_ref()
+                .and_then(|lines| lines.get(target.row as usize).cloned());
+            Some(target)
+        })
+        .collect();
+    serde_json::to_value(ReferencesPayload { targets }).unwrap_or(serde_json::Value::Null)
+}
+
+/// `{"error": …}` — the shape a settled-but-empty answer takes, so the UI can
+/// put a sentence where a list or a receipt was hoped for.
+fn error_payload(message: &str) -> serde_json::Value {
+    serde_json::json!({ "error": message })
+}
+
+#[derive(serde::Serialize)]
+struct CodeActionsPayload {
+    actions: Vec<CodeActionJson>,
+}
+
+#[derive(serde::Serialize)]
+struct CodeActionJson {
+    /// Position in the stored list — what `lspRequestCodeActionApply` takes.
+    index: usize,
+    title: String,
+    /// LSP's kind string ("quickfix", "refactor.extract"), or null.
+    kind: Option<String>,
+    /// The server marked it the best answer; the UI puts it first.
+    is_preferred: bool,
+    /// Why it cannot run, when it cannot — the server's own reason, or this
+    /// client's ("runs a server command"). Null for an action that can.
+    disabled: Option<String>,
+}
+
+/// Why an action in the list cannot be applied here, if it cannot.
+fn action_disabled_reason(action: &lsp::CodeActionOrCommand) -> Option<String> {
+    match action {
+        // A bare command runs on the server and edits arrive by
+        // `workspace/applyEdit`, which this client does not take yet.
+        lsp::CodeActionOrCommand::Command(_) => {
+            Some("runs a server command, which is not supported yet".to_owned())
+        }
+        lsp::CodeActionOrCommand::CodeAction(action) => {
+            if let Some(disabled) = &action.disabled {
+                return Some(disabled.reason.clone());
+            }
+            // No edit, nothing to resolve one from, only a command: same
+            // boat as the bare command.
+            if action.edit.is_none() && action.data.is_none() && action.command.is_some() {
+                return Some("runs a server command, which is not supported yet".to_owned());
+            }
+            None
+        }
+    }
+}
+
+fn code_actions_json(actions: &[lsp::CodeActionOrCommand]) -> serde_json::Value {
+    let actions: Vec<CodeActionJson> = actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| CodeActionJson {
+            index,
+            title: match action {
+                lsp::CodeActionOrCommand::Command(command) => command.title.clone(),
+                lsp::CodeActionOrCommand::CodeAction(action) => action.title.clone(),
+            },
+            kind: match action {
+                lsp::CodeActionOrCommand::Command(_) => None,
+                lsp::CodeActionOrCommand::CodeAction(action) => {
+                    action.kind.as_ref().map(|kind| kind.as_str().to_owned())
+                }
+            },
+            is_preferred: matches!(
+                action,
+                lsp::CodeActionOrCommand::CodeAction(action) if action.is_preferred == Some(true)
+            ),
+            disabled: action_disabled_reason(action),
+        })
+        .collect();
+    serde_json::to_value(CodeActionsPayload { actions }).unwrap_or(serde_json::Value::Null)
+}
+
+/// What an edit will touch, said before it is applied — the payload a rename,
+/// a formatting or a resolved action settles with, so the UI can say
+/// "3 files, 14 edits" and then ask for the apply.
+fn edit_summary_json(edit: &lsp::WorkspaceEdit) -> serde_json::Value {
+    let mut files = 0usize;
+    let mut edits = 0usize;
+    let mut resource_ops = false;
+    if let Some(changes) = &edit.changes {
+        files += changes.len();
+        edits += changes.values().map(Vec::len).sum::<usize>();
+    }
+    match &edit.document_changes {
+        Some(lsp::DocumentChanges::Edits(documents)) => {
+            files += documents.len();
+            edits += documents.iter().map(|doc| doc.edits.len()).sum::<usize>();
+        }
+        Some(lsp::DocumentChanges::Operations(operations)) => {
+            for operation in operations {
+                match operation {
+                    lsp::DocumentChangeOperation::Edit(doc) => {
+                        files += 1;
+                        edits += doc.edits.len();
+                    }
+                    lsp::DocumentChangeOperation::Op(_) => resource_ops = true,
+                }
+            }
+        }
+        None => {}
+    }
+    serde_json::json!({ "files": files, "edits": edits, "resource_ops": resource_ops })
+}
+
+// ---------------------------------------------------------------------------
+// Applying a WorkspaceEdit
+// ---------------------------------------------------------------------------
+
+/// One file's slice of a normalized [`lsp::WorkspaceEdit`].
+struct FileEdits {
+    /// Canonicalized, for the same reason every path in this module is.
+    path: PathBuf,
+    /// The LSP document version the server dated its edits against, when it
+    /// did. Checked against the open document before anything is applied.
+    version: Option<i32>,
+    edits: Vec<lsp::TextEdit>,
+}
+
+/// Flatten the three shapes a [`lsp::WorkspaceEdit`] comes in into one list of
+/// per-file edit sets, refusing what this client cannot do yet.
+fn normalize_workspace_edit(edit: lsp::WorkspaceEdit) -> Result<Vec<FileEdits>, String> {
+    let mut files: Vec<FileEdits> = Vec::new();
+    let mut push = |uri: Uri, version: Option<i32>, edits: Vec<lsp::TextEdit>| -> Result<(), String> {
+        let path = uri
+            .to_file_path()
+            .map_err(|()| format!("the edit names a URI that is not a file: {uri}"))?;
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        files.push(FileEdits { path, version, edits });
+        Ok(())
+    };
+    if let Some(changes) = edit.changes {
+        for (uri, edits) in changes {
+            push(uri, None, edits)?;
+        }
+    }
+    match edit.document_changes {
+        Some(lsp::DocumentChanges::Edits(documents)) => {
+            for document in documents {
+                let edits = plain_edits(document.edits);
+                push(document.text_document.uri, document.text_document.version, edits)?;
+            }
+        }
+        Some(lsp::DocumentChanges::Operations(operations)) => {
+            for operation in operations {
+                match operation {
+                    lsp::DocumentChangeOperation::Edit(document) => {
+                        let edits = plain_edits(document.edits);
+                        push(
+                            document.text_document.uri,
+                            document.text_document.version,
+                            edits,
+                        )?;
+                    }
+                    // Creating, renaming and deleting files is real work this
+                    // client has not built yet — refusing the whole edit is
+                    // honest where applying half of it would corrupt.
+                    lsp::DocumentChangeOperation::Op(_) => {
+                        return Err(
+                            "the edit creates, renames or deletes files, \
+                             which is not supported yet"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+    // Sorted so a multi-file receipt reads in one order every time.
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+/// A document's edits, whatever mix of plain, annotated and snippet forms
+/// they arrived in, as plain text edits.
+fn plain_edits(edits: Vec<lsp::Edit>) -> Vec<lsp::TextEdit> {
+    edits
+        .into_iter()
+        .map(|edit| match edit {
+            lsp::Edit::Plain(edit) => edit,
+            lsp::Edit::Annotated(edit) => edit.text_edit,
+            // rust-analyzer sends snippet edits because the capabilities say
+            // we take them (workspace_edit.snippet_edit_support, vendored) —
+            // there is no caret to place from here, so the placeholders
+            // collapse to their text.
+            lsp::Edit::Snippet(edit) => lsp::TextEdit {
+                range: edit.range,
+                new_text: strip_snippet(&edit.snippet.value),
+            },
+        })
+        .collect()
+}
+
+/// LSP snippet syntax, reduced to the text it would leave behind: `$0` and
+/// `$1` vanish, `${1:body}` keeps its body, `${1|a,b|}` keeps its first
+/// choice, `\$` keeps its dollar. Nested placeholders unwrap recursively.
+fn strip_snippet(snippet: &str) -> String {
+    let mut out = String::with_capacity(snippet.len());
+    let mut chars = snippet.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                // An escaped character stands for itself; a trailing
+                // backslash is kept as one.
+                match chars.next() {
+                    Some(escaped) => out.push(escaped),
+                    None => out.push('\\'),
+                }
+            }
+            '$' => match chars.peek() {
+                // `$1` — a bare tabstop: nothing is left behind.
+                Some(digit) if digit.is_ascii_digit() => {
+                    while chars.peek().is_some_and(char::is_ascii_digit) {
+                        chars.next();
+                    }
+                }
+                Some('{') => {
+                    chars.next();
+                    // `${1:body}` / `${1|a,b|}` / `${1}` — collect to the
+                    // matching brace, then keep what the placeholder keeps.
+                    let mut depth = 1;
+                    let mut inner = String::new();
+                    for ch in chars.by_ref() {
+                        match ch {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        inner.push(ch);
+                    }
+                    if let Some(body) = inner.split_once(':').map(|(_, body)| body) {
+                        out.push_str(&strip_snippet(body));
+                    } else if let Some(choices) = inner.split_once('|').map(|(_, rest)| rest) {
+                        if let Some(first) = choices.trim_end_matches('|').split(',').next() {
+                            out.push_str(first);
+                        }
+                    }
+                    // `${1}` keeps nothing.
+                }
+                _ => out.push('$'),
+            },
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Apply [`lsp::TextEdit`]s to a document held as text — the closed-file
+/// half of the applier, and pure so it is testable on the host.
+///
+/// Positions are UTF-16 (line, character), clamped the way the spec says: a
+/// line past the end means the end of the document, a character past a line's
+/// end means the end of that line. Edits are applied back to front against
+/// one snapshot, which LSP's no-overlap rule makes safe.
+fn apply_edits_to_text(text: &str, edits: &[lsp::TextEdit]) -> String {
+    // Byte offset of each line start, plus one payload-end sentinel.
+    let mut line_starts: Vec<usize> = vec![0];
+    for (index, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            line_starts.push(index + 1);
+        }
+    }
+    let offset_of = |position: Position| -> usize {
+        let Some(&line_start) = line_starts.get(position.line as usize) else {
+            return text.len();
+        };
+        let line_end = line_starts
+            .get(position.line as usize + 1)
+            .map(|next| next - 1)
+            .unwrap_or(text.len());
+        let line = &text[line_start..line_end];
+        let mut utf16 = 0u32;
+        for (byte_index, ch) in line.char_indices() {
+            if utf16 >= position.character {
+                return line_start + byte_index;
+            }
+            utf16 += ch.len_utf16() as u32;
+        }
+        line_end
+    };
+    let mut resolved: Vec<(usize, usize, &str)> = edits
+        .iter()
+        .map(|edit| {
+            let start = offset_of(edit.range.start);
+            let end = offset_of(edit.range.end).max(start);
+            (start, end, edit.new_text.as_str())
+        })
+        .collect();
+    resolved.sort_by_key(|(start, end, _)| (*start, *end));
+    let mut out = text.to_owned();
+    for (start, end, new_text) in resolved.into_iter().rev() {
+        out.replace_range(start..end, new_text);
+    }
+    out
+}
+
+/// One applied file, in the receipt [`Engine::lsp_apply_pending_edit`] hands
+/// back so the UI knows which of its editors to resync.
+#[derive(serde::Serialize)]
+pub struct AppliedFile {
+    /// Absolute host path, canonical — match it against open tabs.
+    pub path: String,
+    /// The open buffer it landed in, or null for a file edited on disk.
+    pub buffer_id: Option<BufferId>,
+    pub edits: usize,
+}
+
+/// What applying a stored edit did.
+#[derive(serde::Serialize)]
+pub struct ApplyReceipt {
+    pub applied: bool,
+    /// Why nothing (or not everything) was applied. Null on success.
+    pub error: Option<String>,
+    pub files: Vec<AppliedFile>,
+}
+
+impl ApplyReceipt {
+    fn refused(error: String) -> Self {
+        Self {
+            applied: false,
+            error: Some(error),
+            files: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3814,6 +4699,166 @@ mod tests {
             watched_change_type(&worktree::PathChange::AddedOrUpdated),
             Some(lsp::FileChangeType::CHANGED)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Workspace edits
+    // -----------------------------------------------------------------------
+
+    fn text_edit(
+        (row, col): (u32, u32),
+        (end_row, end_col): (u32, u32),
+        text: &str,
+    ) -> lsp::TextEdit {
+        lsp::TextEdit {
+            range: Range::new(Position::new(row, col), Position::new(end_row, end_col)),
+            new_text: text.to_owned(),
+        }
+    }
+
+    /// The closed-file applier: UTF-16 positions, back-to-front application,
+    /// and the spec's clamping for positions past the end.
+    #[test]
+    fn edits_land_in_text_by_utf16_position() {
+        let text = "fn main() {\n    let naïve = 1;\n}\n";
+        // Two edits on one line, in *ascending* order as servers send them:
+        // rename `naïve` and change its value. The ï is one UTF-16 unit but
+        // two bytes, which is exactly what this conversion is for.
+        let edited = apply_edits_to_text(
+            text,
+            &[
+                text_edit((1, 8), (1, 13), "clever"),
+                text_edit((1, 16), (1, 17), "2"),
+            ],
+        );
+        assert_eq!(edited, "fn main() {\n    let clever = 2;\n}\n");
+
+        // A position past the last line means the end of the document —
+        // how a formatter appends a missing trailing newline.
+        let appended = apply_edits_to_text("no newline", &[text_edit((5, 0), (5, 0), "\n")]);
+        assert_eq!(appended, "no newline\n");
+
+        // A character past a line's end means the end of that line.
+        let clamped = apply_edits_to_text("ab\ncd\n", &[text_edit((0, 99), (1, 0), "-")]);
+        assert_eq!(clamped, "ab-cd\n");
+    }
+
+    /// Snippet syntax reduced to the text it leaves behind — what
+    /// rust-analyzer's snippet edits collapse to when there is no caret to
+    /// place.
+    #[test]
+    fn snippets_collapse_to_their_text() {
+        assert_eq!(strip_snippet("let $0name = ${1:value};"), "let name = value;");
+        assert_eq!(strip_snippet("${1|first,second|}"), "first");
+        assert_eq!(strip_snippet("${1}"), "");
+        assert_eq!(strip_snippet("plain"), "plain");
+        assert_eq!(strip_snippet(r"\$literal"), "$literal");
+        assert_eq!(strip_snippet("${1:outer ${2:inner}}"), "outer inner");
+    }
+
+    /// Both shapes a `WorkspaceEdit` arrives in flatten to the same list, and
+    /// file operations are refused whole rather than half-applied.
+    #[test]
+    fn workspace_edits_normalize_and_resource_ops_are_refused() {
+        let uri = Uri::from_file_path(Path::new("/p/main.rs")).unwrap();
+        let simple = lsp::WorkspaceEdit {
+            changes: Some(HashMap::from([(
+                uri.clone(),
+                vec![text_edit((0, 0), (0, 1), "x")],
+            )])),
+            document_changes: None,
+            change_annotations: None,
+        };
+        let files = normalize_workspace_edit(simple).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("/p/main.rs"));
+        assert_eq!(files[0].version, None);
+        assert_eq!(files[0].edits.len(), 1);
+
+        let versioned = lsp::WorkspaceEdit {
+            changes: None,
+            document_changes: Some(lsp::DocumentChanges::Edits(vec![lsp::TextDocumentEdit {
+                text_document: lsp::OptionalVersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: Some(7),
+                },
+                edits: vec![lsp::Edit::Plain(text_edit((0, 0), (0, 1), "y"))],
+            }])),
+            change_annotations: None,
+        };
+        let files = normalize_workspace_edit(versioned).unwrap();
+        assert_eq!(files[0].version, Some(7));
+
+        let with_ops = lsp::WorkspaceEdit {
+            changes: None,
+            document_changes: Some(lsp::DocumentChanges::Operations(vec![
+                lsp::DocumentChangeOperation::Op(lsp::ResourceOp::Delete(lsp::DeleteFile {
+                    uri,
+                    options: None,
+                })),
+            ])),
+            change_annotations: None,
+        };
+        assert!(normalize_workspace_edit(with_ops).is_err());
+    }
+
+    /// The whole apply path against a real buffer: one undo step, a receipt
+    /// naming the buffer, and the closed-file half writing through to disk.
+    #[test]
+    fn a_pending_edit_lands_in_buffers_and_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("projects")).unwrap();
+        let open_file = project_with_file(dir.path(), "main.rs", "fn main() {}\n");
+        let closed_file = project_with_file(dir.path(), "lib.rs", "fn lib() {}\n");
+        let engine = Engine::new();
+        let _project = engine.open_project(open_file.parent().unwrap());
+        let buffer = engine.open_file(&open_file).unwrap();
+        let open_canonical = engine.buffer_path(buffer).unwrap();
+        let closed_canonical = std::fs::canonicalize(&closed_file).unwrap();
+
+        // Stage the edit the way a settled rename would have.
+        let edit = lsp::WorkspaceEdit {
+            changes: Some(HashMap::from([
+                (
+                    Uri::from_file_path(&open_canonical).unwrap(),
+                    vec![text_edit((0, 3), (0, 7), "start")],
+                ),
+                (
+                    Uri::from_file_path(&closed_canonical).unwrap(),
+                    vec![text_edit((0, 3), (0, 6), "start")],
+                ),
+            ])),
+            document_changes: None,
+            change_annotations: None,
+        };
+        let id = engine.start_request(RequestKind::Rename, buffer, 0, 3);
+        {
+            let requests = engine.lsp.requests.lock().unwrap();
+            let pending = requests.live.get(&id).unwrap();
+            *pending.stored.lock().unwrap() = StoredWork::Edit(edit);
+        }
+
+        let receipt = engine.lsp_apply_pending_edit(id);
+        assert!(receipt.applied, "refused: {:?}", receipt.error);
+        assert_eq!(receipt.error, None);
+        assert_eq!(receipt.files.len(), 2);
+        // Sorted by path: lib.rs before main.rs.
+        assert_eq!(receipt.files[0].buffer_id, None, "lib.rs is not open");
+        assert_eq!(receipt.files[1].buffer_id, Some(buffer));
+
+        assert_eq!(engine.text(buffer).unwrap(), "fn start() {}\n");
+        assert_eq!(
+            std::fs::read_to_string(&closed_canonical).unwrap(),
+            "fn start() {}\n"
+        );
+
+        // One undo step takes the whole edit back out of the open buffer.
+        engine.undo(buffer).unwrap();
+        assert_eq!(engine.text(buffer).unwrap(), "fn main() {}\n");
+
+        // The edit was taken: applying again has nothing to do.
+        let again = engine.lsp_apply_pending_edit(id);
+        assert!(!again.applied);
     }
 
     // -----------------------------------------------------------------------
